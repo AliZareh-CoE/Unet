@@ -380,33 +380,55 @@ def run_full_pipeline(
     else:
         tiers_to_run = list(range(start_tier, 5))
 
-    # Run each tier
+    # Run each tier with clear progress tracking
+    current_tier = None
+    completed_tiers = []
+
     try:
         if 0 in tiers_to_run:
+            current_tier = 0
             run_tier0(data, dry_run=dry_run)
+            completed_tiers.append(0)
 
         if 1 in tiers_to_run:
+            current_tier = 1
             run_tier1(data, device, dry_run=dry_run)
+            completed_tiers.append(1)
 
         if 2 in tiers_to_run:
+            current_tier = 2
             run_tier2(data, device, dry_run=dry_run)
+            completed_tiers.append(2)
 
         if 3 in tiers_to_run:
+            current_tier = 3
             run_tier3(data, device, dry_run=dry_run)
+            completed_tiers.append(3)
 
         if 4 in tiers_to_run:
+            current_tier = 4
             run_tier4(data, device, dry_run=dry_run)
+            completed_tiers.append(4)
 
     except GateFailure as e:
-        print(f"\n❌ GATE FAILURE: {e}")
+        print(f"\n❌ GATE FAILURE at Tier {current_tier}: {e}")
         print("Pipeline stopped. Review results and adjust approach.")
-        return {"status": "gate_failure", "error": str(e)}
+        return {"status": "gate_failure", "error": str(e), "failed_tier": current_tier}
 
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+        print(f"\n{'='*70}")
+        print(f"❌ ERROR at Tier {current_tier}")
+        print(f"{'='*70}")
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-        return {"status": "error", "error": str(e)}
+        print(f"\n{'='*70}")
+        print(f"COMPLETED TIERS: {completed_tiers}")
+        print(f"FAILED TIER: {current_tier}")
+        print(f"\n★ TO RESUME, RUN:")
+        print(f"  python experiments/tier_runner.py --start-tier {current_tier}")
+        print(f"{'='*70}")
+        return {"status": "error", "error": str(e), "failed_tier": current_tier, "completed": completed_tiers}
 
     # Final summary
     elapsed = time.time() - start_time
