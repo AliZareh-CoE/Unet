@@ -138,8 +138,20 @@ VALIDATION_STUDIES = {
     },
 }
 
+ABLATION_STUDIES = {
+    # Component Ablation: Justify each architectural choice
+    7: {
+        "name": "Component Ablation",
+        "description": "Ablate attention, norm, conditioning, SE, skip, depth",
+        "script": "experiments/study7_ablation/run_study7.py",
+        "default_trials": 35,  # 7 categories × 5 seeds (approx)
+        "gpus_needed": 2,
+        "stage": 1,
+    },
+}
+
 # Combined for easy access
-ALL_STUDIES = {**STAGE1_STUDIES, **STAGE2_STUDIES, **VALIDATION_STUDIES}
+ALL_STUDIES = {**STAGE1_STUDIES, **STAGE2_STUDIES, **VALIDATION_STUDIES, **ABLATION_STUDIES}
 
 
 # =============================================================================
@@ -319,6 +331,7 @@ def run_study(
         4: {"epochs": False, "trials": False, "patience": False}, # run_track_b.py (uses different args)
         5: {"epochs": False, "trials": False, "patience": False}, # run_study5.py (classical - no training)
         6: {"epochs": True, "trials": False, "patience": False, "n_seeds": True},  # run_study6.py
+        7: {"epochs": True, "trials": False, "patience": True, "seeds": True},  # run_study7.py (ablation)
     }
 
     supported = STUDY_ARGS.get(study_id, {"epochs": True, "trials": True, "patience": True})

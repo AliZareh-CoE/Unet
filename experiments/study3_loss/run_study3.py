@@ -67,11 +67,28 @@ STAGE1_EPOCHS = 80
 STAGE1_PATIENCE = 8
 CHECKPOINT_TOP_K = 3
 
-# Loss functions to compare
+# Loss functions to compare - comprehensive ablation for Nature Methods
 LOSS_TYPES = [
-    "l1", "mse", "huber",
+    # Standard regression losses
+    "l1", "mse", "huber", "log_cosh",
+    # Spectral/frequency-domain losses
     "multi_scale_spectral", "stft", "band_specific",
-    "gaussian_nll", "combined"
+    # Correlation-based losses (direct optimization of correlation metrics)
+    "pearson", "concordance",
+    # Probabilistic/uncertainty losses
+    "gaussian_nll",
+    # Structure-preserving losses
+    "ssim", "focal",
+    # Adversarial/perceptual losses
+    "adversarial", "perceptual",
+    # Combined losses
+    "combined"
+]
+
+# Core losses for quick runs (subset)
+CORE_LOSS_TYPES = [
+    "l1", "mse", "huber", "log_cosh",
+    "multi_scale_spectral", "pearson", "concordance"
 ]
 
 
@@ -134,6 +151,45 @@ def get_loss_hp_space(trial: optuna.Trial, loss_type: str) -> Dict[str, Any]:
             "time_loss": trial.suggest_categorical("time_loss", ["l1", "mse", "huber"]),
             "time_weight": trial.suggest_float("time_weight", 0.5, 2.0),
             "spectral_weight": trial.suggest_float("spectral_weight", 0.5, 2.0),
+        })
+
+    # =========================================================================
+    # Literature-standard losses
+    # =========================================================================
+
+    elif loss_type == "log_cosh":
+        pass  # No additional params - smooth L1/L2 hybrid
+
+    elif loss_type == "pearson":
+        hp.update({
+            "per_channel": trial.suggest_categorical("per_channel", [True, False]),
+        })
+
+    elif loss_type == "concordance":
+        hp.update({
+            "per_channel": trial.suggest_categorical("per_channel", [True, False]),
+        })
+
+    elif loss_type == "ssim":
+        hp.update({
+            "window_size": trial.suggest_categorical("window_size", [7, 11, 15]),
+            "data_range": trial.suggest_float("data_range", 1.0, 4.0),
+        })
+
+    elif loss_type == "focal":
+        hp.update({
+            "gamma": trial.suggest_float("gamma", 1.0, 4.0),
+        })
+
+    elif loss_type == "adversarial":
+        hp.update({
+            "loss_type": trial.suggest_categorical("adv_loss_type", ["lsgan", "hinge"]),
+        })
+
+    elif loss_type == "perceptual":
+        hp.update({
+            "feature_dims": trial.suggest_categorical("feature_dims",
+                ["64,128", "64,128,256", "128,256"]),
         })
 
     return hp

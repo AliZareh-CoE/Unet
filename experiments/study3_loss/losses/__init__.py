@@ -6,6 +6,7 @@ All loss functions for neural signal translation comparison:
 - Huber losses (robust to outliers)
 - Probabilistic losses (uncertainty estimation)
 - Multi-scale FFT losses (spectral fidelity)
+- Literature-standard losses (perceptual, adversarial, correlation, etc.)
 """
 
 from __future__ import annotations
@@ -33,6 +34,19 @@ from .multi_scale_fft import (
     CombinedSpectralTimeLoss,
     create_spectral_loss,
 )
+from .literature_losses import (
+    LogCoshLoss,
+    PearsonCorrelationLoss,
+    ConcordanceCorrelationLoss,
+    TemporalSSIMLoss,
+    ContrastiveLoss,
+    AdversarialLoss,
+    FocalMSELoss,
+    SlicedWassersteinLoss,
+    NeuralPerceptualLoss,
+    MultiObjectiveLoss,
+    create_literature_loss,
+)
 
 __all__ = [
     # Huber losses
@@ -55,6 +69,18 @@ __all__ = [
     "BandSpecificLoss",
     "CombinedSpectralTimeLoss",
     "create_spectral_loss",
+    # Literature losses
+    "LogCoshLoss",
+    "PearsonCorrelationLoss",
+    "ConcordanceCorrelationLoss",
+    "TemporalSSIMLoss",
+    "ContrastiveLoss",
+    "AdversarialLoss",
+    "FocalMSELoss",
+    "SlicedWassersteinLoss",
+    "NeuralPerceptualLoss",
+    "MultiObjectiveLoss",
+    "create_literature_loss",
     # Registry
     "LOSS_REGISTRY",
     "create_loss",
@@ -82,6 +108,21 @@ LOSS_REGISTRY = {
     "multi_res_stft": lambda **kw: create_spectral_loss("multi_res_stft", **kw),
     "band_specific": lambda **kw: create_spectral_loss("band_specific", **kw),
     "combined": lambda **kw: create_spectral_loss("combined", **kw),
+    # Literature-standard losses
+    "log_cosh": lambda **kw: create_literature_loss("log_cosh", **kw),
+    "pearson": lambda **kw: create_literature_loss("pearson", **kw),
+    "correlation": lambda **kw: create_literature_loss("pearson", **kw),  # Alias
+    "concordance": lambda **kw: create_literature_loss("concordance", **kw),
+    "ccc": lambda **kw: create_literature_loss("ccc", **kw),  # Alias
+    "ssim": lambda **kw: create_literature_loss("ssim", **kw),
+    "contrastive": lambda **kw: create_literature_loss("contrastive", **kw),
+    "adversarial": lambda **kw: create_literature_loss("adversarial", **kw),
+    "gan": lambda **kw: create_literature_loss("gan", **kw),  # Alias
+    "focal": lambda **kw: create_literature_loss("focal", **kw),
+    "focal_mse": lambda **kw: create_literature_loss("focal_mse", **kw),
+    "wasserstein": lambda **kw: create_literature_loss("wasserstein", **kw),
+    "swd": lambda **kw: create_literature_loss("swd", **kw),  # Alias
+    "perceptual": lambda **kw: create_literature_loss("perceptual", **kw),
 }
 
 
