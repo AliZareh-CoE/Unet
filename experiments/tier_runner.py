@@ -97,13 +97,27 @@ def load_data(dry_run: bool = False) -> Dict[str, torch.Tensor]:
 
     try:
         from data import prepare_data
+        import numpy as np
+
         raw_data = prepare_data()
 
+        # prepare_data returns:
+        # - ob: [trials, channels, time] OB signals
+        # - pcx: [trials, channels, time] PCx signals
+        # - train_idx, val_idx, test_idx: index arrays
+        ob = raw_data["ob"]
+        pcx = raw_data["pcx"]
+        train_idx = raw_data["train_idx"]
+        val_idx = raw_data["val_idx"]
+        test_idx = raw_data["test_idx"]
+
         # Combine train and val for CV, keep test as holdout
-        X_train = torch.cat([raw_data["train"]["ob"], raw_data["val"]["ob"]], dim=0)
-        y_train = torch.cat([raw_data["train"]["hp"], raw_data["val"]["hp"]], dim=0)
-        X_test = raw_data["test"]["ob"]
-        y_test = raw_data["test"]["hp"]
+        train_val_idx = np.concatenate([train_idx, val_idx])
+
+        X_train = torch.from_numpy(ob[train_val_idx]).float()
+        y_train = torch.from_numpy(pcx[train_val_idx]).float()
+        X_test = torch.from_numpy(ob[test_idx]).float()
+        y_test = torch.from_numpy(pcx[test_idx]).float()
 
         print(f"Loaded real data: {X_train.shape[0]} train, {X_test.shape[0]} test")
 
@@ -115,7 +129,7 @@ def load_data(dry_run: bool = False) -> Dict[str, torch.Tensor]:
         }
 
     except Exception as e:
-        print(f"Warning: Could not load real data ({e}), using synthetic")
+        print(f"Warning: Could not load real data ('{e}'), using synthetic")
         N_train, N_test = 160, 40
         C, T = 32, 1000
 
