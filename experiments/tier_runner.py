@@ -186,8 +186,9 @@ def run_tier1(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool
 
     # Check gate
     registry = get_registry()
-    registry.check_gate_tier1()
-    print("\n✓ GATE PASSED: Neural beats classical")
+    registry.check_gate_tier1(dry_run=dry_run)
+    if not dry_run or (registry.tier1 and registry.tier0 and registry.tier1.best_r2 > registry.tier0.best_r2 + 0.05):
+        print("\n✓ GATE PASSED: Neural beats classical")
 
 
 def run_tier2(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
@@ -230,8 +231,9 @@ def run_tier2(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool
 
     # Check gate
     registry = get_registry()
-    registry.check_gate_tier2()
-    print("\n✓ GATE PASSED: Winner beats classical by sufficient margin")
+    registry.check_gate_tier2(dry_run=dry_run)
+    if not dry_run or (registry.tier2 and registry.tier0 and registry.tier2.best_r2_mean > registry.tier0.best_r2 + 0.10):
+        print("\n✓ GATE PASSED: Winner beats classical by sufficient margin")
 
     # Check if SpectralShift is needed
     if registry.needs_spectral_shift():
@@ -317,8 +319,9 @@ def run_tier4(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool
 
     # Check gate
     registry = get_registry()
-    registry.check_gate_tier4()
-    print("\n✓ GATE PASSED: All negative controls passed")
+    registry.check_gate_tier4(dry_run=dry_run)
+    if not dry_run or (registry.tier4 and registry.tier4.all_controls_passed):
+        print("\n✓ GATE PASSED: All negative controls passed")
 
 
 # =============================================================================

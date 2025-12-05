@@ -96,7 +96,27 @@ def create_model(arch_name: str, in_channels: int, out_channels: int, device: to
 
     Returns:
         Model instance
+
+    Variant mapping:
+        - linear: simple
+        - cnn: basic (NOT standard!)
+        - wavenet: standard
+        - fnet: standard
+        - vit: standard
+        - performer: standard
+        - mamba: standard
     """
+    # Variant mapping - each arch has different default variants
+    VARIANT_MAP = {
+        "linear": "simple",
+        "cnn": "basic",  # CNN uses "basic", not "standard"
+        "wavenet": "standard",
+        "fnet": "standard",
+        "vit": "standard",
+        "performer": "standard",
+        "mamba": "standard",
+    }
+
     if arch_name == "unet":
         from models import UNet1DConditioned
         model = UNet1DConditioned(
@@ -104,20 +124,9 @@ def create_model(arch_name: str, in_channels: int, out_channels: int, device: to
             out_channels=out_channels,
             base_channels=32,  # Smaller for screening
         )
-    elif arch_name == "linear":
-        model = create_architecture("linear", variant="simple", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "cnn":
-        model = create_architecture("cnn", variant="standard", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "wavenet":
-        model = create_architecture("wavenet", variant="standard", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "fnet":
-        model = create_architecture("fnet", variant="standard", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "vit":
-        model = create_architecture("vit", variant="standard", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "performer":
-        model = create_architecture("performer", variant="standard", in_channels=in_channels, out_channels=out_channels)
-    elif arch_name == "mamba":
-        model = create_architecture("mamba", variant="standard", in_channels=in_channels, out_channels=out_channels)
+    elif arch_name in VARIANT_MAP:
+        variant = VARIANT_MAP[arch_name]
+        model = create_architecture(arch_name, variant=variant, in_channels=in_channels, out_channels=out_channels)
     else:
         raise ValueError(f"Unknown architecture: {arch_name}")
 
@@ -284,6 +293,7 @@ def run_screening_matrix(
             combo_idx += 1
             print(f"  [{combo_idx}/{total_combos}] {arch_name} + {loss_category}...", end=" ", flush=True)
 
+            model = None  # Initialize for cleanup
             try:
                 # Create fresh model
                 model = create_model(arch_name, in_channels, out_channels, device)
@@ -325,7 +335,8 @@ def run_screening_matrix(
                 ))
 
             # Cleanup
-            del model
+            if model is not None:
+                del model
             gc.collect()
             torch.cuda.empty_cache()
 

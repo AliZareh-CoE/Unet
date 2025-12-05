@@ -128,10 +128,22 @@ def create_model_with_conditioning(
         except (ImportError, TypeError):
             pass
 
+    # Variant mapping for architectures
+    VARIANT_MAP = {
+        "linear": "simple",
+        "cnn": "basic",  # CNN uses "basic", not "standard"
+        "wavenet": "standard",
+        "fnet": "standard",
+        "vit": "standard",
+        "performer": "standard",
+        "mamba": "standard",
+    }
+    variant = VARIANT_MAP.get(arch_name, "standard")
+
     # For other architectures, wrap with conditioning layer
     base_model = create_architecture(
         arch_name,
-        variant="standard",
+        variant=variant,
         in_channels=in_channels,
         out_channels=out_channels,
     )
@@ -292,7 +304,8 @@ def train_single_config(
 
     # PSD error
     try:
-        psd_error = compute_psd_error_db(preds, targets)
+        psd_result = compute_psd_error_db(preds, targets)
+        psd_error = psd_result.get("overall", 0.0) if isinstance(psd_result, dict) else psd_result
     except Exception:
         psd_error = 0.0
 
@@ -300,7 +313,7 @@ def train_single_config(
         "r2": r2,
         "mae": mae,
         "pearson": float(pearson) if not np.isnan(pearson) else 0.0,
-        "psd_error_db": psd_error,
+        "psd_error_db": float(psd_error),
     }
 
 
@@ -373,6 +386,7 @@ def run_factorial_design(
                 print(f"  [{run_idx}/{total_runs}] {arch}+{loss_cat}+{cond} seed={current_seed} fold={fold_idx}...",
                       end=" ", flush=True)
 
+                model = None  # Initialize for cleanup
                 try:
                     # Set seeds
                     torch.manual_seed(current_seed)
@@ -442,7 +456,8 @@ def run_factorial_design(
                     ))
 
                 # Cleanup
-                del model
+                if model is not None:
+                    del model
                 gc.collect()
                 torch.cuda.empty_cache()
 

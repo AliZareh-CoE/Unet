@@ -173,7 +173,8 @@ def train_and_evaluate(
 
     # PSD error
     try:
-        psd_error = compute_psd_error_db(preds, targets)
+        psd_result = compute_psd_error_db(preds, targets)
+        psd_error = psd_result.get("overall", 0.0) if isinstance(psd_result, dict) else psd_result
     except Exception:
         psd_error = 0.0
 
@@ -181,7 +182,7 @@ def train_and_evaluate(
         "r2": r2,
         "mae": mae,
         "pearson": float(pearson) if not np.isnan(pearson) else 0.0,
-        "psd_error_db": psd_error,
+        "psd_error_db": float(psd_error),
     }
 
 
@@ -216,9 +217,21 @@ def create_model_from_config(
         except (ImportError, TypeError):
             pass
 
+    # Variant mapping for architectures
+    VARIANT_MAP = {
+        "linear": "simple",
+        "cnn": "basic",  # CNN uses "basic", not "standard"
+        "wavenet": "standard",
+        "fnet": "standard",
+        "vit": "standard",
+        "performer": "standard",
+        "mamba": "standard",
+    }
+    variant = VARIANT_MAP.get(arch, "standard")
+
     model = create_architecture(
         arch,
-        variant="standard",
+        variant=variant,
         in_channels=in_channels,
         out_channels=out_channels,
     )
@@ -283,6 +296,7 @@ def run_multi_seed_validation(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
+        model = None  # Initialize for cleanup
         try:
             model = create_model_from_config(config, in_channels, out_channels, device)
             criterion = create_loss(loss_name)
@@ -309,7 +323,8 @@ def run_multi_seed_validation(
         except Exception as e:
             print(f"FAILED: {e}")
 
-        del model
+        if model is not None:
+            del model
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -384,6 +399,7 @@ def run_negative_controls(
         train_loader = DataLoader(train_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=True, drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=False)
 
+        model = None  # Initialize for cleanup
         try:
             model = create_model_from_config(config, in_channels, out_channels, device)
             criterion = create_loss(loss_name)
@@ -397,7 +413,8 @@ def run_negative_controls(
         except Exception:
             pass
 
-        del model
+        if model is not None:
+            del model
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -429,6 +446,7 @@ def run_negative_controls(
         train_loader = DataLoader(train_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=True, drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=False)
 
+        model = None  # Initialize for cleanup
         try:
             model = create_model_from_config(config, in_channels, out_channels, device)
             criterion = create_loss(loss_name)
@@ -442,7 +460,8 @@ def run_negative_controls(
         except Exception:
             pass
 
-        del model
+        if model is not None:
+            del model
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -471,6 +490,7 @@ def run_negative_controls(
         train_loader = DataLoader(train_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=True, drop_last=True)
         test_loader = DataLoader(test_dataset, batch_size=VALIDATION_BATCH_SIZE, shuffle=False)
 
+        model = None  # Initialize for cleanup
         try:
             model = create_model_from_config(config, in_channels, out_channels, device)
             criterion = create_loss(loss_name)
@@ -484,7 +504,8 @@ def run_negative_controls(
         except Exception:
             pass
 
-        del model
+        if model is not None:
+            del model
         gc.collect()
         torch.cuda.empty_cache()
 

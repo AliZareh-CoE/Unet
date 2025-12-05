@@ -352,7 +352,7 @@ class ConfigRegistry:
         self.tier1 = result
         self._save_state()
 
-    def check_gate_tier1(self) -> None:
+    def check_gate_tier1(self, dry_run: bool = False) -> None:
         """Gate: Check if screening beats classical baseline."""
         if self.tier0 is None:
             raise ValueError("Must complete Tier 0 before Tier 1")
@@ -361,13 +361,16 @@ class ConfigRegistry:
 
         margin = self.tier1.best_r2 - self.tier0.best_r2
         if margin < self.gate_margin_screening:
-            raise GateFailure(
-                tier="Tier 1",
-                condition=f"Neural must beat classical by {self.gate_margin_screening}",
-                details=f"Best neural: {self.tier1.best_r2:.4f}, "
-                f"Classical: {self.tier0.best_r2:.4f}, "
-                f"Margin: {margin:.4f}",
+            msg = (
+                f"Gate failed at Tier 1: Neural must beat classical by {self.gate_margin_screening} "
+                f"(Best neural: {self.tier1.best_r2:.4f}, Classical: {self.tier0.best_r2:.4f}, "
+                f"Margin: {margin:.4f})"
             )
+            if dry_run:
+                print(f"\n⚠ [DRY-RUN] Gate would fail: {msg}")
+                print("  Continuing anyway for comprehensive testing...\n")
+            else:
+                raise GateFailure(tier="Tier 1", condition=msg, details="")
 
     def get_tier1_selections(self) -> Dict[str, List[str]]:
         """Get selected architectures and losses for Tier 2."""
@@ -418,7 +421,7 @@ class ConfigRegistry:
         self.tier2 = result
         self._save_state()
 
-    def check_gate_tier2(self) -> None:
+    def check_gate_tier2(self, dry_run: bool = False) -> None:
         """Gate: Check factorial design results."""
         if self.tier0 is None or self.tier2 is None:
             raise ValueError("Must complete Tiers 0 and 2")
@@ -426,13 +429,16 @@ class ConfigRegistry:
         # Must beat classical by full margin
         margin = self.tier2.best_r2_mean - self.tier0.best_r2
         if margin < self.gate_margin_classical:
-            raise GateFailure(
-                tier="Tier 2",
-                condition=f"Winner must beat classical by {self.gate_margin_classical}",
-                details=f"Winner: {self.tier2.best_r2_mean:.4f}, "
-                f"Classical: {self.tier0.best_r2:.4f}, "
-                f"Margin: {margin:.4f}",
+            msg = (
+                f"Gate failed at Tier 2: Winner must beat classical by {self.gate_margin_classical} "
+                f"(Winner: {self.tier2.best_r2_mean:.4f}, Classical: {self.tier0.best_r2:.4f}, "
+                f"Margin: {margin:.4f})"
             )
+            if dry_run:
+                print(f"\n⚠ [DRY-RUN] Gate would fail: {msg}")
+                print("  Continuing anyway for comprehensive testing...\n")
+            else:
+                raise GateFailure(tier="Tier 2", condition=msg, details="")
 
     def needs_spectral_shift(self) -> bool:
         """Check if SpectralShift optimization is needed."""
@@ -517,18 +523,19 @@ class ConfigRegistry:
         self.tier4 = result
         self._save_state()
 
-    def check_gate_tier4(self) -> None:
+    def check_gate_tier4(self, dry_run: bool = False) -> None:
         """Gate: Check final validation."""
         if self.tier4 is None:
             raise ValueError("Tier 4 not yet completed")
 
         if not self.tier4.all_controls_passed:
             failed = [c for c in self.tier4.negative_controls if not c.passed]
-            raise GateFailure(
-                tier="Tier 4",
-                condition="All negative controls must pass",
-                details=f"Failed: {[c.control_type for c in failed]}",
-            )
+            msg = f"Gate failed at Tier 4: All negative controls must pass (Failed: {[c.control_type for c in failed]})"
+            if dry_run:
+                print(f"\n⚠ [DRY-RUN] Gate would fail: {msg}")
+                print("  Continuing anyway for comprehensive testing...\n")
+            else:
+                raise GateFailure(tier="Tier 4", condition=msg, details="")
 
     # =========================================================================
     # Summary and Export

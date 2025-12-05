@@ -165,10 +165,22 @@ def create_ablated_model(
         except (ImportError, TypeError):
             pass
 
+    # Variant mapping for architectures
+    VARIANT_MAP = {
+        "linear": "simple",
+        "cnn": "basic",  # CNN uses "basic", not "standard"
+        "wavenet": "standard",
+        "fnet": "standard",
+        "vit": "standard",
+        "performer": "standard",
+        "mamba": "standard",
+    }
+    variant = VARIANT_MAP.get(base_arch, "standard")
+
     # Fallback to base architecture
     model = create_architecture(
         base_arch,
-        variant="standard",
+        variant=variant,
         in_channels=in_channels,
         out_channels=out_channels,
     )
@@ -327,6 +339,7 @@ def run_single_ablation(
                 shuffle=False,
             )
 
+            model = None  # Initialize for cleanup
             try:
                 model = create_ablated_model(
                     arch, ablation_component, ablation_variant,
@@ -351,7 +364,8 @@ def run_single_ablation(
                 print(f"    Failed: {e}")
                 r2_values.append(float("-inf"))
 
-            del model
+            if model is not None:
+                del model
             gc.collect()
             torch.cuda.empty_cache()
 
