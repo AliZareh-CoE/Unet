@@ -33,17 +33,19 @@ class WienerFilter:
 
     def __init__(
         self,
-        n_fft: int = 1024,
+        n_fft: Optional[int] = None,  # None = auto (use signal length)
         regularization: float = 1e-8,
         smooth_window: int = 5,
     ):
-        self.n_fft = n_fft
+        self._n_fft_init = n_fft  # Store initial value
+        self.n_fft = n_fft  # Will be set during fit if None
         self.regularization = regularization
         self.smooth_window = smooth_window
 
         # Filter coefficients (computed during fit)
         self.H: Optional[NDArray] = None
         self._fitted = False
+        self._signal_length: Optional[int] = None  # Store original signal length
 
     def _smooth_spectrum(self, spectrum: NDArray) -> NDArray:
         """Apply moving average smoothing to spectrum."""
@@ -82,6 +84,15 @@ class WienerFilter:
 
         N, C_in, T = X.shape
         _, C_out, _ = y.shape
+
+        # Store signal length for predict
+        self._signal_length = T
+
+        # Auto-set n_fft if not specified (use next power of 2 for efficiency)
+        if self._n_fft_init is None:
+            self.n_fft = int(2 ** np.ceil(np.log2(T)))
+        else:
+            self.n_fft = self._n_fft_init
 
         # Compute FFT of all signals
         X_fft = np.fft.rfft(X, n=self.n_fft, axis=-1)  # [N, C_in, F]
@@ -129,7 +140,7 @@ class WienerFilter:
         N, C_in, T = X.shape
         C_out = self.H.shape[0]
 
-        # FFT of input
+        # FFT of input (use same n_fft as fit)
         X_fft = np.fft.rfft(X, n=self.n_fft, axis=-1)  # [N, C_in, F]
 
         # Apply filter
@@ -138,10 +149,10 @@ class WienerFilter:
             for c_in in range(C_in):
                 y_fft[:, c_out, :] += self.H[c_out, c_in, :] * X_fft[:, c_in, :]
 
-        # Inverse FFT
+        # Inverse FFT - use n_fft to get proper length
         y = np.fft.irfft(y_fft, n=self.n_fft, axis=-1)
 
-        # Truncate to original length
+        # Truncate to original signal length (from input, not fit)
         y = y[..., :T]
 
         if single_channel and C_out == 1:
@@ -181,7 +192,7 @@ class MultiChannelWienerFilter(WienerFilter):
 
     def __init__(
         self,
-        n_fft: int = 1024,
+        n_fft: Optional[int] = None,
         regularization: float = 1e-6,
         use_mimo: bool = True,
     ):
@@ -215,6 +226,15 @@ class MultiChannelWienerFilter(WienerFilter):
 
         N, C_in, T = X.shape
         _, C_out, _ = y.shape
+
+        # Store signal length for predict
+        self._signal_length = T
+
+        # Auto-set n_fft if not specified (use next power of 2 for efficiency)
+        if self._n_fft_init is None:
+            self.n_fft = int(2 ** np.ceil(np.log2(T)))
+        else:
+            self.n_fft = self._n_fft_init
 
         # Compute FFT
         X_fft = np.fft.rfft(X, n=self.n_fft, axis=-1)  # [N, C_in, F]
