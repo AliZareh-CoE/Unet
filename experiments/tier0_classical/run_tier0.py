@@ -19,7 +19,7 @@ Usage:
     python experiments/tier0_classical/run_tier0.py
     python experiments/tier0_classical/run_tier0.py --dry-run
     python experiments/tier0_classical/run_tier0.py --parallel-baselines --n-jobs -1
-    python experiments/tier0_classical/run_tier0.py --use-gpu
+    1python experiments/tier0_classical/run_tier0.py --use-gpu
 """
 
 from __future__ import annotations
