@@ -1,9 +1,9 @@
 """
-Support Vector Regression (SVR) for Neural Signal Translation
-==============================================================
+Support Vector Regression (SVR) for Neural Signal Translation - GPU Accelerated
+=================================================================================
 
 Kernel-based nonlinear regression baseline.
-Uses PCA for dimensionality reduction to handle large feature spaces.
+Uses GPU for preprocessing (PCA, scaling) and cuML for SVR if available.
 """
 
 from __future__ import annotations
@@ -11,23 +11,51 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 from numpy.typing import NDArray
-from sklearn.svm import SVR
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+
+# GPU support
+try:
+    import cupy as cp
+    HAS_CUPY = True
+except ImportError:
+    cp = None
+    HAS_CUPY = False
+
+# cuML for GPU SVR (RAPIDS)
+try:
+    from cuml.svm import SVR as cumlSVR
+    from cuml.decomposition import PCA as cumlPCA
+    from cuml.preprocessing import StandardScaler as cumlScaler
+    HAS_CUML = True
+except ImportError:
+    HAS_CUML = False
+
+
+def get_array_module(use_gpu: bool = True):
+    """Get numpy or cupy module."""
+    if use_gpu and HAS_CUPY:
+        return cp
+    return np
+
+
+def to_numpy(arr) -> np.ndarray:
+    """Convert to numpy array."""
+    if HAS_CUPY and isinstance(arr, cp.ndarray):
+        return arr.get()
+    return np.asarray(arr)
 
 
 class SVRBaseline:
-    """SVR baseline for signal translation.
+    """SVR baseline for signal translation - GPU accelerated.
 
-    Uses PCA to reduce dimensionality before SVR (essential for speed).
+    Uses cuML for GPU SVR if available, falls back to sklearn.
+    PCA preprocessing is GPU accelerated with CuPy.
 
     Args:
         kernel: SVR kernel ('rbf', 'linear', 'poly')
         C: Regularization parameter
         epsilon: Epsilon in epsilon-SVR
-        n_components: PCA components (None = auto)
-        subsample: Subsample rate for training (1.0 = all data)
+        n_components: PCA components for dimensionality reduction
+        use_gpu: Use GPU acceleration
     """
 
     def __init__(
@@ -35,24 +63,81 @@ class SVRBaseline:
         kernel: str = "rbf",
         C: float = 1.0,
         epsilon: float = 0.1,
-        n_components: Optional[int] = 100,
-        subsample: float = 1.0,
+        n_components: int = 100,
+        use_gpu: bool = True,
     ):
         self.kernel = kernel
         self.C = C
         self.epsilon = epsilon
         self.n_components = n_components
-        self.subsample = subsample
+        self.use_gpu = use_gpu and (HAS_CUPY or HAS_CUML)
 
-        self.pca_x: Optional[PCA] = None
-        self.pca_y: Optional[PCA] = None
-        self.scaler_x: Optional[StandardScaler] = None
-        self.scaler_y: Optional[StandardScaler] = None
-        self.model: Optional[MultiOutputRegressor] = None
+        self.pca_x = None
+        self.pca_y = None
+        self.scaler_x = None
+        self.scaler_y = None
+        self.model = None
         self._fitted = False
 
+    def _gpu_pca_fit_transform(self, X: NDArray, n_components: int):
+        """GPU-accelerated PCA fit_transform using CuPy SVD."""
+        xp = get_array_module(self.use_gpu)
+
+        if self.use_gpu and HAS_CUPY:
+            X = xp.asarray(X)
+
+        # Center
+        mean = xp.mean(X, axis=0)
+        X_centered = X - mean
+
+        # SVD for PCA
+        n_comp = min(n_components, X.shape[0] - 1, X.shape[1])
+        U, S, Vt = xp.linalg.svd(X_centered, full_matrices=False)
+
+        components = Vt[:n_comp, :]
+        X_transformed = U[:, :n_comp] * S[:n_comp]
+
+        return to_numpy(X_transformed), to_numpy(components), to_numpy(mean)
+
+    def _gpu_pca_transform(self, X: NDArray, components: NDArray, mean: NDArray):
+        """GPU-accelerated PCA transform."""
+        xp = get_array_module(self.use_gpu)
+
+        if self.use_gpu and HAS_CUPY:
+            X = xp.asarray(X)
+            components = xp.asarray(components)
+            mean = xp.asarray(mean)
+
+        X_transformed = (X - mean) @ components.T
+        return to_numpy(X_transformed)
+
+    def _gpu_standardize_fit(self, X: NDArray):
+        """GPU-accelerated standardization fit."""
+        xp = get_array_module(self.use_gpu)
+
+        if self.use_gpu and HAS_CUPY:
+            X = xp.asarray(X)
+
+        mean = xp.mean(X, axis=0)
+        std = xp.std(X, axis=0)
+        std = xp.where(std < 1e-8, 1.0, std)
+
+        X_scaled = (X - mean) / std
+        return to_numpy(X_scaled), to_numpy(mean), to_numpy(std)
+
+    def _gpu_standardize_transform(self, X: NDArray, mean: NDArray, std: NDArray):
+        """GPU-accelerated standardization transform."""
+        xp = get_array_module(self.use_gpu)
+
+        if self.use_gpu and HAS_CUPY:
+            X = xp.asarray(X)
+            mean = xp.asarray(mean)
+            std = xp.asarray(std)
+
+        return to_numpy((X - mean) / std)
+
     def fit(self, X: NDArray, y: NDArray) -> "SVRBaseline":
-        """Fit SVR model.
+        """Fit SVR model - GPU accelerated.
 
         Args:
             X: Input signals [N, C_in, T]
@@ -72,39 +157,37 @@ class SVRBaseline:
         else:
             N = X.shape[0]
 
-        # Subsample for speed
-        if self.subsample < 1.0:
-            n_samples = int(N * self.subsample)
-            idx = np.random.choice(N, n_samples, replace=False)
-            X = X[idx]
-            y = y[idx]
+        # Standardize on GPU
+        X, self._x_mean, self._x_std = self._gpu_standardize_fit(X)
+        y, self._y_mean, self._y_std = self._gpu_standardize_fit(y)
 
-        # Standardize
-        self.scaler_x = StandardScaler()
-        self.scaler_y = StandardScaler()
-        X = self.scaler_x.fit_transform(X)
-        y = self.scaler_y.fit_transform(y)
+        # PCA on GPU
+        n_comp = min(self.n_components, X.shape[0] - 1, X.shape[1])
+        X_pca, self._pca_x_comp, self._pca_x_mean = self._gpu_pca_fit_transform(X, n_comp)
+        y_pca, self._pca_y_comp, self._pca_y_mean = self._gpu_pca_fit_transform(y, n_comp)
 
-        # PCA for dimensionality reduction
-        n_comp_x = min(self.n_components or X.shape[1], X.shape[0] - 1, X.shape[1])
-        n_comp_y = min(self.n_components or y.shape[1], y.shape[0] - 1, y.shape[1])
-
-        self.pca_x = PCA(n_components=n_comp_x)
-        self.pca_y = PCA(n_components=n_comp_y)
-
-        X_pca = self.pca_x.fit_transform(X)
-        y_pca = self.pca_y.fit_transform(y)
-
-        # Fit SVR
-        base_svr = SVR(kernel=self.kernel, C=self.C, epsilon=self.epsilon)
-        self.model = MultiOutputRegressor(base_svr, n_jobs=-1)
-        self.model.fit(X_pca, y_pca)
+        # Fit SVR - use cuML if available
+        if HAS_CUML and self.use_gpu:
+            # cuML multi-output SVR
+            from cuml.svm import SVR as cumlSVR
+            self.models = []
+            for i in range(y_pca.shape[1]):
+                svr = cumlSVR(kernel=self.kernel, C=self.C, epsilon=self.epsilon)
+                svr.fit(X_pca, y_pca[:, i])
+                self.models.append(svr)
+        else:
+            # sklearn fallback
+            from sklearn.svm import SVR
+            from sklearn.multioutput import MultiOutputRegressor
+            base_svr = SVR(kernel=self.kernel, C=self.C, epsilon=self.epsilon)
+            self.model = MultiOutputRegressor(base_svr, n_jobs=-1)
+            self.model.fit(X_pca, y_pca)
 
         self._fitted = True
         return self
 
     def predict(self, X: NDArray) -> NDArray:
-        """Predict output signals.
+        """Predict output signals - GPU accelerated.
 
         Args:
             X: Input signals [N, C_in, T]
@@ -123,16 +206,31 @@ class SVRBaseline:
         else:
             N = X.shape[0]
 
-        # Transform
-        X = self.scaler_x.transform(X)
-        X_pca = self.pca_x.transform(X)
+        # Standardize on GPU
+        X = self._gpu_standardize_transform(X, self._x_mean, self._x_std)
 
-        # Predict in PCA space
-        y_pca = self.model.predict(X_pca)
+        # PCA transform on GPU
+        X_pca = self._gpu_pca_transform(X, self._pca_x_comp, self._pca_x_mean)
 
-        # Inverse transform
-        y = self.pca_y.inverse_transform(y_pca)
-        y = self.scaler_y.inverse_transform(y)
+        # Predict
+        if HAS_CUML and self.use_gpu and hasattr(self, 'models'):
+            y_pca = np.column_stack([m.predict(X_pca) for m in self.models])
+        else:
+            y_pca = self.model.predict(X_pca)
+
+        # Inverse PCA transform on GPU
+        xp = get_array_module(self.use_gpu)
+        if self.use_gpu and HAS_CUPY:
+            y_pca = xp.asarray(y_pca)
+            pca_y_comp = xp.asarray(self._pca_y_comp)
+            pca_y_mean = xp.asarray(self._pca_y_mean)
+            y = y_pca @ pca_y_comp + pca_y_mean
+            y = to_numpy(y)
+        else:
+            y = y_pca @ self._pca_y_comp + self._pca_y_mean
+
+        # Inverse standardize
+        y = y * self._y_std + self._y_mean
 
         if reshape_back:
             C_out, T = self._output_shape
@@ -146,21 +244,21 @@ class SVRBaseline:
 
 
 class LinearSVRBaseline(SVRBaseline):
-    """Linear SVR - faster than RBF for large datasets."""
+    """Linear SVR - faster than RBF, GPU accelerated."""
 
     def __init__(
         self,
         C: float = 1.0,
         epsilon: float = 0.1,
-        n_components: Optional[int] = 100,
-        subsample: float = 1.0,
+        n_components: int = 100,
+        use_gpu: bool = True,
     ):
         super().__init__(
             kernel="linear",
             C=C,
             epsilon=epsilon,
             n_components=n_components,
-            subsample=subsample,
+            use_gpu=use_gpu,
         )
 
 
