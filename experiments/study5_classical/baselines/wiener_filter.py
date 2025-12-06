@@ -204,7 +204,7 @@ class MultiChannelWienerFilter(WienerFilter):
         X: NDArray,
         y: NDArray,
     ) -> "MultiChannelWienerFilter":
-        """Fit MIMO Wiener filter.
+        """Fit MIMO Wiener filter (vectorized for speed).
 
         For MIMO, we solve: H(f) = S_xy(f) @ S_xx(f)^{-1}
 
@@ -242,28 +242,40 @@ class MultiChannelWienerFilter(WienerFilter):
 
         n_freq = X_fft.shape[-1]
 
-        # Initialize filter [C_out, C_in, F]
-        self.H = np.zeros((C_out, C_in, n_freq), dtype=np.complex128)
+        # VECTORIZED computation (much faster than loop over frequencies)
+        # Transpose for easier matrix operations: [F, N, C]
+        X_fft_t = X_fft.transpose(2, 0, 1)  # [F, N, C_in]
+        y_fft_t = y_fft.transpose(2, 0, 1)  # [F, N, C_out]
 
-        for f in range(n_freq):
-            # Cross-spectral matrix S_xy [C_out, C_in]
-            S_xy = np.zeros((C_out, C_in), dtype=np.complex128)
-            for n in range(N):
-                S_xy += np.outer(y_fft[n, :, f], np.conj(X_fft[n, :, f]))
-            S_xy /= N
+        # Cross-spectral matrix S_xy [F, C_out, C_in] = E[y @ x^H]
+        # Using einsum: for each freq, compute outer product and average over N
+        S_xy = np.einsum('fno,fni->foi', y_fft_t, np.conj(X_fft_t)) / N
 
-            # Auto-spectral matrix S_xx [C_in, C_in]
-            S_xx = np.zeros((C_in, C_in), dtype=np.complex128)
-            for n in range(N):
-                S_xx += np.outer(X_fft[n, :, f], np.conj(X_fft[n, :, f]))
-            S_xx /= N
+        # Auto-spectral matrix S_xx [F, C_in, C_in] = E[x @ x^H]
+        S_xx = np.einsum('fni,fnj->fij', X_fft_t, np.conj(X_fft_t)) / N
 
-            # Regularize and invert
-            S_xx_reg = S_xx + self.regularization * np.eye(C_in)
-            S_xx_inv = np.linalg.inv(S_xx_reg)
+        # Regularize: add regularization * I to each frequency's S_xx
+        eye = np.eye(C_in, dtype=np.complex128)
+        S_xx_reg = S_xx + self.regularization * eye[np.newaxis, :, :]
 
-            # MIMO Wiener filter at frequency f
-            self.H[:, :, f] = S_xy @ S_xx_inv
+        # Solve H @ S_xx = S_xy for each frequency using pseudoinverse (robust)
+        # H [F, C_out, C_in]
+        try:
+            # Use solve for better numerical stability than inv
+            # Solve S_xx^T @ H^T = S_xy^T -> H^T = solve(S_xx^T, S_xy^T)
+            H_t = np.linalg.solve(
+                S_xx_reg.transpose(0, 2, 1),  # [F, C_in, C_in]
+                S_xy.transpose(0, 2, 1)       # [F, C_in, C_out]
+            )  # [F, C_in, C_out]
+            H = H_t.transpose(0, 2, 1)  # [F, C_out, C_in]
+        except np.linalg.LinAlgError:
+            # Fallback to pseudoinverse if solve fails
+            H = np.zeros((n_freq, C_out, C_in), dtype=np.complex128)
+            for f in range(n_freq):
+                H[f] = S_xy[f] @ np.linalg.pinv(S_xx_reg[f])
+
+        # Transpose to expected shape [C_out, C_in, F]
+        self.H = H.transpose(1, 2, 0)
 
         self._fitted = True
         return self
