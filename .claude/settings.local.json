@@ -4,7 +4,9 @@
       "Bash(ls:*)",
       "Bash(wc:*)",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nFix parallel processing stack smashing and add tqdm progress bars\n\n- Use spawn context instead of fork to avoid numpy/scipy memory corruption\n- Add memory-aware worker limit (_get_safe_parallel_workers)\n- Limit thread counts (OMP/MKL/OPENBLAS/NUMEXPR) to avoid contention\n- Add tqdm progress bars for parallel and sequential baseline evaluation\n- Add error handling in parallel workers (return NaN result instead of crash)\n- Fix NUMEXPR_MAX_THREADS warning\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")"
     ],
     "deny": [],
     "ask": []
