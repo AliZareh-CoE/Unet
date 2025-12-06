@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tier 0: Classical Floor (GATE) - MULTI-GPU ACCELERATED
-========================================================
+Tier 0: Classical Floor (GATE) - GPU ACCELERATED
+=================================================
 
 Establishes the minimum performance bar that neural methods must beat.
 Uses 5-fold CV for robust estimation.
@@ -9,13 +9,13 @@ Uses 5-fold CV for robust estimation.
 GATE CONDITION: Neural methods in Tier 1+ must beat best classical by 0.10 R²
 
 PERFORMANCE FEATURES:
-- Multi-GPU parallel baseline evaluation (via CuPy)
-- Each baseline runs on a different GPU simultaneously
+- GPU acceleration for baselines (via CuPy)
 - Vectorized metrics and bootstrap CI
 - tqdm progress bars with real-time updates
+- Checkpoint/resume support
 
 Usage:
-    python experiments/tier0_classical/run_tier0.py --use-gpu     # Multi-GPU parallel
+    python experiments/tier0_classical/run_tier0.py --use-gpu     # GPU accelerated
     python experiments/tier0_classical/run_tier0.py              # Sequential CPU
     python experiments/tier0_classical/run_tier0.py --dry-run    # Quick test
 """
@@ -819,10 +819,10 @@ def run_tier0(
 ) -> Tuple[Tier0Result, Dict[str, Any]]:
     """Run Tier 0: Classical Floor evaluation (Nature Methods publication quality).
 
-    MULTI-GPU ACCELERATED:
-    - With --use-gpu: Runs baselines in parallel across multiple GPUs
-    - Each baseline assigned to a different GPU via ThreadPoolExecutor
+    GPU ACCELERATED:
+    - With --use-gpu: Runs baselines sequentially on GPU 0 using CuPy
     - Vectorized metrics computation and bootstrap CI
+    - Checkpoint/resume support
 
     Args:
         X: Input data [N, C, T]
@@ -834,7 +834,7 @@ def run_tier0(
         resume: Whether to resume from checkpoint (skip completed experiments)
         sample_rate: Sampling rate in Hz for spectral analysis
         n_jobs: Number of parallel jobs for fold CV (default: 1 for GPU mode)
-        use_gpu: Whether to use multi-GPU parallel execution
+        use_gpu: Whether to use GPU acceleration
 
     Returns:
         Tuple of:
@@ -870,7 +870,7 @@ def run_tier0(
     n_gpus = len(available_gpus)
 
     if use_gpu and n_gpus > 0:
-        mode_str = f"multi-GPU ({n_gpus} GPUs)"
+        mode_str = f"sequential GPU (GPU 0)"
     else:
         mode_str = "sequential CPU"
 
@@ -880,71 +880,87 @@ def run_tier0(
     if n_gpus > 0:
         print(f"  GPUs available: {available_gpus}")
 
-    # Multi-GPU parallel baseline evaluation
+    # GPU sequential execution (avoids CUDA context conflicts)
     if use_gpu and n_gpus > 0:
-        print(f"\n  Running {len(baselines_to_run)} baselines on {n_gpus} GPUs...")
+        print(f"\n  Running {len(baselines_to_run)} baselines sequentially on GPU 0...")
+        print(f"  (Sequential GPU avoids CUDA context conflicts)")
         start_all = time.time()
 
-        # Use ThreadPoolExecutor for GPU parallelism (threads share memory, good for GPU)
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Set GPU device once at start
+        try:
+            import cupy as cp
+            cp.cuda.Device(0).use()
+        except Exception as e:
+            print(f"  Warning: Could not set GPU device: {e}")
 
-        parallel_results_dict = {}
-        n_workers = min(n_gpus, len(baselines_to_run))
+        # Sequential GPU execution with tqdm progress bar
+        pbar = tqdm(
+            baselines_to_run,
+            desc="  GPU Baselines",
+            unit="baseline",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        ) if HAS_TQDM else baselines_to_run
 
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            # Submit tasks, round-robin across GPUs
-            future_to_baseline = {}
-            for i, baseline_name in enumerate(baselines_to_run):
-                gpu_id = available_gpus[i % n_gpus]
-                future = executor.submit(
-                    _evaluate_baseline_on_gpu,
-                    baseline_name, X, y, n_folds, seed, sample_rate, gpu_id
+        for baseline_name in pbar:
+            if HAS_TQDM:
+                pbar.set_description(f"  {baseline_name}")
+
+            start = time.time()
+
+            try:
+                classical_result, detailed_result = evaluate_baseline_cv(
+                    baseline_name=baseline_name,
+                    X=X,
+                    y=y,
+                    n_folds=n_folds,
+                    seed=seed,
+                    sample_rate=sample_rate,
+                    n_jobs=1,  # Sequential folds for GPU
+                    use_gpu=True,
                 )
-                future_to_baseline[future] = (baseline_name, gpu_id)
 
-            # Process completions with tqdm progress bar
-            with tqdm(
-                total=len(baselines_to_run),
-                desc="  Baselines",
-                unit="baseline",
-                ncols=100,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
-            ) as pbar:
-                for future in as_completed(future_to_baseline):
-                    baseline_name, gpu_id = future_to_baseline[future]
-                    try:
-                        name, classical_result, detailed_result = future.result()
-                        parallel_results_dict[name] = (classical_result, detailed_result)
+                # Clear GPU memory after each baseline
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
 
-                        # Update progress bar with result
-                        r2_str = f"{classical_result.r2_mean:.3f}" if not np.isnan(classical_result.r2_mean) else "FAIL"
-                        pbar.set_postfix_str(f"{name}@GPU{gpu_id}: R²={r2_str}")
-                        pbar.update(1)
-                    except Exception as e:
-                        tqdm.write(f"  ERROR: {baseline_name}@GPU{gpu_id} failed: {e}")
-                        pbar.update(1)
-
-        # Process results in original order
-        for baseline_name in baselines_to_run:
-            if baseline_name in parallel_results_dict:
-                classical_result, detailed_result = parallel_results_dict[baseline_name]
                 results.append(classical_result)
                 detailed_results.append(detailed_result)
                 if detailed_result.fold_r2s:
                     fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
                 completed_results[baseline_name] = classical_result
 
-                if not np.isnan(classical_result.r2_mean):
-                    ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
-                    print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str}")
+                elapsed = time.time() - start
+                ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
+
+                if HAS_TQDM:
+                    pbar.set_postfix_str(f"R²={classical_result.r2_mean:.3f} ({elapsed:.1f}s)")
+                    tqdm.write(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
                 else:
-                    print(f"  {baseline_name}: FAILED - {getattr(detailed_result, 'error', 'Unknown error')}")
+                    print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
+
+            except Exception as e:
+                elapsed = time.time() - start
+                print(f"  {baseline_name}: FAILED - {e} ({elapsed:.1f}s)")
+                # Create failed result
+                failed_classical = ClassicalResult(
+                    method=baseline_name,
+                    r2_mean=np.nan,
+                    r2_std=np.nan,
+                    mae_mean=np.nan,
+                    mae_std=np.nan,
+                )
+                results.append(failed_classical)
+                completed_results[baseline_name] = failed_classical
+
+            # Save checkpoint after each baseline
+            _save_checkpoint(completed_results)
 
         elapsed_all = time.time() - start_all
         print(f"  Total GPU time: {elapsed_all:.1f}s ({elapsed_all/len(baselines_to_run):.1f}s avg per baseline)")
 
-        # Save checkpoint after all complete
-        _save_checkpoint(completed_results)
     else:
         # Sequential baseline evaluation with tqdm progress bar
         pbar = tqdm(
@@ -1039,18 +1055,16 @@ def run_tier0(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tier 0: Classical Floor - MULTI-GPU ACCELERATED",
+        description="Tier 0: Classical Floor - GPU ACCELERATED",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Performance Tips:
-  --use-gpu    Run baselines in parallel across multiple GPUs (FASTEST)
-               Each baseline runs on a different GPU simultaneously
+  --use-gpu    Use GPU acceleration for baselines (CuPy)
+               Each baseline runs sequentially on GPU 0
 
-Example (8 GPUs = 8 baselines in parallel):
-  python run_tier0.py --use-gpu
-
-Sequential CPU mode:
-  python run_tier0.py
+Example:
+  python run_tier0.py --use-gpu    # GPU accelerated
+  python run_tier0.py              # CPU mode
         """
     )
     parser.add_argument("--dry-run", action="store_true", help="Use small synthetic data")
@@ -1065,7 +1079,7 @@ Sequential CPU mode:
     )
     parser.add_argument(
         "--use-gpu", action="store_true",
-        help="Use multi-GPU parallel execution (baselines run on different GPUs)"
+        help="Use GPU acceleration (sequential on GPU 0)"
     )
     parser.add_argument(
         "--no-resume", action="store_true",
