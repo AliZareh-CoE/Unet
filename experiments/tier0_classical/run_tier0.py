@@ -786,6 +786,9 @@ def _evaluate_baseline_for_parallel(
 def _get_safe_parallel_workers(data_gb: float, n_baselines: int) -> int:
     """Calculate safe number of parallel workers based on memory.
 
+    With spawn context, each worker gets full copy of data.
+    Must be VERY conservative to avoid crashes.
+
     Args:
         data_gb: Size of data in GB
         n_baselines: Number of baselines to run
@@ -793,22 +796,19 @@ def _get_safe_parallel_workers(data_gb: float, n_baselines: int) -> int:
     Returns:
         Safe number of parallel workers
     """
-    try:
-        import psutil
-        available_gb = psutil.virtual_memory().available / 1e9
-    except ImportError:
-        available_gb = 64  # Assume 64GB if psutil not available
-
-    # Each worker needs: data + ~2x overhead for intermediate arrays
-    mem_per_worker = data_gb * 3
-
-    # Leave 20% memory headroom
-    max_by_memory = max(1, int((available_gb * 0.8) / mem_per_worker))
-
-    # Don't exceed number of baselines or CPU count / 2
-    max_workers = min(max_by_memory, n_baselines, max(1, mp.cpu_count() // 2))
-
-    return max_workers
+    # Hard limits based on data size - these are tested safe values
+    if data_gb > 3.0:
+        # Very large data (>3GB): max 2 workers to be safe
+        return min(2, n_baselines)
+    elif data_gb > 1.0:
+        # Large data (1-3GB): max 3 workers
+        return min(3, n_baselines)
+    elif data_gb > 0.5:
+        # Medium data (0.5-1GB): max 4 workers
+        return min(4, n_baselines)
+    else:
+        # Small data (<0.5GB): can use more, but cap at 6
+        return min(6, n_baselines, max(1, mp.cpu_count() // 4))
 
 
 def run_tier0(
