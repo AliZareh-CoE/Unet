@@ -350,25 +350,29 @@ def run_tier4(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool
 
 
 def run_tier1_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
-    """Run Tier 1.5: Conditioning Deep Dive."""
+    """Run Tier 1.5: Auto-Conditioning Signal Sources."""
     from experiments.tier1_5_conditioning import run_tier1_5 as _run_tier1_5
 
     print("\n" + "=" * 70)
-    print("TIER 1.5: CONDITIONING DEEP DIVE")
+    print("TIER 1.5: AUTO-CONDITIONING SIGNAL SOURCES")
     print("=" * 70)
+    print("Testing WHAT to condition on (not HOW to apply conditioning)")
+    print("  - odor_onehot:       One-hot odor identity (baseline)")
+    print("  - cpc:               Contrastive Predictive Coding")
+    print("  - vqvae:             Vector Quantized VAE codes")
+    print("  - freq_disentangled: Frequency-band-specific latents")
+    print("  - cycle_consistent:  Cycle-consistent latent")
 
     X = data["X_train"]
     y = data["y_train"]
 
     if dry_run:
-        architecture = "linear"
-        conditionings = ["concat", "cross_attn_gated"]
+        conditionings = ["odor_onehot", "cpc"]
         n_epochs = 5
         n_seeds = 2
         n_folds = 2
     else:
-        architecture = None  # From Tier 1
-        conditionings = None  # All 6
+        conditionings = None  # All 5 sources
         n_epochs = 80
         n_seeds = 3
         n_folds = 5
@@ -377,7 +381,6 @@ def run_tier1_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bo
         X=X,
         y=y,
         device=device,
-        architecture=architecture,
         conditionings=conditionings,
         n_seeds=n_seeds,
         n_folds=n_folds,
@@ -386,7 +389,7 @@ def run_tier1_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bo
 
     registry = get_registry()
     if registry.tier1_5:
-        print(f"\n✓ Best conditioning: {registry.tier1_5.best_conditioning}")
+        print(f"\n✓ Best conditioning source: {registry.tier1_5.best_conditioning}")
 
 
 def run_tier2_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
