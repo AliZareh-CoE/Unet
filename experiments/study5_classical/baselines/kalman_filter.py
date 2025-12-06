@@ -65,7 +65,9 @@ class KalmanFilter:
         self.process_noise = process_noise
         self.observation_noise = observation_noise
         self.learn_transitions = learn_transitions
-        self.use_gpu = use_gpu and HAS_CUPY
+        # Kalman filters are inherently sequential - GPU doesn't help much
+        # and causes context issues in multi-GPU setups. Force CPU mode.
+        self.use_gpu = False  # Disabled: sequential ops don't benefit from GPU
         self.n_em_iterations = n_em_iterations
 
         self.A: Optional[NDArray] = None
