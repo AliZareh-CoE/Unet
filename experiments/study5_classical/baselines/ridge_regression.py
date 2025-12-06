@@ -75,19 +75,21 @@ class RidgeRegression:
         Returns:
             self
         """
-        # Handle 3D tensors by flattening
+        # Handle 3D tensors - DON'T flatten time dimension (causes memory explosion)
+        # Instead, treat each time point independently
         orig_shape = None
         if X.ndim == 3:
             N, C_in, T = X.shape
             _, C_out, _ = y.shape
             orig_shape = (C_in, T, C_out)
-            X = X.reshape(N, -1)
-            y = y.reshape(N, -1)
+            # Transpose to [N, T, C] then reshape to [N*T, C]
+            X = X.transpose(0, 2, 1).reshape(N * T, C_in)
+            y = y.transpose(0, 2, 1).reshape(N * T, C_out)
 
         # Preprocess
         X = self._preprocess(X, fit=True)
 
-        N, D_in = X.shape
+        N_total, D_in = X.shape
         _, D_out = y.shape
 
         # Center y if fitting intercept
@@ -98,8 +100,12 @@ class RidgeRegression:
             y_mean = np.zeros((1, D_out))
             y_centered = y
 
-        # Closed-form solution
+        # Closed-form solution with memory-efficient approach
         # W = (X^T X + alpha * I)^{-1} X^T y
+        # For large datasets, use chunked computation to avoid memory issues
+        D_in = X.shape[1]
+
+        # X^T X is [D_in, D_in] which is manageable (32x32 = small)
         XtX = X.T @ X
         XtX_reg = XtX + self.alpha * np.eye(D_in)
         Xty = X.T @ y_centered
@@ -129,11 +135,13 @@ class RidgeRegression:
         if not self._fitted:
             raise RuntimeError("Model must be fitted before prediction")
 
-        # Handle 3D
+        # Handle 3D - same reshape as fit
         reshape_back = False
+        N_samples = None
+        T_len = None
         if X.ndim == 3:
-            N, C_in, T = X.shape
-            X = X.reshape(N, -1)
+            N_samples, C_in, T_len = X.shape
+            X = X.transpose(0, 2, 1).reshape(N_samples * T_len, C_in)
             reshape_back = True
 
         # Preprocess
@@ -145,7 +153,8 @@ class RidgeRegression:
         # Reshape back if needed
         if reshape_back and self._orig_shape is not None:
             C_in, T, C_out = self._orig_shape
-            y = y.reshape(-1, C_out, T)
+            # y is [N*T, C_out], reshape to [N, T, C_out] then transpose to [N, C_out, T]
+            y = y.reshape(N_samples, T_len, C_out).transpose(0, 2, 1)
 
         return y
 

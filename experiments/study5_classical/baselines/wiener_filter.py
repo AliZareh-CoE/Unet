@@ -34,13 +34,15 @@ class WienerFilter:
     def __init__(
         self,
         n_fft: Optional[int] = None,  # None = auto (use signal length)
-        regularization: float = 1e-8,
+        regularization: float = 1e-6,  # Increased for stability
         smooth_window: int = 5,
+        diagonal_only: bool = True,  # Only match channel i to channel i
     ):
         self._n_fft_init = n_fft  # Store initial value
         self.n_fft = n_fft  # Will be set during fit if None
         self.regularization = regularization
         self.smooth_window = smooth_window
+        self.diagonal_only = diagonal_only
 
         # Filter coefficients (computed during fit)
         self.H: Optional[NDArray] = None
@@ -103,8 +105,12 @@ class WienerFilter:
         # Initialize filter matrix [C_out, C_in, F]
         self.H = np.zeros((C_out, C_in, n_freq), dtype=np.complex128)
 
-        for c_out in range(C_out):
-            for c_in in range(C_in):
+        # For diagonal_only, only compute H[i,i] (each output from matching input)
+        n_channels = min(C_out, C_in) if self.diagonal_only else C_out
+
+        for c_out in range(n_channels):
+            c_in_range = [c_out] if self.diagonal_only else range(C_in)
+            for c_in in c_in_range:
                 # Cross-spectral density: E[Y(f) * X(f)*]
                 S_xy = np.mean(y_fft[:, c_out, :] * np.conj(X_fft[:, c_in, :]), axis=0)
 
@@ -115,7 +121,7 @@ class WienerFilter:
                 S_xy = self._smooth_spectrum(S_xy)
                 S_xx = self._smooth_spectrum(np.real(S_xx))
 
-                # Wiener filter
+                # Wiener filter with regularization
                 self.H[c_out, c_in, :] = S_xy / (S_xx + self.regularization)
 
         self._fitted = True
@@ -242,13 +248,12 @@ class MultiChannelWienerFilter(WienerFilter):
 
         n_freq = X_fft.shape[-1]
 
-        # VECTORIZED computation (much faster than loop over frequencies)
+        # VECTORIZED computation using einsum (fast for spectral estimation)
         # Transpose for easier matrix operations: [F, N, C]
         X_fft_t = X_fft.transpose(2, 0, 1)  # [F, N, C_in]
         y_fft_t = y_fft.transpose(2, 0, 1)  # [F, N, C_out]
 
         # Cross-spectral matrix S_xy [F, C_out, C_in] = E[y @ x^H]
-        # Using einsum: for each freq, compute outer product and average over N
         S_xy = np.einsum('fno,fni->foi', y_fft_t, np.conj(X_fft_t)) / N
 
         # Auto-spectral matrix S_xx [F, C_in, C_in] = E[x @ x^H]
@@ -258,21 +263,23 @@ class MultiChannelWienerFilter(WienerFilter):
         eye = np.eye(C_in, dtype=np.complex128)
         S_xx_reg = S_xx + self.regularization * eye[np.newaxis, :, :]
 
-        # Solve H @ S_xx = S_xy for each frequency using pseudoinverse (robust)
-        # H [F, C_out, C_in]
+        # Compute H = S_xy @ inv(S_xx) using batched inverse (faster than solve for small matrices)
+        # np.linalg.inv is well-optimized for batched small matrices
         try:
-            # Use solve for better numerical stability than inv
-            # Solve S_xx^T @ H^T = S_xy^T -> H^T = solve(S_xx^T, S_xy^T)
-            H_t = np.linalg.solve(
-                S_xx_reg.transpose(0, 2, 1),  # [F, C_in, C_in]
-                S_xy.transpose(0, 2, 1)       # [F, C_in, C_out]
-            )  # [F, C_in, C_out]
-            H = H_t.transpose(0, 2, 1)  # [F, C_out, C_in]
+            S_xx_inv = np.linalg.inv(S_xx_reg)  # [F, C_in, C_in]
+            H = np.einsum('foi,fij->foj', S_xy, S_xx_inv)  # [F, C_out, C_in]
         except np.linalg.LinAlgError:
-            # Fallback to pseudoinverse if solve fails
+            # Fallback: process in chunks to avoid memory issues
             H = np.zeros((n_freq, C_out, C_in), dtype=np.complex128)
-            for f in range(n_freq):
-                H[f] = S_xy[f] @ np.linalg.pinv(S_xx_reg[f])
+            chunk_size = 256
+            for start in range(0, n_freq, chunk_size):
+                end = min(start + chunk_size, n_freq)
+                try:
+                    S_xx_inv_chunk = np.linalg.inv(S_xx_reg[start:end])
+                    H[start:end] = np.einsum('foi,fij->foj', S_xy[start:end], S_xx_inv_chunk)
+                except np.linalg.LinAlgError:
+                    for f in range(start, end):
+                        H[f] = S_xy[f] @ np.linalg.pinv(S_xx_reg[f])
 
         # Transpose to expected shape [C_out, C_in, F]
         self.H = H.transpose(1, 2, 0)
