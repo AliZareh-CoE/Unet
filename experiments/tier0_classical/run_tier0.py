@@ -792,8 +792,12 @@ def _run_baseline_on_gpu_process(
                 X_val = X[split.val_indices]
                 y_val = y[split.val_indices]
 
-                # Create and fit baseline with GPU
-                baseline = create_baseline(baseline_name, use_gpu=True)
+                # Create and fit baseline with GPU (fallback to CPU if not supported)
+                try:
+                    baseline = create_baseline(baseline_name, use_gpu=True)
+                except TypeError:
+                    # Baseline doesn't support use_gpu parameter
+                    baseline = create_baseline(baseline_name)
                 baseline.fit(X_train, y_train)
                 y_pred = baseline.predict(X_val)
 
@@ -811,7 +815,10 @@ def _run_baseline_on_gpu_process(
                 # Clear GPU memory after each fold
                 cp.get_default_memory_pool().free_all_blocks()
 
-            except Exception as e:
+            except Exception as fold_error:
+                # Log the error for debugging
+                import sys
+                print(f"    Fold failed for {baseline_name}@GPU{gpu_id}: {fold_error}", file=sys.stderr)
                 fold_r2s.append(np.nan)
                 fold_maes.append(np.nan)
                 fold_pearsons.append(np.nan)
@@ -831,6 +838,11 @@ def _run_baseline_on_gpu_process(
         # Clear GPU memory before returning
         cp.get_default_memory_pool().free_all_blocks()
 
+        # Compute band R² with proper handling of empty/all-NaN arrays
+        def safe_nanmean(arr):
+            valid = [v for v in arr if not np.isnan(v)]
+            return float(np.mean(valid)) if valid else None
+
         return {
             'r2_mean': float(np.mean(valid_r2s)) if len(valid_r2s) > 0 else np.nan,
             'r2_std': float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0,
@@ -841,11 +853,11 @@ def _run_baseline_on_gpu_process(
             'pearson_mean': float(np.mean(valid_pearsons)) if len(valid_pearsons) > 0 else np.nan,
             'pearson_std': float(np.std(valid_pearsons, ddof=1)) if len(valid_pearsons) > 1 else 0.0,
             'psd_error_db': float(np.mean(valid_psd_errors)) if len(valid_psd_errors) > 0 else np.nan,
-            'r2_delta': float(np.nanmean(fold_band_r2s["delta"])) if fold_band_r2s["delta"] else None,
-            'r2_theta': float(np.nanmean(fold_band_r2s["theta"])) if fold_band_r2s["theta"] else None,
-            'r2_alpha': float(np.nanmean(fold_band_r2s["alpha"])) if fold_band_r2s["alpha"] else None,
-            'r2_beta': float(np.nanmean(fold_band_r2s["beta"])) if fold_band_r2s["beta"] else None,
-            'r2_gamma': float(np.nanmean(fold_band_r2s["gamma"])) if fold_band_r2s["gamma"] else None,
+            'r2_delta': safe_nanmean(fold_band_r2s["delta"]),
+            'r2_theta': safe_nanmean(fold_band_r2s["theta"]),
+            'r2_alpha': safe_nanmean(fold_band_r2s["alpha"]),
+            'r2_beta': safe_nanmean(fold_band_r2s["beta"]),
+            'r2_gamma': safe_nanmean(fold_band_r2s["gamma"]),
             'fold_r2s': fold_r2s,
             'gpu_id': gpu_id,
         }
