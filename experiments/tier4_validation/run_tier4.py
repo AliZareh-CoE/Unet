@@ -85,6 +85,129 @@ LOSS_CATEGORY_MAP = {
     "combined": "combined",
 }
 
+# Frequency bands for per-frequency analysis (in Hz, assuming 1000 Hz sampling)
+FREQUENCY_BANDS = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta": (12, 30),
+    "gamma": (30, 100),
+}
+
+
+# =============================================================================
+# Per-Frequency Analysis
+# =============================================================================
+
+def compute_per_band_r2(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    fs: float = 1000.0,
+) -> Dict[str, float]:
+    """Compute R² for each frequency band.
+
+    Args:
+        preds: Predicted signals [N, C, T]
+        targets: Target signals [N, C, T]
+        fs: Sampling frequency in Hz
+
+    Returns:
+        Dictionary mapping band name to R² value
+    """
+    from scipy import signal as scipy_signal
+
+    # Convert to numpy
+    if isinstance(preds, torch.Tensor):
+        preds = preds.numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.numpy()
+
+    band_r2 = {}
+
+    for band_name, (low_freq, high_freq) in FREQUENCY_BANDS.items():
+        # Design bandpass filter
+        nyq = fs / 2
+        low = low_freq / nyq
+        high = min(high_freq / nyq, 0.99)  # Ensure we don't exceed Nyquist
+
+        try:
+            b, a = scipy_signal.butter(4, [low, high], btype='band')
+
+            # Filter predictions and targets
+            preds_filtered = scipy_signal.filtfilt(b, a, preds, axis=-1)
+            targets_filtered = scipy_signal.filtfilt(b, a, targets, axis=-1)
+
+            # Compute R² for this band
+            ss_res = np.sum((targets_filtered - preds_filtered) ** 2)
+            ss_tot = np.sum((targets_filtered - np.mean(targets_filtered)) ** 2)
+
+            r2 = 1 - ss_res / (ss_tot + 1e-8)
+            band_r2[band_name] = float(r2)
+
+        except Exception:
+            band_r2[band_name] = 0.0
+
+    return band_r2
+
+
+def compute_per_band_psd_error(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    fs: float = 1000.0,
+) -> Dict[str, float]:
+    """Compute PSD error (in dB) for each frequency band.
+
+    Args:
+        preds: Predicted signals [N, C, T]
+        targets: Target signals [N, C, T]
+        fs: Sampling frequency in Hz
+
+    Returns:
+        Dictionary mapping band name to PSD error in dB
+    """
+    from scipy import signal as scipy_signal
+
+    # Convert to numpy
+    if isinstance(preds, torch.Tensor):
+        preds = preds.numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.numpy()
+
+    # Flatten to [N*C, T]
+    preds_flat = preds.reshape(-1, preds.shape[-1])
+    targets_flat = targets.reshape(-1, targets.shape[-1])
+
+    # Compute PSDs
+    nperseg = min(256, preds_flat.shape[-1])
+    freqs, psd_preds = scipy_signal.welch(preds_flat, fs=fs, nperseg=nperseg, axis=-1)
+    _, psd_targets = scipy_signal.welch(targets_flat, fs=fs, nperseg=nperseg, axis=-1)
+
+    # Average across samples
+    psd_preds = np.mean(psd_preds, axis=0)
+    psd_targets = np.mean(psd_targets, axis=0)
+
+    band_psd_error = {}
+
+    for band_name, (low_freq, high_freq) in FREQUENCY_BANDS.items():
+        # Find frequency indices for this band
+        mask = (freqs >= low_freq) & (freqs <= high_freq)
+
+        if np.any(mask):
+            psd_pred_band = psd_preds[mask]
+            psd_target_band = psd_targets[mask]
+
+            # Compute mean PSD error in dB
+            psd_pred_mean = np.mean(psd_pred_band)
+            psd_target_mean = np.mean(psd_target_band)
+
+            # Error in dB
+            error_db = 10 * np.log10((psd_pred_mean + 1e-10) / (psd_target_mean + 1e-10))
+            band_psd_error[band_name] = float(abs(error_db))
+        else:
+            band_psd_error[band_name] = 0.0
+
+    return band_psd_error
+
 
 # =============================================================================
 # Model Training
@@ -178,11 +301,24 @@ def train_and_evaluate(
     except Exception:
         psd_error = 0.0
 
+    # Per-frequency band analysis
+    try:
+        band_r2 = compute_per_band_r2(preds, targets)
+    except Exception:
+        band_r2 = {band: 0.0 for band in FREQUENCY_BANDS}
+
+    try:
+        band_psd_error = compute_per_band_psd_error(preds, targets)
+    except Exception:
+        band_psd_error = {band: 0.0 for band in FREQUENCY_BANDS}
+
     return {
         "r2": r2,
         "mae": mae,
         "pearson": float(pearson) if not np.isnan(pearson) else 0.0,
         "psd_error_db": float(psd_error),
+        "band_r2": band_r2,
+        "band_psd_error": band_psd_error,
     }
 
 
@@ -287,6 +423,8 @@ def run_multi_seed_validation(
     mae_values = []
     pearson_values = []
     psd_values = []
+    band_r2_values = {band: [] for band in FREQUENCY_BANDS}
+    band_psd_error_values = {band: [] for band in FREQUENCY_BANDS}
 
     print(f"\n  Validating {config_name} with {n_seeds} seeds...")
 
@@ -318,6 +456,13 @@ def run_multi_seed_validation(
             pearson_values.append(metrics["pearson"])
             psd_values.append(metrics["psd_error_db"])
 
+            # Collect per-band metrics
+            for band in FREQUENCY_BANDS:
+                if "band_r2" in metrics and band in metrics["band_r2"]:
+                    band_r2_values[band].append(metrics["band_r2"][band])
+                if "band_psd_error" in metrics and band in metrics["band_psd_error"]:
+                    band_psd_error_values[band].append(metrics["band_psd_error"][band])
+
             print(f"R² = {metrics['r2']:.4f}")
 
         except Exception as e:
@@ -332,6 +477,21 @@ def run_multi_seed_validation(
     r2_array = np.array(r2_values)
     ci = bootstrap_ci(r2_array, statistic="mean", n_bootstrap=N_BOOTSTRAP, seed=42)
 
+    # Compute mean per-band metrics
+    mean_band_r2 = {
+        band: float(np.mean(values)) if values else 0.0
+        for band, values in band_r2_values.items()
+    }
+    mean_band_psd_error = {
+        band: float(np.mean(values)) if values else 0.0
+        for band, values in band_psd_error_values.items()
+    }
+
+    # Print per-band summary
+    print(f"\n    Per-frequency R² breakdown for {config_name}:")
+    for band, r2 in mean_band_r2.items():
+        print(f"      {band.capitalize()}: R² = {r2:.4f}")
+
     return ValidationResult(
         config_name=config_name,
         r2_mean=float(np.mean(r2_values)),
@@ -342,6 +502,8 @@ def run_multi_seed_validation(
         pearson_mean=float(np.mean(pearson_values)),
         psd_error_db=float(np.mean(psd_values)),
         n_seeds=len(r2_values),
+        band_r2=mean_band_r2,
+        band_psd_error=mean_band_psd_error,
     )
 
 
@@ -738,6 +900,14 @@ def main():
         print(f"    R² = {vr.r2_mean:.4f} ± {vr.r2_std:.4f}")
         print(f"    95% CI = [{vr.r2_ci_lower:.4f}, {vr.r2_ci_upper:.4f}]")
         print(f"    MAE = {vr.mae_mean:.4f}, Pearson = {vr.pearson_mean:.4f}")
+        if vr.band_r2:
+            print(f"    Per-Frequency R²:")
+            for band, r2 in vr.band_r2.items():
+                print(f"      {band.capitalize():8s}: {r2:.4f}")
+        if vr.band_psd_error:
+            print(f"    Per-Frequency PSD Error (dB):")
+            for band, err in vr.band_psd_error.items():
+                print(f"      {band.capitalize():8s}: {err:.2f} dB")
 
     print("\nNegative Controls:")
     print("-" * 60)

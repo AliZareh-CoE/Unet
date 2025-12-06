@@ -10,13 +10,21 @@ Tier Flow:
        ↓
     Tier 1: Quick Screening (GATE: neural must beat classical by 0.05)
        ↓
+    Tier 1.5: Conditioning Deep Dive (tests 6 conditioning mechanisms)
+       ↓
     Tier 2: Factorial Design (KEY TIER: finds interactions)
        ↓
-    [Conditional: SpectralShift if PSD error > 3dB]
+    Tier 2.5: Probabilistic Loss Ablation (signal distribution losses)
        ↓
     Tier 3: Ablation (FEEDBACK: removes useless components)
        ↓
+    Tier 3.5: SpectralShift Variants (PSD correction approaches)
+       ↓
     Tier 4: Final Validation (GATE: negative controls must pass)
+       ↓
+    Tier 5: Biological Validation (GATE: proves biological meaning)
+       ↓
+    Tier 6: Cross-Dataset Generalization (tests on external data)
        ↓
     COMPLETE
 
@@ -32,6 +40,9 @@ Usage:
 
     # Run single tier
     python experiments/tier_runner.py --tier 2
+
+    # Run tier 1.5
+    python experiments/tier_runner.py --tier 1.5
 """
 
 from __future__ import annotations
@@ -338,21 +349,218 @@ def run_tier4(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool
         print("\n✓ GATE PASSED: All negative controls passed")
 
 
+def run_tier1_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
+    """Run Tier 1.5: Conditioning Deep Dive."""
+    from experiments.tier1_5_conditioning import run_tier1_5 as _run_tier1_5
+
+    print("\n" + "=" * 70)
+    print("TIER 1.5: CONDITIONING DEEP DIVE")
+    print("=" * 70)
+
+    X = data["X_train"]
+    y = data["y_train"]
+
+    if dry_run:
+        architecture = "linear"
+        conditionings = ["concat", "cross_attn_gated"]
+        n_epochs = 5
+        n_seeds = 2
+        n_folds = 2
+    else:
+        architecture = None  # From Tier 1
+        conditionings = None  # All 6
+        n_epochs = 80
+        n_seeds = 3
+        n_folds = 5
+
+    _run_tier1_5(
+        X=X,
+        y=y,
+        device=device,
+        architecture=architecture,
+        conditionings=conditionings,
+        n_seeds=n_seeds,
+        n_folds=n_folds,
+        n_epochs=n_epochs,
+    )
+
+    registry = get_registry()
+    if registry.tier1_5:
+        print(f"\n✓ Best conditioning: {registry.tier1_5.best_conditioning}")
+
+
+def run_tier2_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
+    """Run Tier 2.5: Probabilistic Loss Ablation."""
+    from experiments.tier2_5_probabilistic import run_tier2_5 as _run_tier2_5
+
+    print("\n" + "=" * 70)
+    print("TIER 2.5: PROBABILISTIC LOSS ABLATION")
+    print("=" * 70)
+
+    X = data["X_train"]
+    y = data["y_train"]
+
+    if dry_run:
+        architecture = "linear"
+        base_losses = ["huber"]
+        prob_losses = ["rayleigh", "von_mises"]
+        n_epochs = 5
+        n_seeds = 2
+        n_folds = 2
+    else:
+        architecture = None  # From Tier 2
+        base_losses = None  # All base losses
+        prob_losses = None  # All 7 probabilistic losses
+        n_epochs = 80
+        n_seeds = 3
+        n_folds = 5
+
+    _run_tier2_5(
+        X=X,
+        y=y,
+        device=device,
+        architecture=architecture,
+        base_losses=base_losses,
+        prob_losses=prob_losses,
+        n_seeds=n_seeds,
+        n_folds=n_folds,
+        n_epochs=n_epochs,
+    )
+
+    registry = get_registry()
+    if registry.tier2_5:
+        print(f"\n✓ Best probabilistic loss: {registry.tier2_5.best_combination}")
+
+
+def run_tier3_5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
+    """Run Tier 3.5: SpectralShift Variants."""
+    from experiments.tier3_5_spectralshift import run_tier3_5 as _run_tier3_5
+
+    print("\n" + "=" * 70)
+    print("TIER 3.5: SPECTRALSHIFT VARIANTS")
+    print("=" * 70)
+
+    X = data["X_train"]
+    y = data["y_train"]
+
+    if dry_run:
+        methods = ["hard_fft", "soft"]
+        n_epochs = 5
+        n_seeds = 2
+        n_folds = 2
+    else:
+        methods = None  # All methods
+        n_epochs = 80
+        n_seeds = 3
+        n_folds = 5
+
+    _run_tier3_5(
+        X=X,
+        y=y,
+        device=device,
+        methods=methods,
+        n_seeds=n_seeds,
+        n_folds=n_folds,
+        n_epochs=n_epochs,
+    )
+
+    registry = get_registry()
+    if registry.tier3_5:
+        print(f"\n✓ Best SpectralShift method: {registry.tier3_5.best_method}")
+        print(f"  PSD Error: {registry.tier3_5.best_psd_error:.2f} dB")
+
+
+def run_tier5(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
+    """Run Tier 5: Biological Validation."""
+    from experiments.tier5_biological import run_tier5 as _run_tier5
+
+    print("\n" + "=" * 70)
+    print("TIER 5: BIOLOGICAL VALIDATION")
+    print("=" * 70)
+    print("⚠ CRITICAL: Proves translated signals are biologically meaningful!")
+
+    X_train = data["X_train"]
+    y_train = data["y_train"]
+    X_test = data["X_test"]
+    y_test = data["y_test"]
+
+    if dry_run:
+        n_epochs = 5
+    else:
+        n_epochs = 80
+
+    _run_tier5(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        device=device,
+        n_epochs=n_epochs,
+    )
+
+    # Check gate
+    registry = get_registry()
+    registry.check_gate_tier5(dry_run=dry_run)
+    if not dry_run or (registry.tier5 and registry.tier5.passed):
+        print("\n✓ GATE PASSED: Biological validation passed")
+
+
+def run_tier6(data: Dict[str, torch.Tensor], device: torch.device, dry_run: bool = False) -> None:
+    """Run Tier 6: Cross-Dataset Generalization."""
+    from experiments.tier6_generalization import run_tier6 as _run_tier6
+
+    print("\n" + "=" * 70)
+    print("TIER 6: CROSS-DATASET GENERALIZATION")
+    print("=" * 70)
+    print("⚠ CRITICAL: Tests model on external/shifted datasets!")
+
+    X_train = data["X_train"]
+    y_train = data["y_train"]
+    X_test = data["X_test"]
+    y_test = data["y_test"]
+
+    if dry_run:
+        datasets = ["frequency_shifted"]
+        n_epochs = 5
+        n_seeds = 2
+    else:
+        datasets = None  # All datasets
+        n_epochs = 80
+        n_seeds = 5
+
+    _run_tier6(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        device=device,
+        datasets=datasets,
+        n_seeds=n_seeds,
+        n_epochs=n_epochs,
+    )
+
+    # Check gate
+    registry = get_registry()
+    registry.check_gate_tier6(dry_run=dry_run)
+    if not dry_run or (registry.tier6 and registry.tier6.generalizes):
+        print("\n✓ GATE PASSED: Model generalizes to external datasets")
+
+
 # =============================================================================
 # Master Pipeline
 # =============================================================================
 
 def run_full_pipeline(
     dry_run: bool = False,
-    start_tier: int = 0,
-    single_tier: Optional[int] = None,
+    start_tier: float = 0,
+    single_tier: Optional[float] = None,
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """Run the complete tier-based experimental pipeline.
 
     Args:
         dry_run: If True, use minimal configuration for testing
-        start_tier: Tier to start from (for resuming)
+        start_tier: Tier to start from (for resuming), supports 1.5, 2.5, 3.5
         single_tier: Run only this specific tier
         device: Device to use
 
@@ -374,61 +582,58 @@ def run_full_pipeline(
     print("\nLoading data...")
     data = load_data(dry_run=dry_run)
 
+    # Define tier order with half-tiers
+    ALL_TIERS = [0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6]
+
     # Determine which tiers to run
     if single_tier is not None:
         tiers_to_run = [single_tier]
     else:
-        tiers_to_run = list(range(start_tier, 5))
+        start_idx = ALL_TIERS.index(start_tier) if start_tier in ALL_TIERS else 0
+        tiers_to_run = ALL_TIERS[start_idx:]
 
-    # Run each tier with clear progress tracking
-    current_tier = None
-    completed_tiers = []
-
+    # Run each tier
     try:
         if 0 in tiers_to_run:
-            current_tier = 0
             run_tier0(data, dry_run=dry_run)
-            completed_tiers.append(0)
 
         if 1 in tiers_to_run:
-            current_tier = 1
             run_tier1(data, device, dry_run=dry_run)
-            completed_tiers.append(1)
+
+        if 1.5 in tiers_to_run:
+            run_tier1_5(data, device, dry_run=dry_run)
 
         if 2 in tiers_to_run:
-            current_tier = 2
             run_tier2(data, device, dry_run=dry_run)
-            completed_tiers.append(2)
+
+        if 2.5 in tiers_to_run:
+            run_tier2_5(data, device, dry_run=dry_run)
 
         if 3 in tiers_to_run:
-            current_tier = 3
             run_tier3(data, device, dry_run=dry_run)
-            completed_tiers.append(3)
+
+        if 3.5 in tiers_to_run:
+            run_tier3_5(data, device, dry_run=dry_run)
 
         if 4 in tiers_to_run:
-            current_tier = 4
             run_tier4(data, device, dry_run=dry_run)
-            completed_tiers.append(4)
+
+        if 5 in tiers_to_run:
+            run_tier5(data, device, dry_run=dry_run)
+
+        if 6 in tiers_to_run:
+            run_tier6(data, device, dry_run=dry_run)
 
     except GateFailure as e:
-        print(f"\n❌ GATE FAILURE at Tier {current_tier}: {e}")
+        print(f"\n❌ GATE FAILURE: {e}")
         print("Pipeline stopped. Review results and adjust approach.")
-        return {"status": "gate_failure", "error": str(e), "failed_tier": current_tier}
+        return {"status": "gate_failure", "error": str(e)}
 
     except Exception as e:
-        print(f"\n{'='*70}")
-        print(f"❌ ERROR at Tier {current_tier}")
-        print(f"{'='*70}")
-        print(f"Error: {e}")
+        print(f"\n❌ ERROR: {e}")
         import traceback
         traceback.print_exc()
-        print(f"\n{'='*70}")
-        print(f"COMPLETED TIERS: {completed_tiers}")
-        print(f"FAILED TIER: {current_tier}")
-        print(f"\n★ TO RESUME, RUN:")
-        print(f"  python experiments/tier_runner.py --start-tier {current_tier}")
-        print(f"{'='*70}")
-        return {"status": "error", "error": str(e), "failed_tier": current_tier, "completed": completed_tiers}
+        return {"status": "error", "error": str(e)}
 
     # Final summary
     elapsed = time.time() - start_time
@@ -463,9 +668,14 @@ def main():
 Tier Flow:
     Tier 0: Classical Floor
     Tier 1: Quick Screening (8×6 matrix)
+    Tier 1.5: Conditioning Deep Dive
     Tier 2: Factorial Design (KEY: finds interactions)
+    Tier 2.5: Probabilistic Loss Ablation
     Tier 3: Focused Ablation (removes useless components)
+    Tier 3.5: SpectralShift Variants
     Tier 4: Final Validation (negative controls)
+    Tier 5: Biological Validation (CRITICAL)
+    Tier 6: Cross-Dataset Generalization (CRITICAL)
 
 Examples:
     # Full pipeline
@@ -479,23 +689,40 @@ Examples:
 
     # Run only Tier 3
     python experiments/tier_runner.py --tier 3
+
+    # Run Tier 1.5 (Conditioning)
+    python experiments/tier_runner.py --tier 1.5
+
+    # Run Tier 5 (Biological Validation)
+    python experiments/tier_runner.py --tier 5
         """
     )
 
+    VALID_TIERS = [0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6]
+
     parser.add_argument("--dry-run", action="store_true",
                         help="Run with minimal configuration for testing")
-    parser.add_argument("--start-tier", type=int, default=0, choices=[0, 1, 2, 3, 4],
-                        help="Tier to start from (for resuming)")
-    parser.add_argument("--tier", type=int, choices=[0, 1, 2, 3, 4],
-                        help="Run only this specific tier")
+    parser.add_argument("--start-tier", type=float, default=0,
+                        help="Tier to start from (for resuming). Options: 0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6")
+    parser.add_argument("--tier", type=float,
+                        help="Run only this specific tier. Options: 0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use (cuda or cpu)")
 
     args = parser.parse_args()
 
+    # Validate tier arguments
+    VALID_TIERS = [0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6]
+    if args.start_tier not in VALID_TIERS:
+        print(f"Error: --start-tier must be one of {VALID_TIERS}")
+        sys.exit(1)
+    if args.tier is not None and args.tier not in VALID_TIERS:
+        print(f"Error: --tier must be one of {VALID_TIERS}")
+        sys.exit(1)
+
     print("=" * 70)
     print("NATURE METHODS EXPERIMENTAL PIPELINE")
-    print("Bulletproof Edition")
+    print("Bulletproof Edition - Complete 10-Tier System")
     print("=" * 70)
     print()
     print("This pipeline implements:")
@@ -506,6 +733,11 @@ Examples:
     print("  • Negative controls (shuffled, reversed, permutation)")
     print("  • Bootstrap 95% confidence intervals")
     print("  • Gates between tiers to catch failures early")
+    print("  • Conditioning mechanism comparison (Tier 1.5)")
+    print("  • Probabilistic loss ablation (Tier 2.5)")
+    print("  • SpectralShift optimization (Tier 3.5)")
+    print("  • Biological validation (Tier 5)")
+    print("  • Cross-dataset generalization (Tier 6)")
     print()
 
     if args.dry_run:

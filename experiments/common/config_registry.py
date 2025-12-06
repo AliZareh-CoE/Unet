@@ -240,6 +240,9 @@ class ValidationResult:
     pearson_mean: float
     psd_error_db: float
     n_seeds: int
+    # Per-frequency band breakdown
+    band_r2: Optional[Dict[str, float]] = None
+    band_psd_error: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -250,6 +253,169 @@ class NegativeControlResult:
     r2: float
     expected_behavior: str
     passed: bool
+
+
+# =============================================================================
+# New Tier Results (1.5, 2.5, 3.5, 5, 6)
+# =============================================================================
+
+
+@dataclass
+class ConditioningResult:
+    """Result from conditioning comparison."""
+    conditioning: str
+    r2_mean: float
+    r2_std: float
+    mae_mean: float = 0.0
+    mae_std: float = 0.0
+
+
+@dataclass
+class Tier1_5Result:
+    """Results from Tier 1.5 (Conditioning Deep Dive)."""
+    architecture: str
+    results: Dict[str, ConditioningResult]
+    best_conditioning: str
+    best_r2_mean: float
+    best_r2_std: float
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            "tier": "1.5",
+            "name": "Conditioning Deep Dive",
+            "architecture": self.architecture,
+            "best_conditioning": self.best_conditioning,
+            "best_r2": f"{self.best_r2_mean:.4f} +/- {self.best_r2_std:.4f}",
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class ProbabilisticLossResult:
+    """Result from probabilistic loss test."""
+    base_loss: str
+    prob_loss: str
+    r2_mean: float
+    r2_std: float = 0.0
+
+
+@dataclass
+class Tier2_5Result:
+    """Results from Tier 2.5 (Probabilistic Loss Ablation)."""
+    architecture: str
+    results: Dict[str, ProbabilisticLossResult]
+    best_combination: str
+    best_r2_mean: float
+    best_r2_std: float
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            "tier": "2.5",
+            "name": "Probabilistic Loss Ablation",
+            "architecture": self.architecture,
+            "best_combination": self.best_combination,
+            "best_r2": f"{self.best_r2_mean:.4f} +/- {self.best_r2_std:.4f}",
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class SpectralShiftResult:
+    """Result from SpectralShift variant test."""
+    method: str
+    r2_mean: float
+    r2_std: float
+    psd_error_mean: float
+    psd_error_std: float = 0.0
+
+
+@dataclass
+class Tier3_5Result:
+    """Results from Tier 3.5 (SpectralShift Variants)."""
+    results: Dict[str, SpectralShiftResult]
+    best_method: str
+    best_r2_mean: float
+    best_psd_error: float
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            "tier": "3.5",
+            "name": "SpectralShift Variants",
+            "best_method": self.best_method,
+            "best_r2": f"{self.best_r2_mean:.4f}",
+            "best_psd_error_db": f"{self.best_psd_error:.2f}",
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class BiologicalMetrics:
+    """Biological validation metrics."""
+    odor_decode_real: float
+    odor_decode_pred: float
+    pac_correlation: float
+    resp_coupling_diff: float
+    mi_pred_real: float
+    mi_input_real: float
+    band_r2: Dict[str, float]
+    biological_validity_score: float
+
+
+@dataclass
+class Tier5Result:
+    """Results from Tier 5 (Biological Validation)."""
+    metrics: BiologicalMetrics
+    passed: bool
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            "tier": 5,
+            "name": "Biological Validation",
+            "biological_validity_score": self.metrics.biological_validity_score,
+            "odor_decode_ratio": self.metrics.odor_decode_pred / (self.metrics.odor_decode_real + 1e-8),
+            "pac_correlation": self.metrics.pac_correlation,
+            "band_r2": self.metrics.band_r2,
+            "passed": self.passed,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class GeneralizationResult:
+    """Result from external dataset test."""
+    dataset: str
+    zero_shot_r2: float
+    few_shot_r2: float
+    full_finetune_r2: float
+    transfer_efficiency: float
+
+
+@dataclass
+class Tier6Result:
+    """Results from Tier 6 (Cross-Dataset Generalization)."""
+    results: Dict[str, GeneralizationResult]
+    source_r2: float
+    avg_zero_shot_r2: float
+    avg_few_shot_r2: float
+    avg_full_finetune_r2: float
+    generalizes: bool
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict:
+        return {
+            "tier": 6,
+            "name": "Cross-Dataset Generalization",
+            "source_r2": self.source_r2,
+            "avg_zero_shot_r2": self.avg_zero_shot_r2,
+            "avg_few_shot_r2": self.avg_few_shot_r2,
+            "avg_full_finetune_r2": self.avg_full_finetune_r2,
+            "generalizes": self.generalizes,
+            "timestamp": self.timestamp,
+        }
 
 
 @dataclass
@@ -316,9 +482,14 @@ class ConfigRegistry:
         # Tier results
         self.tier0: Optional[Tier0Result] = None
         self.tier1: Optional[Tier1Result] = None
+        self.tier1_5: Optional[Tier1_5Result] = None
         self.tier2: Optional[Tier2Result] = None
+        self.tier2_5: Optional[Tier2_5Result] = None
         self.tier3: Optional[Tier3Result] = None
+        self.tier3_5: Optional[Tier3_5Result] = None
         self.tier4: Optional[Tier4Result] = None
+        self.tier5: Optional[Tier5Result] = None
+        self.tier6: Optional[Tier6Result] = None
 
         # Configuration parameters
         self.gate_margin_classical = 0.10  # Neural must beat classical by this
@@ -538,6 +709,113 @@ class ConfigRegistry:
                 raise GateFailure(tier="Tier 4", condition=msg, details="")
 
     # =========================================================================
+    # Tier 1.5: Conditioning Deep Dive
+    # =========================================================================
+
+    def register_tier1_5(self, result: Tier1_5Result) -> None:
+        """Register Tier 1.5 results."""
+        self.tier1_5 = result
+        self._save_state()
+
+    def get_best_conditioning(self) -> str:
+        """Get best conditioning mechanism from Tier 1.5."""
+        if self.tier1_5 is None:
+            return "cross_attn_gated"  # Default
+        return self.tier1_5.best_conditioning
+
+    # =========================================================================
+    # Tier 2.5: Probabilistic Loss Ablation
+    # =========================================================================
+
+    def register_tier2_5(self, result: Tier2_5Result) -> None:
+        """Register Tier 2.5 results."""
+        self.tier2_5 = result
+        self._save_state()
+
+    def get_best_prob_loss(self) -> Optional[str]:
+        """Get best probabilistic loss from Tier 2.5."""
+        if self.tier2_5 is None:
+            return None
+        return self.tier2_5.best_combination
+
+    # =========================================================================
+    # Tier 3.5: SpectralShift Variants
+    # =========================================================================
+
+    def register_tier3_5(self, result: Tier3_5Result) -> None:
+        """Register Tier 3.5 results."""
+        self.tier3_5 = result
+        self._save_state()
+
+    def get_best_spectral_method(self) -> str:
+        """Get best SpectralShift method from Tier 3.5."""
+        if self.tier3_5 is None:
+            return "soft"  # Default
+        return self.tier3_5.best_method
+
+    # =========================================================================
+    # Tier 5: Biological Validation
+    # =========================================================================
+
+    def register_tier5(self, result: Tier5Result) -> None:
+        """Register Tier 5 results."""
+        self.tier5 = result
+        self._save_state()
+
+    def check_gate_tier5(self, dry_run: bool = False) -> None:
+        """Gate: Check biological validation passed."""
+        if self.tier5 is None:
+            raise ValueError("Tier 5 not yet completed")
+
+        if not self.tier5.passed:
+            msg = (
+                f"Gate failed at Tier 5: Biological validation did not pass "
+                f"(Score: {self.tier5.metrics.biological_validity_score:.4f})"
+            )
+            if dry_run:
+                print(f"\n⚠ [DRY-RUN] Gate would fail: {msg}")
+                print("  Continuing anyway for comprehensive testing...\n")
+            else:
+                raise GateFailure(tier="Tier 5", condition=msg, details="")
+
+    def get_biological_metrics(self) -> Optional[BiologicalMetrics]:
+        """Get biological validation metrics from Tier 5."""
+        if self.tier5 is None:
+            return None
+        return self.tier5.metrics
+
+    # =========================================================================
+    # Tier 6: Cross-Dataset Generalization
+    # =========================================================================
+
+    def register_tier6(self, result: Tier6Result) -> None:
+        """Register Tier 6 results."""
+        self.tier6 = result
+        self._save_state()
+
+    def check_gate_tier6(self, dry_run: bool = False) -> None:
+        """Gate: Check cross-dataset generalization."""
+        if self.tier6 is None:
+            raise ValueError("Tier 6 not yet completed")
+
+        if not self.tier6.generalizes:
+            msg = (
+                f"Gate failed at Tier 6: Model does not generalize "
+                f"(Avg zero-shot: {self.tier6.avg_zero_shot_r2:.4f})"
+            )
+            if dry_run:
+                print(f"\n⚠ [DRY-RUN] Gate would fail: {msg}")
+                print("  Continuing anyway for comprehensive testing...\n")
+            else:
+                raise GateFailure(tier="Tier 6", condition=msg, details="")
+
+    def get_generalization_results(self) -> Optional[Dict[str, GeneralizationResult]]:
+        """Get generalization results from Tier 6."""
+        if self.tier6 is None:
+            return None
+        return self.tier6.results
+
+    # =========================================================================
     # Summary and Export
     # =========================================================================
 
@@ -552,27 +830,47 @@ class ConfigRegistry:
             summary["tier0"] = self.tier0.to_dict()
         if self.tier1:
             summary["tier1"] = self.tier1.to_dict()
+        if self.tier1_5:
+            summary["tier1_5"] = self.tier1_5.to_dict()
         if self.tier2:
             summary["tier2"] = self.tier2.to_dict()
+        if self.tier2_5:
+            summary["tier2_5"] = self.tier2_5.to_dict()
         if self.tier3:
             summary["tier3"] = self.tier3.to_dict()
+        if self.tier3_5:
+            summary["tier3_5"] = self.tier3_5.to_dict()
         if self.tier4:
             summary["tier4"] = self.tier4.to_dict()
+        if self.tier5:
+            summary["tier5"] = self.tier5.to_dict()
+        if self.tier6:
+            summary["tier6"] = self.tier6.to_dict()
 
         return summary
 
     def _get_status(self) -> str:
         """Get current experiment status."""
-        if self.tier4 is not None:
-            return "COMPLETE"
+        if self.tier6 is not None:
+            return "COMPLETE (all tiers including generalization)"
+        elif self.tier5 is not None:
+            return "Tier 6 (Generalization) pending"
+        elif self.tier4 is not None:
+            return "Tier 5 (Biological Validation) pending"
+        elif self.tier3_5 is not None:
+            return "Tier 4 (Final Validation) pending"
         elif self.tier3 is not None:
-            return "Tier 4 pending"
+            return "Tier 3.5 (SpectralShift) pending"
+        elif self.tier2_5 is not None:
+            return "Tier 3 (Ablation) pending"
         elif self.tier2 is not None:
-            return "Tier 3 pending"
+            return "Tier 2.5 (Probabilistic Loss) pending"
+        elif self.tier1_5 is not None:
+            return "Tier 2 (Factorial) pending"
         elif self.tier1 is not None:
-            return "Tier 2 pending"
+            return "Tier 1.5 (Conditioning) pending"
         elif self.tier0 is not None:
-            return "Tier 1 pending"
+            return "Tier 1 (Screening) pending"
         else:
             return "Not started"
 
@@ -612,14 +910,39 @@ class ConfigRegistry:
                 "",
             ])
 
+        if self.tier1_5:
+            lines.extend([
+                "Conditioning Analysis (Tier 1.5):",
+                f"  Best conditioning: {self.tier1_5.best_conditioning}",
+                f"  R²: {self.tier1_5.best_r2_mean:.4f} +/- {self.tier1_5.best_r2_std:.4f}",
+                "",
+            ])
+
         if self.tier2:
             arch, loss, cond = self.tier2.best_combination
             lines.extend([
-                "Winning Configuration:",
+                "Winning Configuration (Factorial Design):",
                 f"  Architecture: {arch}",
                 f"  Loss: {loss}",
                 f"  Conditioning: {cond}",
                 f"  R²: {self.tier2.best_r2_mean:.4f} +/- {self.tier2.best_r2_std:.4f}",
+                "",
+            ])
+
+        if self.tier2_5:
+            lines.extend([
+                "Probabilistic Loss Analysis (Tier 2.5):",
+                f"  Best combination: {self.tier2_5.best_combination}",
+                f"  R²: {self.tier2_5.best_r2_mean:.4f} +/- {self.tier2_5.best_r2_std:.4f}",
+                "",
+            ])
+
+        if self.tier3_5:
+            lines.extend([
+                "SpectralShift Analysis (Tier 3.5):",
+                f"  Best method: {self.tier3_5.best_method}",
+                f"  R²: {self.tier3_5.best_r2_mean:.4f}",
+                f"  PSD Error: {self.tier3_5.best_psd_error:.2f} dB",
                 "",
             ])
 
@@ -631,6 +954,29 @@ class ConfigRegistry:
                 f"  Improvement over classical: {self.tier4.improvement_over_classical:.4f}",
                 f"  Effect size (Cohen's d): {self.tier4.effect_size_vs_classical:.2f}",
                 f"  Negative controls: {'PASS' if self.tier4.all_controls_passed else 'FAIL'}",
+                "",
+            ])
+
+        if self.tier5:
+            lines.extend([
+                "Biological Validation (Tier 5):",
+                f"  Biological validity score: {self.tier5.metrics.biological_validity_score:.4f}",
+                f"  Odor decoding (pred/real): {self.tier5.metrics.odor_decode_pred:.4f}/{self.tier5.metrics.odor_decode_real:.4f}",
+                f"  PAC correlation: {self.tier5.metrics.pac_correlation:.4f}",
+                f"  Respiratory coupling diff: {self.tier5.metrics.resp_coupling_diff:.4f}",
+                f"  Per-band R²: {self.tier5.metrics.band_r2}",
+                f"  PASSED: {'YES' if self.tier5.passed else 'NO'}",
+                "",
+            ])
+
+        if self.tier6:
+            lines.extend([
+                "Cross-Dataset Generalization (Tier 6):",
+                f"  Source dataset R²: {self.tier6.source_r2:.4f}",
+                f"  Avg zero-shot R²: {self.tier6.avg_zero_shot_r2:.4f}",
+                f"  Avg few-shot R²: {self.tier6.avg_few_shot_r2:.4f}",
+                f"  Avg full fine-tune R²: {self.tier6.avg_full_finetune_r2:.4f}",
+                f"  GENERALIZES: {'YES' if self.tier6.generalizes else 'NO'}",
                 "",
             ])
 
