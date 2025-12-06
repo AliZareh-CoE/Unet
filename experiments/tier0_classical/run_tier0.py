@@ -958,19 +958,44 @@ Example for GPU acceleration:
         print(f"  [DRY-RUN] Using synthetic data: {X.shape}")
     else:
         try:
+            # Import from project root
             from data import prepare_data
+
+            print("  Loading olfactory dataset from /data ...")
             data = prepare_data()
 
-            # Combine train and val for CV (holdout is separate)
-            X_train = data["train"]["ob"].numpy()
-            y_train = data["train"]["hp"].numpy()
-            X_val = data["val"]["ob"].numpy()
-            y_val = data["val"]["hp"].numpy()
+            # prepare_data returns:
+            #   ob: [n_samples, 32, time] - OB signals (input)
+            #   pcx: [n_samples, 32, time] - PCx signals (target)
+            #   train_idx, val_idx, test_idx: split indices
+            ob = data["ob"]    # Full OB data
+            pcx = data["pcx"]  # Full PCx data (target for translation)
 
-            X = np.concatenate([X_train, X_val], axis=0)
-            y = np.concatenate([y_train, y_val], axis=0)
+            # For Tier 0 CV: combine train+val as CV pool
+            # Test set is HOLDOUT (reserved for Tier 4 final validation)
+            train_idx = data["train_idx"]
+            val_idx = data["val_idx"]
+            cv_indices = np.concatenate([train_idx, val_idx])
+
+            # Extract CV pool samples
+            X = ob[cv_indices]   # OB input signals
+            y = pcx[cv_indices]  # PCx target signals
+
             baselines = BASELINES
-            print(f"  Loaded real data: {X.shape}")
+            print(f"  Loaded real data: X={X.shape}, y={y.shape}")
+            print(f"  CV pool: {len(cv_indices)} samples (train+val)")
+            print(f"  Holdout test: {len(data['test_idx'])} samples (reserved for Tier 4)")
+
+        except FileNotFoundError as e:
+            print(f"  ERROR: Data files not found: {e}")
+            print(f"  Expected data at: /data/signal_windows_1khz.npy")
+            print(f"  Falling back to synthetic data for testing...")
+            N = 200
+            C_in, C_out, T = 32, 32, 500
+            X = np.random.randn(N, C_in, T).astype(np.float32)
+            y = np.random.randn(N, C_out, T).astype(np.float32)
+            baselines = BASELINES
+
         except Exception as e:
             print(f"  Warning: Could not load data ({e}), using synthetic")
             N = 200

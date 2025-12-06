@@ -50,7 +50,9 @@ class DatasetType(Enum):
 # =============================================================================
 # Constants - Olfactory Dataset (OB/PCx)
 # =============================================================================
+# Data directory - /data is the primary location on server
 _DATA_DIR = Path("/data")
+
 DATA_PATH = _DATA_DIR / "signal_windows_1khz.npy"
 ODOR_CSV_PATH = _DATA_DIR / "signal_windows_meta_1khz.csv"
 TRAIN_SPLIT_PATH = _DATA_DIR / "train_indices.npy"
