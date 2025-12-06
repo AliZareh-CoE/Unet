@@ -236,18 +236,27 @@ class KalmanFilter:
 
         N, T, input_dim = X.shape
 
-        # Process samples in parallel using threads
         y_pred = np.zeros((N, T, self._output_dim))
 
-        # Use ThreadPoolExecutor for parallel sample processing
-        with ThreadPoolExecutor(max_workers=min(8, N)) as executor:
-            args_list = [(i, X[i], None) for i in range(N)]
-            results = list(executor.map(self._process_sample, args_list))
-
-        for idx, x_filtered in results:
-            x_filtered_np = to_numpy(x_filtered)
+        # GPU mode: sequential processing to avoid CUDA context issues
+        # CPU mode: parallel processing with ThreadPoolExecutor
+        if self.use_gpu:
+            # Sequential processing for GPU (avoids threading issues)
             C_np = to_numpy(self.C)
-            y_pred[idx] = x_filtered_np @ C_np.T
+            for i in range(N):
+                x_filtered = self._kalman_filter_single(X[i], None)
+                x_filtered_np = to_numpy(x_filtered)
+                y_pred[i] = x_filtered_np @ C_np.T
+        else:
+            # Parallel processing for CPU
+            with ThreadPoolExecutor(max_workers=min(8, N)) as executor:
+                args_list = [(i, X[i], None) for i in range(N)]
+                results = list(executor.map(self._process_sample, args_list))
+
+            for idx, x_filtered in results:
+                x_filtered_np = to_numpy(x_filtered)
+                C_np = to_numpy(self.C)
+                y_pred[idx] = x_filtered_np @ C_np.T
 
         if transpose_back or self._transpose:
             y_pred = np.transpose(y_pred, (0, 2, 1))
