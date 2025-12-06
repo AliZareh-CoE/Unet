@@ -23,11 +23,8 @@ from .ridge_regression import (
     MultiOutputRidgeCV,
     create_ridge_regression,
 )
-from .kalman_filter import (
-    KalmanFilter,
-    ExtendedKalmanFilter,
-    create_kalman_filter,
-)
+# Kalman filter removed - not suitable for this signal translation task
+# (produces garbage R² values due to state-space model mismatch)
 from .var_model import (
     VARModel,
     VARExogenous,
@@ -49,10 +46,7 @@ __all__ = [
     "TemporalRidgeRegression",
     "MultiOutputRidgeCV",
     "create_ridge_regression",
-    # Kalman filter
-    "KalmanFilter",
-    "ExtendedKalmanFilter",
-    "create_kalman_filter",
+    # Kalman filter - REMOVED (not suitable for this task)
     # VAR
     "VARModel",
     "VARExogenous",
@@ -75,9 +69,7 @@ BASELINE_REGISTRY = {
     "ridge": create_ridge_regression,
     "ridge_temporal": lambda **kw: create_ridge_regression("temporal", **kw),
     "ridge_cv": lambda **kw: create_ridge_regression("cv", **kw),
-    # Kalman filter variants
-    "kalman": create_kalman_filter,
-    "kalman_extended": lambda **kw: create_kalman_filter("extended", **kw),
+    # Kalman filter - REMOVED (not suitable for signal translation)
     # VAR variants
     "var": create_var_model,
     "var_exogenous": lambda **kw: create_var_model("exogenous", **kw),
