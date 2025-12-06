@@ -30,11 +30,7 @@ from .var_model import (
     VARExogenous,
     create_var_model,
 )
-from .svr_baseline import (
-    SVRBaseline,
-    LinearSVRBaseline,
-    create_svr_baseline,
-)
+# SVR removed - O(n²) complexity unsuitable for high-dimensional neural data (32x5000)
 
 __all__ = [
     # Wiener filter
@@ -51,10 +47,7 @@ __all__ = [
     "VARModel",
     "VARExogenous",
     "create_var_model",
-    # SVR
-    "SVRBaseline",
-    "LinearSVRBaseline",
-    "create_svr_baseline",
+    # SVR - REMOVED (O(n²) complexity unsuitable for 32x5000 data)
     # Registry
     "BASELINE_REGISTRY",
     "create_baseline",
@@ -73,9 +66,7 @@ BASELINE_REGISTRY = {
     # VAR variants
     "var": create_var_model,
     "var_exogenous": lambda **kw: create_var_model("exogenous", **kw),
-    # SVR variants
-    "svr": create_svr_baseline,
-    "svr_linear": lambda **kw: create_svr_baseline("linear", **kw),
+    # SVR - REMOVED (O(n²) complexity, unsuitable for high-dimensional data)
 }
 
 
