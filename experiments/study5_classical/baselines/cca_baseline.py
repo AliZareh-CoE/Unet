@@ -46,6 +46,28 @@ class CCABaseline:
         self.y_mean: Optional[NDArray] = None
         self._fitted = False
 
+    def _pca_reduce_dim(self, X: NDArray, max_dim: int = 500) -> Tuple[NDArray, NDArray, NDArray]:
+        """Reduce dimensionality with PCA to avoid memory issues.
+
+        Args:
+            X: Input data [N, D]
+            max_dim: Maximum dimensions to keep
+
+        Returns:
+            X_reduced, components, mean
+        """
+        mean = np.mean(X, axis=0)
+        X_centered = X - mean
+
+        n_components = min(max_dim, X.shape[0] - 1, X.shape[1])
+
+        # Use truncated SVD for efficiency
+        U, S, Vt = linalg.svd(X_centered, full_matrices=False)
+        components = Vt[:n_components, :]
+
+        X_reduced = U[:, :n_components] * S[:n_components]
+        return X_reduced, components, mean
+
     def fit(
         self,
         X: NDArray,
@@ -76,6 +98,13 @@ class CCABaseline:
 
         N, D_x = X.shape
         _, D_y = y.shape
+
+        # Apply PCA if dimensions too large (avoid memory explosion)
+        self._use_pca = D_x > 500 or D_y > 500
+        if self._use_pca:
+            X, self._pca_x_comp, self._pca_x_mean = self._pca_reduce_dim(X, max_dim=500)
+            y, self._pca_y_comp, self._pca_y_mean = self._pca_reduce_dim(y, max_dim=500)
+            D_x, D_y = X.shape[1], y.shape[1]
 
         # Center data
         self.x_mean = np.mean(X, axis=0, keepdims=True)
@@ -166,12 +195,20 @@ class CCABaseline:
             X = X.reshape(N, -1)
             reshape_back = True
 
+        # Apply PCA reduction if used during fit
+        if getattr(self, '_use_pca', False):
+            X = (X - self._pca_x_mean) @ self._pca_x_comp.T
+
         # Center and project to canonical space
         X_c = X - self.x_mean
         X_canonical = X_c @ self.W_x
 
-        # Reconstruct output
+        # Reconstruct output in reduced space
         y = X_canonical @ self.reconstruction_weights + self.y_mean
+
+        # Project back from PCA space if needed
+        if getattr(self, '_use_pca', False):
+            y = y @ self._pca_y_comp + self._pca_y_mean
 
         # Reshape if needed
         if reshape_back and self._orig_shape_y is not None:
