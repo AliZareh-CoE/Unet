@@ -38,12 +38,16 @@ from typing import Any, Dict, List, Optional, Tuple
 # PERFORMANCE: Configure NumPy/BLAS threading BEFORE importing NumPy
 # =============================================================================
 # These must be set before numpy import for OpenBLAS/MKL
+# Use moderate thread counts to avoid contention in parallel mode
+_DEFAULT_THREADS = str(min(8, os.cpu_count() or 8))
 if "OMP_NUM_THREADS" not in os.environ:
-    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
+    os.environ["OMP_NUM_THREADS"] = _DEFAULT_THREADS
 if "MKL_NUM_THREADS" not in os.environ:
-    os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
+    os.environ["MKL_NUM_THREADS"] = _DEFAULT_THREADS
 if "OPENBLAS_NUM_THREADS" not in os.environ:
-    os.environ["OPENBLAS_NUM_THREADS"] = str(os.cpu_count())
+    os.environ["OPENBLAS_NUM_THREADS"] = _DEFAULT_THREADS
+if "NUMEXPR_MAX_THREADS" not in os.environ:
+    os.environ["NUMEXPR_MAX_THREADS"] = _DEFAULT_THREADS
 
 # =============================================================================
 # CRITICAL: Fix Python path for imports
@@ -726,18 +730,85 @@ def _evaluate_baseline_for_parallel(
     seed: int,
     sample_rate: float,
 ) -> Tuple[str, ClassicalResult, DetailedBaselineResult]:
-    """Wrapper for parallel baseline evaluation."""
-    classical_result, detailed_result = evaluate_baseline_cv(
-        baseline_name=baseline_name,
-        X=X,
-        y=y,
-        n_folds=n_folds,
-        seed=seed,
-        sample_rate=sample_rate,
-        n_jobs=1,  # Sequential folds when running baselines in parallel
-        use_gpu=False,
-    )
-    return baseline_name, classical_result, detailed_result
+    """Wrapper for parallel baseline evaluation.
+
+    Note: Runs with n_jobs=1 to avoid nested parallelism issues.
+    """
+    # Limit thread usage within subprocess to avoid contention
+    import os
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    os.environ["NUMEXPR_MAX_THREADS"] = "4"
+
+    try:
+        classical_result, detailed_result = evaluate_baseline_cv(
+            baseline_name=baseline_name,
+            X=X,
+            y=y,
+            n_folds=n_folds,
+            seed=seed,
+            sample_rate=sample_rate,
+            n_jobs=1,  # Sequential folds when running baselines in parallel
+            use_gpu=False,
+        )
+        return baseline_name, classical_result, detailed_result
+    except Exception as e:
+        # Return a failed result instead of crashing
+        from experiments.common.config_registry import ClassicalResult
+        failed_classical = ClassicalResult(
+            method=baseline_name,
+            r2_mean=np.nan,
+            r2_std=np.nan,
+            mae_mean=np.nan,
+            mae_std=np.nan,
+        )
+        failed_detailed = DetailedBaselineResult(
+            method=baseline_name,
+            r2_mean=np.nan,
+            r2_std=np.nan,
+            r2_ci_lower=np.nan,
+            r2_ci_upper=np.nan,
+            mae_mean=np.nan,
+            mae_std=np.nan,
+            pearson_mean=np.nan,
+            pearson_std=np.nan,
+            psd_error_mean=np.nan,
+            psd_error_std=np.nan,
+            band_r2={},
+            fold_r2s=[],
+            n_folds=n_folds,
+            error=str(e),
+        )
+        return baseline_name, failed_classical, failed_detailed
+
+
+def _get_safe_parallel_workers(data_gb: float, n_baselines: int) -> int:
+    """Calculate safe number of parallel workers based on memory.
+
+    Args:
+        data_gb: Size of data in GB
+        n_baselines: Number of baselines to run
+
+    Returns:
+        Safe number of parallel workers
+    """
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / 1e9
+    except ImportError:
+        available_gb = 64  # Assume 64GB if psutil not available
+
+    # Each worker needs: data + ~2x overhead for intermediate arrays
+    mem_per_worker = data_gb * 3
+
+    # Leave 20% memory headroom
+    max_by_memory = max(1, int((available_gb * 0.8) / mem_per_worker))
+
+    # Don't exceed number of baselines or CPU count / 2
+    max_workers = min(max_by_memory, n_baselines, max(1, mp.cpu_count() // 2))
+
+    return max_workers
 
 
 def run_tier0(
@@ -802,25 +873,34 @@ def run_tier0(
             print(f"  {baseline_name}... SKIPPED (already done) R² = {result.r2_mean:.4f} ± {result.r2_std:.4f}")
             results.append(result)
 
-    n_parallel_jobs = min(len(baselines_to_run), mp.cpu_count()) if parallel_baselines else 1
-    mode_str = f"parallel ({n_parallel_jobs} baselines)" if n_parallel_jobs > 1 else "sequential"
+    # Calculate safe number of parallel workers based on memory
+    data_gb = X.nbytes * 2 / 1e9  # X + y
+    if parallel_baselines:
+        n_parallel_jobs = _get_safe_parallel_workers(data_gb, len(baselines_to_run))
+    else:
+        n_parallel_jobs = 1
+
+    mode_str = f"parallel ({n_parallel_jobs} workers)" if n_parallel_jobs > 1 else "sequential"
     gpu_str = " + GPU" if use_gpu else ""
 
     print(f"\nEvaluating {len(baselines_to_run)} classical baselines with {n_folds}-fold CV...")
     print(f"  Mode: {mode_str}{gpu_str}, {n_jobs} jobs per baseline for fold CV")
-    print(f"  Data shape: {X.shape}, Memory: ~{X.nbytes * 2 / 1e9:.1f} GB")
+    print(f"  Data shape: {X.shape}, Memory: ~{data_gb:.1f} GB")
 
     # Parallel baseline evaluation
     if parallel_baselines and n_parallel_jobs > 1:
-        print(f"\n  Running {len(baselines_to_run)} baselines in parallel...")
+        print(f"\n  Running {len(baselines_to_run)} baselines in parallel ({n_parallel_jobs} workers)...")
         start_all = time.time()
 
-        # Use ProcessPoolExecutor with tqdm for real-time progress
+        # Use ProcessPoolExecutor with spawn context for stability
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         parallel_results_dict = {}
 
-        with ProcessPoolExecutor(max_workers=n_parallel_jobs) as executor:
+        # Use 'spawn' to avoid fork issues with numpy/scipy (stack smashing)
+        ctx = mp.get_context('spawn')
+
+        with ProcessPoolExecutor(max_workers=n_parallel_jobs, mp_context=ctx) as executor:
             # Submit all tasks
             future_to_baseline = {
                 executor.submit(
@@ -845,10 +925,11 @@ def run_tier0(
                         parallel_results_dict[name] = (classical_result, detailed_result)
 
                         # Update progress bar with result
-                        pbar.set_postfix_str(f"{name}: R²={classical_result.r2_mean:.3f}")
+                        r2_str = f"{classical_result.r2_mean:.3f}" if not np.isnan(classical_result.r2_mean) else "FAIL"
+                        pbar.set_postfix_str(f"{name}: R²={r2_str}")
                         pbar.update(1)
                     except Exception as e:
-                        print(f"\n  ERROR: {baseline_name} failed: {e}")
+                        tqdm.write(f"  ERROR: {baseline_name} failed: {e}")
                         pbar.update(1)
 
         # Process results in original order
@@ -861,8 +942,11 @@ def run_tier0(
                     fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
                 completed_results[baseline_name] = classical_result
 
-                ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
-                print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str}")
+                if not np.isnan(classical_result.r2_mean):
+                    ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
+                    print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str}")
+                else:
+                    print(f"  {baseline_name}: FAILED - {getattr(detailed_result, 'error', 'Unknown error')}")
 
         elapsed_all = time.time() - start_all
         print(f"  Total parallel time: {elapsed_all:.1f}s ({elapsed_all/len(baselines_to_run):.1f}s avg per baseline)")
