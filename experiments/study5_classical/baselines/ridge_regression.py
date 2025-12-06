@@ -237,8 +237,9 @@ class TemporalRidgeRegression(RidgeRegression):
         window_size: int = 10,
         stride: int = 1,
         fit_intercept: bool = True,
+        use_gpu: bool = True,
     ):
-        super().__init__(alpha=alpha, fit_intercept=fit_intercept)
+        super().__init__(alpha=alpha, fit_intercept=fit_intercept, use_gpu=use_gpu)
         self.window_size = window_size
         self.stride = stride
 
@@ -365,10 +366,12 @@ class MultiOutputRidgeCV:
         alphas: Optional[List[float]] = None,
         cv: int = 5,
         fit_intercept: bool = True,
+        use_gpu: bool = True,
     ):
         self.alphas = alphas or [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
         self.cv = cv
         self.fit_intercept = fit_intercept
+        self.use_gpu = use_gpu
 
         self.best_alpha: Optional[float] = None
         self.model: Optional[RidgeRegression] = None
@@ -411,6 +414,7 @@ class MultiOutputRidgeCV:
                 model = RidgeRegression(
                     alpha=alpha,
                     fit_intercept=self.fit_intercept,
+                    use_gpu=self.use_gpu,
                 )
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_val)
@@ -431,6 +435,7 @@ class MultiOutputRidgeCV:
         self.model = RidgeRegression(
             alpha=best_alpha,
             fit_intercept=self.fit_intercept,
+            use_gpu=self.use_gpu,
         )
         self.model.fit(X, y)
         self._fitted = True
