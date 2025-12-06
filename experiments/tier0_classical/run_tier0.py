@@ -92,8 +92,7 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier0_classical"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # All baselines to evaluate - these are deterministic, no seeds needed
-# CCA excluded - causes segfaults with large data
-BASELINES = [b for b in BASELINE_REGISTRY.keys() if 'cca' not in b.lower()]
+BASELINES = list(BASELINE_REGISTRY.keys())
 
 # Fast baselines for dry-run
 FAST_BASELINES = ["ridge", "wiener"]

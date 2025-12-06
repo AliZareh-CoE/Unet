@@ -5,7 +5,6 @@ Classical Baselines for Study 5
 Classical signal processing baselines for comparison:
 - Wiener Filter: Optimal linear filter in frequency domain
 - Ridge Regression: L2-regularized linear mapping
-- CCA: Canonical Correlation Analysis
 - Kalman Filter: State-space temporal model
 """
 
@@ -21,12 +20,6 @@ from .ridge_regression import (
     TemporalRidgeRegression,
     MultiOutputRidgeCV,
     create_ridge_regression,
-)
-from .cca_baseline import (
-    CCABaseline,
-    RegularizedCCA,
-    TemporalCCA,
-    create_cca_baseline,
 )
 from .kalman_filter import (
     KalmanFilter,
@@ -44,11 +37,6 @@ __all__ = [
     "TemporalRidgeRegression",
     "MultiOutputRidgeCV",
     "create_ridge_regression",
-    # CCA
-    "CCABaseline",
-    "RegularizedCCA",
-    "TemporalCCA",
-    "create_cca_baseline",
     # Kalman filter
     "KalmanFilter",
     "ExtendedKalmanFilter",
@@ -65,9 +53,6 @@ BASELINE_REGISTRY = {
     "ridge": create_ridge_regression,
     "ridge_temporal": lambda **kw: create_ridge_regression("temporal", **kw),
     "ridge_cv": lambda **kw: create_ridge_regression("cv", **kw),
-    "cca": create_cca_baseline,
-    "cca_regularized": lambda **kw: create_cca_baseline("regularized", **kw),
-    "cca_temporal": lambda **kw: create_cca_baseline("temporal", **kw),
     "kalman": create_kalman_filter,
     "kalman_extended": lambda **kw: create_kalman_filter("extended", **kw),
 }
