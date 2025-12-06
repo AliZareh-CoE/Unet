@@ -81,13 +81,24 @@ def compute_metrics(y_pred: np.ndarray, y_true: np.ndarray) -> Dict[str, float]:
     # MAE
     mae = np.mean(np.abs(y_true - y_pred))
 
-    # Pearson correlation (mean across dimensions)
-    correlations = []
-    for d in range(min(y_pred.shape[1], 100)):  # Limit for speed
-        corr = np.corrcoef(y_pred[:, d], y_true[:, d])[0, 1]
-        if not np.isnan(corr):
-            correlations.append(corr)
-    pearson = np.mean(correlations) if correlations else 0.0
+    # Pearson correlation (vectorized across dimensions)
+    # Limit dimensions for speed, then compute all correlations at once
+    n_dims = min(y_pred.shape[1], 100)
+    y_pred_sub = y_pred[:, :n_dims]
+    y_true_sub = y_true[:, :n_dims]
+
+    # Vectorized Pearson: (x - mean(x)) @ (y - mean(y)) / (std(x) * std(y) * n)
+    y_pred_centered = y_pred_sub - y_pred_sub.mean(axis=0, keepdims=True)
+    y_true_centered = y_true_sub - y_true_sub.mean(axis=0, keepdims=True)
+
+    y_pred_std = y_pred_sub.std(axis=0) + 1e-8
+    y_true_std = y_true_sub.std(axis=0) + 1e-8
+
+    correlations = np.sum(y_pred_centered * y_true_centered, axis=0) / (
+        y_pred_std * y_true_std * y_pred_sub.shape[0]
+    )
+    valid_corrs = correlations[~np.isnan(correlations)]
+    pearson = float(np.mean(valid_corrs)) if len(valid_corrs) > 0 else 0.0
 
     return {
         "r2": float(r2),

@@ -253,7 +253,7 @@ def compute_mutual_information(
     signal2: np.ndarray,
     n_bins: int = 32,
 ) -> float:
-    """Compute mutual information between two signals.
+    """Compute mutual information between two signals (vectorized).
 
     Args:
         signal1: First signal (flattened)
@@ -269,18 +269,21 @@ def compute_mutual_information(
 
     # Compute joint histogram
     hist_2d, _, _ = np.histogram2d(s1, s2, bins=n_bins)
-    p_joint = hist_2d / hist_2d.sum()
+    p_joint = hist_2d / (hist_2d.sum() + 1e-10)
 
     # Marginals
-    p_s1 = np.sum(p_joint, axis=1)
-    p_s2 = np.sum(p_joint, axis=0)
+    p_s1 = np.sum(p_joint, axis=1, keepdims=True)
+    p_s2 = np.sum(p_joint, axis=0, keepdims=True)
 
-    # MI = sum p(x,y) * log(p(x,y) / (p(x) * p(y)))
-    mi = 0.0
-    for i in range(n_bins):
-        for j in range(n_bins):
-            if p_joint[i, j] > 0 and p_s1[i] > 0 and p_s2[j] > 0:
-                mi += p_joint[i, j] * np.log2(p_joint[i, j] / (p_s1[i] * p_s2[j]))
+    # Vectorized MI = sum p(x,y) * log(p(x,y) / (p(x) * p(y)))
+    # Create outer product of marginals
+    p_indep = p_s1 @ p_s2  # [n_bins, n_bins]
+
+    # Mask for valid entries (both p_joint and p_indep > 0)
+    valid_mask = (p_joint > 0) & (p_indep > 0)
+
+    # Compute MI only for valid entries
+    mi = np.sum(p_joint[valid_mask] * np.log2(p_joint[valid_mask] / p_indep[valid_mask]))
 
     return float(mi)
 
@@ -290,7 +293,7 @@ def compute_per_band_r2(
     target: np.ndarray,
     fs: float = 1000.0,
 ) -> Dict[str, float]:
-    """Compute R² for each frequency band.
+    """Compute R² for each frequency band (vectorized filtering).
 
     Args:
         pred: Predicted signals [N, C, T]
@@ -311,13 +314,9 @@ def compute_per_band_r2(
         try:
             b, a = signal.butter(4, [low, high], btype="band", fs=fs)
 
-            pred_filtered = np.zeros_like(pred)
-            target_filtered = np.zeros_like(target)
-
-            for i in range(pred.shape[0]):
-                for c in range(pred.shape[1]):
-                    pred_filtered[i, c] = signal.filtfilt(b, a, pred[i, c])
-                    target_filtered[i, c] = signal.filtfilt(b, a, target[i, c])
+            # Vectorized filtering across all samples and channels using axis=-1
+            pred_filtered = signal.filtfilt(b, a, pred, axis=-1)
+            target_filtered = signal.filtfilt(b, a, target, axis=-1)
 
             # Compute R²
             pred_flat = pred_filtered.reshape(pred.shape[0], -1)
@@ -329,7 +328,7 @@ def compute_per_band_r2(
 
             band_r2[band_name] = float(r2)
 
-        except Exception as e:
+        except Exception:
             band_r2[band_name] = float("nan")
 
     return band_r2

@@ -300,13 +300,23 @@ def evaluate_model(
     # MAE
     mae = np.mean(np.abs(targets_flat - preds_flat))
 
-    # Pearson
-    correlations = []
-    for d in range(min(preds_flat.shape[1], 100)):
-        corr = np.corrcoef(preds_flat[:, d], targets_flat[:, d])[0, 1]
-        if not np.isnan(corr):
-            correlations.append(corr)
-    pearson = np.mean(correlations) if correlations else 0.0
+    # Pearson (vectorized)
+    n_dims = min(preds_flat.shape[1], 100)
+    preds_sub = preds_flat[:, :n_dims]
+    targets_sub = targets_flat[:, :n_dims]
+
+    # Vectorized Pearson: (x - mean(x)) @ (y - mean(y)) / (std(x) * std(y) * n)
+    preds_centered = preds_sub - preds_sub.mean(axis=0, keepdims=True)
+    targets_centered = targets_sub - targets_sub.mean(axis=0, keepdims=True)
+
+    preds_std = preds_sub.std(axis=0) + 1e-8
+    targets_std = targets_sub.std(axis=0) + 1e-8
+
+    correlations = np.sum(preds_centered * targets_centered, axis=0) / (
+        preds_std * targets_std * preds_sub.shape[0]
+    )
+    valid_corrs = correlations[~np.isnan(correlations)]
+    pearson = float(np.mean(valid_corrs)) if len(valid_corrs) > 0 else 0.0
 
     return {
         "r2": float(r2),

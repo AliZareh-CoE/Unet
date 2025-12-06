@@ -234,16 +234,12 @@ class VQVAEEncoder(nn.Module):
         )
 
     def quantize(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize latents to nearest codebook entries."""
+        """Quantize latents to nearest codebook entries (optimized with cdist)."""
         B, D, T = z.shape
         z_flat = z.transpose(1, 2).reshape(-1, D)  # [B*T, D]
 
-        # Distances to codebook
-        distances = (
-            z_flat.pow(2).sum(dim=1, keepdim=True)
-            - 2 * z_flat @ self.codebook.weight.T
-            + self.codebook.weight.pow(2).sum(dim=1)
-        )
+        # Use cdist for efficient distance computation
+        distances = torch.cdist(z_flat, self.codebook.weight, p=2).pow(2)  # [B*T, n_codes]
 
         # Nearest codes
         indices = distances.argmin(dim=1)
