@@ -63,6 +63,16 @@ try:
 except ImportError:
     HAS_JOBLIB = False
 
+# Progress bar support
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # Fallback: no-op tqdm
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 from experiments.common.cross_validation import create_data_splits
 from experiments.common.config_registry import (
     ClassicalResult,
@@ -448,9 +458,18 @@ def evaluate_baseline_cv(
             for split in splits.cv_splits
         )
     else:
-        # Sequential (for GPU or when joblib unavailable)
-        fold_results = [
-            _evaluate_single_fold(
+        # Sequential (for GPU or when joblib unavailable) - with tqdm for fold progress
+        fold_results = []
+        fold_iter = tqdm(
+            splits.cv_splits,
+            desc=f"    {baseline_name} folds",
+            unit="fold",
+            leave=False,
+            ncols=80,
+        ) if HAS_TQDM else splits.cv_splits
+
+        for split in fold_iter:
+            result = _evaluate_single_fold(
                 fold_idx=split.fold_idx,
                 train_indices=split.train_indices,
                 val_indices=split.val_indices,
@@ -460,8 +479,9 @@ def evaluate_baseline_cv(
                 sample_rate=sample_rate,
                 use_gpu=use_gpu,
             )
-            for split in splits.cv_splits
-        ]
+            fold_results.append(result)
+            if HAS_TQDM and hasattr(fold_iter, 'set_postfix_str') and result["success"]:
+                fold_iter.set_postfix_str(f"R²={result['metrics']['r2']:.3f}")
 
     # Track all metrics per fold
     fold_r2s = []
@@ -791,31 +811,58 @@ def run_tier0(
     print(f"  Data shape: {X.shape}, Memory: ~{X.nbytes * 2 / 1e9:.1f} GB")
 
     # Parallel baseline evaluation
-    if parallel_baselines and HAS_JOBLIB and n_parallel_jobs > 1:
+    if parallel_baselines and n_parallel_jobs > 1:
         print(f"\n  Running {len(baselines_to_run)} baselines in parallel...")
         start_all = time.time()
 
-        parallel_results = Parallel(n_jobs=n_parallel_jobs, prefer="processes")(
-            delayed(_evaluate_baseline_for_parallel)(
-                baseline_name=baseline_name,
-                X=X,
-                y=y,
-                n_folds=n_folds,
-                seed=seed,
-                sample_rate=sample_rate,
-            )
-            for baseline_name in baselines_to_run
-        )
+        # Use ProcessPoolExecutor with tqdm for real-time progress
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        for baseline_name, classical_result, detailed_result in parallel_results:
-            results.append(classical_result)
-            detailed_results.append(detailed_result)
-            if detailed_result.fold_r2s:
-                fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
-            completed_results[baseline_name] = classical_result
+        parallel_results_dict = {}
 
-            ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
-            print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str}")
+        with ProcessPoolExecutor(max_workers=n_parallel_jobs) as executor:
+            # Submit all tasks
+            future_to_baseline = {
+                executor.submit(
+                    _evaluate_baseline_for_parallel,
+                    baseline_name, X, y, n_folds, seed, sample_rate
+                ): baseline_name
+                for baseline_name in baselines_to_run
+            }
+
+            # Process completions with tqdm progress bar
+            with tqdm(
+                total=len(baselines_to_run),
+                desc="  Baselines",
+                unit="baseline",
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            ) as pbar:
+                for future in as_completed(future_to_baseline):
+                    baseline_name = future_to_baseline[future]
+                    try:
+                        name, classical_result, detailed_result = future.result()
+                        parallel_results_dict[name] = (classical_result, detailed_result)
+
+                        # Update progress bar with result
+                        pbar.set_postfix_str(f"{name}: R²={classical_result.r2_mean:.3f}")
+                        pbar.update(1)
+                    except Exception as e:
+                        print(f"\n  ERROR: {baseline_name} failed: {e}")
+                        pbar.update(1)
+
+        # Process results in original order
+        for baseline_name in baselines_to_run:
+            if baseline_name in parallel_results_dict:
+                classical_result, detailed_result = parallel_results_dict[baseline_name]
+                results.append(classical_result)
+                detailed_results.append(detailed_result)
+                if detailed_result.fold_r2s:
+                    fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
+                completed_results[baseline_name] = classical_result
+
+                ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
+                print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str}")
 
         elapsed_all = time.time() - start_all
         print(f"  Total parallel time: {elapsed_all:.1f}s ({elapsed_all/len(baselines_to_run):.1f}s avg per baseline)")
@@ -823,9 +870,21 @@ def run_tier0(
         # Save checkpoint after all complete
         _save_checkpoint(completed_results)
     else:
-        # Sequential baseline evaluation
-        for baseline_name in baselines_to_run:
-            print(f"  {baseline_name}...", end=" ", flush=True)
+        # Sequential baseline evaluation with tqdm progress bar
+        pbar = tqdm(
+            baselines_to_run,
+            desc="  Baselines",
+            unit="baseline",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        ) if HAS_TQDM else baselines_to_run
+
+        for baseline_name in pbar:
+            if HAS_TQDM:
+                pbar.set_description(f"  {baseline_name}")
+            else:
+                print(f"  {baseline_name}...", end=" ", flush=True)
+
             start = time.time()
 
             classical_result, detailed_result = evaluate_baseline_cv(
@@ -847,7 +906,13 @@ def run_tier0(
 
             elapsed = time.time() - start
             ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
-            print(f"R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
+
+            if HAS_TQDM:
+                pbar.set_postfix_str(f"R²={classical_result.r2_mean:.3f} ({elapsed:.1f}s)")
+                # Also print the full result after progress bar updates
+                tqdm.write(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
+            else:
+                print(f"R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
 
             # Save checkpoint after each baseline
             completed_results[baseline_name] = classical_result
