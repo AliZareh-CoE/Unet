@@ -175,6 +175,50 @@ def evaluate_baseline_cv(
     )
 
 
+def _load_checkpoint() -> Dict[str, ClassicalResult]:
+    """Load checkpoint for intra-tier resume."""
+    checkpoint_file = ARTIFACTS_DIR / "tier0_checkpoint.json"
+    if not checkpoint_file.exists():
+        return {}
+
+    with open(checkpoint_file) as f:
+        data = json.load(f)
+
+    results = {}
+    for name, r in data.items():
+        results[name] = ClassicalResult(
+            method=r["method"],
+            r2_mean=r["r2_mean"],
+            r2_std=r["r2_std"],
+            mae_mean=r["mae_mean"],
+            mae_std=r["mae_std"],
+        )
+    return results
+
+
+def _save_checkpoint(results: Dict[str, ClassicalResult]) -> None:
+    """Save checkpoint for intra-tier resume."""
+    checkpoint_file = ARTIFACTS_DIR / "tier0_checkpoint.json"
+    data = {}
+    for name, r in results.items():
+        data[name] = {
+            "method": r.method,
+            "r2_mean": r.r2_mean,
+            "r2_std": r.r2_std,
+            "mae_mean": r.mae_mean,
+            "mae_std": r.mae_std,
+        }
+    with open(checkpoint_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _clear_checkpoint() -> None:
+    """Clear checkpoint after successful tier completion."""
+    checkpoint_file = ARTIFACTS_DIR / "tier0_checkpoint.json"
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+
+
 def run_tier0(
     X: np.ndarray,
     y: np.ndarray,
@@ -182,6 +226,7 @@ def run_tier0(
     n_folds: int = 5,
     seed: int = 42,
     register: bool = True,
+    resume: bool = True,
 ) -> Tier0Result:
     """Run Tier 0: Classical Floor evaluation.
 
@@ -192,16 +237,32 @@ def run_tier0(
         n_folds: Number of CV folds
         seed: Random seed
         register: Whether to register results with ConfigRegistry
+        resume: Whether to resume from checkpoint (skip completed experiments)
 
     Returns:
         Tier0Result with all baseline results
     """
     baselines = baselines or BASELINES
+
+    # Load checkpoint for intra-tier resume
+    completed_results = {}
+    if resume:
+        completed_results = _load_checkpoint()
+        if completed_results:
+            print(f"\n🔄 Resuming from checkpoint: {len(completed_results)} baselines already done")
+
     results = []
 
     print(f"\nEvaluating {len(baselines)} classical baselines with {n_folds}-fold CV...")
 
     for baseline_name in baselines:
+        # Skip if already completed
+        if baseline_name in completed_results:
+            result = completed_results[baseline_name]
+            print(f"  {baseline_name}... SKIPPED (already done) R² = {result.r2_mean:.4f} ± {result.r2_std:.4f}")
+            results.append(result)
+            continue
+
         print(f"  {baseline_name}...", end=" ", flush=True)
         start = time.time()
 
@@ -216,6 +277,10 @@ def run_tier0(
 
         elapsed = time.time() - start
         print(f"R² = {result.r2_mean:.4f} ± {result.r2_std:.4f} ({elapsed:.1f}s)")
+
+        # Save checkpoint after each baseline
+        completed_results[baseline_name] = result
+        _save_checkpoint(completed_results)
 
     # Find best
     valid_results = [r for r in results if not np.isnan(r.r2_mean)]
@@ -234,6 +299,9 @@ def run_tier0(
     if register:
         registry = get_registry(ARTIFACTS_DIR)
         registry.register_tier0(tier0_result)
+
+    # Clear checkpoint on successful completion
+    _clear_checkpoint()
 
     return tier0_result
 

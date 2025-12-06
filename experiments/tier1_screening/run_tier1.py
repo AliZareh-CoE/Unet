@@ -230,6 +230,54 @@ def quick_train(
 
 
 # =============================================================================
+# Checkpoint Support
+# =============================================================================
+
+def _load_checkpoint() -> Dict[str, ScreeningResult]:
+    """Load checkpoint for intra-tier resume."""
+    checkpoint_file = ARTIFACTS_DIR / "tier1_checkpoint.json"
+    if not checkpoint_file.exists():
+        return {}
+
+    with open(checkpoint_file) as f:
+        data = json.load(f)
+
+    results = {}
+    for key, r in data.items():
+        results[key] = ScreeningResult(
+            architecture=r["architecture"],
+            loss=r["loss"],
+            r2=r["r2"],
+            mae=r["mae"],
+            training_time=r["training_time"],
+        )
+    return results
+
+
+def _save_checkpoint(results: Dict[str, ScreeningResult]) -> None:
+    """Save checkpoint for intra-tier resume."""
+    checkpoint_file = ARTIFACTS_DIR / "tier1_checkpoint.json"
+    data = {}
+    for key, r in results.items():
+        data[key] = {
+            "architecture": r.architecture,
+            "loss": r.loss,
+            "r2": r.r2,
+            "mae": r.mae,
+            "training_time": r.training_time,
+        }
+    with open(checkpoint_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _clear_checkpoint() -> None:
+    """Clear checkpoint after successful tier completion."""
+    checkpoint_file = ARTIFACTS_DIR / "tier1_checkpoint.json"
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
+
+
+# =============================================================================
 # Screening Matrix
 # =============================================================================
 
@@ -243,6 +291,7 @@ def run_screening_matrix(
     n_epochs: int = 20,
     batch_size: int = 16,
     seed: int = 42,
+    resume: bool = True,
 ) -> List[ScreeningResult]:
     """Run full 8x6 screening matrix.
 
@@ -256,12 +305,20 @@ def run_screening_matrix(
         n_epochs: Training epochs
         batch_size: Batch size
         seed: Random seed
+        resume: Whether to resume from checkpoint
 
     Returns:
         List of ScreeningResult for each combination
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    # Load checkpoint for intra-tier resume
+    completed_results = {}
+    if resume:
+        completed_results = _load_checkpoint()
+        if completed_results:
+            print(f"\n🔄 Resuming from checkpoint: {len(completed_results)} combinations already done")
 
     n_samples = X.shape[0]
     in_channels = X.shape[1]
@@ -291,6 +348,15 @@ def run_screening_matrix(
     for arch_name in architectures:
         for loss_category, loss_name in losses.items():
             combo_idx += 1
+            combo_key = f"{arch_name}_{loss_category}"
+
+            # Skip if already completed
+            if combo_key in completed_results:
+                result = completed_results[combo_key]
+                print(f"  [{combo_idx}/{total_combos}] {arch_name} + {loss_category}... SKIPPED (already done) R² = {result.r2:.4f}")
+                results.append(result)
+                continue
+
             print(f"  [{combo_idx}/{total_combos}] {arch_name} + {loss_category}...", end=" ", flush=True)
 
             model = None  # Initialize for cleanup
@@ -314,25 +380,35 @@ def run_screening_matrix(
                     lr=SCREEN_LR,
                 )
 
-                results.append(ScreeningResult(
+                result = ScreeningResult(
                     architecture=arch_name,
                     loss=loss_category,
                     r2=metrics["r2"],
                     mae=metrics["mae"],
                     training_time=metrics["training_time"],
-                ))
+                )
+                results.append(result)
 
                 print(f"R² = {metrics['r2']:.4f} ({metrics['training_time']:.1f}s)")
 
+                # Save checkpoint after each combination
+                completed_results[combo_key] = result
+                _save_checkpoint(completed_results)
+
             except Exception as e:
                 print(f"FAILED: {e}")
-                results.append(ScreeningResult(
+                result = ScreeningResult(
                     architecture=arch_name,
                     loss=loss_category,
                     r2=float("-inf"),
                     mae=float("inf"),
                     training_time=0,
-                ))
+                )
+                results.append(result)
+
+                # Save checkpoint even for failures
+                completed_results[combo_key] = result
+                _save_checkpoint(completed_results)
 
             # Cleanup
             if model is not None:
@@ -412,6 +488,7 @@ def run_tier1(
     n_epochs: int = SCREEN_EPOCHS,
     seed: int = 42,
     register: bool = True,
+    resume: bool = True,
 ) -> Tier1Result:
     """Run Tier 1: Quick Screening.
 
@@ -425,6 +502,7 @@ def run_tier1(
         n_epochs: Training epochs
         seed: Random seed
         register: Whether to register with ConfigRegistry
+        resume: Whether to resume from checkpoint
 
     Returns:
         Tier1Result with top selections
@@ -445,6 +523,7 @@ def run_tier1(
         data_fraction=data_fraction,
         n_epochs=n_epochs,
         seed=seed,
+        resume=resume,
     )
 
     # Select top performers
@@ -469,6 +548,9 @@ def run_tier1(
     # Register
     if register:
         registry.register_tier1(tier1_result)
+
+    # Clear checkpoint on successful completion
+    _clear_checkpoint()
 
     return tier1_result
 

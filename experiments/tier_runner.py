@@ -558,6 +558,7 @@ def run_full_pipeline(
     start_tier: float = 0,
     single_tier: Optional[float] = None,
     device: str = "cuda",
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """Run the complete tier-based experimental pipeline.
 
@@ -566,6 +567,7 @@ def run_full_pipeline(
         start_tier: Tier to start from (for resuming), supports 1.5, 2.5, 3.5
         single_tier: Run only this specific tier
         device: Device to use
+        resume: If True, skip already-completed tiers
 
     Returns:
         Dictionary with all results
@@ -575,11 +577,28 @@ def run_full_pipeline(
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Reset registry for fresh run (unless resuming)
-    if start_tier == 0 and single_tier is None:
+    # Handle resume vs fresh start
+    if resume:
+        # Load existing state and determine where to resume
+        registry = get_registry(ARTIFACTS_DIR)
+        if registry.load_state():
+            next_tier = registry.get_next_tier()
+            if next_tier is not None:
+                print(f"\n🔄 RESUMING from tier {next_tier}")
+                start_tier = next_tier
+            else:
+                print("\n✓ All tiers already complete!")
+                return registry.get_full_summary()
+        else:
+            print("\n⚠ No previous state found, starting fresh")
+            reset_registry()
+            registry = get_registry(ARTIFACTS_DIR)
+    elif start_tier == 0 and single_tier is None:
+        # Fresh run - reset registry
         reset_registry()
-
-    registry = get_registry(ARTIFACTS_DIR)
+        registry = get_registry(ARTIFACTS_DIR)
+    else:
+        registry = get_registry(ARTIFACTS_DIR)
 
     # Load data
     print("\nLoading data...")
@@ -705,8 +724,10 @@ Examples:
 
     parser.add_argument("--dry-run", action="store_true",
                         help="Run with minimal configuration for testing")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last completed tier (skip already-done tiers)")
     parser.add_argument("--start-tier", type=float, default=0,
-                        help="Tier to start from (for resuming). Options: 0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6")
+                        help="Tier to start from. Options: 0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6")
     parser.add_argument("--tier", type=float,
                         help="Run only this specific tier. Options: 0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6")
     parser.add_argument("--device", type=str, default="cuda",
@@ -752,6 +773,7 @@ Examples:
         start_tier=args.start_tier,
         single_tier=args.tier,
         device=args.device,
+        resume=args.resume,
     )
 
 

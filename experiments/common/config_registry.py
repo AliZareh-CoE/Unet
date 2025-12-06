@@ -880,18 +880,90 @@ class ConfigRegistry:
         with open(state_file, "w") as f:
             json.dump(self.get_full_summary(), f, indent=2, default=str)
 
-    def load_state(self) -> None:
-        """Load state from disk (for resuming)."""
+    def load_state(self) -> bool:
+        """Load state from disk (for resuming).
+
+        Returns:
+            True if state was loaded, False if no state exists
+        """
         state_file = self.artifacts_dir / "registry_state.json"
         if not state_file.exists():
-            return
+            return False
 
         with open(state_file) as f:
             state = json.load(f)
 
-        # Note: Full deserialization would require reconstructing dataclass objects
-        # For now, just print what's available
+        # Reconstruct tier completion markers from saved state
+        # We use simple markers to track completion (full deserialization not needed for resume)
+        self._completed_tiers = set()
+
+        if "tier0" in state:
+            self._completed_tiers.add(0)
+        if "tier1" in state:
+            self._completed_tiers.add(1)
+        if "tier1_5" in state:
+            self._completed_tiers.add(1.5)
+        if "tier2" in state:
+            self._completed_tiers.add(2)
+        if "tier2_5" in state:
+            self._completed_tiers.add(2.5)
+        if "tier3" in state:
+            self._completed_tiers.add(3)
+        if "tier3_5" in state:
+            self._completed_tiers.add(3.5)
+        if "tier4" in state:
+            self._completed_tiers.add(4)
+        if "tier5" in state:
+            self._completed_tiers.add(5)
+        if "tier6" in state:
+            self._completed_tiers.add(6)
+
         print(f"Loaded state: {state.get('experiment_status', 'unknown')}")
+        print(f"Completed tiers: {sorted(self._completed_tiers)}")
+        return True
+
+    def get_completed_tiers(self) -> set:
+        """Get set of completed tier numbers."""
+        if hasattr(self, '_completed_tiers'):
+            return self._completed_tiers
+
+        # Check from current state
+        completed = set()
+        if self.tier0 is not None:
+            completed.add(0)
+        if self.tier1 is not None:
+            completed.add(1)
+        if self.tier1_5 is not None:
+            completed.add(1.5)
+        if self.tier2 is not None:
+            completed.add(2)
+        if self.tier2_5 is not None:
+            completed.add(2.5)
+        if self.tier3 is not None:
+            completed.add(3)
+        if self.tier3_5 is not None:
+            completed.add(3.5)
+        if self.tier4 is not None:
+            completed.add(4)
+        if self.tier5 is not None:
+            completed.add(5)
+        if self.tier6 is not None:
+            completed.add(6)
+        return completed
+
+    def get_next_tier(self) -> Optional[float]:
+        """Get the next tier to run (first incomplete tier).
+
+        Returns:
+            Next tier number or None if all complete
+        """
+        ALL_TIERS = [0, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6]
+        completed = self.get_completed_tiers()
+
+        for tier in ALL_TIERS:
+            if tier not in completed:
+                return tier
+        return None
 
     def export_for_paper(self) -> str:
         """Export results formatted for Nature Methods paper."""

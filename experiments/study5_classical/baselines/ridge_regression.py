@@ -4,6 +4,8 @@ Ridge Regression for Neural Signal Translation
 
 L2-regularized linear mapping between neural signals.
 Simple but effective baseline for signal translation.
+
+Supports GPU acceleration via CuPy when available.
 """
 
 from __future__ import annotations
@@ -13,6 +15,18 @@ from typing import Optional, Tuple, List
 import numpy as np
 from numpy.typing import NDArray
 
+# GPU acceleration imports
+try:
+    from experiments.common.gpu_utils import (
+        is_cupy_available,
+        to_numpy,
+    )
+    _GPU_UTILS_AVAILABLE = True
+except ImportError:
+    _GPU_UTILS_AVAILABLE = False
+    def is_cupy_available(): return False
+    def to_numpy(x): return np.asarray(x)
+
 
 class RidgeRegression:
     """Ridge regression for neural signal translation.
@@ -21,10 +35,13 @@ class RidgeRegression:
 
     Closed-form solution: W = (X^T X + alpha * I)^{-1} X^T Y
 
+    Supports GPU acceleration via CuPy when available.
+
     Args:
         alpha: L2 regularization strength
         fit_intercept: Whether to fit an intercept term
         normalize: Whether to normalize input features
+        use_gpu: Whether to use GPU acceleration if available
     """
 
     def __init__(
@@ -32,10 +49,12 @@ class RidgeRegression:
         alpha: float = 1.0,
         fit_intercept: bool = True,
         normalize: bool = False,
+        use_gpu: bool = True,
     ):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
         self.normalize = normalize
+        self.use_gpu = use_gpu and is_cupy_available()
 
         # Parameters
         self.W: Optional[NDArray] = None
@@ -105,12 +124,30 @@ class RidgeRegression:
         # For large datasets, use chunked computation to avoid memory issues
         D_in = X.shape[1]
 
-        # X^T X is [D_in, D_in] which is manageable (32x32 = small)
-        XtX = X.T @ X
-        XtX_reg = XtX + self.alpha * np.eye(D_in)
-        Xty = X.T @ y_centered
+        # Use GPU if available
+        if self.use_gpu and _GPU_UTILS_AVAILABLE:
+            import cupy as cp
+            X_gpu = cp.asarray(X)
+            y_gpu = cp.asarray(y_centered)
 
-        self.W = np.linalg.solve(XtX_reg, Xty)
+            XtX = X_gpu.T @ X_gpu
+            XtX_reg = XtX + self.alpha * cp.eye(D_in)
+            Xty = X_gpu.T @ y_gpu
+
+            W_gpu = cp.linalg.solve(XtX_reg, Xty)
+            self.W = W_gpu.get()
+
+            # Free GPU memory
+            del X_gpu, y_gpu, XtX, XtX_reg, Xty, W_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+        else:
+            # CPU implementation
+            # X^T X is [D_in, D_in] which is manageable (32x32 = small)
+            XtX = X.T @ X
+            XtX_reg = XtX + self.alpha * np.eye(D_in)
+            Xty = X.T @ y_centered
+
+            self.W = np.linalg.solve(XtX_reg, Xty)
 
         # Compute intercept
         if self.fit_intercept:
@@ -147,8 +184,17 @@ class RidgeRegression:
         # Preprocess
         X = self._preprocess(X, fit=False)
 
-        # Predict
-        y = X @ self.W + self.b
+        # Predict (use GPU for large matrices)
+        if self.use_gpu and _GPU_UTILS_AVAILABLE and X.shape[0] * X.shape[1] > 10000:
+            import cupy as cp
+            X_gpu = cp.asarray(X)
+            W_gpu = cp.asarray(self.W)
+            b_gpu = cp.asarray(self.b)
+            y = (X_gpu @ W_gpu + b_gpu).get()
+            del X_gpu, W_gpu, b_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+        else:
+            y = X @ self.W + self.b
 
         # Reshape back if needed
         if reshape_back and self._orig_shape is not None:

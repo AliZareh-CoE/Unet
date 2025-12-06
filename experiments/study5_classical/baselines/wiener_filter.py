@@ -4,6 +4,8 @@ Wiener Filter for Neural Signal Translation
 
 Optimal linear filter in frequency domain that minimizes MSE.
 Provides theoretical baseline for linear signal translation.
+
+Supports GPU acceleration via CuPy when available.
 """
 
 from __future__ import annotations
@@ -12,6 +14,25 @@ from typing import Optional, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+
+# GPU acceleration imports
+try:
+    from experiments.common.gpu_utils import (
+        is_cupy_available,
+        get_array_module,
+        to_numpy,
+        to_gpu,
+        gpu_fft,
+        gpu_ifft,
+        gpu_inv,
+        gpu_einsum,
+    )
+    _GPU_UTILS_AVAILABLE = True
+except ImportError:
+    _GPU_UTILS_AVAILABLE = False
+    def is_cupy_available(): return False
+    def to_numpy(x): return np.asarray(x)
+    def to_gpu(x): return x
 
 
 class WienerFilter:
@@ -29,6 +50,7 @@ class WienerFilter:
         n_fft: FFT size for spectral estimation
         regularization: Regularization term to prevent division by zero
         smooth_window: Window size for spectral smoothing (0 to disable)
+        use_gpu: Whether to use GPU acceleration if available
     """
 
     def __init__(
@@ -37,12 +59,14 @@ class WienerFilter:
         regularization: float = 1e-6,  # Increased for stability
         smooth_window: int = 5,
         diagonal_only: bool = True,  # Only match channel i to channel i
+        use_gpu: bool = True,  # Use GPU if available
     ):
         self._n_fft_init = n_fft  # Store initial value
         self.n_fft = n_fft  # Will be set during fit if None
         self.regularization = regularization
         self.smooth_window = smooth_window
         self.diagonal_only = diagonal_only
+        self.use_gpu = use_gpu and is_cupy_available()
 
         # Filter coefficients (computed during fit)
         self.H: Optional[NDArray] = None
@@ -190,10 +214,13 @@ class MultiChannelWienerFilter(WienerFilter):
     Estimates a single MIMO (Multiple-Input Multiple-Output) filter
     that optimally maps all input channels to all output channels.
 
+    Supports GPU acceleration via CuPy when available.
+
     Args:
         n_fft: FFT size
         regularization: Regularization for matrix inversion
         use_mimo: If True, jointly optimize all channels
+        use_gpu: Whether to use GPU acceleration if available
     """
 
     def __init__(
@@ -201,8 +228,9 @@ class MultiChannelWienerFilter(WienerFilter):
         n_fft: Optional[int] = None,
         regularization: float = 1e-6,
         use_mimo: bool = True,
+        use_gpu: bool = True,
     ):
-        super().__init__(n_fft=n_fft, regularization=regularization)
+        super().__init__(n_fft=n_fft, regularization=regularization, use_gpu=use_gpu)
         self.use_mimo = use_mimo
 
     def fit(
@@ -210,7 +238,7 @@ class MultiChannelWienerFilter(WienerFilter):
         X: NDArray,
         y: NDArray,
     ) -> "MultiChannelWienerFilter":
-        """Fit MIMO Wiener filter (vectorized for speed).
+        """Fit MIMO Wiener filter (vectorized for speed, GPU accelerated).
 
         For MIMO, we solve: H(f) = S_xy(f) @ S_xx(f)^{-1}
 
@@ -242,14 +270,27 @@ class MultiChannelWienerFilter(WienerFilter):
         else:
             self.n_fft = self._n_fft_init
 
+        # Use GPU if available and enabled
+        if self.use_gpu and _GPU_UTILS_AVAILABLE:
+            H = self._fit_gpu(X, y, N, C_in, C_out)
+        else:
+            H = self._fit_cpu(X, y, N, C_in, C_out)
+
+        # Transpose to expected shape [C_out, C_in, F]
+        self.H = H.transpose(1, 2, 0)
+
+        self._fitted = True
+        return self
+
+    def _fit_cpu(self, X: NDArray, y: NDArray, N: int, C_in: int, C_out: int) -> NDArray:
+        """CPU implementation of MIMO Wiener fit."""
         # Compute FFT
         X_fft = np.fft.rfft(X, n=self.n_fft, axis=-1)  # [N, C_in, F]
         y_fft = np.fft.rfft(y, n=self.n_fft, axis=-1)  # [N, C_out, F]
 
         n_freq = X_fft.shape[-1]
 
-        # VECTORIZED computation using einsum (fast for spectral estimation)
-        # Transpose for easier matrix operations: [F, N, C]
+        # VECTORIZED computation using einsum
         X_fft_t = X_fft.transpose(2, 0, 1)  # [F, N, C_in]
         y_fft_t = y_fft.transpose(2, 0, 1)  # [F, N, C_out]
 
@@ -259,17 +300,15 @@ class MultiChannelWienerFilter(WienerFilter):
         # Auto-spectral matrix S_xx [F, C_in, C_in] = E[x @ x^H]
         S_xx = np.einsum('fni,fnj->fij', X_fft_t, np.conj(X_fft_t)) / N
 
-        # Regularize: add regularization * I to each frequency's S_xx
+        # Regularize
         eye = np.eye(C_in, dtype=np.complex128)
         S_xx_reg = S_xx + self.regularization * eye[np.newaxis, :, :]
 
-        # Compute H = S_xy @ inv(S_xx) using batched inverse (faster than solve for small matrices)
-        # np.linalg.inv is well-optimized for batched small matrices
+        # Compute H = S_xy @ inv(S_xx)
         try:
-            S_xx_inv = np.linalg.inv(S_xx_reg)  # [F, C_in, C_in]
-            H = np.einsum('foi,fij->foj', S_xy, S_xx_inv)  # [F, C_out, C_in]
+            S_xx_inv = np.linalg.inv(S_xx_reg)
+            H = np.einsum('foi,fij->foj', S_xy, S_xx_inv)
         except np.linalg.LinAlgError:
-            # Fallback: process in chunks to avoid memory issues
             H = np.zeros((n_freq, C_out, C_in), dtype=np.complex128)
             chunk_size = 256
             for start in range(0, n_freq, chunk_size):
@@ -281,11 +320,54 @@ class MultiChannelWienerFilter(WienerFilter):
                     for f in range(start, end):
                         H[f] = S_xy[f] @ np.linalg.pinv(S_xx_reg[f])
 
-        # Transpose to expected shape [C_out, C_in, F]
-        self.H = H.transpose(1, 2, 0)
+        return H
 
-        self._fitted = True
-        return self
+    def _fit_gpu(self, X: NDArray, y: NDArray, N: int, C_in: int, C_out: int) -> NDArray:
+        """GPU-accelerated implementation of MIMO Wiener fit using CuPy."""
+        import cupy as cp
+
+        # Transfer to GPU
+        X_gpu = cp.asarray(X)
+        y_gpu = cp.asarray(y)
+
+        # Compute FFT on GPU
+        X_fft = cp.fft.rfft(X_gpu, n=self.n_fft, axis=-1)  # [N, C_in, F]
+        y_fft = cp.fft.rfft(y_gpu, n=self.n_fft, axis=-1)  # [N, C_out, F]
+
+        n_freq = X_fft.shape[-1]
+
+        # VECTORIZED computation using einsum on GPU
+        X_fft_t = X_fft.transpose(2, 0, 1)  # [F, N, C_in]
+        y_fft_t = y_fft.transpose(2, 0, 1)  # [F, N, C_out]
+
+        # Cross-spectral matrix S_xy [F, C_out, C_in]
+        S_xy = cp.einsum('fno,fni->foi', y_fft_t, cp.conj(X_fft_t)) / N
+
+        # Auto-spectral matrix S_xx [F, C_in, C_in]
+        S_xx = cp.einsum('fni,fnj->fij', X_fft_t, cp.conj(X_fft_t)) / N
+
+        # Regularize
+        eye = cp.eye(C_in, dtype=cp.complex128)
+        S_xx_reg = S_xx + self.regularization * eye[cp.newaxis, :, :]
+
+        # Compute H = S_xy @ inv(S_xx) on GPU
+        try:
+            S_xx_inv = cp.linalg.inv(S_xx_reg)
+            H_gpu = cp.einsum('foi,fij->foj', S_xy, S_xx_inv)
+        except cp.linalg.LinAlgError:
+            # Fallback to pinv
+            H_gpu = cp.zeros((n_freq, C_out, C_in), dtype=cp.complex128)
+            for f in range(n_freq):
+                H_gpu[f] = S_xy[f] @ cp.linalg.pinv(S_xx_reg[f])
+
+        # Transfer back to CPU
+        H = H_gpu.get()
+
+        # Free GPU memory
+        del X_gpu, y_gpu, X_fft, y_fft, X_fft_t, y_fft_t, S_xy, S_xx, S_xx_reg, S_xx_inv, H_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+
+        return H
 
 
 def create_wiener_filter(
