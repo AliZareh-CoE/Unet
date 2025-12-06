@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Tier 0: Classical Floor (GATE) - GPU ACCELERATED
-=================================================
+Tier 0: Classical Floor (GATE) - MULTI-GPU ACCELERATED
+========================================================
 
 Establishes the minimum performance bar that neural methods must beat.
 Uses 5-fold CV for robust estimation.
@@ -9,13 +9,14 @@ Uses 5-fold CV for robust estimation.
 GATE CONDITION: Neural methods in Tier 1+ must beat best classical by 0.10 R²
 
 PERFORMANCE FEATURES:
-- GPU acceleration for baselines (via CuPy)
+- Multi-GPU parallel execution (1 baseline per GPU, others queue)
+- Process-based isolation prevents CUDA context conflicts
 - Vectorized metrics and bootstrap CI
 - tqdm progress bars with real-time updates
 - Checkpoint/resume support
 
 Usage:
-    python experiments/tier0_classical/run_tier0.py --use-gpu     # GPU accelerated
+    python experiments/tier0_classical/run_tier0.py --use-gpu     # Multi-GPU parallel
     python experiments/tier0_classical/run_tier0.py              # Sequential CPU
     python experiments/tier0_classical/run_tier0.py --dry-run    # Quick test
 """
@@ -730,6 +731,138 @@ def _get_available_gpus() -> List[int]:
         return []
 
 
+def _run_baseline_on_gpu_process(
+    baseline_name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    n_folds: int,
+    seed: int,
+    sample_rate: float,
+    gpu_id: int,
+) -> Dict[str, Any]:
+    """Run a baseline on a specific GPU in a separate process.
+
+    This function is designed to be called via ProcessPoolExecutor with spawn context.
+    Each process gets its own fresh CUDA context, avoiding memory conflicts.
+
+    Args:
+        baseline_name: Name of baseline to evaluate
+        X, y: Data arrays
+        n_folds: Number of CV folds
+        seed: Random seed
+        sample_rate: Sample rate in Hz
+        gpu_id: GPU device ID to use
+
+    Returns:
+        Dictionary with results (for pickling across process boundary)
+    """
+    try:
+        # Set GPU device for this process (fresh CUDA context)
+        import cupy as cp
+        cp.cuda.Device(gpu_id).use()
+
+        # Limit thread counts in subprocess to avoid contention
+        import os
+        os.environ["OMP_NUM_THREADS"] = "4"
+        os.environ["MKL_NUM_THREADS"] = "4"
+        os.environ["OPENBLAS_NUM_THREADS"] = "4"
+
+        # Import here to ensure fresh module state
+        from experiments.study5_classical.baselines import create_baseline
+        from experiments.common.cross_validation import create_data_splits
+
+        # Create CV splits
+        splits = create_data_splits(
+            n_samples=X.shape[0],
+            n_folds=n_folds,
+            holdout_fraction=0.0,
+            seed=seed,
+        )
+
+        fold_r2s = []
+        fold_maes = []
+        fold_pearsons = []
+        fold_psd_errors = []
+        fold_band_r2s = {band: [] for band in NEURAL_BANDS.keys()}
+
+        for split in splits.cv_splits:
+            try:
+                X_train = X[split.train_indices]
+                y_train = y[split.train_indices]
+                X_val = X[split.val_indices]
+                y_val = y[split.val_indices]
+
+                # Create and fit baseline with GPU
+                baseline = create_baseline(baseline_name, use_gpu=True)
+                baseline.fit(X_train, y_train)
+                y_pred = baseline.predict(X_val)
+
+                # Compute metrics
+                metrics = compute_metrics(y_pred, y_val, sample_rate=sample_rate)
+
+                fold_r2s.append(metrics["r2"])
+                fold_maes.append(metrics["mae"])
+                fold_pearsons.append(metrics.get("pearson", np.nan))
+                fold_psd_errors.append(metrics.get("psd_error_db", np.nan))
+
+                for band in NEURAL_BANDS.keys():
+                    fold_band_r2s[band].append(metrics.get(f"r2_{band}", np.nan))
+
+                # Clear GPU memory after each fold
+                cp.get_default_memory_pool().free_all_blocks()
+
+            except Exception as e:
+                fold_r2s.append(np.nan)
+                fold_maes.append(np.nan)
+                fold_pearsons.append(np.nan)
+                fold_psd_errors.append(np.nan)
+                for band in NEURAL_BANDS.keys():
+                    fold_band_r2s[band].append(np.nan)
+
+        # Aggregate results
+        valid_r2s = np.array([r for r in fold_r2s if not np.isnan(r)])
+        valid_maes = np.array([m for m in fold_maes if not np.isnan(m)])
+        valid_pearsons = np.array([p for p in fold_pearsons if not np.isnan(p)])
+        valid_psd_errors = np.array([p for p in fold_psd_errors if not np.isnan(p)])
+
+        # Bootstrap CI
+        ci = compute_bootstrap_ci(np.array(fold_r2s))
+
+        # Clear GPU memory before returning
+        cp.get_default_memory_pool().free_all_blocks()
+
+        return {
+            'r2_mean': float(np.mean(valid_r2s)) if len(valid_r2s) > 0 else np.nan,
+            'r2_std': float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0,
+            'r2_ci_lower': ci['ci_lower'],
+            'r2_ci_upper': ci['ci_upper'],
+            'mae_mean': float(np.mean(valid_maes)) if len(valid_maes) > 0 else np.nan,
+            'mae_std': float(np.std(valid_maes, ddof=1)) if len(valid_maes) > 1 else 0.0,
+            'pearson_mean': float(np.mean(valid_pearsons)) if len(valid_pearsons) > 0 else np.nan,
+            'pearson_std': float(np.std(valid_pearsons, ddof=1)) if len(valid_pearsons) > 1 else 0.0,
+            'psd_error_db': float(np.mean(valid_psd_errors)) if len(valid_psd_errors) > 0 else np.nan,
+            'r2_delta': float(np.nanmean(fold_band_r2s["delta"])) if fold_band_r2s["delta"] else None,
+            'r2_theta': float(np.nanmean(fold_band_r2s["theta"])) if fold_band_r2s["theta"] else None,
+            'r2_alpha': float(np.nanmean(fold_band_r2s["alpha"])) if fold_band_r2s["alpha"] else None,
+            'r2_beta': float(np.nanmean(fold_band_r2s["beta"])) if fold_band_r2s["beta"] else None,
+            'r2_gamma': float(np.nanmean(fold_band_r2s["gamma"])) if fold_band_r2s["gamma"] else None,
+            'fold_r2s': fold_r2s,
+            'gpu_id': gpu_id,
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'r2_mean': np.nan,
+            'r2_std': np.nan,
+            'mae_mean': np.nan,
+            'mae_std': np.nan,
+            'gpu_id': gpu_id,
+        }
+
+
 def _evaluate_baseline_on_gpu(
     baseline_name: str,
     X: np.ndarray,
@@ -819,8 +952,9 @@ def run_tier0(
 ) -> Tuple[Tier0Result, Dict[str, Any]]:
     """Run Tier 0: Classical Floor evaluation (Nature Methods publication quality).
 
-    GPU ACCELERATED:
-    - With --use-gpu: Runs baselines sequentially on GPU 0 using CuPy
+    MULTI-GPU ACCELERATED:
+    - With --use-gpu: Runs baselines in parallel across GPUs (1 per GPU)
+    - Process-based isolation prevents CUDA context conflicts
     - Vectorized metrics computation and bootstrap CI
     - Checkpoint/resume support
 
@@ -870,7 +1004,7 @@ def run_tier0(
     n_gpus = len(available_gpus)
 
     if use_gpu and n_gpus > 0:
-        mode_str = f"sequential GPU (GPU 0)"
+        mode_str = f"multi-GPU pool ({n_gpus} GPUs, 1 task each)"
     else:
         mode_str = "sequential CPU"
 
@@ -880,86 +1014,116 @@ def run_tier0(
     if n_gpus > 0:
         print(f"  GPUs available: {available_gpus}")
 
-    # GPU sequential execution (avoids CUDA context conflicts)
+    # Multi-GPU parallel execution with GPU pool (one task per GPU, others wait)
     if use_gpu and n_gpus > 0:
-        print(f"\n  Running {len(baselines_to_run)} baselines sequentially on GPU 0...")
-        print(f"  (Sequential GPU avoids CUDA context conflicts)")
+        print(f"\n  Running {len(baselines_to_run)} baselines on {n_gpus} GPUs (1 task per GPU)...")
+        print(f"  (Process-based isolation prevents CUDA context conflicts)")
         start_all = time.time()
 
-        # Set GPU device once at start
-        try:
-            import cupy as cp
-            cp.cuda.Device(0).use()
-        except Exception as e:
-            print(f"  Warning: Could not set GPU device: {e}")
+        # Use ProcessPoolExecutor with spawn context for clean CUDA contexts
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import queue
 
-        # Sequential GPU execution with tqdm progress bar
-        pbar = tqdm(
-            baselines_to_run,
-            desc="  GPU Baselines",
-            unit="baseline",
-            ncols=100,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-        ) if HAS_TQDM else baselines_to_run
+        # Create GPU assignment queue (each GPU ID appears once)
+        gpu_queue = queue.Queue()
+        for gpu_id in available_gpus:
+            gpu_queue.put(gpu_id)
 
-        for baseline_name in pbar:
-            if HAS_TQDM:
-                pbar.set_description(f"  {baseline_name}")
+        parallel_results_dict = {}
+        n_workers = min(n_gpus, len(baselines_to_run))
 
-            start = time.time()
+        # Use spawn context for fresh CUDA contexts in each process
+        ctx = mp.get_context('spawn')
 
-            try:
-                classical_result, detailed_result = evaluate_baseline_cv(
-                    baseline_name=baseline_name,
-                    X=X,
-                    y=y,
-                    n_folds=n_folds,
-                    seed=seed,
-                    sample_rate=sample_rate,
-                    n_jobs=1,  # Sequential folds for GPU
-                    use_gpu=True,
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+            # Submit tasks - each will run on its own GPU
+            future_to_baseline = {}
+            for i, baseline_name in enumerate(baselines_to_run):
+                gpu_id = available_gpus[i % n_gpus]
+                future = executor.submit(
+                    _run_baseline_on_gpu_process,
+                    baseline_name, X, y, n_folds, seed, sample_rate, gpu_id
                 )
+                future_to_baseline[future] = (baseline_name, gpu_id)
 
-                # Clear GPU memory after each baseline
-                try:
-                    cp.get_default_memory_pool().free_all_blocks()
-                except Exception:
-                    pass
+            # Process completions with tqdm progress bar
+            with tqdm(
+                total=len(baselines_to_run),
+                desc="  GPU Baselines",
+                unit="baseline",
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+            ) as pbar:
+                for future in as_completed(future_to_baseline):
+                    baseline_name, gpu_id = future_to_baseline[future]
+                    try:
+                        result_dict = future.result()
+                        parallel_results_dict[baseline_name] = result_dict
 
+                        # Update progress bar with result
+                        r2 = result_dict.get('r2_mean', np.nan)
+                        r2_str = f"{r2:.3f}" if not np.isnan(r2) else "FAIL"
+                        pbar.set_postfix_str(f"{baseline_name}@GPU{gpu_id}: R²={r2_str}")
+                        pbar.update(1)
+
+                        # Print result
+                        if not np.isnan(r2):
+                            ci_str = f"[{result_dict.get('r2_ci_lower', 0):.4f}, {result_dict.get('r2_ci_upper', 0):.4f}]"
+                            tqdm.write(f"  {baseline_name}@GPU{gpu_id}: R² = {r2:.4f} ± {result_dict.get('r2_std', 0):.4f} {ci_str}")
+                        else:
+                            tqdm.write(f"  {baseline_name}@GPU{gpu_id}: FAILED - {result_dict.get('error', 'Unknown')}")
+                    except Exception as e:
+                        tqdm.write(f"  ERROR: {baseline_name}@GPU{gpu_id} failed: {e}")
+                        parallel_results_dict[baseline_name] = {'error': str(e), 'r2_mean': np.nan}
+                        pbar.update(1)
+
+        # Process results in original order
+        for baseline_name in baselines_to_run:
+            if baseline_name in parallel_results_dict:
+                result_dict = parallel_results_dict[baseline_name]
+
+                # Reconstruct ClassicalResult
+                classical_result = ClassicalResult(
+                    method=baseline_name,
+                    r2_mean=result_dict.get('r2_mean', np.nan),
+                    r2_std=result_dict.get('r2_std', np.nan),
+                    mae_mean=result_dict.get('mae_mean', np.nan),
+                    mae_std=result_dict.get('mae_std', np.nan),
+                )
                 results.append(classical_result)
-                detailed_results.append(detailed_result)
-                if detailed_result.fold_r2s:
-                    fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
                 completed_results[baseline_name] = classical_result
 
-                elapsed = time.time() - start
-                ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
+                # Reconstruct DetailedBaselineResult if available
+                if 'fold_r2s' in result_dict:
+                    detailed_result = DetailedBaselineResult(
+                        method=baseline_name,
+                        r2_mean=result_dict.get('r2_mean', np.nan),
+                        r2_std=result_dict.get('r2_std', np.nan),
+                        r2_ci_lower=result_dict.get('r2_ci_lower', np.nan),
+                        r2_ci_upper=result_dict.get('r2_ci_upper', np.nan),
+                        mae_mean=result_dict.get('mae_mean', np.nan),
+                        mae_std=result_dict.get('mae_std', np.nan),
+                        pearson_mean=result_dict.get('pearson_mean', np.nan),
+                        pearson_std=result_dict.get('pearson_std', np.nan),
+                        psd_error_db=result_dict.get('psd_error_db', np.nan),
+                        r2_delta=result_dict.get('r2_delta'),
+                        r2_theta=result_dict.get('r2_theta'),
+                        r2_alpha=result_dict.get('r2_alpha'),
+                        r2_beta=result_dict.get('r2_beta'),
+                        r2_gamma=result_dict.get('r2_gamma'),
+                        fold_r2s=result_dict.get('fold_r2s'),
+                    )
+                    detailed_results.append(detailed_result)
+                    if detailed_result.fold_r2s:
+                        fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
 
-                if HAS_TQDM:
-                    pbar.set_postfix_str(f"R²={classical_result.r2_mean:.3f} ({elapsed:.1f}s)")
-                    tqdm.write(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
-                else:
-                    print(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
-
-            except Exception as e:
-                elapsed = time.time() - start
-                print(f"  {baseline_name}: FAILED - {e} ({elapsed:.1f}s)")
-                # Create failed result
-                failed_classical = ClassicalResult(
-                    method=baseline_name,
-                    r2_mean=np.nan,
-                    r2_std=np.nan,
-                    mae_mean=np.nan,
-                    mae_std=np.nan,
-                )
-                results.append(failed_classical)
-                completed_results[baseline_name] = failed_classical
-
-            # Save checkpoint after each baseline
-            _save_checkpoint(completed_results)
+        # Save checkpoint after all complete
+        _save_checkpoint(completed_results)
 
         elapsed_all = time.time() - start_all
+        successful = sum(1 for r in results if not np.isnan(r.r2_mean))
         print(f"  Total GPU time: {elapsed_all:.1f}s ({elapsed_all/len(baselines_to_run):.1f}s avg per baseline)")
+        print(f"  Successful: {successful}/{len(baselines_to_run)}")
 
     else:
         # Sequential baseline evaluation with tqdm progress bar
@@ -1055,15 +1219,16 @@ def run_tier0(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tier 0: Classical Floor - GPU ACCELERATED",
+        description="Tier 0: Classical Floor - MULTI-GPU ACCELERATED",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Performance Tips:
-  --use-gpu    Use GPU acceleration for baselines (CuPy)
-               Each baseline runs sequentially on GPU 0
+  --use-gpu    Use multi-GPU parallel execution (1 baseline per GPU)
+               With 8 GPUs: up to 8 baselines run simultaneously
+               Others queue and wait for a GPU to become free
 
 Example:
-  python run_tier0.py --use-gpu    # GPU accelerated
+  python run_tier0.py --use-gpu    # Multi-GPU parallel (FASTEST)
   python run_tier0.py              # CPU mode
         """
     )
@@ -1079,7 +1244,7 @@ Example:
     )
     parser.add_argument(
         "--use-gpu", action="store_true",
-        help="Use GPU acceleration (sequential on GPU 0)"
+        help="Use multi-GPU parallel (1 baseline per GPU, others queue)"
     )
     parser.add_argument(
         "--no-resume", action="store_true",
