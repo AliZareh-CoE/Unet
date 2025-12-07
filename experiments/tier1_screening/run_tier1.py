@@ -76,7 +76,7 @@ def _save_checkpoint(results: Dict[str, Dict]) -> None:
 # =============================================================================
 
 DDP_WORKER_SCRIPT = '''#!/usr/bin/env python3
-"""DDP Worker - ONE experiment across 8 GPUs using torchrun"""
+"""FSDP Worker - ONE experiment across 8 GPUs using torchrun with FSDP"""
 import argparse
 import os
 import sys
@@ -91,10 +91,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.amp import autocast, GradScaler
 
 from experiments.study1_architecture.architectures import create_architecture
 from experiments.study3_loss.losses import create_loss
@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
-    # Initialize DDP
+    # Initialize distributed
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
@@ -150,9 +150,12 @@ def main():
 
     is_main = (local_rank == 0)
 
+    # Clear GPU cache before starting
+    torch.cuda.empty_cache()
+
     if is_main:
         print(f"\\nTraining {args.arch} + {args.loss}")
-        print(f"  World size: {world_size} GPUs")
+        print(f"  World size: {world_size} GPUs (FSDP)")
         print(f"  Batch size: {args.batch_size} total ({args.batch_size // world_size} per GPU)")
         print(f"  Epochs: {args.epochs}")
 
@@ -182,23 +185,29 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_per_gpu, sampler=val_sampler,
                             num_workers=2, pin_memory=True)
 
-    # Create model + DDP
-    model = create_model(args.arch, in_channels, out_channels).to(device)
-    model = DDP(model, device_ids=[local_rank])
+    # Create model on CPU first, then wrap with FSDP (shards across GPUs)
+    model = create_model(args.arch, in_channels, out_channels)
+
+    # FSDP with mixed precision - shards model across all GPUs
+    mp_policy = MixedPrecision(
+        param_dtype=torch.float16,
+        reduce_dtype=torch.float16,
+        buffer_dtype=torch.float16,
+    )
+    model = FSDP(model, mixed_precision=mp_policy, device_id=local_rank)
 
     # Loss
     criterion = create_loss(args.loss)
     if hasattr(criterion, 'to'):
         criterion = criterion.to(device)
 
-    # Optimizer
+    # Optimizer (FSDP handles mixed precision internally)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = GradScaler('cuda')
 
     start_time = time.time()
 
-    # Training
+    # Training (FSDP MixedPrecision handles fp16 automatically)
     for epoch in range(args.epochs):
         model.train()
         train_sampler.set_epoch(epoch)
@@ -211,19 +220,17 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast('cuda'):
-                y_pred = model(x)
-                try:
-                    loss = criterion(y_pred, y_batch)
-                except:
-                    loss = nn.functional.l1_loss(y_pred, y_batch)
+            # FSDP with MixedPrecision handles autocast internally
+            y_pred = model(x)
+            try:
+                loss = criterion(y_pred, y_batch)
+            except:
+                loss = nn.functional.l1_loss(y_pred, y_batch)
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                loss.backward()
+                model.clip_grad_norm_(1.0)  # FSDP's gradient clipping
+                optimizer.step()
                 epoch_loss += loss.item()
                 n_batches += 1
 
@@ -243,8 +250,7 @@ def main():
     with torch.no_grad():
         for x, y_batch in val_loader:
             x = x.to(device, non_blocking=True)
-            with autocast('cuda'):
-                y_pred = model(x)
+            y_pred = model(x)
             local_preds.append(y_pred.float().cpu())
             local_targets.append(y_batch)
 
