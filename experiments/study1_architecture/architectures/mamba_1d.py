@@ -224,16 +224,22 @@ class SelectiveSSM(nn.Module):
         B_bar = delta * B_proj  # [B, T, N]
 
         # Sequential scan (simple implementation)
-        # For efficiency, this should use parallel scan or hardware-specific kernels
+        # h: [B, D, N] - each feature in d_inner has its own state vector of size N
         h = torch.zeros(B, D, N, device=x.device, dtype=x.dtype)
         ys = []
 
         for t in range(T):
-            h = A_bar[:, t:t+1, :] * h + B_bar[:, t:t+1, :] * x[:, t:t+1, :].unsqueeze(-1)
-            y_t = (h * C_proj[:, t:t+1, :].unsqueeze(2)).sum(-1)  # [B, 1, D]
+            # Proper broadcasting for SSM update
+            a_t = A_bar[:, t, :].unsqueeze(1)  # [B, 1, N]
+            b_t = B_bar[:, t, :].unsqueeze(1)  # [B, 1, N]
+            x_t = x[:, t, :].unsqueeze(-1)     # [B, D, 1]
+            c_t = C_proj[:, t, :].unsqueeze(1) # [B, 1, N]
+
+            h = a_t * h + b_t * x_t  # [B, D, N]
+            y_t = (h * c_t).sum(-1)  # [B, D]
             ys.append(y_t)
 
-        y = torch.cat(ys, dim=1)  # [B, T, D]
+        y = torch.stack(ys, dim=1)  # [B, T, D]
 
         # Skip connection
         y = y + self.D * x

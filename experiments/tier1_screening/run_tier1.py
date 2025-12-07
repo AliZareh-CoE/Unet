@@ -38,7 +38,7 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier1_screening"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_EPOCHS = 50
-TRAIN_BATCH_SIZE = 64  # Total batch size (divided across 8 GPUs = 8 per GPU)
+TRAIN_BATCH_SIZE = 8  # Reduced for single 6GB GPU
 TRAIN_LR = 1e-3
 
 ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba"]
@@ -75,10 +75,9 @@ def _save_checkpoint(results: Dict[str, Dict]) -> None:
 # DDP Worker Script (saved to file, run with torchrun)
 # =============================================================================
 
-DDP_WORKER_SCRIPT = '''#!/usr/bin/env python3
-"""FSDP Worker - ONE experiment across 8 GPUs using torchrun with FSDP"""
+SINGLE_GPU_SCRIPT = '''#!/usr/bin/env python3
+"""Single-GPU Training with mixed precision (autocast + GradScaler)"""
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -90,27 +89,23 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 
 from experiments.study1_architecture.architectures import create_architecture
 from experiments.study3_loss.losses import create_loss
 
 
 class MemmapDataset(Dataset):
-    """Dataset using memory-mapped files - NO RAM duplication across processes."""
+    """Dataset using memory-mapped files."""
     def __init__(self, x_path: str, y_path: str):
-        self.X = np.load(x_path, mmap_mode='r')  # Memory-mapped, read-only
+        self.X = np.load(x_path, mmap_mode='r')
         self.y = np.load(y_path, mmap_mode='r')
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        # Copy single sample to tensor (minimal memory)
         x = torch.from_numpy(self.X[idx].copy()).float()
         y = torch.from_numpy(self.y[idx].copy()).float()
         return x, y
@@ -137,80 +132,55 @@ def main():
     parser.add_argument("--loss", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
-    # Initialize distributed
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-
-    is_main = (local_rank == 0)
-
-    # Clear GPU cache before starting
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.cuda.empty_cache()
 
-    if is_main:
-        print(f"\\nTraining {args.arch} + {args.loss}")
-        print(f"  World size: {world_size} GPUs (FSDP)")
-        print(f"  Batch size: {args.batch_size} total ({args.batch_size // world_size} per GPU)")
-        print(f"  Epochs: {args.epochs}")
+    print(f"\\nTraining {args.arch} + {args.loss}")
+    print(f"  Device: {device}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Epochs: {args.epochs}")
 
-    # Load data using memory-mapped files (shared across processes, no duplication)
+    # Load data
     data_dir = Path(args.data_dir)
     train_dataset = MemmapDataset(str(data_dir / "X_train.npy"), str(data_dir / "y_train.npy"))
     val_dataset = MemmapDataset(str(data_dir / "X_val.npy"), str(data_dir / "y_val.npy"))
 
-    if is_main:
-        print(f"  Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-        print(f"  Shape: {train_dataset.X.shape}")
+    print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+    print(f"  Shape: {train_dataset.X.shape}")
 
     # Get dims
     sample_x, sample_y = train_dataset[0]
     in_channels = sample_x.shape[0]
     out_channels = sample_y.shape[0]
 
-    # Distributed samplers
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size,
-                                        rank=local_rank, shuffle=True)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size,
-                                      rank=local_rank, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                              shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                            shuffle=False, num_workers=2, pin_memory=True)
 
-    batch_per_gpu = args.batch_size // world_size
-    train_loader = DataLoader(train_dataset, batch_size=batch_per_gpu, sampler=train_sampler,
-                              num_workers=2, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_per_gpu, sampler=val_sampler,
-                            num_workers=2, pin_memory=True)
-
-    # Create model on CPU first, then wrap with FSDP (shards across GPUs)
+    # Model
     model = create_model(args.arch, in_channels, out_channels)
-
-    # FSDP with mixed precision - shards model across all GPUs
-    mp_policy = MixedPrecision(
-        param_dtype=torch.float16,
-        reduce_dtype=torch.float16,
-        buffer_dtype=torch.float16,
-    )
-    model = FSDP(model, mixed_precision=mp_policy, device_id=local_rank)
+    model = model.to(device)
 
     # Loss
     criterion = create_loss(args.loss)
     if hasattr(criterion, 'to'):
         criterion = criterion.to(device)
 
-    # Optimizer (FSDP handles mixed precision internally)
+    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler('cuda')
 
     start_time = time.time()
 
-    # Training (FSDP MixedPrecision handles fp16 automatically)
+    # Training
     for epoch in range(args.epochs):
         model.train()
-        train_sampler.set_epoch(epoch)
         epoch_loss = 0.0
         n_batches = 0
 
@@ -220,77 +190,67 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            # FSDP with MixedPrecision handles autocast internally
-            y_pred = model(x)
-            try:
-                loss = criterion(y_pred, y_batch)
-            except:
-                loss = nn.functional.l1_loss(y_pred, y_batch)
+            with autocast('cuda'):
+                y_pred = model(x)
+                try:
+                    loss = criterion(y_pred, y_batch)
+                except:
+                    loss = nn.functional.l1_loss(y_pred, y_batch)
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                loss.backward()
-                model.clip_grad_norm_(1.0)  # FSDP's gradient clipping
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
                 epoch_loss += loss.item()
                 n_batches += 1
 
         scheduler.step()
 
-        if is_main and (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0:
             avg_loss = epoch_loss / max(n_batches, 1)
             print(f"  Epoch {epoch+1}/{args.epochs}: loss={avg_loss:.6f}")
 
     training_time = time.time() - start_time
 
-    # Evaluation - compute metrics locally then aggregate with all_reduce
+    # Evaluation
     model.eval()
-    local_preds = []
-    local_targets = []
+    all_preds = []
+    all_targets = []
 
     with torch.no_grad():
         for x, y_batch in val_loader:
             x = x.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
-            y_pred = model(x)
-            local_preds.append(y_pred.float())
-            local_targets.append(y_batch.float())
+            with autocast('cuda'):
+                y_pred = model(x)
+            all_preds.append(y_pred.float().cpu())
+            all_targets.append(y_batch.float().cpu())
 
-    local_preds = torch.cat(local_preds, dim=0)
-    local_targets = torch.cat(local_targets, dim=0)
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
 
-    # Compute local statistics on GPU
-    local_ss_res = ((local_targets - local_preds) ** 2).sum()
-    local_ss_tot = ((local_targets - local_targets.mean()) ** 2).sum()
-    local_mae_sum = (local_targets - local_preds).abs().sum()
-    local_count = torch.tensor([local_targets.numel()], device=device, dtype=torch.float32)
+    # Compute metrics
+    ss_res = ((all_targets - all_preds) ** 2).sum().item()
+    ss_tot = ((all_targets - all_targets.mean()) ** 2).sum().item()
+    r2 = 1 - ss_res / (ss_tot + 1e-8)
+    mae = (all_targets - all_preds).abs().mean().item()
 
-    # Aggregate across all GPUs using all_reduce
-    dist.all_reduce(local_ss_res, op=dist.ReduceOp.SUM)
-    dist.all_reduce(local_ss_tot, op=dist.ReduceOp.SUM)
-    dist.all_reduce(local_mae_sum, op=dist.ReduceOp.SUM)
-    dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+    print(f"  DONE: R²={r2:.4f}, MAE={mae:.6f}, Time={training_time:.1f}s")
 
-    # Compute final metrics
-    r2 = (1 - local_ss_res / (local_ss_tot + 1e-8)).item()
-    mae = (local_mae_sum / local_count).item()
-
-    if is_main:
-        print(f"  DONE: R²={r2:.4f}, MAE={mae:.6f}, Time={training_time:.1f}s")
-
-        # Save result
-        result = {
-            "arch": args.arch,
-            "loss": args.loss,
-            "r2": r2,
-            "mae": mae,
-            "training_time": training_time,
-            "success": True,
-        }
-        result_file = data_dir / f"result_{args.arch}_{args.loss}.json"
-        with open(result_file, "w") as f:
-            json.dump(result, f)
-
-    dist.destroy_process_group()
+    # Save result
+    result = {
+        "arch": args.arch,
+        "loss": args.loss,
+        "r2": r2,
+        "mae": mae,
+        "training_time": training_time,
+        "success": True,
+    }
+    result_file = data_dir / f"result_{args.arch}_{args.loss}.json"
+    with open(result_file, "w") as f:
+        json.dump(result, f)
 
 
 if __name__ == "__main__":
@@ -298,55 +258,50 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         import traceback
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        if local_rank == 0:
-            print(f"ERROR: {e}")
-            traceback.print_exc()
-            # Save error result
-            import argparse
-            parser = argparse.ArgumentParser()
-            parser.add_argument("--arch", required=True)
-            parser.add_argument("--loss", required=True)
-            parser.add_argument("--data-dir", required=True)
-            parser.add_argument("--epochs", type=int, default=50)
-            parser.add_argument("--batch-size", type=int, default=64)
-            parser.add_argument("--lr", type=float, default=1e-3)
-            args, _ = parser.parse_known_args()
-            result = {"arch": args.arch, "loss": args.loss, "r2": float("-inf"),
-                      "mae": float("inf"), "training_time": 0, "success": False, "error": str(e)}
-            result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}.json"
-            with open(result_file, "w") as f:
-                json.dump(result, f)
+        print(f"ERROR: {e}")
+        traceback.print_exc()
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--arch", required=True)
+        parser.add_argument("--loss", required=True)
+        parser.add_argument("--data-dir", required=True)
+        parser.add_argument("--epochs", type=int, default=50)
+        parser.add_argument("--batch-size", type=int, default=8)
+        parser.add_argument("--lr", type=float, default=1e-3)
+        args, _ = parser.parse_known_args()
+        result = {"arch": args.arch, "loss": args.loss, "r2": float("-inf"),
+                  "mae": float("inf"), "training_time": 0, "success": False, "error": str(e)}
+        result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}.json"
+        with open(result_file, "w") as f:
+            json.dump(result, f)
         raise
 '''
 
 
-def run_experiment_with_torchrun(
+def run_experiment(
     arch: str,
     loss_name: str,
     data_dir: Path,
     n_epochs: int,
     batch_size: int,
     lr: float,
-    n_gpus: int,
+    python_path: str,
 ) -> Dict[str, Any]:
-    """Run ONE experiment using torchrun with DDP."""
+    """Run ONE experiment using single GPU."""
 
     # Write worker script
-    worker_path = ARTIFACTS_DIR / "ddp_worker.py"
+    worker_path = ARTIFACTS_DIR / "worker.py"
     with open(worker_path, "w") as f:
-        f.write(DDP_WORKER_SCRIPT)
+        f.write(SINGLE_GPU_SCRIPT)
 
     # Clear previous result
     result_file = data_dir / f"result_{arch}_{loss_name}.json"
     if result_file.exists():
         result_file.unlink()
 
-    # Build torchrun command
+    # Build command (direct Python, no torchrun)
     cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        f"--nproc_per_node={n_gpus}",
-        "--master_port=29500",
+        python_path,
         str(worker_path),
         f"--arch={arch}",
         f"--loss={loss_name}",
@@ -357,7 +312,7 @@ def run_experiment_with_torchrun(
     ]
 
     print(f"\n{'='*60}")
-    print(f"[torchrun] {arch} + {loss_name} on {n_gpus} GPUs")
+    print(f"[Training] {arch} + {loss_name}")
     print(f"{'='*60}")
 
     start = time.time()
@@ -393,15 +348,26 @@ def main():
     np.random.seed(args.seed)
 
     print("=" * 60)
-    print("TIER 1: DDP Training (torchrun)")
+    print("TIER 1: Single-GPU Training")
     print("=" * 60)
-    print("ONE experiment at a time, DDP across all GPUs")
-    print("FULL data, memory-mapped files (no RAM duplication)")
+    print("ONE experiment at a time with mixed precision")
+    print("Memory-mapped files (no RAM duplication)")
     print()
 
-    import torch
-    n_gpus = torch.cuda.device_count()
-    print(f"GPUs: {n_gpus}")
+    # Find Python with PyTorch
+    python_candidates = [
+        "/home/codemaster/miniconda3/envs/DeepLearning/bin/python",
+        "/home/codemaster/miniconda3/envs/ML_WORK/bin/python",
+        sys.executable,
+    ]
+    python_path = None
+    for p in python_candidates:
+        if Path(p).exists():
+            python_path = p
+            break
+    if not python_path:
+        raise RuntimeError("Could not find Python with PyTorch")
+    print(f"Python: {python_path}")
 
     # Load and prepare data
     print("\nPreparing data...")
@@ -410,8 +376,8 @@ def main():
         N, C, T = 100, 32, 500
         X = np.random.randn(N, C, T).astype(np.float32)
         y = np.random.randn(N, C, T).astype(np.float32)
-        architectures = ["linear", "cnn"]
-        losses = {"huber": "huber"}
+        architectures = ARCHITECTURES  # All 7 architectures
+        losses = {"huber": "huber"}  # One loss for quick test
         n_epochs = 3
     else:
         from data import prepare_data
@@ -470,14 +436,14 @@ def main():
     for i, (arch, loss_cat, loss_name) in enumerate(combos):
         print(f"\n[{i+1}/{len(combos)}] {arch} + {loss_cat}")
 
-        result = run_experiment_with_torchrun(
+        result = run_experiment(
             arch=arch,
             loss_name=loss_name,
             data_dir=data_dir,
             n_epochs=n_epochs,
             batch_size=args.batch_size,
             lr=args.lr,
-            n_gpus=n_gpus,
+            python_path=python_path,
         )
 
         results[f"{arch}_{loss_cat}"] = {
