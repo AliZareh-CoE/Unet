@@ -327,6 +327,7 @@ def _train_combination_on_gpu(
     """Train a single arch+loss combination on a specific GPU.
 
     This runs in a separate process with isolated CUDA context.
+    Includes OOM retry with smaller batch size.
     """
     import os
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -342,129 +343,177 @@ def _train_combination_on_gpu(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    try:
-        # Convert numpy to tensors
-        X_train_t = torch.from_numpy(X_train).float()
-        y_train_t = torch.from_numpy(y_train).float()
-        X_val_t = torch.from_numpy(X_val).float()
-        y_val_t = torch.from_numpy(y_val).float()
+    # OOM retry: try progressively smaller batch sizes
+    batch_sizes_to_try = [batch_size, batch_size // 2, batch_size // 4, 2]
+    last_error = None
 
-        # Create dataloaders
-        train_dataset = TensorDataset(X_train_t, y_train_t)
-        val_dataset = TensorDataset(X_val_t, y_val_t)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    for current_batch_size in batch_sizes_to_try:
+        if current_batch_size < 1:
+            continue
 
-        # Create model (import here for fresh module state)
-        from experiments.study1_architecture.architectures import create_architecture, ARCHITECTURE_REGISTRY
-        from experiments.study3_loss.losses import create_loss
-
-        VARIANT_MAP = {
-            "linear": "simple",
-            "cnn": "basic",
-            "wavenet": "standard",
-            "fnet": "standard",
-            "vit": "standard",
-            "performer": "standard",
-            "mamba": "standard",
-        }
-
-        if arch_name == "unet":
-            from models import UNet1DConditioned
-            model = UNet1DConditioned(in_channels=in_channels, out_channels=out_channels, base_channels=32)
-        else:
-            variant = VARIANT_MAP.get(arch_name, "standard")
-            model = create_architecture(arch_name, variant=variant, in_channels=in_channels, out_channels=out_channels)
-
-        model = model.to(device)
-
-        # Create loss
-        criterion = create_loss(loss_name)
-        if hasattr(criterion, 'to'):
-            criterion = criterion.to(device)
-
-        # Training with AMP
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-        scaler = GradScaler('cuda')
-
-        import time
-        start_time = time.time()
-
-        for epoch in range(n_epochs):
-            model.train()
-            for batch in train_loader:
-                x, y_batch = batch
-                x, y_batch = x.to(device), y_batch.to(device)
-
-                optimizer.zero_grad()
-                with autocast('cuda'):
-                    y_pred = model(x)
-                    try:
-                        loss = criterion(y_pred, y_batch)
-                    except Exception:
-                        loss = nn.functional.l1_loss(y_pred, y_batch)
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    continue
-
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-
-            scheduler.step()
-
-        training_time = time.time() - start_time
-
-        # Evaluate
-        model.eval()
-        all_preds, all_targets = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                x, y_batch = batch
-                x, y_batch = x.to(device), y_batch.to(device)
-                with autocast('cuda'):
-                    y_pred = model(x)
-                all_preds.append(y_pred.float().cpu())
-                all_targets.append(y_batch.cpu())
-
-        preds = torch.cat(all_preds, dim=0)
-        targets = torch.cat(all_targets, dim=0)
-
-        ss_res = ((targets - preds) ** 2).sum()
-        ss_tot = ((targets - targets.mean()) ** 2).sum()
-        r2 = (1 - ss_res / (ss_tot + 1e-8)).item()
-        mae = (targets - preds).abs().mean().item()
-
-        # Cleanup GPU memory
-        del model, optimizer, scaler
+        # Clear GPU memory before each attempt
         torch.cuda.empty_cache()
 
-        return {
-            "arch": arch_name,
-            "loss": loss_category,
-            "r2": r2,
-            "mae": mae,
-            "training_time": training_time,
-            "gpu_id": gpu_id,
-            "success": True,
-        }
+        try:
+            # Convert numpy to tensors
+            X_train_t = torch.from_numpy(X_train).float()
+            y_train_t = torch.from_numpy(y_train).float()
+            X_val_t = torch.from_numpy(X_val).float()
+            y_val_t = torch.from_numpy(y_val).float()
 
-    except Exception as e:
-        import traceback
-        return {
-            "arch": arch_name,
-            "loss": loss_category,
-            "r2": float("-inf"),
-            "mae": float("inf"),
-            "training_time": 0,
-            "gpu_id": gpu_id,
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
+            # Create dataloaders with current batch size
+            train_dataset = TensorDataset(X_train_t, y_train_t)
+            val_dataset = TensorDataset(X_val_t, y_val_t)
+            train_loader = DataLoader(train_dataset, batch_size=current_batch_size, shuffle=True, drop_last=True)
+            val_loader = DataLoader(val_dataset, batch_size=current_batch_size, shuffle=False)
+
+            # Create model (import here for fresh module state)
+            from experiments.study1_architecture.architectures import create_architecture, ARCHITECTURE_REGISTRY
+            from experiments.study3_loss.losses import create_loss
+
+            VARIANT_MAP = {
+                "linear": "simple",
+                "cnn": "basic",
+                "wavenet": "standard",
+                "fnet": "standard",
+                "vit": "standard",
+                "performer": "standard",
+                "mamba": "standard",
+            }
+
+            if arch_name == "unet":
+                from models import UNet1DConditioned
+                model = UNet1DConditioned(in_channels=in_channels, out_channels=out_channels, base_channels=32)
+            else:
+                variant = VARIANT_MAP.get(arch_name, "standard")
+                model = create_architecture(arch_name, variant=variant, in_channels=in_channels, out_channels=out_channels)
+
+            model = model.to(device)
+
+            # Create loss
+            criterion = create_loss(loss_name)
+            if hasattr(criterion, 'to'):
+                criterion = criterion.to(device)
+
+            # Training with AMP
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+            scaler = GradScaler('cuda')
+
+            import time
+            start_time = time.time()
+
+            for epoch in range(n_epochs):
+                model.train()
+                for batch in train_loader:
+                    x, y_batch = batch
+                    x, y_batch = x.to(device), y_batch.to(device)
+
+                    optimizer.zero_grad()
+                    with autocast('cuda'):
+                        y_pred = model(x)
+                        try:
+                            loss = criterion(y_pred, y_batch)
+                        except Exception:
+                            loss = nn.functional.l1_loss(y_pred, y_batch)
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        continue
+
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                scheduler.step()
+
+            training_time = time.time() - start_time
+
+            # Evaluate
+            model.eval()
+            all_preds, all_targets = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    x, y_batch = batch
+                    x, y_batch = x.to(device), y_batch.to(device)
+                    with autocast('cuda'):
+                        y_pred = model(x)
+                    all_preds.append(y_pred.float().cpu())
+                    all_targets.append(y_batch.cpu())
+
+            preds = torch.cat(all_preds, dim=0)
+            targets = torch.cat(all_targets, dim=0)
+
+            ss_res = ((targets - preds) ** 2).sum()
+            ss_tot = ((targets - targets.mean()) ** 2).sum()
+            r2 = (1 - ss_res / (ss_tot + 1e-8)).item()
+            mae = (targets - preds).abs().mean().item()
+
+            # Cleanup GPU memory
+            del model, optimizer, scaler
+            torch.cuda.empty_cache()
+
+            return {
+                "arch": arch_name,
+                "loss": loss_category,
+                "r2": r2,
+                "mae": mae,
+                "training_time": training_time,
+                "gpu_id": gpu_id,
+                "batch_size_used": current_batch_size,
+                "success": True,
+            }
+
+        except RuntimeError as e:
+            # Check if it's an OOM error
+            if "out of memory" in str(e).lower():
+                last_error = e
+                # Cleanup and try smaller batch
+                torch.cuda.empty_cache()
+                continue
+            else:
+                # Non-OOM error, return failure
+                import traceback
+                torch.cuda.empty_cache()
+                return {
+                    "arch": arch_name,
+                    "loss": loss_category,
+                    "r2": float("-inf"),
+                    "mae": float("inf"),
+                    "training_time": 0,
+                    "gpu_id": gpu_id,
+                    "success": False,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+
+        except Exception as e:
+            import traceback
+            torch.cuda.empty_cache()
+            return {
+                "arch": arch_name,
+                "loss": loss_category,
+                "r2": float("-inf"),
+                "mae": float("inf"),
+                "training_time": 0,
+                "gpu_id": gpu_id,
+                "success": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+
+    # All batch sizes failed with OOM
+    return {
+        "arch": arch_name,
+        "loss": loss_category,
+        "r2": float("-inf"),
+        "mae": float("inf"),
+        "training_time": 0,
+        "gpu_id": gpu_id,
+        "success": False,
+        "error": f"OOM even with batch_size=2: {last_error}",
+    }
 
 
 # =============================================================================
@@ -575,6 +624,13 @@ def run_screening_matrix(
     ctx = mp.get_context('spawn')
     n_workers = min(n_gpus, combos_to_run)
 
+    # Import tqdm for progress bar
+    try:
+        from tqdm import tqdm
+        HAS_TQDM = True
+    except ImportError:
+        HAS_TQDM = False
+
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
         future_to_combo = {}
 
@@ -589,12 +645,19 @@ def run_screening_matrix(
             )
             future_to_combo[future] = (arch_name, loss_category)
 
-        # Process results as they complete
-        completed = 0
+        # Process results as they complete with tqdm progress bar
+        if HAS_TQDM:
+            pbar = tqdm(
+                total=combos_to_run,
+                desc="  Training",
+                unit="combo",
+                ncols=100,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
+
         for future in as_completed(future_to_combo):
             arch_name, loss_category = future_to_combo[future]
             combo_key = f"{arch_name}_{loss_category}"
-            completed += 1
 
             try:
                 result_dict = future.result()
@@ -604,9 +667,18 @@ def run_screening_matrix(
                 gpu_id = result_dict["gpu_id"]
 
                 if result_dict["success"]:
-                    print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category} @GPU{gpu_id}: R² = {r2:.4f} ({training_time:.1f}s)")
+                    msg = f"{arch_name}+{loss_category} @GPU{gpu_id}: R²={r2:.4f} ({training_time:.1f}s)"
+                    if HAS_TQDM:
+                        pbar.set_postfix_str(msg)
+                        tqdm.write(f"  ✓ {msg}")
+                    else:
+                        print(f"  ✓ {msg}")
                 else:
-                    print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category} @GPU{gpu_id}: FAILED - {result_dict.get('error', 'Unknown')}")
+                    msg = f"{arch_name}+{loss_category} @GPU{gpu_id}: FAILED - {result_dict.get('error', 'Unknown')[:50]}"
+                    if HAS_TQDM:
+                        tqdm.write(f"  ✗ {msg}")
+                    else:
+                        print(f"  ✗ {msg}")
 
                 result = ScreeningResult(
                     architecture=arch_name,
@@ -621,7 +693,11 @@ def run_screening_matrix(
                 _save_checkpoint(completed_results)
 
             except Exception as e:
-                print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category}: FAILED - {e}")
+                msg = f"{arch_name}+{loss_category}: FAILED - {e}"
+                if HAS_TQDM:
+                    tqdm.write(f"  ✗ {msg}")
+                else:
+                    print(f"  ✗ {msg}")
                 result = ScreeningResult(
                     architecture=arch_name,
                     loss=loss_category,
@@ -631,6 +707,12 @@ def run_screening_matrix(
                 )
                 completed_results[combo_key] = result
                 _save_checkpoint(completed_results)
+
+            if HAS_TQDM:
+                pbar.update(1)
+
+        if HAS_TQDM:
+            pbar.close()
 
     # Return all results in order
     results = []
