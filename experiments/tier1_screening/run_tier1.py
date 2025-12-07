@@ -48,34 +48,18 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_EPOCHS = 50
 TRAIN_BATCH_SIZE = 8  # For single 6GB GPU
 TRAIN_LR = 1e-3
-N_FOLDS = 5
-N_SEEDS = 3  # Multiple seeds for robust estimation
+N_FOLDS = 1  # Single run (no cross-validation)
+N_SEEDS = 1
 
 ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba"]
 
+# Best loss per category (literature-recommended)
 LOSS_CATEGORIES = {
-    # Standard losses
-    "huber": "huber",
-    "l1": "l1",
-    "mse": "mse",
-    # Spectral losses (frequency domain)
-    "spectral": "multi_scale_spectral",
-    "stft": "stft",
-    "band_specific": "band_specific",
-    # Wavelet loss (from models.py - CWT-based)
-    "wavelet": "wavelet",
-    # High-frequency spectral (from models.py - FFT PSD matching)
-    "hf_spectral": "hf_spectral",
-    # Correlation-based
-    "ccc": "concordance",
-    "pearson": "pearson",
-    # Perceptual
-    "ssim": "ssim",
-    "log_cosh": "log_cosh",
-    # Probabilistic
-    "gaussian_nll": "gaussian_nll",
-    # Combined (multi-objective)
-    "combined": "combined",
+    "huber": "huber",              # Standard robust loss
+    "spectral": "multi_scale_spectral",  # Best spectral (Défossez et al.)
+    "wavelet": "wavelet",          # CWT multi-scale (from models.py)
+    "ccc": "concordance",          # Gold standard correlation (Lin 1989)
+    "combined": "combined",        # Multi-objective
 }
 
 
@@ -629,11 +613,10 @@ def main():
         y = np.random.randn(N, C, T).astype(np.float32)
         odors = np.random.randint(0, 7, size=N).astype(np.int64)
         n_odors = 7
-        architectures = ["cnn"]  # Quick test
-        # Test key losses including wavelet and hf_spectral
-        losses = {"huber": "huber", "wavelet": "wavelet", "hf_spectral": "hf_spectral"}
+        architectures = ["cnn", "wavenet"]  # Quick test
+        losses = {"huber": "huber", "wavelet": "wavelet"}
         n_epochs = 3
-        n_folds = 2
+        n_folds = 1  # Single run
         seeds = [42]
     else:
         from data import prepare_data
