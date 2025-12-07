@@ -53,13 +53,12 @@ N_SEEDS = 1
 
 ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba"]
 
-# Best loss per category (literature-recommended)
+# Best loss per category (fast + literature-recommended)
 LOSS_CATEGORIES = {
-    "huber": "huber",              # Standard robust loss
-    "spectral": "multi_scale_spectral",  # Best spectral (Défossez et al.)
-    "wavelet": "wavelet",          # CWT multi-scale (from models.py)
+    "huber": "huber",              # Standard robust loss (fast)
+    "mse": "mse",                  # Baseline
+    "spectral": "multi_scale_spectral",  # FFT-based spectral (Défossez et al.)
     "ccc": "concordance",          # Gold standard correlation (Lin 1989)
-    "combined": "combined",        # Multi-objective
 }
 
 
@@ -614,7 +613,7 @@ def main():
         odors = np.random.randint(0, 7, size=N).astype(np.int64)
         n_odors = 7
         architectures = ["cnn", "wavenet"]  # Quick test
-        losses = {"huber": "huber", "wavelet": "wavelet"}
+        losses = {"huber": "huber", "spectral": "multi_scale_spectral"}
         n_epochs = 3
         n_folds = 1  # Single run
         seeds = [42]
