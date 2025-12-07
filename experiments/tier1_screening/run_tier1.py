@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 from experiments.common.config_registry import (
     ScreeningResult,
@@ -75,10 +75,10 @@ LOSS_CATEGORIES = {
     "combined": "combined",     # Time + frequency
 }
 
-# Screening hyperparameters
-SCREEN_DATA_FRACTION = 0.2
-SCREEN_EPOCHS = 20
-SCREEN_BATCH_SIZE = 8  # Reduced from 16 to avoid OOM
+# Training hyperparameters (full training, not screening)
+SCREEN_DATA_FRACTION = 1.0   # 100% data - we have 8x A100s
+SCREEN_EPOCHS = 50           # Full training
+SCREEN_BATCH_SIZE = 16       # A100 can handle this
 SCREEN_LR = 1e-3
 
 
@@ -167,7 +167,7 @@ def quick_train(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     # AMP scaler for mixed precision training
-    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
+    scaler = GradScaler('cuda') if use_amp and device.type == 'cuda' else None
 
     start_time = time.time()
 
@@ -185,7 +185,7 @@ def quick_train(
 
             # Mixed precision forward pass
             if scaler is not None:
-                with autocast():
+                with autocast('cuda'):
                     y_pred = model(x)
                     try:
                         loss = criterion(y_pred, y)
@@ -231,7 +231,7 @@ def quick_train(
             x, y = x.to(device), y.to(device)
 
             if scaler is not None:
-                with autocast():
+                with autocast('cuda'):
                     y_pred = model(x)
             else:
                 y_pred = model(x)
@@ -306,6 +306,168 @@ def _clear_checkpoint() -> None:
 
 
 # =============================================================================
+# Multi-GPU Training Worker
+# =============================================================================
+
+def _train_combination_on_gpu(
+    arch_name: str,
+    loss_category: str,
+    loss_name: str,
+    gpu_id: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    in_channels: int,
+    out_channels: int,
+    n_epochs: int,
+    batch_size: int,
+    lr: float,
+) -> Dict[str, Any]:
+    """Train a single arch+loss combination on a specific GPU.
+
+    This runs in a separate process with isolated CUDA context.
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    # Limit threads to avoid contention
+    os.environ["OMP_NUM_THREADS"] = "4"
+    os.environ["MKL_NUM_THREADS"] = "4"
+
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from torch.amp import autocast, GradScaler
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        # Convert numpy to tensors
+        X_train_t = torch.from_numpy(X_train).float()
+        y_train_t = torch.from_numpy(y_train).float()
+        X_val_t = torch.from_numpy(X_val).float()
+        y_val_t = torch.from_numpy(y_val).float()
+
+        # Create dataloaders
+        train_dataset = TensorDataset(X_train_t, y_train_t)
+        val_dataset = TensorDataset(X_val_t, y_val_t)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        # Create model (import here for fresh module state)
+        from experiments.study1_architecture.architectures import create_architecture, ARCHITECTURE_REGISTRY
+        from experiments.study3_loss.losses import create_loss
+
+        VARIANT_MAP = {
+            "linear": "simple",
+            "cnn": "basic",
+            "wavenet": "standard",
+            "fnet": "standard",
+            "vit": "standard",
+            "performer": "standard",
+            "mamba": "standard",
+        }
+
+        if arch_name == "unet":
+            from models import UNet1DConditioned
+            model = UNet1DConditioned(in_channels=in_channels, out_channels=out_channels, base_channels=32)
+        else:
+            variant = VARIANT_MAP.get(arch_name, "standard")
+            model = create_architecture(arch_name, variant=variant, in_channels=in_channels, out_channels=out_channels)
+
+        model = model.to(device)
+
+        # Create loss
+        criterion = create_loss(loss_name)
+        if hasattr(criterion, 'to'):
+            criterion = criterion.to(device)
+
+        # Training with AMP
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+        scaler = GradScaler('cuda')
+
+        import time
+        start_time = time.time()
+
+        for epoch in range(n_epochs):
+            model.train()
+            for batch in train_loader:
+                x, y_batch = batch
+                x, y_batch = x.to(device), y_batch.to(device)
+
+                optimizer.zero_grad()
+                with autocast('cuda'):
+                    y_pred = model(x)
+                    try:
+                        loss = criterion(y_pred, y_batch)
+                    except Exception:
+                        loss = nn.functional.l1_loss(y_pred, y_batch)
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
+            scheduler.step()
+
+        training_time = time.time() - start_time
+
+        # Evaluate
+        model.eval()
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                x, y_batch = batch
+                x, y_batch = x.to(device), y_batch.to(device)
+                with autocast('cuda'):
+                    y_pred = model(x)
+                all_preds.append(y_pred.float().cpu())
+                all_targets.append(y_batch.cpu())
+
+        preds = torch.cat(all_preds, dim=0)
+        targets = torch.cat(all_targets, dim=0)
+
+        ss_res = ((targets - preds) ** 2).sum()
+        ss_tot = ((targets - targets.mean()) ** 2).sum()
+        r2 = (1 - ss_res / (ss_tot + 1e-8)).item()
+        mae = (targets - preds).abs().mean().item()
+
+        # Cleanup GPU memory
+        del model, optimizer, scaler
+        torch.cuda.empty_cache()
+
+        return {
+            "arch": arch_name,
+            "loss": loss_category,
+            "r2": r2,
+            "mae": mae,
+            "training_time": training_time,
+            "gpu_id": gpu_id,
+            "success": True,
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "arch": arch_name,
+            "loss": loss_category,
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "training_time": 0,
+            "gpu_id": gpu_id,
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
+# =============================================================================
 # Screening Matrix
 # =============================================================================
 
@@ -315,21 +477,23 @@ def run_screening_matrix(
     architectures: List[str],
     losses: Dict[str, str],
     device: torch.device,
-    data_fraction: float = 0.2,
-    n_epochs: int = 20,
+    data_fraction: float = 1.0,
+    n_epochs: int = 50,
     batch_size: int = 16,
     seed: int = 42,
     resume: bool = True,
 ) -> List[ScreeningResult]:
-    """Run full 8x6 screening matrix.
+    """Run full arch×loss matrix with MULTI-GPU parallel execution.
+
+    Uses 8 GPUs to train combinations in parallel (1 combo per GPU).
 
     Args:
         X: Input data [N, C, T]
         y: Target data [N, C, T]
         architectures: List of architecture names
         losses: Dict of loss_category -> loss_name
-        device: Device
-        data_fraction: Fraction of data to use
+        device: Device (ignored - uses all available GPUs)
+        data_fraction: Fraction of data to use (1.0 = all)
         n_epochs: Training epochs
         batch_size: Batch size
         seed: Random seed
@@ -338,6 +502,9 @@ def run_screening_matrix(
     Returns:
         List of ScreeningResult for each combination
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing as mp
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -352,79 +519,109 @@ def run_screening_matrix(
     in_channels = X.shape[1]
     out_channels = y.shape[1]
 
-    # Subsample data
+    # Subsample data (1.0 = use all)
     n_screen = int(n_samples * data_fraction)
     indices = np.random.permutation(n_samples)[:n_screen]
 
-    # Split into train/val
+    # Split into train/val (80/20)
     n_train = int(n_screen * 0.8)
     train_idx = indices[:n_train]
     val_idx = indices[n_train:]
 
-    # Create dataloaders
-    dataset = TensorDataset(X, y)
-    train_subset = Subset(dataset, train_idx.tolist())
-    val_subset = Subset(dataset, val_idx.tolist())
+    # Convert to numpy for multiprocessing (tensors can't be pickled across spawn)
+    X_np = X.numpy() if isinstance(X, torch.Tensor) else X
+    y_np = y.numpy() if isinstance(y, torch.Tensor) else y
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
+    X_train = X_np[train_idx]
+    y_train = y_np[train_idx]
+    X_val = X_np[val_idx]
+    y_val = y_np[val_idx]
 
-    results = []
-    total_combos = len(architectures) * len(losses)
-    combo_idx = 0
+    print(f"  Training data: {X_train.shape}, Validation data: {X_val.shape}")
 
+    # Get available GPUs
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise RuntimeError("No GPUs available! Tier 1 requires GPU.")
+
+    print(f"  GPUs available: {n_gpus}")
+
+    # Build list of combinations to run
+    all_combos = []
     for arch_name in architectures:
         for loss_category, loss_name in losses.items():
-            combo_idx += 1
             combo_key = f"{arch_name}_{loss_category}"
+            if combo_key not in completed_results:
+                all_combos.append((arch_name, loss_category, loss_name))
 
-            # Skip if already completed
+    total_combos = len(architectures) * len(losses)
+    combos_to_run = len(all_combos)
+
+    print(f"\n  Running {combos_to_run} combinations on {n_gpus} GPUs ({total_combos - combos_to_run} already done)")
+
+    # Add completed results first
+    results = []
+    for arch_name in architectures:
+        for loss_category, _ in losses.items():
+            combo_key = f"{arch_name}_{loss_category}"
             if combo_key in completed_results:
-                result = completed_results[combo_key]
-                print(f"  [{combo_idx}/{total_combos}] {arch_name} + {loss_category}... SKIPPED (already done) R² = {result.r2:.4f}")
-                results.append(result)
-                continue
+                results.append(completed_results[combo_key])
 
-            print(f"  [{combo_idx}/{total_combos}] {arch_name} + {loss_category}...", end=" ", flush=True)
+    if combos_to_run == 0:
+        print("  All combinations already completed!")
+        return results
 
-            model = None  # Initialize for cleanup
+    # Run combinations in parallel across GPUs
+    ctx = mp.get_context('spawn')
+    n_workers = min(n_gpus, combos_to_run)
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        future_to_combo = {}
+
+        for i, (arch_name, loss_category, loss_name) in enumerate(all_combos):
+            gpu_id = i % n_gpus
+            future = executor.submit(
+                _train_combination_on_gpu,
+                arch_name, loss_category, loss_name, gpu_id,
+                X_train, y_train, X_val, y_val,
+                in_channels, out_channels,
+                n_epochs, batch_size, SCREEN_LR,
+            )
+            future_to_combo[future] = (arch_name, loss_category)
+
+        # Process results as they complete
+        completed = 0
+        for future in as_completed(future_to_combo):
+            arch_name, loss_category = future_to_combo[future]
+            combo_key = f"{arch_name}_{loss_category}"
+            completed += 1
+
             try:
-                # Create fresh model
-                model = create_model(arch_name, in_channels, out_channels, device)
+                result_dict = future.result()
+                r2 = result_dict["r2"]
+                mae = result_dict["mae"]
+                training_time = result_dict["training_time"]
+                gpu_id = result_dict["gpu_id"]
 
-                # Create loss
-                criterion = create_loss(loss_name)
-                if hasattr(criterion, 'to'):
-                    criterion = criterion.to(device)
-
-                # Train
-                metrics = quick_train(
-                    model=model,
-                    criterion=criterion,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    device=device,
-                    n_epochs=n_epochs,
-                    lr=SCREEN_LR,
-                )
+                if result_dict["success"]:
+                    print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category} @GPU{gpu_id}: R² = {r2:.4f} ({training_time:.1f}s)")
+                else:
+                    print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category} @GPU{gpu_id}: FAILED - {result_dict.get('error', 'Unknown')}")
 
                 result = ScreeningResult(
                     architecture=arch_name,
                     loss=loss_category,
-                    r2=metrics["r2"],
-                    mae=metrics["mae"],
-                    training_time=metrics["training_time"],
+                    r2=r2,
+                    mae=mae,
+                    training_time=training_time,
                 )
-                results.append(result)
 
-                print(f"R² = {metrics['r2']:.4f} ({metrics['training_time']:.1f}s)")
-
-                # Save checkpoint after each combination
+                # Save checkpoint
                 completed_results[combo_key] = result
                 _save_checkpoint(completed_results)
 
             except Exception as e:
-                print(f"FAILED: {e}")
+                print(f"  [{completed}/{combos_to_run}] {arch_name} + {loss_category}: FAILED - {e}")
                 result = ScreeningResult(
                     architecture=arch_name,
                     loss=loss_category,
@@ -432,17 +629,16 @@ def run_screening_matrix(
                     mae=float("inf"),
                     training_time=0,
                 )
-                results.append(result)
-
-                # Save checkpoint even for failures
                 completed_results[combo_key] = result
                 _save_checkpoint(completed_results)
 
-            # Cleanup
-            if model is not None:
-                del model
-            gc.collect()
-            torch.cuda.empty_cache()
+    # Return all results in order
+    results = []
+    for arch_name in architectures:
+        for loss_category, _ in losses.items():
+            combo_key = f"{arch_name}_{loss_category}"
+            if combo_key in completed_results:
+                results.append(completed_results[combo_key])
 
     return results
 
@@ -625,21 +821,34 @@ def main():
         print(f"  [DRY-RUN] Using synthetic data: {X.shape}")
     else:
         try:
-            from data import prepare_data, create_dataloaders
+            from data import prepare_data
             data = prepare_data()
-            X_train = data["train"]["ob"]
-            y_train = data["train"]["hp"]
-            X_val = data["val"]["ob"]
-            y_val = data["val"]["hp"]
-            X = torch.cat([X_train, X_val], dim=0)
-            y = torch.cat([y_train, y_val], dim=0)
+
+            # Correct data loading: prepare_data returns flat dict with indices
+            train_idx = data["train_idx"]
+            val_idx = data["val_idx"]
+
+            # ob = input (OB signals), pcx = target (PCx signals)
+            ob = data["ob"]   # [n_samples, 32, time]
+            pcx = data["pcx"]  # [n_samples, 32, time]
+
+            # Combine train+val for training (test is held out for Tier 4)
+            cv_idx = np.concatenate([train_idx, val_idx])
+
+            X = torch.from_numpy(ob[cv_idx]).float()
+            y = torch.from_numpy(pcx[cv_idx]).float()
+
             architectures = ARCHITECTURES
             losses = LOSS_CATEGORIES
             n_epochs = args.epochs
             data_fraction = args.data_fraction
-            print(f"  Loaded real data: {X.shape}")
+            print(f"  Loaded real data: X={X.shape}, y={y.shape}")
+            print(f"  Training samples: {len(cv_idx)} (train+val combined)")
         except Exception as e:
-            print(f"  Warning: Could not load data ({e}), using synthetic")
+            import traceback
+            traceback.print_exc()
+            print(f"  ERROR: Could not load data ({e})")
+            print(f"  Falling back to synthetic data for testing...")
             N = 200
             C = 32
             T = 1000
