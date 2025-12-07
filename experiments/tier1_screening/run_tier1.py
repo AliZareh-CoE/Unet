@@ -242,7 +242,7 @@ def main():
 
     training_time = time.time() - start_time
 
-    # Evaluation
+    # Evaluation - compute metrics locally then aggregate with all_reduce
     model.eval()
     local_preds = []
     local_targets = []
@@ -250,29 +250,31 @@ def main():
     with torch.no_grad():
         for x, y_batch in val_loader:
             x = x.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
             y_pred = model(x)
-            local_preds.append(y_pred.float().cpu())
-            local_targets.append(y_batch)
+            local_preds.append(y_pred.float())
+            local_targets.append(y_batch.float())
 
     local_preds = torch.cat(local_preds, dim=0)
     local_targets = torch.cat(local_targets, dim=0)
 
-    # Gather all predictions to rank 0
-    gathered_preds = [torch.zeros_like(local_preds) for _ in range(world_size)] if is_main else None
-    gathered_targets = [torch.zeros_like(local_targets) for _ in range(world_size)] if is_main else None
+    # Compute local statistics on GPU
+    local_ss_res = ((local_targets - local_preds) ** 2).sum()
+    local_ss_tot = ((local_targets - local_targets.mean()) ** 2).sum()
+    local_mae_sum = (local_targets - local_preds).abs().sum()
+    local_count = torch.tensor([local_targets.numel()], device=device, dtype=torch.float32)
 
-    dist.gather(local_preds, gathered_preds, dst=0)
-    dist.gather(local_targets, gathered_targets, dst=0)
+    # Aggregate across all GPUs using all_reduce
+    dist.all_reduce(local_ss_res, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_ss_tot, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_mae_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
+
+    # Compute final metrics
+    r2 = (1 - local_ss_res / (local_ss_tot + 1e-8)).item()
+    mae = (local_mae_sum / local_count).item()
 
     if is_main:
-        all_preds = torch.cat(gathered_preds, dim=0)
-        all_targets = torch.cat(gathered_targets, dim=0)
-
-        ss_res = ((all_targets - all_preds) ** 2).sum()
-        ss_tot = ((all_targets - all_targets.mean()) ** 2).sum()
-        r2 = (1 - ss_res / (ss_tot + 1e-8)).item()
-        mae = (all_targets - all_preds).abs().mean().item()
-
         print(f"  DONE: R²={r2:.4f}, MAE={mae:.6f}, Time={training_time:.1f}s")
 
         # Save result
