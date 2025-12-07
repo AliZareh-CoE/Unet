@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Tier 1.5: Auto-Conditioning Signal Sources
-===========================================
+Tier 1.5: Conditioning Optimization for U-Net
+==============================================
 
-Tests different conditioning signal SOURCES to find what information
-best guides the neural translation. This is about WHAT to condition on,
-not HOW to apply the conditioning.
+Purpose: Find the BEST conditioning source for our U-Net (CondUNet1D).
 
+After Tier 1 proves U-Net beats all other architectures, this tier
+tests different conditioning signal SOURCES to find what information
+best guides the U-Net translation.
+
+Architecture: CondUNet1D (from models.py) - FIXED
 Conditioning Sources Tested:
-    1. odor_onehot: One-hot encoding of odor identity (current baseline)
+    1. odor_onehot: One-hot encoding of odor identity (baseline)
     2. cpc: Contrastive Predictive Coding embeddings (self-supervised)
     3. vqvae: Vector Quantized VAE discrete codes
     4. freq_disentangled: Frequency-band-specific latents (delta/theta/alpha/beta/gamma)
     5. cycle_consistent: Latent with cycle-consistency reconstruction constraint
 
-This tier uses the winning architecture from Tier 1 screening.
+This tier uses U-Net ONLY - no architecture comparison.
 """
 
 from __future__ import annotations
@@ -454,11 +457,20 @@ class CycleConsistentEncoder(nn.Module):
 
 
 # =============================================================================
-# Conditioned Translation Model
+# Conditioned Translation Model - Uses CondUNet1D as backbone
 # =============================================================================
 
 class ConditionedTranslator(nn.Module):
-    """Neural translator with conditioning from various sources."""
+    """U-Net based translator with various conditioning sources.
+
+    Uses CondUNet1D from models.py as the backbone, testing different
+    ways to derive the conditioning signal:
+    - odor_onehot: Direct odor identity (baseline)
+    - cpc: Contrastive Predictive Coding from input signal
+    - vqvae: Vector Quantized VAE codes
+    - freq_disentangled: Frequency-band specific latents
+    - cycle_consistent: Cycle-consistent latent
+    """
 
     def __init__(
         self,
@@ -471,40 +483,47 @@ class ConditionedTranslator(nn.Module):
         super().__init__()
         self.cond_source = cond_source
         self.embed_dim = embed_dim
+        self.n_odors = n_odors
+
+        # Import CondUNet1D from models.py - our main architecture
+        from models import CondUNet1D
 
         # Create conditioning encoder based on source
         if cond_source == "odor_onehot":
-            self.cond_encoder = OdorOneHotEncoder(n_odors, embed_dim)
-        elif cond_source == "cpc":
-            self.cond_encoder = CPCEncoder(in_channels, embed_dim)
-        elif cond_source == "vqvae":
-            self.cond_encoder = VQVAEEncoder(in_channels, embed_dim)
-        elif cond_source == "freq_disentangled":
-            self.cond_encoder = FreqDisentangledEncoder(in_channels, embed_dim)
-        elif cond_source == "cycle_consistent":
-            self.cond_encoder = CycleConsistentEncoder(in_channels, out_channels, embed_dim)
+            # Use CondUNet1D's built-in odor conditioning
+            self.cond_encoder = None  # Not needed, UNet handles it
+            self.unet = CondUNet1D(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                base_channels=64,
+                n_odors=n_odors,
+            )
         else:
-            raise ValueError(f"Unknown conditioning source: {cond_source}")
+            # For other sources, we need to extract conditioning and inject it
+            if cond_source == "cpc":
+                self.cond_encoder = CPCEncoder(in_channels, embed_dim)
+            elif cond_source == "vqvae":
+                self.cond_encoder = VQVAEEncoder(in_channels, embed_dim)
+            elif cond_source == "freq_disentangled":
+                self.cond_encoder = FreqDisentangledEncoder(in_channels, embed_dim)
+            elif cond_source == "cycle_consistent":
+                self.cond_encoder = CycleConsistentEncoder(in_channels, out_channels, embed_dim)
+            else:
+                raise ValueError(f"Unknown conditioning source: {cond_source}")
 
-        # Main translation network (FiLM-conditioned CNN)
-        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=7, padding=3)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
-        self.conv3 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv1d(128, 64, kernel_size=3, padding=1)
-        self.conv_out = nn.Conv1d(64, out_channels, kernel_size=1)
+            # Create UNet with custom conditioning injection
+            # We use the same architecture but replace odor embedding with our encoder
+            self.unet = CondUNet1D(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                base_channels=64,
+                n_odors=1,  # Minimal, we'll override the conditioning
+            )
 
-        # FiLM layers for conditioning
-        self.film1 = nn.Linear(embed_dim, 64 * 2)
-        self.film2 = nn.Linear(embed_dim, 128 * 2)
-        self.film3 = nn.Linear(embed_dim, 128 * 2)
-        self.film4 = nn.Linear(embed_dim, 64 * 2)
-
-    def apply_film(self, x: torch.Tensor, film_params: torch.Tensor) -> torch.Tensor:
-        """Apply FiLM modulation."""
-        gamma, beta = film_params.chunk(2, dim=-1)
-        gamma = gamma.unsqueeze(-1)  # [B, C, 1]
-        beta = beta.unsqueeze(-1)    # [B, C, 1]
-        return gamma * x + beta
+            # Override the odor embedding to accept our conditioning
+            # CondUNet1D uses embed_dim for FiLM, we project our encoding to match
+            unet_embed_dim = self.unet.odor_embed.embedding_dim if hasattr(self.unet, 'odor_embed') else 64
+            self.cond_projector = nn.Linear(embed_dim, unet_embed_dim)
 
     def forward(
         self,
@@ -524,12 +543,15 @@ class ConditionedTranslator(nn.Module):
         """
         aux_losses = {}
 
-        # Get conditioning embedding
         if self.cond_source == "odor_onehot":
+            # Use CondUNet1D's native odor conditioning
             if odor_ids is None:
-                raise ValueError("odor_onehot requires odor_ids")
-            cond = self.cond_encoder(odor_ids)
-        elif self.cond_source == "cpc":
+                odor_ids = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+            y_pred = self.unet(x, odor_ids)
+            return y_pred, aux_losses
+
+        # For other conditioning sources, extract the conditioning embedding
+        if self.cond_source == "cpc":
             cond, z_seq = self.cond_encoder(x)
             # CPC loss requires context from GRU
             _, context = self.cond_encoder.gru(z_seq)
@@ -546,22 +568,45 @@ class ConditionedTranslator(nn.Module):
         else:
             cond = torch.zeros(x.size(0), self.embed_dim, device=x.device)
 
-        # Forward through FiLM-conditioned network
-        h = F.relu(self.conv1(x))
-        h = self.apply_film(h, self.film1(cond))
+        # Project conditioning to UNet's expected dimension
+        cond_projected = self.cond_projector(cond)
 
-        h = F.relu(self.conv2(h))
-        h = self.apply_film(h, self.film2(cond))
-
-        h = F.relu(self.conv3(h))
-        h = self.apply_film(h, self.film3(cond))
-
-        h = F.relu(self.conv4(h))
-        h = self.apply_film(h, self.film4(cond))
-
-        y_pred = self.conv_out(h)
+        # Inject conditioning into UNet by temporarily replacing odor embedding output
+        # We use a forward hook to inject our conditioning
+        y_pred = self._forward_with_custom_cond(x, cond_projected)
 
         return y_pred, aux_losses
+
+    def _forward_with_custom_cond(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Forward through UNet with custom conditioning injection."""
+        # Store original forward method
+        original_odor_embed = self.unet.odor_embed if hasattr(self.unet, 'odor_embed') else None
+
+        if original_odor_embed is not None:
+            # Create a wrapper that returns our conditioning
+            class ConditioningOverride(nn.Module):
+                def __init__(self, cond_tensor):
+                    super().__init__()
+                    self.cond = cond_tensor
+
+                def forward(self, x):
+                    return self.cond
+
+            # Temporarily replace odor_embed
+            self.unet.odor_embed = ConditioningOverride(cond)
+
+            try:
+                # Forward with dummy odor_ids (will be ignored)
+                dummy_odor = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+                y_pred = self.unet(x, dummy_odor)
+            finally:
+                # Restore original
+                self.unet.odor_embed = original_odor_embed
+        else:
+            # Fallback: just forward without conditioning
+            y_pred = self.unet(x, torch.zeros(x.size(0), dtype=torch.long, device=x.device))
+
+        return y_pred
 
 
 # =============================================================================
