@@ -917,8 +917,12 @@ def main():
             # Combine train+val for training (test is held out for Tier 4)
             cv_idx = np.concatenate([train_idx, val_idx])
 
-            X = torch.from_numpy(ob[cv_idx]).float()
-            y = torch.from_numpy(pcx[cv_idx]).float()
+            # Subsample time steps to fit in GPU memory (5000 -> 1000)
+            # This is valid: we're testing architecture patterns, not final performance
+            time_subsample = 5  # Every 5th timestep: 5000 -> 1000
+            X = torch.from_numpy(ob[cv_idx][:, :, ::time_subsample]).float()
+            y = torch.from_numpy(pcx[cv_idx][:, :, ::time_subsample]).float()
+            print(f"  Subsampled time: 5000 -> {X.shape[2]} (every {time_subsample}th step)")
 
             architectures = ARCHITECTURES
             losses = LOSS_CATEGORIES
