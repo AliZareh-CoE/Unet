@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Tier 1: Architecture Screening with Statistical Analysis
-=========================================================
+Tier 1: Architecture Screening (Single Run)
+=============================================
 
-Full training with cross-validation and bootstrap CI.
-Compares neural architectures against Tier 0 classical baselines.
+Full training for neural architectures with simple, comparable metrics.
+Compares against Tier 0 classical baselines without complex cross-validation.
 
 Features:
 - Odor conditioning support
-- 5-fold cross-validation with multiple seeds
-- Bootstrap 95% confidence intervals
-- Statistical comparison with classical baselines
+- Single-run training (no folds/seeds to keep comparable with train.py)
+- Metrics: R², MAE, Pearson correlation, PSD error (same as tier0/train.py)
+- Per-frequency-band R² (delta, theta, alpha, beta, gamma)
 - Checkpointing for resume
+
+Losses tested:
+- l1: Simple L1 baseline
+- huber: Robust Huber loss
+- l1_wavelet: L1 + Wavelet combo (exactly like train.py)
+- spectral: Multi-scale spectral loss
 
 Usage:
     python experiments/tier1_screening/run_tier1.py
@@ -30,7 +36,7 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # =============================================================================
 PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
@@ -48,17 +54,24 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_EPOCHS = 50
 TRAIN_BATCH_SIZE = 8  # For single 6GB GPU
 TRAIN_LR = 1e-3
-N_FOLDS = 1  # Single run (no cross-validation)
-N_SEEDS = 1
 
 ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba"]
 
-# Best loss per category (fast + literature-recommended)
-LOSS_CATEGORIES = {
-    "huber": "huber",              # Standard robust loss (fast)
-    "mse": "mse",                  # Baseline
-    "spectral": "multi_scale_spectral",  # FFT-based spectral (Défossez et al.)
-    "ccc": "concordance",          # Gold standard correlation (Lin 1989)
+# Loss functions (comparable with train.py)
+LOSS_FUNCTIONS = {
+    "l1": "l1",                    # Simple baseline
+    "huber": "huber",              # Robust baseline
+    "l1_wavelet": "l1_wavelet",    # Proven combo from train.py
+    "spectral": "multi_scale_spectral",  # Frequency-aware
+}
+
+# Neural frequency bands (same as tier0)
+NEURAL_BANDS = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta": (12, 30),
+    "gamma": (30, 100),
 }
 
 
@@ -71,55 +84,21 @@ class NeuralResult:
     """Result for a single architecture + loss combination."""
     architecture: str
     loss: str
+    # Core metrics (same as tier0)
     r2_mean: float
-    r2_std: float
-    r2_ci_lower: float
-    r2_ci_upper: float
     mae_mean: float
-    mae_std: float
-    training_time: float
-    fold_r2s: List[float]
-    n_folds: int
-    n_seeds: int
-    success: bool
+    pearson_mean: float
+    psd_error_db: float
+    # Per-band R²
+    r2_delta: Optional[float] = None
+    r2_theta: Optional[float] = None
+    r2_alpha: Optional[float] = None
+    r2_beta: Optional[float] = None
+    r2_gamma: Optional[float] = None
+    # Training info
+    training_time: float = 0.0
+    success: bool = True
     error: Optional[str] = None
-
-
-# =============================================================================
-# Statistical Functions
-# =============================================================================
-
-def compute_bootstrap_ci(values: np.ndarray, n_bootstrap: int = 10000, ci_level: float = 0.95) -> Dict[str, float]:
-    """Compute bootstrap 95% confidence interval - VECTORIZED."""
-    valid_values = values[~np.isnan(values)]
-
-    if len(valid_values) < 2:
-        return {"ci_lower": np.nan, "ci_upper": np.nan, "se": np.nan}
-
-    n = len(valid_values)
-    rng = np.random.RandomState(42)
-
-    # Vectorized bootstrap
-    bootstrap_indices = rng.randint(0, n, size=(n_bootstrap, n))
-    bootstrap_samples = valid_values[bootstrap_indices]
-    bootstrap_means = np.mean(bootstrap_samples, axis=1)
-
-    alpha = 1 - ci_level
-    ci_lower = float(np.percentile(bootstrap_means, 100 * alpha / 2))
-    ci_upper = float(np.percentile(bootstrap_means, 100 * (1 - alpha / 2)))
-    se = float(np.std(bootstrap_means, ddof=1))
-
-    return {"ci_lower": ci_lower, "ci_upper": ci_upper, "se": se}
-
-
-def paired_t_test(scores1: np.ndarray, scores2: np.ndarray) -> Tuple[float, float]:
-    """Paired t-test for comparing two methods."""
-    from scipy import stats
-    valid_mask = ~(np.isnan(scores1) | np.isnan(scores2))
-    if valid_mask.sum() < 2:
-        return np.nan, np.nan
-    t_stat, p_value = stats.ttest_rel(scores1[valid_mask], scores2[valid_mask])
-    return float(t_stat), float(p_value)
 
 
 # =============================================================================
@@ -141,11 +120,11 @@ def _save_checkpoint(results: Dict[str, Dict]) -> None:
 
 
 # =============================================================================
-# Worker Script (with odor conditioning)
+# Worker Script (with odor conditioning and proper losses)
 # =============================================================================
 
 WORKER_SCRIPT = '''#!/usr/bin/env python3
-"""Single-GPU Training with odor conditioning and mixed precision"""
+"""Single-GPU Training with odor conditioning, mixed precision, and proper losses."""
 import argparse
 import sys
 import time
@@ -158,29 +137,66 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
+from scipy import signal as scipy_signal
 
 from experiments.study1_architecture.architectures import create_architecture
 from experiments.study3_loss.losses import create_loss as create_study3_loss
 
-# Import losses from models.py
+# Import wavelet loss builder from models.py (exactly like train.py)
 try:
-    from models import WaveletLoss, HighFrequencySpectralLoss
-    HAS_MODEL_LOSSES = True
+    from models import build_wavelet_loss
+    HAS_WAVELET_LOSS = True
 except ImportError:
-    HAS_MODEL_LOSSES = False
+    HAS_WAVELET_LOSS = False
+    build_wavelet_loss = None
+
+# Neural frequency bands for per-band R²
+NEURAL_BANDS = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta": (12, 30),
+    "gamma": (30, 100),
+}
+
+
+class L1WaveletLoss(nn.Module):
+    """Combined L1 + Wavelet loss - exactly like train.py.
+
+    Uses the same weights as train.py DEFAULT_CONFIG:
+    - weight_l1: 1.0
+    - weight_wavelet: 10.0
+    """
+    def __init__(self):
+        super().__init__()
+        if HAS_WAVELET_LOSS:
+            # Use the same wavelet config as train.py
+            self.wavelet_loss = build_wavelet_loss(
+                wavelet="morlet",
+                omega0=3.0,
+                use_complex_morlet=False,
+            )
+        else:
+            self.wavelet_loss = None
+        self.weight_l1 = 1.0
+        self.weight_wavelet = 10.0
+
+    def forward(self, pred, target):
+        l1_loss = F.l1_loss(pred, target)
+        if self.wavelet_loss is not None:
+            wav_loss = self.wavelet_loss(pred, target)
+            return self.weight_l1 * l1_loss + self.weight_wavelet * wav_loss
+        return l1_loss
 
 
 def create_loss(name: str, **kwargs):
-    """Create loss by name, with support for models.py losses."""
-    # Handle special losses from models.py
-    if name == "wavelet" and HAS_MODEL_LOSSES:
-        return WaveletLoss(omega0=5.0)
-    elif name == "hf_spectral" and HAS_MODEL_LOSSES:
-        return HighFrequencySpectralLoss(sample_rate=1000.0, use_log_psd=True)
+    """Create loss by name, with support for l1_wavelet combo."""
+    if name == "l1_wavelet":
+        return L1WaveletLoss()
     else:
-        # Use study3_loss registry
         return create_study3_loss(name, **kwargs)
 
 
@@ -212,15 +228,96 @@ def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: i
         "mamba": "standard",
     }
     variant = VARIANT_MAP.get(arch_name, "standard")
-    # Try to pass n_odors for conditioning
     try:
         return create_architecture(arch_name, variant=variant,
                                    in_channels=in_channels, out_channels=out_channels,
                                    n_odors=n_odors)
     except TypeError:
-        # Architecture doesn't support n_odors
         return create_architecture(arch_name, variant=variant,
                                    in_channels=in_channels, out_channels=out_channels)
+
+
+def compute_metrics(y_pred: np.ndarray, y_true: np.ndarray, sample_rate: float = 1000.0):
+    """Compute metrics - same as tier0 for comparability.
+
+    Returns:
+        Dict with: r2, mae, pearson, psd_error_db, r2_delta, r2_theta, r2_alpha, r2_beta, r2_gamma
+    """
+    if y_pred.ndim == 2:
+        y_pred = y_pred[:, np.newaxis, :]
+        y_true = y_true[:, np.newaxis, :]
+
+    N, C, T = y_pred.shape
+
+    # R² - per-channel then averaged
+    pred_flat = y_pred.transpose(1, 0, 2).reshape(C, -1)
+    true_flat = y_true.transpose(1, 0, 2).reshape(C, -1)
+
+    ss_res = np.sum((true_flat - pred_flat) ** 2, axis=1)
+    true_means = np.mean(true_flat, axis=1, keepdims=True)
+    ss_tot = np.sum((true_flat - true_means) ** 2, axis=1)
+
+    r2_per_channel = 1 - ss_res / (ss_tot + 1e-8)
+    r2 = float(np.mean(r2_per_channel))
+
+    # MAE
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+
+    # Pearson correlation
+    pred_centered = pred_flat - np.mean(pred_flat, axis=1, keepdims=True)
+    true_centered = true_flat - np.mean(true_flat, axis=1, keepdims=True)
+    numerator = np.sum(pred_centered * true_centered, axis=1)
+    denominator = np.sqrt(np.sum(pred_centered ** 2, axis=1) * np.sum(true_centered ** 2, axis=1))
+    correlations = numerator / (denominator + 1e-8)
+    valid_mask = np.isfinite(correlations)
+    pearson = float(np.mean(correlations[valid_mask])) if valid_mask.any() else 0.0
+
+    # PSD Error in dB
+    try:
+        _, psd_pred = scipy_signal.welch(y_pred, fs=sample_rate, axis=-1, nperseg=min(256, T))
+        _, psd_true = scipy_signal.welch(y_true, fs=sample_rate, axis=-1, nperseg=min(256, T))
+        log_pred = np.log10(psd_pred + 1e-10)
+        log_true = np.log10(psd_true + 1e-10)
+        psd_error_db = float(10 * np.mean(np.abs(log_pred - log_true)))
+    except Exception:
+        psd_error_db = np.nan
+
+    # Per-frequency-band R²
+    band_r2 = {}
+    try:
+        nyq = sample_rate / 2
+        for band_name, (f_low, f_high) in NEURAL_BANDS.items():
+            if f_low >= nyq:
+                continue
+            low = f_low / nyq
+            high = min(f_high / nyq, 0.99)
+            if low < high:
+                try:
+                    b, a = scipy_signal.butter(4, [low, high], btype='band')
+                    pred_filt = scipy_signal.filtfilt(b, a, y_pred, axis=-1)
+                    true_filt = scipy_signal.filtfilt(b, a, y_true, axis=-1)
+
+                    pred_band_flat = pred_filt.transpose(1, 0, 2).reshape(C, -1)
+                    true_band_flat = true_filt.transpose(1, 0, 2).reshape(C, -1)
+
+                    ss_res_band = np.sum((true_band_flat - pred_band_flat) ** 2, axis=1)
+                    true_band_means = np.mean(true_band_flat, axis=1, keepdims=True)
+                    ss_tot_band = np.sum((true_band_flat - true_band_means) ** 2, axis=1)
+
+                    r2_band = 1 - ss_res_band / (ss_tot_band + 1e-8)
+                    band_r2[band_name] = float(np.mean(r2_band))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "r2": r2,
+        "mae": mae,
+        "pearson": pearson,
+        "psd_error_db": psd_error_db,
+        **{f"r2_{k}": v for k, v in band_r2.items()},
+    }
 
 
 def main():
@@ -232,7 +329,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n-odors", type=int, default=0)
-    parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -245,7 +341,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.cuda.empty_cache()
 
-    print(f"\\nTraining {args.arch} + {args.loss} (fold {args.fold}, seed {args.seed})")
+    print(f"\\nTraining {args.arch} + {args.loss} (seed {args.seed})")
     print(f"  Device: {device}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Epochs: {args.epochs}")
@@ -316,7 +412,6 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with autocast('cuda'):
-                # Try to pass odor_ids for conditioning
                 try:
                     y_pred = model(x, odor_ids)
                 except TypeError:
@@ -326,7 +421,7 @@ def main():
                     loss = criterion(y_pred, y_batch)
                 except Exception as e:
                     print(f"  [Warning] Loss {args.loss} failed: {e}, using L1")
-                    loss = nn.functional.l1_loss(y_pred, y_batch)
+                    loss = F.l1_loss(y_pred, y_batch)
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 scaler.scale(loss).backward()
@@ -362,32 +457,27 @@ def main():
                     y_pred = model(x, odor_ids)
                 except TypeError:
                     y_pred = model(x)
-            all_preds.append(y_pred.float().cpu())
-            all_targets.append(y_batch.float().cpu())
+            all_preds.append(y_pred.float().cpu().numpy())
+            all_targets.append(y_batch.float().cpu().numpy())
 
-    all_preds = torch.cat(all_preds, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
 
-    # Compute metrics
-    ss_res = ((all_targets - all_preds) ** 2).sum().item()
-    ss_tot = ((all_targets - all_targets.mean()) ** 2).sum().item()
-    r2 = 1 - ss_res / (ss_tot + 1e-8)
-    mae = (all_targets - all_preds).abs().mean().item()
+    # Compute metrics (same as tier0)
+    metrics = compute_metrics(all_preds, all_targets)
 
-    print(f"  DONE: R²={r2:.4f}, MAE={mae:.6f}, Time={training_time:.1f}s")
+    print(f"  DONE: R²={metrics['r2']:.4f}, Pearson={metrics['pearson']:.4f}, PSD_err={metrics['psd_error_db']:.2f}dB, Time={training_time:.1f}s")
 
     # Save result
     result = {
         "arch": args.arch,
         "loss": args.loss,
-        "fold": args.fold,
         "seed": args.seed,
-        "r2": r2,
-        "mae": mae,
         "training_time": training_time,
         "success": True,
+        **metrics,
     }
-    result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}_f{args.fold}_s{args.seed}.json"
+    result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}.json"
     with open(result_file, "w") as f:
         json.dump(result, f)
 
@@ -408,13 +498,13 @@ if __name__ == "__main__":
         parser.add_argument("--batch-size", type=int, default=8)
         parser.add_argument("--lr", type=float, default=1e-3)
         parser.add_argument("--n-odors", type=int, default=0)
-        parser.add_argument("--fold", type=int, default=0)
         parser.add_argument("--seed", type=int, default=42)
         args, _ = parser.parse_known_args()
-        result = {"arch": args.arch, "loss": args.loss, "fold": args.fold, "seed": args.seed,
-                  "r2": float("-inf"), "mae": float("inf"), "training_time": 0,
+        result = {"arch": args.arch, "loss": args.loss, "seed": args.seed,
+                  "r2": float("-inf"), "mae": float("inf"), "pearson": 0.0,
+                  "psd_error_db": float("inf"), "training_time": 0,
                   "success": False, "error": str(e)}
-        result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}_f{args.fold}_s{args.seed}.json"
+        result_file = Path(args.data_dir) / f"result_{args.arch}_{args.loss}.json"
         with open(result_file, "w") as f:
             json.dump(result, f)
         raise
@@ -429,11 +519,9 @@ def run_single_experiment(
     batch_size: int,
     lr: float,
     n_odors: int,
-    fold: int,
-    seed: int,
     python_path: str,
 ) -> Dict[str, Any]:
-    """Run ONE experiment (single fold, single seed)."""
+    """Run ONE experiment (single run, no folds)."""
 
     # Write worker script
     worker_path = ARTIFACTS_DIR / "worker.py"
@@ -441,7 +529,7 @@ def run_single_experiment(
         f.write(WORKER_SCRIPT)
 
     # Clear previous result
-    result_file = data_dir / f"result_{arch}_{loss_name}_f{fold}_s{seed}.json"
+    result_file = data_dir / f"result_{arch}_{loss_name}.json"
     if result_file.exists():
         result_file.unlink()
 
@@ -455,8 +543,7 @@ def run_single_experiment(
         f"--batch-size={batch_size}",
         f"--lr={lr}",
         f"--n-odors={n_odors}",
-        f"--fold={fold}",
-        f"--seed={seed}",
+        f"--seed=42",
     ]
 
     try:
@@ -483,78 +570,55 @@ def evaluate_architecture(
     batch_size: int,
     lr: float,
     n_odors: int,
-    n_folds: int,
-    seeds: List[int],
     python_path: str,
 ) -> NeuralResult:
-    """Evaluate architecture with cross-validation and multiple seeds."""
+    """Evaluate architecture with single run (no CV for simplicity)."""
 
     print(f"\n{'='*60}")
     print(f"Evaluating: {arch} + {loss_name}")
-    print(f"  {n_folds} folds × {len(seeds)} seeds = {n_folds * len(seeds)} runs")
     print(f"{'='*60}")
 
-    all_r2s = []
-    all_maes = []
-    total_time = 0.0
-
-    for seed in seeds:
-        for fold in range(n_folds):
-            print(f"  [{arch}+{loss_name}] Fold {fold+1}/{n_folds}, Seed {seed}")
-
-            result = run_single_experiment(
-                arch=arch,
-                loss_name=loss_name,
-                data_dir=data_dir,
-                n_epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                n_odors=n_odors,
-                fold=fold,
-                seed=seed,
-                python_path=python_path,
-            )
-
-            if result.get("success", False):
-                all_r2s.append(result["r2"])
-                all_maes.append(result.get("mae", np.nan))
-                total_time += result.get("training_time", 0)
-                print(f"    R²={result['r2']:.4f}")
-            else:
-                all_r2s.append(np.nan)
-                all_maes.append(np.nan)
-                print(f"    FAILED: {result.get('error', 'Unknown')}")
-
-    # Compute statistics
-    r2_array = np.array(all_r2s)
-    mae_array = np.array(all_maes)
-    valid_r2s = r2_array[~np.isnan(r2_array)]
-    valid_maes = mae_array[~np.isnan(mae_array)]
-
-    ci = compute_bootstrap_ci(r2_array)
-
-    r2_mean = float(np.mean(valid_r2s)) if len(valid_r2s) > 0 else np.nan
-    r2_std = float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0
-    mae_mean = float(np.mean(valid_maes)) if len(valid_maes) > 0 else np.nan
-    mae_std = float(np.std(valid_maes, ddof=1)) if len(valid_maes) > 1 else 0.0
-
-    print(f"\n  SUMMARY: R² = {r2_mean:.4f} ± {r2_std:.4f} [{ci['ci_lower']:.4f}, {ci['ci_upper']:.4f}]")
-
-    return NeuralResult(
-        architecture=arch,
-        loss=loss_name,
-        r2_mean=r2_mean,
-        r2_std=r2_std,
-        r2_ci_lower=ci["ci_lower"],
-        r2_ci_upper=ci["ci_upper"],
-        mae_mean=mae_mean,
-        mae_std=mae_std,
-        training_time=total_time,
-        fold_r2s=all_r2s,
-        n_folds=n_folds,
-        n_seeds=len(seeds),
-        success=len(valid_r2s) > 0,
+    result = run_single_experiment(
+        arch=arch,
+        loss_name=loss_name,
+        data_dir=data_dir,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
+        lr=lr,
+        n_odors=n_odors,
+        python_path=python_path,
     )
+
+    if result.get("success", False):
+        print(f"  R²={result['r2']:.4f}, Pearson={result['pearson']:.4f}, PSD_err={result['psd_error_db']:.2f}dB")
+        return NeuralResult(
+            architecture=arch,
+            loss=loss_name,
+            r2_mean=result["r2"],
+            mae_mean=result.get("mae", np.nan),
+            pearson_mean=result.get("pearson", np.nan),
+            psd_error_db=result.get("psd_error_db", np.nan),
+            r2_delta=result.get("r2_delta"),
+            r2_theta=result.get("r2_theta"),
+            r2_alpha=result.get("r2_alpha"),
+            r2_beta=result.get("r2_beta"),
+            r2_gamma=result.get("r2_gamma"),
+            training_time=result.get("training_time", 0),
+            success=True,
+        )
+    else:
+        print(f"  FAILED: {result.get('error', 'Unknown')}")
+        return NeuralResult(
+            architecture=arch,
+            loss=loss_name,
+            r2_mean=np.nan,
+            mae_mean=np.nan,
+            pearson_mean=np.nan,
+            psd_error_db=np.nan,
+            training_time=0,
+            success=False,
+            error=result.get("error"),
+        )
 
 
 def load_tier0_results() -> Optional[Dict[str, Any]]:
@@ -577,15 +641,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS)
     parser.add_argument("--batch-size", type=int, default=TRAIN_BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=TRAIN_LR)
-    parser.add_argument("--n-folds", type=int, default=N_FOLDS)
-    parser.add_argument("--n-seeds", type=int, default=N_SEEDS)
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("TIER 1: Architecture Screening with Statistical Analysis")
+    print("TIER 1: Architecture Screening (Single Run)")
     print("=" * 60)
-    print(f"Cross-validation: {args.n_folds} folds × {args.n_seeds} seeds")
+    print("Losses: l1, huber, l1_wavelet, spectral")
+    print("Metrics: R², MAE, Pearson, PSD error, per-band R²")
     print()
 
     # Find Python with PyTorch
@@ -613,10 +676,8 @@ def main():
         odors = np.random.randint(0, 7, size=N).astype(np.int64)
         n_odors = 7
         architectures = ["cnn", "wavenet"]  # Quick test
-        losses = {"huber": "huber", "spectral": "multi_scale_spectral"}
+        losses = {"l1": "l1", "huber": "huber"}
         n_epochs = 3
-        n_folds = 1  # Single run
-        seeds = [42]
     else:
         from data import prepare_data
         data = prepare_data()
@@ -633,10 +694,8 @@ def main():
         odors = odors_all[cv_idx]
 
         architectures = ARCHITECTURES
-        losses = LOSS_CATEGORIES
+        losses = LOSS_FUNCTIONS
         n_epochs = args.epochs
-        n_folds = args.n_folds
-        seeds = list(range(42, 42 + args.n_seeds))
 
     # Split data
     n_samples = len(X)
@@ -680,7 +739,6 @@ def main():
               if f"{a}_{lc}" not in results]
 
     print(f"\nExperiments: {len(combos)} to run")
-    print(f"Total runs: {len(combos)} × {n_folds} folds × {len(seeds)} seeds = {len(combos) * n_folds * len(seeds)}")
 
     # Run experiments
     for i, (arch, loss_cat, loss_name) in enumerate(combos):
@@ -694,8 +752,6 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             n_odors=n_odors,
-            n_folds=n_folds,
-            seeds=seeds,
             python_path=python_path,
         )
 
@@ -703,66 +759,75 @@ def main():
         _save_checkpoint(results)
 
     # ==========================================================================
-    # Statistical Analysis
+    # Results Summary
     # ==========================================================================
-    print("\n" + "=" * 60)
-    print("STATISTICAL ANALYSIS")
-    print("=" * 60)
+    print("\n" + "=" * 80)
+    print("RESULTS SUMMARY")
+    print("=" * 80)
 
     # Load Tier 0 results
     tier0 = load_tier0_results()
     if tier0:
-        best_classical = tier0.get("best_r2", 0.0)
+        best_classical_r2 = tier0.get("best_r2", 0.0)
         best_classical_method = tier0.get("best_method", "unknown")
-        print(f"\nTier 0 Classical Floor: {best_classical:.4f} ({best_classical_method})")
-        print(f"Gate threshold (beat by 0.10): {best_classical + 0.10:.4f}")
+        print(f"\nTier 0 Classical Floor: R²={best_classical_r2:.4f} ({best_classical_method})")
+        print(f"Gate threshold (beat by 0.10): {best_classical_r2 + 0.10:.4f}")
     else:
-        best_classical = 0.0
+        best_classical_r2 = 0.0
         print("\n[Warning] No Tier 0 results found for comparison")
 
     # Summary table
-    print(f"\n{'='*80}")
-    print(f"{'Arch':12} {'Loss':12} {'R² Mean':>10} {'± Std':>8} {'95% CI':>20} {'vs Classical':>12}")
-    print(f"{'='*80}")
+    print(f"\n{'='*100}")
+    print(f"{'Arch':12} {'Loss':12} {'R²':>8} {'Pearson':>8} {'MAE':>8} {'PSD_err':>10} {'vs Classical':>12}")
+    print(f"{'='*100}")
 
     sorted_results = sorted(results.items(), key=lambda x: -x[1].get("r2_mean", float("-inf")))
 
     passing_gate = []
     for key, r in sorted_results:
         r2 = r.get("r2_mean", float("-inf"))
-        std = r.get("r2_std", 0)
-        ci_l = r.get("r2_ci_lower", float("-inf"))
-        ci_u = r.get("r2_ci_upper", float("-inf"))
+        pearson = r.get("pearson_mean", np.nan)
+        mae = r.get("mae_mean", np.nan)
+        psd_err = r.get("psd_error_db", np.nan)
         arch = r.get("architecture", "?")
         loss = r.get("loss", "?")
 
         if np.isnan(r2) or r2 == float("-inf"):
             status = "FAIL"
-        elif r2 > best_classical + 0.10:
+        elif r2 > best_classical_r2 + 0.10:
             status = "✓ PASS"
-            passing_gate.append((arch, loss, r2))
-        elif r2 > best_classical:
+            passing_gate.append((arch, loss, r2, pearson, psd_err))
+        elif r2 > best_classical_r2:
             status = "~ marginal"
         else:
             status = "✗ below"
 
-        ci_str = f"[{ci_l:.4f}, {ci_u:.4f}]" if not np.isnan(ci_l) else "[nan, nan]"
-        print(f"{arch:12} {loss:12} {r2:10.4f} {std:8.4f} {ci_str:>20} {status:>12}")
+        psd_str = f"{psd_err:.2f}dB" if not np.isnan(psd_err) else "nan"
+        print(f"{arch:12} {loss:12} {r2:8.4f} {pearson:8.4f} {mae:8.4f} {psd_str:>10} {status:>12}")
 
-    print(f"{'='*80}")
+    print(f"{'='*100}")
+
+    # Per-band R² for top result
+    if sorted_results:
+        top_key, top_result = sorted_results[0]
+        print(f"\nTop result ({top_result.get('architecture')} + {top_result.get('loss')}) per-band R²:")
+        for band in ["delta", "theta", "alpha", "beta", "gamma"]:
+            band_r2 = top_result.get(f"r2_{band}")
+            if band_r2 is not None:
+                print(f"  {band:8}: {band_r2:.4f}")
 
     # Gate summary
     print(f"\n{'='*60}")
     print("GATE RESULTS")
     print(f"{'='*60}")
-    print(f"Classical floor (Tier 0): {best_classical:.4f}")
-    print(f"Gate threshold (+0.10):   {best_classical + 0.10:.4f}")
+    print(f"Classical floor (Tier 0): {best_classical_r2:.4f}")
+    print(f"Gate threshold (+0.10):   {best_classical_r2 + 0.10:.4f}")
     print(f"Combinations passing:     {len(passing_gate)}/{len(results)}")
 
     if passing_gate:
         print("\nPassing combinations (proceed to Tier 2):")
-        for arch, loss, r2 in sorted(passing_gate, key=lambda x: -x[2]):
-            print(f"  {arch} + {loss}: R² = {r2:.4f} (Δ = +{r2 - best_classical:.4f})")
+        for arch, loss, r2, pearson, psd_err in sorted(passing_gate, key=lambda x: -x[2]):
+            print(f"  {arch} + {loss}: R²={r2:.4f} (Δ=+{r2 - best_classical_r2:.4f}), Pearson={pearson:.4f}, PSD_err={psd_err:.2f}dB")
     else:
         print("\n[!] No neural methods beat the gate threshold.")
         print("    Consider: more epochs, hyperparameter tuning, or architectural changes.")
@@ -770,19 +835,18 @@ def main():
     # Save final results
     final_results = {
         "tier": 1,
-        "name": "Architecture Screening",
+        "name": "Architecture Screening (Single Run)",
         "timestamp": datetime.now().isoformat(),
         "config": {
             "epochs": n_epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
-            "n_folds": n_folds,
-            "n_seeds": len(seeds),
+            "losses": list(losses.keys()),
         },
-        "classical_floor": best_classical,
-        "gate_threshold": best_classical + 0.10,
+        "classical_floor": best_classical_r2,
+        "gate_threshold": best_classical_r2 + 0.10,
         "results": results,
-        "passing_gate": [{"arch": a, "loss": l, "r2": r} for a, l, r in passing_gate],
+        "passing_gate": [{"arch": a, "loss": l, "r2": r, "pearson": p, "psd_error_db": e} for a, l, r, p, e in passing_gate],
         "best_neural": sorted_results[0] if sorted_results else None,
     }
 
