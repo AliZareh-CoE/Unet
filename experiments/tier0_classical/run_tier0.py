@@ -959,13 +959,11 @@ def run_tier0(
     register: bool = True,
     resume: bool = True,
     sample_rate: float = 1000.0,
-    n_jobs: int = 1,
-    use_gpu: bool = False,
 ) -> Tuple[Tier0Result, Dict[str, Any]]:
-    """Run Tier 0: Classical Floor evaluation (Nature Methods publication quality).
+    """Run Tier 0: Classical Floor evaluation (GPU-ONLY).
 
-    MULTI-GPU ACCELERATED:
-    - With --use-gpu: Runs baselines in parallel across GPUs (1 per GPU)
+    MULTI-GPU PARALLEL:
+    - Runs baselines in parallel across GPUs (1 per GPU)
     - Process-based isolation prevents CUDA context conflicts
     - Vectorized metrics computation and bootstrap CI
     - Checkpoint/resume support
@@ -979,8 +977,6 @@ def run_tier0(
         register: Whether to register results with ConfigRegistry
         resume: Whether to resume from checkpoint (skip completed experiments)
         sample_rate: Sampling rate in Hz for spectral analysis
-        n_jobs: Number of parallel jobs for fold CV (default: 1 for GPU mode)
-        use_gpu: Whether to use GPU acceleration
 
     Returns:
         Tuple of:
@@ -1010,24 +1006,21 @@ def run_tier0(
             print(f"  {baseline_name}... SKIPPED (already done) R² = {result.r2_mean:.4f} ± {result.r2_std:.4f}")
             results.append(result)
 
-    # Check for available GPUs
+    # Check for available GPUs (GPU-only mode)
     data_gb = X.nbytes * 2 / 1e9  # X + y
-    available_gpus = _get_available_gpus() if use_gpu else []
+    available_gpus = _get_available_gpus()
     n_gpus = len(available_gpus)
 
-    if use_gpu and n_gpus > 0:
-        mode_str = f"multi-GPU pool ({n_gpus} GPUs, 1 task each)"
-    else:
-        mode_str = "sequential CPU"
+    if n_gpus == 0:
+        raise RuntimeError("No GPUs available! Tier 0 requires GPU. Install CuPy and ensure CUDA is available.")
 
     print(f"\nEvaluating {len(baselines_to_run)} classical baselines with {n_folds}-fold CV...")
-    print(f"  Mode: {mode_str}, {n_jobs} jobs per baseline for fold CV")
+    print(f"  Mode: multi-GPU pool ({n_gpus} GPUs, 1 task each)")
     print(f"  Data shape: {X.shape}, Memory: ~{data_gb:.1f} GB")
-    if n_gpus > 0:
-        print(f"  GPUs available: {available_gpus}")
+    print(f"  GPUs available: {available_gpus}")
 
     # Multi-GPU parallel execution with GPU pool (one task per GPU, others wait)
-    if use_gpu and n_gpus > 0:
+    if baselines_to_run:  # Only run if there are baselines to process
         print(f"\n  Running {len(baselines_to_run)} baselines on {n_gpus} GPUs (1 task per GPU)...")
         print(f"  (Process-based isolation prevents CUDA context conflicts)")
         start_all = time.time()
@@ -1137,55 +1130,6 @@ def run_tier0(
         print(f"  Total GPU time: {elapsed_all:.1f}s ({elapsed_all/len(baselines_to_run):.1f}s avg per baseline)")
         print(f"  Successful: {successful}/{len(baselines_to_run)}")
 
-    else:
-        # Sequential baseline evaluation with tqdm progress bar
-        pbar = tqdm(
-            baselines_to_run,
-            desc="  Baselines",
-            unit="baseline",
-            ncols=100,
-            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-        ) if HAS_TQDM else baselines_to_run
-
-        for baseline_name in pbar:
-            if HAS_TQDM:
-                pbar.set_description(f"  {baseline_name}")
-            else:
-                print(f"  {baseline_name}...", end=" ", flush=True)
-
-            start = time.time()
-
-            classical_result, detailed_result = evaluate_baseline_cv(
-                baseline_name=baseline_name,
-                X=X,
-                y=y,
-                n_folds=n_folds,
-                seed=seed,
-                sample_rate=sample_rate,
-                n_jobs=n_jobs,
-                use_gpu=use_gpu,
-            )
-            results.append(classical_result)
-            detailed_results.append(detailed_result)
-
-            # Store fold-level results for statistical tests
-            if detailed_result.fold_r2s:
-                fold_results_for_stats[baseline_name] = detailed_result.fold_r2s
-
-            elapsed = time.time() - start
-            ci_str = f"[{detailed_result.r2_ci_lower:.4f}, {detailed_result.r2_ci_upper:.4f}]"
-
-            if HAS_TQDM:
-                pbar.set_postfix_str(f"R²={classical_result.r2_mean:.3f} ({elapsed:.1f}s)")
-                # Also print the full result after progress bar updates
-                tqdm.write(f"  {baseline_name}: R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
-            else:
-                print(f"R² = {classical_result.r2_mean:.4f} ± {classical_result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
-
-            # Save checkpoint after each baseline
-            completed_results[baseline_name] = classical_result
-            _save_checkpoint(completed_results)
-
     # Find best
     valid_results = [r for r in results if not np.isnan(r.r2_mean)]
     if not valid_results:
@@ -1231,33 +1175,22 @@ def run_tier0(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Tier 0: Classical Floor - MULTI-GPU ACCELERATED",
+        description="Tier 0: Classical Floor - MULTI-GPU ONLY",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Performance Tips:
-  --use-gpu    Use multi-GPU parallel execution (1 baseline per GPU)
-               With 8 GPUs: up to 8 baselines run simultaneously
-               Others queue and wait for a GPU to become free
+GPU-Only Execution:
+  Runs baselines in parallel across all available GPUs (1 baseline per GPU).
+  Requires CuPy and CUDA-capable GPUs.
 
 Example:
-  python run_tier0.py --use-gpu    # Multi-GPU parallel (FASTEST)
-  python run_tier0.py              # CPU mode
+  python run_tier0.py              # Multi-GPU parallel
+  python run_tier0.py --dry-run    # Quick test with synthetic data
         """
     )
     parser.add_argument("--dry-run", action="store_true", help="Use small synthetic data")
     parser.add_argument("--folds", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default=None, help="Output JSON file")
-
-    # Performance options
-    parser.add_argument(
-        "--n-jobs", type=int, default=1,
-        help="Number of parallel jobs for fold CV (default: 1, use 1 for GPU mode)"
-    )
-    parser.add_argument(
-        "--use-gpu", action="store_true",
-        help="Use multi-GPU parallel (1 baseline per GPU, others queue)"
-    )
     parser.add_argument(
         "--no-resume", action="store_true",
         help="Don't resume from checkpoint, start fresh"
@@ -1333,11 +1266,10 @@ Example:
 
     # Print performance configuration
     print(f"\nPerformance configuration:")
-    print(f"  Parallel fold CV jobs: {args.n_jobs}")
-    print(f"  Multi-GPU acceleration: {args.use_gpu}")
+    print(f"  Mode: Multi-GPU parallel (GPU-only)")
     print(f"  Resume from checkpoint: {not args.no_resume}")
 
-    # Run
+    # Run (GPU-only mode)
     result, publication_results = run_tier0(
         X=X,
         y=y,
@@ -1345,8 +1277,6 @@ Example:
         n_folds=args.folds,
         seed=args.seed,
         resume=not args.no_resume,
-        n_jobs=args.n_jobs,
-        use_gpu=args.use_gpu,
     )
 
     # Summary

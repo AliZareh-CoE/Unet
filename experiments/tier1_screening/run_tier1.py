@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.cuda.amp import autocast, GradScaler
 
 from experiments.common.config_registry import (
     ScreeningResult,
@@ -77,7 +78,7 @@ LOSS_CATEGORIES = {
 # Screening hyperparameters
 SCREEN_DATA_FRACTION = 0.2
 SCREEN_EPOCHS = 20
-SCREEN_BATCH_SIZE = 16
+SCREEN_BATCH_SIZE = 8  # Reduced from 16 to avoid OOM
 SCREEN_LR = 1e-3
 
 
@@ -145,8 +146,9 @@ def quick_train(
     device: torch.device,
     n_epochs: int = 20,
     lr: float = 1e-3,
+    use_amp: bool = True,
 ) -> Dict[str, float]:
-    """Quick training for screening.
+    """Quick training for screening with AMP for memory efficiency.
 
     Args:
         model: Model to train
@@ -156,12 +158,16 @@ def quick_train(
         device: Device
         n_epochs: Number of epochs
         lr: Learning rate
+        use_amp: Use automatic mixed precision (reduces memory ~50%)
 
     Returns:
         Dictionary with r2, mae, and training time
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    # AMP scaler for mixed precision training
+    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
 
     start_time = time.time()
 
@@ -176,27 +182,43 @@ def quick_train(
             x, y = x.to(device), y.to(device)
 
             optimizer.zero_grad()
-            y_pred = model(x)
 
-            # Handle loss functions that need special treatment
-            try:
-                loss = criterion(y_pred, y)
-            except Exception:
-                # Some losses might need variance output
-                loss = nn.functional.l1_loss(y_pred, y)
+            # Mixed precision forward pass
+            if scaler is not None:
+                with autocast():
+                    y_pred = model(x)
+                    try:
+                        loss = criterion(y_pred, y)
+                    except Exception:
+                        loss = nn.functional.l1_loss(y_pred, y)
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                y_pred = model(x)
+                try:
+                    loss = criterion(y_pred, y)
+                except Exception:
+                    loss = nn.functional.l1_loss(y_pred, y)
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
         scheduler.step()
 
     training_time = time.time() - start_time
 
-    # Evaluate
+    # Evaluate (use AMP for inference too to save memory)
     model.eval()
     all_preds, all_targets = [], []
 
@@ -207,8 +229,14 @@ def quick_train(
             else:
                 x, y = batch
             x, y = x.to(device), y.to(device)
-            y_pred = model(x)
-            all_preds.append(y_pred.cpu())
+
+            if scaler is not None:
+                with autocast():
+                    y_pred = model(x)
+            else:
+                y_pred = model(x)
+
+            all_preds.append(y_pred.float().cpu())
             all_targets.append(y.cpu())
 
     preds = torch.cat(all_preds, dim=0)
