@@ -393,14 +393,14 @@ def run_tier3_5(
 
     # If no base predictions, we need to generate them using the winning model
     if base_predictions is None:
-        print("  Generating base predictions from model...")
-        # Use a simple model for demo
-        from models import UNet1DConditioned
+        print("  Generating base predictions from U-Net model...")
+        from models import CondUNet1D
 
-        model = UNet1DConditioned(
+        model = CondUNet1D(
             in_channels=X.shape[1],
             out_channels=y.shape[1],
             base_channels=32,
+            n_odors=7,
         ).to(device)
 
         # Quick training

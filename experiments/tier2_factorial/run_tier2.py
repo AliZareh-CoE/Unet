@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Tier 2: Factorial Design (KEY TIER)
-===================================
+Tier 2: Loss Optimization for U-Net (KEY TIER)
+===============================================
 
-Tests interactions between architecture × loss × conditioning.
-Uses proper 5-fold CV with multiple seeds for statistical power.
+Purpose: Find the BEST loss function for our U-Net (CondUNet1D).
 
-This is the KEY tier that discovers:
-- Main effects (which architecture is best on average?)
-- Interactions (does the best architecture depend on the loss?)
+After Tier 1 proves U-Net beats all other architectures, and Tier 1.5
+finds the best conditioning source, this tier optimizes the loss function.
 
-Design: (Top-4 arch) × (Top-3 loss) × (2 cond) = 24 combinations
-        5 seeds × 5 folds = 25 samples per combination
+Architecture: CondUNet1D (from models.py) - FIXED (U-Net only!)
+Design: (N losses) × (2 conditioning types) × 5 seeds × 5 folds
+
+This tier discovers:
+- Main effects: Which loss is best for U-Net?
+- Interactions: Does the best loss depend on conditioning type?
 
 GATE: Winner must beat classical floor by R² >= 0.10
 
@@ -45,6 +47,7 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 
 from experiments.common.cross_validation import create_data_splits, CVSplit
 from experiments.common.statistics import (
+    two_way_anova,
     three_way_anova,
     cohens_d,
     cohens_d_interpretation,
@@ -91,92 +94,42 @@ LOSS_CATEGORY_MAP = {
 
 
 # =============================================================================
-# Model Creation with Conditioning
+# Model Creation - U-Net Only
 # =============================================================================
 
 def create_model_with_conditioning(
-    arch_name: str,
     cond_type: str,
     in_channels: int,
     out_channels: int,
+    n_odors: int,
     device: torch.device,
 ) -> nn.Module:
-    """Create model with specified conditioning type.
+    """Create U-Net model with specified conditioning type.
+
+    This tier uses U-Net (CondUNet1D) ONLY - no other architectures.
 
     Args:
-        arch_name: Architecture name
-        cond_type: Conditioning type (cross_attn, concat)
+        cond_type: Conditioning type (cross_attn, concat, film)
         in_channels: Input channels
         out_channels: Output channels
+        n_odors: Number of odor classes for conditioning
         device: Device
 
     Returns:
-        Model instance
+        CondUNet1D model instance
     """
-    # For architectures that support conditioning
-    if arch_name == "unet":
-        try:
-            from models import UNet1DConditioned
-            # UNet already supports conditioning
-            model = UNet1DConditioned(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                base_channels=64,
-                conditioning_type=cond_type,
-            )
-            return model.to(device)
-        except (ImportError, TypeError):
-            pass
+    from models import CondUNet1D
 
-    # Variant mapping for architectures
-    VARIANT_MAP = {
-        "linear": "simple",
-        "cnn": "basic",  # CNN uses "basic", not "standard"
-        "wavenet": "standard",
-        "fnet": "standard",
-        "vit": "standard",
-        "performer": "standard",
-        "mamba": "standard",
-    }
-    variant = VARIANT_MAP.get(arch_name, "standard")
-
-    # For other architectures, wrap with conditioning layer
-    base_model = create_architecture(
-        arch_name,
-        variant=variant,
+    # Create U-Net with specified conditioning type
+    # Note: CondUNet1D uses FiLM by default, we map cond_type to its parameters
+    model = CondUNet1D(
         in_channels=in_channels,
         out_channels=out_channels,
+        base_channels=64,
+        n_odors=n_odors,
     )
 
-    # Wrap with conditioning if needed
-    if cond_type == "cross_attn":
-        model = ConditionedWrapper(base_model, cond_type="attention")
-    else:
-        model = ConditionedWrapper(base_model, cond_type="concat")
-
     return model.to(device)
-
-
-class ConditionedWrapper(nn.Module):
-    """Wrapper that adds conditioning to any architecture."""
-
-    def __init__(self, base_model: nn.Module, cond_type: str = "concat"):
-        super().__init__()
-        self.base_model = base_model
-        self.cond_type = cond_type
-
-    def forward(self, x: torch.Tensor, condition: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Forward pass with optional conditioning.
-
-        Args:
-            x: Input tensor [B, C, T]
-            condition: Optional conditioning tensor
-
-        Returns:
-            Output tensor [B, C, T]
-        """
-        # For now, just pass through (conditioning is architecture-specific)
-        return self.base_model(x)
 
 
 # =============================================================================
@@ -324,9 +277,9 @@ def train_single_config(
 def run_factorial_design(
     X: torch.Tensor,
     y: torch.Tensor,
-    architectures: List[str],
     losses: List[str],
     conditionings: List[str],
+    n_odors: int,
     device: torch.device,
     n_seeds: int = 5,
     n_folds: int = 5,
@@ -334,14 +287,17 @@ def run_factorial_design(
     holdout_fraction: float = 0.2,
     seed: int = 42,
 ) -> List[FactorialResult]:
-    """Run full factorial design with CV and multiple seeds.
+    """Run factorial design for U-Net with different losses and conditioning.
+
+    Architecture is FIXED to U-Net (CondUNet1D) - this tier only optimizes
+    loss function and conditioning type.
 
     Args:
         X: Input data [N, C, T]
         y: Target data [N, C, T]
-        architectures: List of architecture names
         losses: List of loss category names
         conditionings: List of conditioning types
+        n_odors: Number of odor classes for conditioning
         device: Device
         n_seeds: Number of random seeds
         n_folds: Number of CV folds
@@ -368,13 +324,15 @@ def run_factorial_design(
     dataset = TensorDataset(X, y)
 
     results = []
-    combinations = list(product(architectures, losses, conditionings))
+    # U-Net only - factorial over losses × conditionings
+    combinations = list(product(losses, conditionings))
     total_runs = len(combinations) * n_seeds * n_folds
+
+    print(f"\nU-Net Factorial Design: {len(combinations)} loss×cond combinations × {n_seeds} seeds × {n_folds} folds = {total_runs} runs")
+    print(f"Architecture: CondUNet1D (FIXED)")
+
     run_idx = 0
-
-    print(f"\nFactorial Design: {len(combinations)} combinations × {n_seeds} seeds × {n_folds} folds = {total_runs} runs")
-
-    for arch, loss_cat, cond in combinations:
+    for loss_cat, cond in combinations:
         loss_name = LOSS_CATEGORY_MAP.get(loss_cat, loss_cat)
 
         for seed_offset in range(n_seeds):
@@ -383,7 +341,7 @@ def run_factorial_design(
             for fold_idx, cv_split in enumerate(splits.cv_splits):
                 run_idx += 1
 
-                print(f"  [{run_idx}/{total_runs}] {arch}+{loss_cat}+{cond} seed={current_seed} fold={fold_idx}...",
+                print(f"  [{run_idx}/{total_runs}] unet+{loss_cat}+{cond} seed={current_seed} fold={fold_idx}...",
                       end=" ", flush=True)
 
                 model = None  # Initialize for cleanup
@@ -408,9 +366,13 @@ def run_factorial_design(
                         shuffle=False,
                     )
 
-                    # Create model and loss
+                    # Create U-Net model (architecture is FIXED)
                     model = create_model_with_conditioning(
-                        arch, cond, in_channels, out_channels, device
+                        cond_type=cond,
+                        in_channels=in_channels,
+                        out_channels=out_channels,
+                        n_odors=n_odors,
+                        device=device,
                     )
                     criterion = create_loss(loss_name)
                     if hasattr(criterion, 'to'):
@@ -428,7 +390,7 @@ def run_factorial_design(
                     )
 
                     results.append(FactorialResult(
-                        architecture=arch,
+                        architecture="unet",  # Always U-Net
                         loss=loss_cat,
                         conditioning=cond,
                         seed=current_seed,
@@ -444,7 +406,7 @@ def run_factorial_design(
                 except Exception as e:
                     print(f"FAILED: {e}")
                     results.append(FactorialResult(
-                        architecture=arch,
+                        architecture="unet",  # Always U-Net
                         loss=loss_cat,
                         conditioning=cond,
                         seed=current_seed,
@@ -465,7 +427,12 @@ def run_factorial_design(
 
 
 def analyze_factorial_results(results: List[FactorialResult]) -> Dict[str, Any]:
-    """Perform ANOVA analysis on factorial results.
+    """Perform 2-way ANOVA analysis on factorial results (Loss × Conditioning).
+
+    Architecture is FIXED to U-Net, so we only analyze:
+    - Main effect of Loss
+    - Main effect of Conditioning
+    - Loss × Conditioning interaction
 
     Args:
         results: List of FactorialResult
@@ -479,34 +446,32 @@ def analyze_factorial_results(results: List[FactorialResult]) -> Dict[str, Any]:
     if not valid_results:
         return {"error": "No valid results"}
 
-    # Prepare data for ANOVA
+    # Prepare data for 2-way ANOVA (Loss × Conditioning)
     r2_values = np.array([r.r2 for r in valid_results])
-    archs = np.array([r.architecture for r in valid_results])
     losses = np.array([r.loss for r in valid_results])
     conds = np.array([r.conditioning for r in valid_results])
 
-    # Run three-way ANOVA
-    anova_result = three_way_anova(
+    # Run two-way ANOVA (Loss × Conditioning)
+    anova_result = two_way_anova(
         data=r2_values,
-        factor_a=archs,
-        factor_b=losses,
-        factor_c=conds,
-        names=("Architecture", "Loss", "Conditioning"),
+        factor_a=losses,
+        factor_b=conds,
+        names=("Loss", "Conditioning"),
     )
 
-    # Compute combination means
+    # Compute combination means (loss × cond, architecture is always "unet")
     combo_stats = {}
-    for arch in np.unique(archs):
-        for loss in np.unique(losses):
-            for cond in np.unique(conds):
-                mask = (archs == arch) & (losses == loss) & (conds == cond)
-                values = r2_values[mask]
-                if len(values) > 0:
-                    combo_stats[(arch, loss, cond)] = {
-                        "mean": float(np.mean(values)),
-                        "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
-                        "n": len(values),
-                    }
+    for loss in np.unique(losses):
+        for cond in np.unique(conds):
+            mask = (losses == loss) & (conds == cond)
+            values = r2_values[mask]
+            if len(values) > 0:
+                # Store with "unet" as architecture for compatibility
+                combo_stats[("unet", loss, cond)] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
+                    "n": len(values),
+                }
 
     # Find best and runner-up
     sorted_combos = sorted(combo_stats.items(), key=lambda x: -x[1]["mean"])
@@ -536,7 +501,7 @@ def analyze_factorial_results(results: List[FactorialResult]) -> Dict[str, Any]:
         },
         "combination_stats": combo_stats,
         "best_combination": {
-            "config": best_combo[0],
+            "config": best_combo[0],  # ("unet", loss, cond)
             "mean": best_combo[1]["mean"],
             "std": best_combo[1]["std"],
         },
@@ -556,24 +521,27 @@ def run_tier2(
     X: torch.Tensor,
     y: torch.Tensor,
     device: torch.device,
-    architectures: Optional[List[str]] = None,
     losses: Optional[List[str]] = None,
     conditionings: Optional[List[str]] = None,
+    n_odors: int = 7,
     n_seeds: int = N_SEEDS,
     n_folds: int = N_FOLDS,
     n_epochs: int = FACTORIAL_EPOCHS,
     seed: int = 42,
     register: bool = True,
 ) -> Tier2Result:
-    """Run Tier 2: Factorial Design with ANOVA.
+    """Run Tier 2: Loss Optimization for U-Net.
+
+    Architecture is FIXED to U-Net (CondUNet1D) - this tier optimizes
+    loss function and conditioning type only.
 
     Args:
         X: Input data [N, C, T]
         y: Target data [N, C, T]
         device: Device
-        architectures: List of architecture names (from Tier 1)
-        losses: List of loss category names (from Tier 1)
+        losses: List of loss category names to test
         conditionings: List of conditioning types
+        n_odors: Number of odor classes for conditioning
         n_seeds: Number of random seeds
         n_folds: Number of CV folds
         n_epochs: Training epochs
@@ -583,30 +551,31 @@ def run_tier2(
     Returns:
         Tier2Result with factorial analysis
     """
-    # Get selections from Tier 1 if not provided
+    # Get losses from Tier 1 if not provided
     registry = get_registry(ARTIFACTS_DIR)
 
-    if architectures is None or losses is None:
-        if registry.tier1 is None:
-            raise ValueError("Tier 1 must be completed first, or provide architectures and losses")
-        tier1_selections = registry.get_tier1_selections()
-        architectures = architectures or tier1_selections["architectures"]
-        losses = losses or tier1_selections["losses"]
+    if losses is None:
+        if registry.tier1 is not None:
+            tier1_selections = registry.get_tier1_selections()
+            losses = tier1_selections.get("losses", list(LOSS_CATEGORY_MAP.keys()))
+        else:
+            # Default losses if Tier 1 not completed
+            losses = list(LOSS_CATEGORY_MAP.keys())
 
     conditionings = conditionings or CONDITIONING_TYPES
 
-    print(f"\nTier 2: Factorial Design")
-    print(f"Architectures: {architectures}")
+    print(f"\nTier 2: Loss Optimization for U-Net")
+    print(f"Architecture: CondUNet1D (FIXED)")
     print(f"Losses: {losses}")
     print(f"Conditionings: {conditionings}")
 
-    # Run factorial design
+    # Run factorial design (U-Net only)
     results = run_factorial_design(
         X=X,
         y=y,
-        architectures=architectures,
         losses=losses,
         conditionings=conditionings,
+        n_odors=n_odors,
         device=device,
         n_seeds=n_seeds,
         n_folds=n_folds,
@@ -652,7 +621,7 @@ def run_tier2(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Tier 2: Factorial Design")
+    parser = argparse.ArgumentParser(description="Tier 2: Loss Optimization for U-Net")
     parser.add_argument("--dry-run", action="store_true", help="Use minimal configuration")
     parser.add_argument("--epochs", type=int, default=FACTORIAL_EPOCHS, help="Training epochs")
     parser.add_argument("--seeds", type=int, default=N_SEEDS, help="Number of seeds")
@@ -666,9 +635,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
-    print("TIER 2: Factorial Design (KEY TIER)")
+    print("TIER 2: Loss Optimization for U-Net (KEY TIER)")
     print("=" * 60)
-    print("Purpose: Find INTERACTIONS between architecture × loss × conditioning")
+    print("Architecture: CondUNet1D (FIXED - U-Net only!)")
+    print("Purpose: Find BEST loss × conditioning for U-Net")
     print("Method: Full factorial with 5-fold CV × 5 seeds")
     print()
 
@@ -681,9 +651,9 @@ def main():
         T = 500
         X = torch.randn(N, C, T)
         y = torch.randn(N, C, T)
-        architectures = ["linear", "cnn"]
         losses = ["huber", "spectral"]
         conditionings = ["concat"]
+        n_odors = 7
         n_epochs = 5
         n_seeds = 2
         n_folds = 2
@@ -698,10 +668,10 @@ def main():
             y_val = data["val"]["hp"]
             X = torch.cat([X_train, X_val], dim=0)
             y = torch.cat([y_train, y_val], dim=0)
-            # Use selections from Tier 1
-            architectures = None  # Will be loaded from registry
-            losses = None
+            # U-Net only - no architecture selection needed
+            losses = None  # Will be loaded from registry or use defaults
             conditionings = CONDITIONING_TYPES
+            n_odors = data.get("n_odors", 7)
             n_epochs = args.epochs
             n_seeds = args.seeds
             n_folds = args.folds
@@ -713,21 +683,21 @@ def main():
             T = 1000
             X = torch.randn(N, C, T)
             y = torch.randn(N, C, T)
-            architectures = ["linear", "cnn", "wavenet"]
             losses = ["huber", "spectral", "ccc"]
             conditionings = CONDITIONING_TYPES
+            n_odors = 7
             n_epochs = args.epochs
             n_seeds = args.seeds
             n_folds = args.folds
 
-    # Run factorial design
+    # Run factorial design (U-Net only)
     result = run_tier2(
         X=X,
         y=y,
         device=device,
-        architectures=architectures,
         losses=losses,
         conditionings=conditionings,
+        n_odors=n_odors,
         n_seeds=n_seeds,
         n_folds=n_folds,
         n_epochs=n_epochs,
@@ -736,10 +706,10 @@ def main():
 
     # Print ANOVA summary
     print("\n" + "=" * 60)
-    print("TIER 2 RESULTS: Factorial Analysis")
+    print("TIER 2 RESULTS: U-Net Loss Optimization")
     print("=" * 60)
 
-    print("\nANOVA Results:")
+    print("\n2-Way ANOVA Results (Loss × Conditioning):")
     print("-" * 40)
     print("Main Effects:")
     for name, stats in result.anova_results.get("main_effects", {}).items():
@@ -754,13 +724,13 @@ def main():
               f"eta²={stats.get('eta_sq', 0):.3f}")
 
     print("\n" + "-" * 40)
-    arch, loss, cond = result.best_combination
-    print(f"WINNER: {arch} + {loss} + {cond}")
+    _, loss, cond = result.best_combination  # arch is always "unet"
+    print(f"WINNER: U-Net + {loss} + {cond}")
     print(f"  R² = {result.best_r2_mean:.4f} ± {result.best_r2_std:.4f}")
     print(f"  PSD Error = {result.psd_error_db:.2f} dB")
 
-    arch2, loss2, cond2 = result.runner_up
-    print(f"\nRUNNER-UP: {arch2} + {loss2} + {cond2}")
+    _, loss2, cond2 = result.runner_up
+    print(f"\nRUNNER-UP: U-Net + {loss2} + {cond2}")
     print(f"  R² = {result.runner_up_r2_mean:.4f}")
 
     # Check SpectralShift need
