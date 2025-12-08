@@ -73,7 +73,7 @@ ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 LOSS_FUNCTIONS = {
     "l1": "l1",                    # Simple baseline
     "huber": "huber",              # Robust baseline
-    "l1_wavelet": "l1_wavelet",    # Proven combo from train.py
+    "wavelet": "wavelet",          # Standalone wavelet loss
     "spectral": "multi_scale_spectral",  # Frequency-aware
 }
 
@@ -179,17 +179,11 @@ NEURAL_BANDS = {
 }
 
 
-class L1WaveletLoss(nn.Module):
-    """Combined L1 + Wavelet loss - exactly like train.py.
-
-    Uses the same weights as train.py DEFAULT_CONFIG:
-    - weight_l1: 1.0
-    - weight_wavelet: 10.0
-    """
+class WaveletLoss(nn.Module):
+    """Standalone wavelet loss."""
     def __init__(self):
         super().__init__()
         if HAS_WAVELET_LOSS:
-            # Use the same wavelet config as train.py
             self.wavelet_loss = build_wavelet_loss(
                 wavelet="morlet",
                 omega0=3.0,
@@ -197,21 +191,17 @@ class L1WaveletLoss(nn.Module):
             )
         else:
             self.wavelet_loss = None
-        self.weight_l1 = 1.0
-        self.weight_wavelet = 10.0
 
     def forward(self, pred, target):
-        l1_loss = F.l1_loss(pred, target)
         if self.wavelet_loss is not None:
-            wav_loss = self.wavelet_loss(pred, target)
-            return self.weight_l1 * l1_loss + self.weight_wavelet * wav_loss
-        return l1_loss
+            return self.wavelet_loss(pred, target)
+        return F.l1_loss(pred, target)  # Fallback
 
 
 def create_loss(name: str, **kwargs):
-    """Create loss by name, with support for l1_wavelet combo."""
-    if name == "l1_wavelet":
-        return L1WaveletLoss()
+    """Create loss by name, with support for wavelet."""
+    if name == "wavelet":
+        return WaveletLoss()
     else:
         return create_study3_loss(name, **kwargs)
 
