@@ -158,13 +158,16 @@ from tqdm import tqdm
 from experiments.study1_architecture.architectures import create_architecture
 from experiments.study3_loss.losses import create_loss as create_study3_loss
 
-# Import wavelet loss builder from models.py (exactly like train.py)
+# Import from models.py (exactly like train.py)
 try:
-    from models import build_wavelet_loss
+    from models import build_wavelet_loss, CondUNet1D
     HAS_WAVELET_LOSS = True
+    HAS_UNET = True
 except ImportError:
     HAS_WAVELET_LOSS = False
+    HAS_UNET = False
     build_wavelet_loss = None
+    CondUNet1D = None
 
 # Neural frequency bands for per-band R²
 NEURAL_BANDS = {
@@ -231,6 +234,27 @@ class OdorDataset(Dataset):
 
 
 def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: int = 0):
+    # Handle UNet (CondUNet1D) - same config as train.py
+    if arch_name == "unet" and HAS_UNET:
+        return CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base=64,  # Smaller than train.py (128) for faster tier1 screening
+            n_odors=n_odors,
+            dropout=0.0,
+            use_attention=True,
+            attention_type="cross_freq_v2",
+            norm_type="batch",
+            cond_mode="cross_attn_gated",
+            use_spectral_shift=False,  # Disable for tier1 (adds complexity)
+            n_downsample=4,
+            conv_type="modern",
+            use_se=True,
+            conv_kernel_size=7,
+            dilations=(1, 4, 16, 32),
+        )
+
+    # Other architectures from study1
     # Handle U-Net specially - use CondUNet1D from models.py
     if arch_name == "unet":
         from models import CondUNet1D
@@ -247,8 +271,6 @@ def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: i
         "wavenet": "standard",
         "fnet": "standard",
         "vit": "standard",
-        "performer": "standard",
-        "mamba": "standard",
     }
     variant = VARIANT_MAP.get(arch_name, "standard")
     try:
