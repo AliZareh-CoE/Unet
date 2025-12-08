@@ -74,7 +74,6 @@ LOSS_FUNCTIONS = {
     "l1": "l1",                    # Simple baseline
     "huber": "huber",              # Robust baseline
     "wavelet": "wavelet",          # Standalone wavelet loss
-    "spectral": "multi_scale_spectral",  # Frequency-aware
 }
 
 # Neural frequency bands (same as tier0)
