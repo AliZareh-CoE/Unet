@@ -495,7 +495,7 @@ class ConditionedTranslator(nn.Module):
             self.unet = CondUNet1D(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                base_channels=64,
+                base=64,
                 n_odors=n_odors,
             )
         else:
@@ -516,13 +516,13 @@ class ConditionedTranslator(nn.Module):
             self.unet = CondUNet1D(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                base_channels=64,
+                base=64,
                 n_odors=1,  # Minimal, we'll override the conditioning
             )
 
             # Override the odor embedding to accept our conditioning
-            # CondUNet1D uses embed_dim for FiLM, we project our encoding to match
-            unet_embed_dim = self.unet.odor_embed.embedding_dim if hasattr(self.unet, 'odor_embed') else 64
+            # CondUNet1D uses emb_dim (default 128) for FiLM, we project our encoding to match
+            unet_embed_dim = self.unet.embed.embedding_dim if hasattr(self.unet, 'embed') else 128
             self.cond_projector = nn.Linear(embed_dim, unet_embed_dim)
 
     def forward(
@@ -579,10 +579,10 @@ class ConditionedTranslator(nn.Module):
 
     def _forward_with_custom_cond(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """Forward through UNet with custom conditioning injection."""
-        # Store original forward method
-        original_odor_embed = self.unet.odor_embed if hasattr(self.unet, 'odor_embed') else None
+        # Store original embedding module
+        original_embed = self.unet.embed if hasattr(self.unet, 'embed') else None
 
-        if original_odor_embed is not None:
+        if original_embed is not None:
             # Create a wrapper that returns our conditioning
             class ConditioningOverride(nn.Module):
                 def __init__(self, cond_tensor):
@@ -592,8 +592,8 @@ class ConditionedTranslator(nn.Module):
                 def forward(self, x):
                     return self.cond
 
-            # Temporarily replace odor_embed
-            self.unet.odor_embed = ConditioningOverride(cond)
+            # Temporarily replace embed
+            self.unet.embed = ConditioningOverride(cond)
 
             try:
                 # Forward with dummy odor_ids (will be ignored)
@@ -601,7 +601,7 @@ class ConditionedTranslator(nn.Module):
                 y_pred = self.unet(x, dummy_odor)
             finally:
                 # Restore original
-                self.unet.odor_embed = original_odor_embed
+                self.unet.embed = original_embed
         else:
             # Fallback: just forward without conditioning
             y_pred = self.unet(x, torch.zeros(x.size(0), dtype=torch.long, device=x.device))
