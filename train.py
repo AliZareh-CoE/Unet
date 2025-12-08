@@ -99,9 +99,9 @@ LOGS_DIR = OUTPUT_DIR / "logs"
 # Default hyperparameters
 DEFAULT_CONFIG = {
     # Training
-    "batch_size": 32,
+    "batch_size": 8,
     "num_epochs": 80,
-    "learning_rate": 0.002,
+    "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
     "beta2": 0.920298282605139,
     "early_stop_patience": 15,  # Increased for better PSD convergence
