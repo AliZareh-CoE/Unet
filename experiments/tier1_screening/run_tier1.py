@@ -27,8 +27,7 @@ Features:
 Losses tested:
 - l1: Simple L1 baseline
 - huber: Robust Huber loss
-- l1_wavelet: L1 + Wavelet combo
-- spectral: Multi-scale spectral loss
+- wavelet: Standalone wavelet loss
 
 Usage:
     python experiments/tier1_screening/run_tier1.py
@@ -684,7 +683,7 @@ def main():
     print("=" * 60)
     print("TIER 1: Architecture Screening (Single Run)")
     print("=" * 60)
-    print("Losses: l1, huber, l1_wavelet, spectral")
+    print("Losses: l1, huber, wavelet")
     print("Metrics: R², MAE, Pearson, PSD error, per-band R²")
     print()
 
