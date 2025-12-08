@@ -44,6 +44,14 @@ from torch.utils.data import DataLoader, TensorDataset
 from scipy import signal as scipy_signal
 from tqdm import tqdm
 
+# Import wavelet loss from models.py (same as train.py)
+try:
+    from models import build_wavelet_loss
+    HAS_WAVELET_LOSS = True
+except ImportError:
+    HAS_WAVELET_LOSS = False
+    build_wavelet_loss = None
+
 from experiments.common.cross_validation import create_data_splits
 from experiments.common.config_registry import (
     get_registry,
@@ -736,11 +744,27 @@ def train_with_conditioning(
     lr: float = 1e-3,
     aux_loss_weight: float = 0.1,
     show_progress: bool = True,
+    weight_l1: float = 1.0,
+    weight_wavelet: float = 10.0,  # Same as train.py DEFAULT_CONFIG
 ) -> Dict[str, float]:
-    """Train model and return validation metrics."""
+    """Train model and return validation metrics.
+
+    Uses combined L1 + Wavelet loss (same as train.py):
+        loss = weight_l1 * L1_loss + weight_wavelet * wavelet_loss
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
-    criterion = nn.HuberLoss()
+
+    # Build wavelet loss (same config as train.py)
+    wavelet_loss = None
+    if HAS_WAVELET_LOSS:
+        wavelet_loss = build_wavelet_loss(
+            wavelet="morlet",
+            omega0=3.0,
+            use_complex_morlet=False,
+        )
+        if hasattr(wavelet_loss, 'to'):
+            wavelet_loss = wavelet_loss.to(device)
 
     model.train()
     epoch_iter = tqdm(range(n_epochs), desc="Training", leave=False, disable=not show_progress)
@@ -766,10 +790,15 @@ def train_with_conditioning(
             # Forward
             y_pred, aux_losses = model(X, y, odor_ids)
 
-            # Main loss
-            loss = criterion(y_pred, y)
+            # Main loss: L1 + Wavelet (same as train.py)
+            l1_loss = F.l1_loss(y_pred, y)
+            loss = weight_l1 * l1_loss
 
-            # Add auxiliary losses
+            if wavelet_loss is not None:
+                wav_loss = wavelet_loss(y_pred, y)
+                loss = loss + weight_wavelet * wav_loss
+
+            # Add auxiliary losses from conditioning encoders
             for aux_name, aux_loss in aux_losses.items():
                 if aux_loss is not None and not torch.isnan(aux_loss):
                     loss = loss + aux_loss_weight * aux_loss
