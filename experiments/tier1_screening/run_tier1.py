@@ -235,7 +235,9 @@ class OdorDataset(Dataset):
 
 def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: int = 0):
     # Handle UNet (CondUNet1D) - same config as train.py
-    if arch_name == "unet" and HAS_UNET:
+    if arch_name == "unet":
+        if not HAS_UNET:
+            raise ImportError("CondUNet1D not available - models.py import failed")
         return CondUNet1D(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -255,16 +257,6 @@ def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: i
         )
 
     # Other architectures from study1
-    # Handle U-Net specially - use CondUNet1D from models.py
-    if arch_name == "unet":
-        from models import CondUNet1D
-        return CondUNet1D(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            base_channels=64,
-            n_odors=n_odors if n_odors > 0 else 7,
-        )
-
     VARIANT_MAP = {
         "linear": "simple",
         "cnn": "basic",
