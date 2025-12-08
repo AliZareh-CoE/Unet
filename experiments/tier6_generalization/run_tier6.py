@@ -192,7 +192,8 @@ def load_pretrained_model(
     Returns:
         Model instance
     """
-    from models import create_architecture, UNet1DConditioned
+    from models import CondUNet1D
+    from experiments.study1_architecture.architectures import create_architecture
 
     VARIANT_MAP = {
         "linear": "simple", "cnn": "basic", "wavenet": "standard",
@@ -201,10 +202,11 @@ def load_pretrained_model(
     }
 
     if architecture == "unet":
-        model = UNet1DConditioned(
+        model = CondUNet1D(
             in_channels=in_channels,
             out_channels=out_channels,
             base_channels=64,
+            n_odors=7,
         )
     else:
         model = create_architecture(

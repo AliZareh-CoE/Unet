@@ -342,16 +342,14 @@ def create_model_from_config(
     arch = config.get("architecture", "cnn")
 
     if arch == "unet":
-        try:
-            from models import UNet1DConditioned
-            model = UNet1DConditioned(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                base_channels=64,
-            )
-            return model.to(device)
-        except (ImportError, TypeError):
-            pass
+        from models import CondUNet1D
+        model = CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=64,
+            n_odors=7,
+        )
+        return model.to(device)
 
     # Variant mapping for architectures
     VARIANT_MAP = {
