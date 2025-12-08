@@ -55,7 +55,7 @@ TRAIN_EPOCHS = 50
 TRAIN_BATCH_SIZE = 8  # For single 6GB GPU
 TRAIN_LR = 1e-3
 
-ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba"]
+ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer"]  # mamba removed (slow sequential scan)
 
 # Loss functions (comparable with train.py)
 LOSS_FUNCTIONS = {
