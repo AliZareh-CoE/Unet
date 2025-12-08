@@ -67,7 +67,7 @@ TRAIN_BATCH_SIZE = 32  # Increased for better gradient estimation
 TRAIN_LR = 1e-3
 
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
-ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer", "mamba", "unet"]
+ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer"]  # mamba removed (slow sequential scan)
 
 # Loss functions (comparable with train.py)
 LOSS_FUNCTIONS = {
@@ -153,6 +153,7 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
 from scipy import signal as scipy_signal
+from tqdm import tqdm
 
 from experiments.study1_architecture.architectures import create_architecture
 from experiments.study3_loss.losses import create_loss as create_study3_loss
@@ -414,8 +415,11 @@ def main():
 
     start_time = time.time()
 
-    # Training
-    for epoch in range(args.epochs):
+    # Training with tqdm progress bars
+    epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+{args.loss}", unit="epoch",
+                      dynamic_ncols=True, leave=True)
+
+    for epoch in epoch_pbar:
         model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -426,7 +430,11 @@ def main():
             for pg in optimizer.param_groups:
                 pg['lr'] = args.lr * warmup_factor
 
-        for x, y_batch, odor_ids in train_loader:
+        # Batch progress bar with live loss
+        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:02d}", unit="batch",
+                          leave=False, dynamic_ncols=True)
+
+        for x, y_batch, odor_ids in batch_pbar:
             x = x.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
             odor_ids = odor_ids.to(device, non_blocking=True)
@@ -442,7 +450,6 @@ def main():
                 try:
                     loss = criterion(y_pred, y_batch)
                 except Exception as e:
-                    print(f"  [Warning] Loss {args.loss} failed: {e}, using L1")
                     loss = F.l1_loss(y_pred, y_batch)
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
@@ -454,22 +461,27 @@ def main():
                 epoch_loss += loss.item()
                 n_batches += 1
 
+                # Update batch progress bar with live loss
+                batch_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
         if epoch >= warmup_epochs:
             scheduler.step()
 
-        if (epoch + 1) % 10 == 0:
-            avg_loss = epoch_loss / max(n_batches, 1)
-            print(f"  Epoch {epoch+1}/{args.epochs}: loss={avg_loss:.6f}")
+        # Update epoch progress bar with average loss
+        avg_loss = epoch_loss / max(n_batches, 1)
+        lr = optimizer.param_groups[0]['lr']
+        epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
 
     training_time = time.time() - start_time
 
-    # Evaluation
+    # Evaluation with progress bar
     model.eval()
     all_preds = []
     all_targets = []
 
+    eval_pbar = tqdm(val_loader, desc="Evaluating", unit="batch", leave=False, dynamic_ncols=True)
     with torch.no_grad():
-        for x, y_batch, odor_ids in val_loader:
+        for x, y_batch, odor_ids in eval_pbar:
             x = x.to(device, non_blocking=True)
             y_batch = y_batch.to(device, non_blocking=True)
             odor_ids = odor_ids.to(device, non_blocking=True)
@@ -569,8 +581,8 @@ def run_single_experiment(
     ]
 
     try:
-        subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, timeout=7200,
-                      capture_output=True, text=True)
+        # Don't capture output so tqdm progress bars are visible
+        subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, timeout=7200)
 
         if result_file.exists():
             with open(result_file) as f:
