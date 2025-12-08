@@ -89,8 +89,6 @@ FREQ_BANDS = {
 class ConditioningRunResult:
     """Result from a single conditioning run."""
     conditioning: str
-    seed: int
-    fold: int
     r2: float
     mae: float
     pearson: float
@@ -101,6 +99,8 @@ class ConditioningRunResult:
     r2_beta: Optional[float] = None
     r2_gamma: Optional[float] = None
     training_time: float = 0.0
+    success: bool = True
+    error: Optional[str] = None
 
 
 # =============================================================================
@@ -827,13 +827,11 @@ def run_tier1_5(
     architecture: Optional[str] = None,
     conditionings: Optional[List[str]] = None,
     odor_labels: Optional[torch.Tensor] = None,
-    n_seeds: int = 3,
-    n_folds: int = 3,
     n_epochs: int = 50,
     batch_size: int = 32,
     register: bool = True,
 ) -> Tier1_5Result:
-    """Run Tier 1.5: Auto-Conditioning Signal Sources.
+    """Run Tier 1.5: Auto-Conditioning Signal Sources (Single Run).
 
     Args:
         X: Input data [N, C_in, T]
@@ -842,8 +840,6 @@ def run_tier1_5(
         architecture: Not used (kept for compatibility)
         conditionings: List of conditioning sources to test
         odor_labels: Odor ID labels [N] for odor_onehot conditioning
-        n_seeds: Number of random seeds
-        n_folds: Number of CV folds
         n_epochs: Training epochs
         batch_size: Batch size
         register: Whether to register results
@@ -853,9 +849,9 @@ def run_tier1_5(
     """
     conditionings = conditionings or CONDITIONING_SOURCES
 
-    print(f"\nTesting {len(conditionings)} conditioning SOURCES")
+    print(f"\nTesting {len(conditionings)} conditioning SOURCES (single run each)")
     print(f"Sources: {conditionings}")
-    print(f"Seeds: {n_seeds}, Folds: {n_folds}, Epochs: {n_epochs}")
+    print(f"Epochs: {n_epochs}")
 
     N = X.shape[0]
     in_channels = X.shape[1]
@@ -868,127 +864,104 @@ def run_tier1_5(
     else:
         n_odors = int(odor_labels.max().item()) + 1
 
-    # Create CV splits
-    splits = create_data_splits(
-        n_samples=N,
-        n_folds=n_folds,
-        holdout_fraction=0.0,
-        seed=42,
-    )
+    # Simple 80/20 train/val split (like tier1)
+    np.random.seed(42)
+    indices = np.random.permutation(N)
+    n_train = int(N * 0.8)
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:]
 
     all_results: List[ConditioningRunResult] = []
 
-    # Calculate total runs for progress bar
-    total_runs = len(conditionings) * n_seeds * n_folds
-    run_pbar = tqdm(total=total_runs, desc="Overall Progress", unit="run")
+    # Progress bar for conditioning sources
+    cond_pbar = tqdm(conditionings, desc="Conditioning Sources", unit="source")
 
-    for cond_source in conditionings:
-        print(f"\n  Conditioning Source: {cond_source}")
-        cond_r2s = []
+    for cond_source in cond_pbar:
+        cond_pbar.set_postfix(source=cond_source)
 
-        for seed in range(n_seeds):
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+        # Prepare data
+        X_train = X[train_idx]
+        y_train = y[train_idx]
+        odor_train = odor_labels[train_idx]
 
-            for split in splits.cv_splits:
-                run_pbar.set_postfix(cond=cond_source, seed=seed, fold=split.fold_idx)
+        X_val = X[val_idx]
+        y_val = y[val_idx]
+        odor_val = odor_labels[val_idx]
 
-                # Prepare data
-                X_train = X[split.train_indices]
-                y_train = y[split.train_indices]
-                odor_train = odor_labels[split.train_indices]
+        train_dataset = TensorDataset(X_train, y_train, odor_train)
+        val_dataset = TensorDataset(X_val, y_val, odor_val)
 
-                X_val = X[split.val_indices]
-                y_val = y[split.val_indices]
-                odor_val = odor_labels[split.val_indices]
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-                train_dataset = TensorDataset(X_train, y_train, odor_train)
-                val_dataset = TensorDataset(X_val, y_val, odor_val)
+        # Create model
+        model = None
+        try:
+            model = ConditionedTranslator(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                cond_source=cond_source,
+                embed_dim=64,
+                n_odors=n_odors,
+            ).to(device)
 
-                train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-                val_loader = DataLoader(val_dataset, batch_size=batch_size)
+            start_time = time.time()
+            metrics = train_with_conditioning(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                n_epochs=n_epochs,
+                device=device,
+                show_progress=True,
+            )
+            elapsed = time.time() - start_time
 
-                # Create model
-                model = None
-                try:
-                    model = ConditionedTranslator(
-                        in_channels=in_channels,
-                        out_channels=out_channels,
-                        cond_source=cond_source,
-                        embed_dim=64,
-                        n_odors=n_odors,
-                    ).to(device)
-
-                    start_time = time.time()
-                    metrics = train_with_conditioning(
-                        model=model,
-                        train_loader=train_loader,
-                        val_loader=val_loader,
-                        n_epochs=n_epochs,
-                        device=device,
-                        show_progress=False,  # Disable inner progress bar
-                    )
-                    elapsed = time.time() - start_time
-
-                    all_results.append(ConditioningRunResult(
-                        conditioning=cond_source,
-                        seed=seed,
-                        fold=split.fold_idx,
-                        r2=metrics["r2"],
-                        mae=metrics["mae"],
-                        pearson=metrics["pearson"],
-                        psd_error_db=metrics["psd_error_db"],
-                        r2_delta=metrics.get("r2_delta"),
-                        r2_theta=metrics.get("r2_theta"),
-                        r2_alpha=metrics.get("r2_alpha"),
-                        r2_beta=metrics.get("r2_beta"),
-                        r2_gamma=metrics.get("r2_gamma"),
-                        training_time=elapsed,
-                    ))
-                    cond_r2s.append(metrics["r2"])
-
-                except Exception as e:
-                    print(f"    [seed={seed}, fold={split.fold_idx}] Error: {e}")
-                    all_results.append(ConditioningRunResult(
-                        conditioning=cond_source,
-                        seed=seed,
-                        fold=split.fold_idx,
-                        r2=float("-inf"),
-                        mae=float("inf"),
-                        pearson=0.0,
-                        psd_error_db=float("inf"),
-                        training_time=0,
-                    ))
-
-                finally:
-                    if model is not None:
-                        del model
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    run_pbar.update(1)
-
-        if cond_r2s:
-            valid_r2s = [r for r in cond_r2s if r > float("-inf")]
-            if valid_r2s:
-                mean_r2 = np.mean(valid_r2s)
-                print(f"    Mean R²: {mean_r2:.4f}")
-
-    run_pbar.close()
-
-    # Aggregate results
-    cond_results = {}
-    for cond_source in conditionings:
-        cond_runs = [r for r in all_results if r.conditioning == cond_source]
-        valid_r2s = [r.r2 for r in cond_runs if r.r2 > float("-inf")]
-        valid_maes = [r.mae for r in cond_runs if r.mae < float("inf")]
-
-        if valid_r2s:
-            cond_results[cond_source] = ConditioningResult(
+            result = ConditioningRunResult(
                 conditioning=cond_source,
-                r2_mean=float(np.mean(valid_r2s)),
-                r2_std=float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0,
-                mae_mean=float(np.mean(valid_maes)) if valid_maes else float("inf"),
-                mae_std=float(np.std(valid_maes, ddof=1)) if len(valid_maes) > 1 else 0.0,
+                r2=metrics["r2"],
+                mae=metrics["mae"],
+                pearson=metrics["pearson"],
+                psd_error_db=metrics["psd_error_db"],
+                r2_delta=metrics.get("r2_delta"),
+                r2_theta=metrics.get("r2_theta"),
+                r2_alpha=metrics.get("r2_alpha"),
+                r2_beta=metrics.get("r2_beta"),
+                r2_gamma=metrics.get("r2_gamma"),
+                training_time=elapsed,
+                success=True,
+            )
+            all_results.append(result)
+            print(f"  {cond_source}: R²={metrics['r2']:.4f}, Pearson={metrics['pearson']:.4f}")
+
+        except Exception as e:
+            print(f"  {cond_source}: FAILED - {e}")
+            all_results.append(ConditioningRunResult(
+                conditioning=cond_source,
+                r2=float("-inf"),
+                mae=float("inf"),
+                pearson=0.0,
+                psd_error_db=float("inf"),
+                training_time=0,
+                success=False,
+                error=str(e),
+            ))
+
+        finally:
+            if model is not None:
+                del model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Build results dict (no aggregation needed for single run)
+    cond_results = {}
+    for result in all_results:
+        if result.success:
+            cond_results[result.conditioning] = ConditioningResult(
+                conditioning=result.conditioning,
+                r2_mean=result.r2,
+                r2_std=0.0,  # Single run, no std
+                mae_mean=result.mae,
+                mae_std=0.0,
             )
 
     # Find best
@@ -1037,10 +1010,8 @@ def run_tier1_5(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Tier 1.5: Auto-Conditioning Signal Sources")
+    parser = argparse.ArgumentParser(description="Tier 1.5: Auto-Conditioning Signal Sources (Single Run)")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--seeds", type=int, default=3)
-    parser.add_argument("--folds", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--device", type=str, default="cuda")
 
@@ -1049,7 +1020,7 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
-    print("TIER 1.5: Auto-Conditioning Signal Sources")
+    print("TIER 1.5: Auto-Conditioning Signal Sources (Single Run)")
     print("=" * 60)
     print()
     print("Testing conditioning SOURCES (what to condition on):")
@@ -1068,8 +1039,6 @@ def main():
         odor_labels = torch.randint(0, 5, (N,))
         conditionings = FAST_SOURCES
         n_epochs = 5
-        n_seeds = 2
-        n_folds = 2
         print("[DRY-RUN] Using synthetic data\n")
     else:
         try:
@@ -1092,8 +1061,6 @@ def main():
 
             conditionings = CONDITIONING_SOURCES
             n_epochs = args.epochs
-            n_seeds = args.seeds
-            n_folds = args.folds
             print(f"Loaded real data: {X.shape}\n")
         except Exception as e:
             print(f"Could not load real data ({e}), using synthetic\n")
@@ -1103,8 +1070,6 @@ def main():
             odor_labels = torch.randint(0, 10, (N,))
             conditionings = CONDITIONING_SOURCES
             n_epochs = args.epochs
-            n_seeds = args.seeds
-            n_folds = args.folds
 
     run_tier1_5(
         X=X,
@@ -1112,8 +1077,6 @@ def main():
         device=device,
         conditionings=conditionings,
         odor_labels=odor_labels,
-        n_seeds=n_seeds,
-        n_folds=n_folds,
         n_epochs=n_epochs,
     )
 
