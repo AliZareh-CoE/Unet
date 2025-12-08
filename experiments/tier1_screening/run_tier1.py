@@ -62,8 +62,8 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier1_screening"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_EPOCHS = 50
-TRAIN_BATCH_SIZE = 32  # Increased for better gradient estimation
-TRAIN_LR = 1e-3
+TRAIN_BATCH_SIZE = 8  # Same as train.py
+TRAIN_LR = 0.0002  # Same as train.py
 
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
 ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
@@ -352,7 +352,7 @@ def main():
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=0.0002)
     parser.add_argument("--n-odors", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -418,6 +418,10 @@ def main():
     start_time = time.time()
 
     # Training with tqdm progress bars
+    # Track best validation loss for early stopping / best model
+    best_val_loss = float('inf')
+    best_model_state = None
+
     epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+{args.loss}", unit="epoch",
                       dynamic_ncols=True, leave=True)
 
@@ -469,14 +473,48 @@ def main():
         if epoch >= warmup_epochs:
             scheduler.step()
 
+        # Validation after each epoch to track best model
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for x, y_batch, odor_ids in val_loader:
+                x = x.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+                odor_ids = odor_ids.to(device, non_blocking=True)
+                with autocast('cuda'):
+                    try:
+                        y_pred = model(x, odor_ids)
+                    except TypeError:
+                        y_pred = model(x)
+                    try:
+                        loss = criterion(y_pred, y_batch)
+                    except Exception:
+                        loss = F.l1_loss(y_pred, y_batch)
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    val_loss += loss.item()
+                    val_batches += 1
+
+        avg_val_loss = val_loss / max(val_batches, 1)
+
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
         # Update epoch progress bar with average loss
         avg_loss = epoch_loss / max(n_batches, 1)
         lr = optimizer.param_groups[0]['lr']
-        epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr:.2e}")
+        epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}", val=f"{avg_val_loss:.4f}", lr=f"{lr:.2e}")
 
     training_time = time.time() - start_time
 
-    # Evaluation with progress bar
+    # Load best model for final evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"  Loaded best model (val_loss={best_val_loss:.4f})")
+
+    # Final evaluation with best model
     model.eval()
     all_preds = []
     all_targets = []
@@ -510,6 +548,7 @@ def main():
         "loss": args.loss,
         "seed": args.seed,
         "training_time": training_time,
+        "best_val_loss": best_val_loss,
         "success": True,
         **metrics,
     }
@@ -532,7 +571,7 @@ if __name__ == "__main__":
         parser.add_argument("--data-dir", required=True)
         parser.add_argument("--epochs", type=int, default=50)
         parser.add_argument("--batch-size", type=int, default=8)
-        parser.add_argument("--lr", type=float, default=1e-3)
+        parser.add_argument("--lr", type=float, default=0.0002)
         parser.add_argument("--n-odors", type=int, default=0)
         parser.add_argument("--seed", type=int, default=42)
         args, _ = parser.parse_known_args()

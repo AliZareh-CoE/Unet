@@ -741,7 +741,7 @@ def train_with_conditioning(
     val_loader: DataLoader,
     n_epochs: int,
     device: torch.device,
-    lr: float = 1e-3,
+    lr: float = 0.0002,  # Same as train.py
     aux_loss_weight: float = 0.1,
     show_progress: bool = True,
     weight_l1: float = 1.0,
@@ -751,25 +751,33 @@ def train_with_conditioning(
 
     Uses combined L1 + Wavelet loss (same as train.py):
         loss = weight_l1 * L1_loss + weight_wavelet * wavelet_loss
+
+    Tracks best validation loss and returns metrics from best epoch.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
 
     # Build wavelet loss (same config as train.py)
-    wavelet_loss = None
+    wavelet_loss_fn = None
     if HAS_WAVELET_LOSS:
-        wavelet_loss = build_wavelet_loss(
+        wavelet_loss_fn = build_wavelet_loss(
             wavelet="morlet",
             omega0=3.0,
             use_complex_morlet=False,
         )
-        if hasattr(wavelet_loss, 'to'):
-            wavelet_loss = wavelet_loss.to(device)
+        if hasattr(wavelet_loss_fn, 'to'):
+            wavelet_loss_fn = wavelet_loss_fn.to(device)
 
-    model.train()
+    # Track best validation loss for best model selection
+    best_val_loss = float('inf')
+    best_model_state = None
+    best_epoch = -1
+
     epoch_iter = tqdm(range(n_epochs), desc="Training", leave=False, disable=not show_progress)
 
     for epoch in epoch_iter:
+        # Training phase
+        model.train()
         epoch_loss = 0.0
         n_batches = 0
 
@@ -794,8 +802,8 @@ def train_with_conditioning(
             l1_loss = F.l1_loss(y_pred, y)
             loss = weight_l1 * l1_loss
 
-            if wavelet_loss is not None:
-                wav_loss = wavelet_loss(y_pred, y)
+            if wavelet_loss_fn is not None:
+                wav_loss = wavelet_loss_fn(y_pred, y)
                 loss = loss + weight_wavelet * wav_loss
 
             # Add auxiliary losses from conditioning encoders
@@ -812,11 +820,57 @@ def train_with_conditioning(
 
         scheduler.step()
 
+        # Validation phase - track best model
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 4:
+                    X, y, cond, odor_ids = batch
+                    X, y, odor_ids = X.to(device), y.to(device), odor_ids.to(device)
+                elif len(batch) == 3:
+                    X, y, odor_ids = batch
+                    X, y, odor_ids = X.to(device), y.to(device), odor_ids.to(device)
+                else:
+                    X, y = batch
+                    X, y = X.to(device), y.to(device)
+                    odor_ids = None
+
+                y_pred, _ = model(X, y, odor_ids)
+
+                # Compute validation loss (L1 + Wavelet)
+                l1_loss = F.l1_loss(y_pred, y)
+                batch_loss = weight_l1 * l1_loss
+
+                if wavelet_loss_fn is not None:
+                    wav_loss = wavelet_loss_fn(y_pred, y)
+                    batch_loss = batch_loss + weight_wavelet * wav_loss
+
+                if not (torch.isnan(batch_loss) or torch.isinf(batch_loss)):
+                    val_loss += batch_loss.item()
+                    val_batches += 1
+
+        avg_val_loss = val_loss / max(val_batches, 1)
+
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_epoch = epoch
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
         # Update progress bar
         avg_loss = epoch_loss / max(n_batches, 1)
-        epoch_iter.set_postfix(loss=f"{avg_loss:.4f}")
+        epoch_iter.set_postfix(loss=f"{avg_loss:.4f}", val_loss=f"{avg_val_loss:.4f}", best=best_epoch)
 
-    # Validation
+    # Load best model for final evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        if show_progress:
+            print(f"    Loaded best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
+
+    # Final Validation with best model
     model.eval()
     all_preds = []
     all_targets = []
@@ -857,7 +911,7 @@ def run_tier1_5(
     conditionings: Optional[List[str]] = None,
     odor_labels: Optional[torch.Tensor] = None,
     n_epochs: int = 50,
-    batch_size: int = 32,
+    batch_size: int = 8,  # Same as train.py
     register: bool = True,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Auto-Conditioning Signal Sources (Single Run).
