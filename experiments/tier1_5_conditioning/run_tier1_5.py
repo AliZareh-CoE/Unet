@@ -41,6 +41,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from scipy import signal as scipy_signal
+from tqdm import tqdm
 
 from experiments.common.cross_validation import create_data_splits
 from experiments.common.config_registry import (
@@ -91,7 +93,14 @@ class ConditioningRunResult:
     fold: int
     r2: float
     mae: float
-    training_time: float
+    pearson: float
+    psd_error_db: float
+    r2_delta: Optional[float] = None
+    r2_theta: Optional[float] = None
+    r2_alpha: Optional[float] = None
+    r2_beta: Optional[float] = None
+    r2_gamma: Optional[float] = None
+    training_time: float = 0.0
 
 
 # =============================================================================
@@ -635,6 +644,89 @@ class ConditionedTranslator(nn.Module):
 # Training
 # =============================================================================
 
+def compute_full_metrics(y_pred: np.ndarray, y_true: np.ndarray, sample_rate: float = 1000.0) -> Dict[str, float]:
+    """Compute full metrics matching tier1 for comparability.
+
+    Returns:
+        Dict with: r2, mae, pearson, psd_error_db, r2_delta, r2_theta, r2_alpha, r2_beta, r2_gamma
+    """
+    if y_pred.ndim == 2:
+        y_pred = y_pred[:, np.newaxis, :]
+        y_true = y_true[:, np.newaxis, :]
+
+    N, C, T = y_pred.shape
+
+    # R² - per-channel then averaged
+    pred_flat = y_pred.transpose(1, 0, 2).reshape(C, -1)
+    true_flat = y_true.transpose(1, 0, 2).reshape(C, -1)
+
+    ss_res = np.sum((true_flat - pred_flat) ** 2, axis=1)
+    true_means = np.mean(true_flat, axis=1, keepdims=True)
+    ss_tot = np.sum((true_flat - true_means) ** 2, axis=1)
+
+    r2_per_channel = 1 - ss_res / (ss_tot + 1e-8)
+    r2 = float(np.mean(r2_per_channel))
+
+    # MAE
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+
+    # Pearson correlation
+    pred_centered = pred_flat - np.mean(pred_flat, axis=1, keepdims=True)
+    true_centered = true_flat - np.mean(true_flat, axis=1, keepdims=True)
+    numerator = np.sum(pred_centered * true_centered, axis=1)
+    denominator = np.sqrt(np.sum(pred_centered ** 2, axis=1) * np.sum(true_centered ** 2, axis=1))
+    correlations = numerator / (denominator + 1e-8)
+    valid_mask = np.isfinite(correlations)
+    pearson = float(np.mean(correlations[valid_mask])) if valid_mask.any() else 0.0
+
+    # PSD Error in dB
+    try:
+        _, psd_pred = scipy_signal.welch(y_pred, fs=sample_rate, axis=-1, nperseg=min(256, T))
+        _, psd_true = scipy_signal.welch(y_true, fs=sample_rate, axis=-1, nperseg=min(256, T))
+        log_pred = np.log10(psd_pred + 1e-10)
+        log_true = np.log10(psd_true + 1e-10)
+        psd_error_db = float(10 * np.mean(np.abs(log_pred - log_true)))
+    except Exception:
+        psd_error_db = np.nan
+
+    # Per-frequency-band R²
+    band_r2 = {}
+    try:
+        nyq = sample_rate / 2
+        for band_name, (f_low, f_high) in FREQ_BANDS.items():
+            if f_low >= nyq:
+                continue
+            low = f_low / nyq
+            high = min(f_high / nyq, 0.99)
+            if low < high:
+                try:
+                    b, a = scipy_signal.butter(4, [low, high], btype='band')
+                    pred_filt = scipy_signal.filtfilt(b, a, y_pred, axis=-1)
+                    true_filt = scipy_signal.filtfilt(b, a, y_true, axis=-1)
+
+                    pred_band_flat = pred_filt.transpose(1, 0, 2).reshape(C, -1)
+                    true_band_flat = true_filt.transpose(1, 0, 2).reshape(C, -1)
+
+                    ss_res_band = np.sum((true_band_flat - pred_band_flat) ** 2, axis=1)
+                    true_band_means = np.mean(true_band_flat, axis=1, keepdims=True)
+                    ss_tot_band = np.sum((true_band_flat - true_band_means) ** 2, axis=1)
+
+                    r2_band = 1 - ss_res_band / (ss_tot_band + 1e-8)
+                    band_r2[band_name] = float(np.mean(r2_band))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "r2": r2,
+        "mae": mae,
+        "pearson": pearson,
+        "psd_error_db": psd_error_db,
+        **{f"r2_{k}": v for k, v in band_r2.items()},
+    }
+
+
 def train_with_conditioning(
     model: ConditionedTranslator,
     train_loader: DataLoader,
@@ -643,14 +735,20 @@ def train_with_conditioning(
     device: torch.device,
     lr: float = 1e-3,
     aux_loss_weight: float = 0.1,
-) -> Tuple[float, float]:
+    show_progress: bool = True,
+) -> Dict[str, float]:
     """Train model and return validation metrics."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
     criterion = nn.HuberLoss()
 
     model.train()
-    for epoch in range(n_epochs):
+    epoch_iter = tqdm(range(n_epochs), desc="Training", leave=False, disable=not show_progress)
+
+    for epoch in epoch_iter:
+        epoch_loss = 0.0
+        n_batches = 0
+
         for batch in train_loader:
             if len(batch) == 4:
                 X, y, cond, odor_ids = batch
@@ -680,8 +778,14 @@ def train_with_conditioning(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
 
         scheduler.step()
+
+        # Update progress bar
+        avg_loss = epoch_loss / max(n_batches, 1)
+        epoch_iter.set_postfix(loss=f"{avg_loss:.4f}")
 
     # Validation
     model.eval()
@@ -708,15 +812,8 @@ def train_with_conditioning(
     preds = torch.cat(all_preds, dim=0).numpy()
     targets = torch.cat(all_targets, dim=0).numpy()
 
-    # R²
-    ss_res = np.sum((targets - preds) ** 2)
-    ss_tot = np.sum((targets - np.mean(targets)) ** 2)
-    r2 = 1 - ss_res / (ss_tot + 1e-8)
-
-    # MAE
-    mae = np.mean(np.abs(targets - preds))
-
-    return float(r2), float(mae)
+    # Compute full metrics (matching tier1)
+    return compute_full_metrics(preds, targets)
 
 
 # =============================================================================
@@ -781,6 +878,10 @@ def run_tier1_5(
 
     all_results: List[ConditioningRunResult] = []
 
+    # Calculate total runs for progress bar
+    total_runs = len(conditionings) * n_seeds * n_folds
+    run_pbar = tqdm(total=total_runs, desc="Overall Progress", unit="run")
+
     for cond_source in conditionings:
         print(f"\n  Conditioning Source: {cond_source}")
         cond_r2s = []
@@ -790,6 +891,8 @@ def run_tier1_5(
             np.random.seed(seed)
 
             for split in splits.cv_splits:
+                run_pbar.set_postfix(cond=cond_source, seed=seed, fold=split.fold_idx)
+
                 # Prepare data
                 X_train = X[split.train_indices]
                 y_train = y[split.train_indices]
@@ -817,12 +920,13 @@ def run_tier1_5(
                     ).to(device)
 
                     start_time = time.time()
-                    r2, mae = train_with_conditioning(
+                    metrics = train_with_conditioning(
                         model=model,
                         train_loader=train_loader,
                         val_loader=val_loader,
                         n_epochs=n_epochs,
                         device=device,
+                        show_progress=False,  # Disable inner progress bar
                     )
                     elapsed = time.time() - start_time
 
@@ -830,11 +934,18 @@ def run_tier1_5(
                         conditioning=cond_source,
                         seed=seed,
                         fold=split.fold_idx,
-                        r2=r2,
-                        mae=mae,
+                        r2=metrics["r2"],
+                        mae=metrics["mae"],
+                        pearson=metrics["pearson"],
+                        psd_error_db=metrics["psd_error_db"],
+                        r2_delta=metrics.get("r2_delta"),
+                        r2_theta=metrics.get("r2_theta"),
+                        r2_alpha=metrics.get("r2_alpha"),
+                        r2_beta=metrics.get("r2_beta"),
+                        r2_gamma=metrics.get("r2_gamma"),
                         training_time=elapsed,
                     ))
-                    cond_r2s.append(r2)
+                    cond_r2s.append(metrics["r2"])
 
                 except Exception as e:
                     print(f"    [seed={seed}, fold={split.fold_idx}] Error: {e}")
@@ -844,6 +955,8 @@ def run_tier1_5(
                         fold=split.fold_idx,
                         r2=float("-inf"),
                         mae=float("inf"),
+                        pearson=0.0,
+                        psd_error_db=float("inf"),
                         training_time=0,
                     ))
 
@@ -852,12 +965,15 @@ def run_tier1_5(
                         del model
                     gc.collect()
                     torch.cuda.empty_cache()
+                    run_pbar.update(1)
 
         if cond_r2s:
             valid_r2s = [r for r in cond_r2s if r > float("-inf")]
             if valid_r2s:
                 mean_r2 = np.mean(valid_r2s)
                 print(f"    Mean R²: {mean_r2:.4f}")
+
+    run_pbar.close()
 
     # Aggregate results
     cond_results = {}
