@@ -1602,6 +1602,266 @@ class AdaptiveSpectralShift(nn.Module):
 
 
 # =============================================================================
+# Spectro-Temporal Auto-Conditioning Encoder
+# =============================================================================
+
+class SpectroTemporalEncoder(nn.Module):
+    """Lightweight encoder for unsupervised 'reaction type' identification.
+
+    This encoder captures the input signal's spectral-temporal fingerprint
+    to enable dynamic, signal-adaptive conditioning. Instead of relying
+    solely on static odor labels, the model can identify specific 'reaction
+    types' (e.g., beta events vs gamma bursts) directly from input dynamics.
+
+    Architecture:
+        Two parallel branches:
+        1. Spectral Branch: FFT/PSD-based frequency content (shift-invariant)
+        2. Temporal Branch: Multi-scale dilated convolutions for transient shapes
+
+        The outputs are concatenated to produce a latent 'style' embedding
+        that can be fused with the odor embedding for FiLM conditioning.
+
+    Args:
+        in_channels: Number of input channels (default: 32)
+        emb_dim: Output embedding dimension (default: 128)
+        n_freq_bands: Number of frequency bands in spectral branch (default: 10)
+        temporal_hidden: Hidden dimension for temporal branch (default: 64)
+        temporal_dilations: Dilation rates for multi-scale temporal conv
+        temporal_kernel: Kernel size for temporal convolutions (default: 7)
+        sample_rate: Sampling rate in Hz (default: 1000)
+        max_freq: Maximum frequency to consider (default: 100 Hz)
+        dropout: Dropout probability (default: 0.1)
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 32,
+        emb_dim: int = 128,
+        n_freq_bands: int = 10,
+        temporal_hidden: int = 64,
+        temporal_dilations: Tuple[int, ...] = (1, 4, 16),
+        temporal_kernel: int = 7,
+        sample_rate: float = SAMPLING_RATE_HZ,
+        max_freq: float = MAX_FREQ_HZ,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.emb_dim = emb_dim
+        self.n_freq_bands = n_freq_bands
+        self.sample_rate = sample_rate
+        self.max_freq = max_freq
+        self.temporal_dilations = temporal_dilations
+
+        # =====================================================================
+        # Spectral Branch: FFT/PSD-based frequency content analysis
+        # =====================================================================
+        # Input: log-power in each frequency band → [B, in_channels, n_freq_bands]
+        # Output: spectral embedding → [B, emb_dim // 2]
+        spectral_input_dim = in_channels * n_freq_bands
+        self.spectral_encoder = nn.Sequential(
+            nn.Linear(spectral_input_dim, emb_dim),
+            nn.LayerNorm(emb_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(emb_dim, emb_dim // 2),
+            nn.LayerNorm(emb_dim // 2),
+        )
+
+        # =====================================================================
+        # Temporal Branch: Multi-scale dilated convolutions for transients
+        # =====================================================================
+        # Each dilation captures different temporal scales:
+        # - d=1:  fine-grained transients (gamma events ~10-30ms)
+        # - d=4:  medium-scale patterns (beta bursts ~30-80ms)
+        # - d=16: slow modulations (theta waves ~100-250ms)
+        n_scales = len(temporal_dilations)
+
+        # Parallel dilated convolution branches
+        self.temporal_convs = nn.ModuleList([
+            nn.Conv1d(
+                in_channels, temporal_hidden,
+                kernel_size=temporal_kernel,
+                dilation=d,
+                padding=(temporal_kernel - 1) * d // 2,
+            )
+            for d in temporal_dilations
+        ])
+
+        # Combine multi-scale features
+        self.temporal_fusion = nn.Sequential(
+            nn.Conv1d(temporal_hidden * n_scales, temporal_hidden, kernel_size=1),
+            nn.BatchNorm1d(temporal_hidden),
+            nn.GELU(),
+        )
+
+        # Temporal pooling + projection to embedding
+        self.temporal_pool = nn.AdaptiveAvgPool1d(1)
+        self.temporal_proj = nn.Sequential(
+            nn.Linear(temporal_hidden, emb_dim // 2),
+            nn.LayerNorm(emb_dim // 2),
+        )
+
+        # =====================================================================
+        # Output projection (optional gating for fusion strength)
+        # =====================================================================
+        self.output_gate = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.Sigmoid(),
+        )
+        self.output_proj = nn.Linear(emb_dim, emb_dim)
+
+        # Cache for frequency band masks
+        self._freq_masks: Optional[torch.Tensor] = None
+        self._cached_length: int = 0
+
+    def _build_freq_masks(self, T: int, device: torch.device) -> torch.Tensor:
+        """Build frequency band masks for spectral analysis.
+
+        Returns:
+            Tensor of shape [n_freq_bands, n_fft // 2 + 1]
+        """
+        n_fft = T // 2 + 1
+        if self._freq_masks is not None and self._cached_length == n_fft:
+            return self._freq_masks.to(device)
+
+        freqs = torch.fft.rfftfreq(T, d=1.0 / self.sample_rate)
+
+        # Create log-spaced frequency bands from 1 Hz to max_freq
+        band_edges = torch.logspace(
+            math.log10(1.0), math.log10(self.max_freq),
+            self.n_freq_bands + 1,
+        )
+
+        masks = []
+        for i in range(self.n_freq_bands):
+            low = band_edges[i]
+            high = band_edges[i + 1]
+            # Soft band edges for smooth gradients
+            mask = torch.sigmoid((freqs - low) * 2) * torch.sigmoid((high - freqs) * 2)
+            # Normalize mask to sum to 1
+            mask = mask / (mask.sum() + 1e-8)
+            masks.append(mask)
+
+        self._freq_masks = torch.stack(masks, dim=0)  # [n_bands, n_fft]
+        self._cached_length = n_fft
+        return self._freq_masks.to(device)
+
+    def _spectral_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute spectral branch embedding.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            Spectral embedding [B, emb_dim // 2]
+        """
+        B, C, T = x.shape
+        device = x.device
+
+        # Get frequency band masks
+        masks = self._build_freq_masks(T, device)  # [n_bands, n_fft]
+
+        # Compute FFT and power spectral density (requires float32)
+        x_fft = torch.fft.rfft(x, dim=-1)  # [B, C, n_fft]
+        power = x_fft.abs().square()  # [B, C, n_fft]
+
+        # Extract band powers: [B, C, n_bands]
+        band_power = torch.einsum('bcf,kf->bck', power, masks)
+
+        # Log-scale for better dynamic range
+        band_power_log = torch.log(band_power + 1e-10)  # [B, C, n_bands]
+
+        # Flatten and encode - convert back to original dtype for linear layers
+        band_flat = band_power_log.reshape(B, -1)  # [B, C * n_bands]
+        return self.spectral_encoder(band_flat.to(self._param_dtype))  # [B, emb_dim // 2]
+
+    def _temporal_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute temporal branch embedding.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            Temporal embedding [B, emb_dim // 2]
+        """
+        # Multi-scale dilated convolutions
+        temporal_features = []
+        for conv in self.temporal_convs:
+            feat = F.gelu(conv(x))  # [B, temporal_hidden, T]
+            temporal_features.append(feat)
+
+        # Concatenate scales: [B, temporal_hidden * n_scales, T]
+        multi_scale = torch.cat(temporal_features, dim=1)
+
+        # Fuse multi-scale features
+        fused = self.temporal_fusion(multi_scale)  # [B, temporal_hidden, T]
+
+        # Global average pooling
+        pooled = self.temporal_pool(fused).squeeze(-1)  # [B, temporal_hidden]
+
+        # Project to embedding space
+        return self.temporal_proj(pooled)  # [B, emb_dim // 2]
+
+    @property
+    def _param_dtype(self) -> torch.dtype:
+        """Get the dtype of model parameters (for mixed precision compatibility)."""
+        return next(self.parameters()).dtype
+
+    @torch.amp.autocast('cuda', enabled=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        odor_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute spectro-temporal style embedding.
+
+        Args:
+            x: Input signal [B, C, T]
+            odor_emb: Optional odor embedding to fuse with [B, emb_dim]
+
+        Returns:
+            Style embedding [B, emb_dim], optionally fused with odor embedding
+        """
+        original_dtype = x.dtype
+        param_dtype = self._param_dtype
+
+        # FFT requires float32, but we need to match param dtype for linear layers
+        x_float = x.float()
+
+        # Spectral branch: FFT in float32, then convert for encoder
+        spectral_emb = self._spectral_forward(x_float)  # [B, emb_dim // 2]
+
+        # Temporal branch: run in param dtype for conv layers
+        x_param = x.to(param_dtype)
+        temporal_emb = self._temporal_forward(x_param)  # [B, emb_dim // 2]
+
+        # Ensure both branches are in same dtype before concatenation
+        spectral_emb = spectral_emb.to(param_dtype)
+        temporal_emb = temporal_emb.to(param_dtype)
+
+        # Concatenate branches
+        style_emb = torch.cat([spectral_emb, temporal_emb], dim=-1)  # [B, emb_dim]
+
+        # Apply gated output projection
+        gate = self.output_gate(style_emb)
+        style_emb = self.output_proj(style_emb) * gate
+
+        # Fuse with odor embedding if provided
+        if odor_emb is not None:
+            # Additive fusion with learned style embedding
+            style_emb = style_emb + odor_emb.to(param_dtype)
+
+        return style_emb.to(original_dtype)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_channels={self.in_channels}, emb_dim={self.emb_dim}, "
+            f"n_freq_bands={self.n_freq_bands}, dilations={self.temporal_dilations}"
+        )
+
+
+# =============================================================================
 # Main Model: CondUNet1D
 # =============================================================================
 

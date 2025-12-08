@@ -16,6 +16,7 @@ Conditioning Sources Tested:
     3. vqvae: Vector Quantized VAE discrete codes
     4. freq_disentangled: Frequency-band-specific latents (delta/theta/alpha/beta/gamma)
     5. cycle_consistent: Latent with cycle-consistency reconstruction constraint
+    6. spectro_temporal: SpectroTemporalEncoder - FFT + multi-scale temporal conv (auto-conditioning)
 
 This tier uses U-Net ONLY - no architecture comparison.
 """
@@ -44,13 +45,16 @@ from torch.utils.data import DataLoader, TensorDataset
 from scipy import signal as scipy_signal
 from tqdm import tqdm
 
-# Import wavelet loss from models.py (same as train.py)
+# Import wavelet loss and SpectroTemporalEncoder from models.py
 try:
-    from models import build_wavelet_loss
+    from models import build_wavelet_loss, SpectroTemporalEncoder
     HAS_WAVELET_LOSS = True
+    HAS_SPECTRO_TEMPORAL = True
 except ImportError:
     HAS_WAVELET_LOSS = False
+    HAS_SPECTRO_TEMPORAL = False
     build_wavelet_loss = None
+    SpectroTemporalEncoder = None
 
 from experiments.common.cross_validation import create_data_splits
 from experiments.common.config_registry import (
@@ -74,10 +78,11 @@ CONDITIONING_SOURCES = [
     "vqvae",              # Vector Quantized VAE codes
     "freq_disentangled",  # Frequency-band-specific latents
     "cycle_consistent",   # Cycle-consistent latent
+    "spectro_temporal",   # SpectroTemporalEncoder (auto-conditioning from signal dynamics)
 ]
 
 # Fast subset for dry-run
-FAST_SOURCES = ["odor_onehot", "cpc"]
+FAST_SOURCES = ["odor_onehot", "spectro_temporal"]
 
 # Frequency bands for disentanglement
 FREQ_BANDS = {
@@ -487,6 +492,7 @@ class ConditionedTranslator(nn.Module):
     - vqvae: Vector Quantized VAE codes
     - freq_disentangled: Frequency-band specific latents
     - cycle_consistent: Cycle-consistent latent
+    - spectro_temporal: SpectroTemporalEncoder (auto-conditioning from signal dynamics)
     """
 
     def __init__(
@@ -536,6 +542,19 @@ class ConditionedTranslator(nn.Module):
                 self.cond_encoder = FreqDisentangledEncoder(in_channels, embed_dim)
             elif cond_source == "cycle_consistent":
                 self.cond_encoder = CycleConsistentEncoder(in_channels, out_channels, embed_dim)
+            elif cond_source == "spectro_temporal":
+                # SpectroTemporalEncoder from models.py - uses FFT + multi-scale temporal conv
+                if not HAS_SPECTRO_TEMPORAL or SpectroTemporalEncoder is None:
+                    raise ImportError("SpectroTemporalEncoder not available in models.py")
+                # Use 128 for embed_dim to match UNet's default embedding dimension
+                self.cond_encoder = SpectroTemporalEncoder(
+                    in_channels=in_channels,
+                    emb_dim=128,  # Match UNet's emb_dim
+                    n_freq_bands=10,
+                    temporal_hidden=64,
+                    temporal_dilations=(1, 4, 16),
+                    temporal_kernel=7,
+                )
             else:
                 raise ValueError(f"Unknown conditioning source: {cond_source}")
 
@@ -604,11 +623,20 @@ class ConditionedTranslator(nn.Module):
         elif self.cond_source == "cycle_consistent":
             cond, cycle_losses = self.cond_encoder(x, y)
             aux_losses.update(cycle_losses)
+        elif self.cond_source == "spectro_temporal":
+            # SpectroTemporalEncoder: extract style embedding from input signal dynamics
+            # No auxiliary loss - purely unsupervised style extraction
+            cond = self.cond_encoder(x, odor_emb=None)  # [B, 128] - already correct dim
         else:
             cond = torch.zeros(x.size(0), self.embed_dim, device=x.device)
 
         # Project conditioning to UNet's expected dimension
-        cond_projected = self.cond_projector(cond)
+        # Note: spectro_temporal already outputs 128-dim, but we still project for consistency
+        if self.cond_source == "spectro_temporal":
+            # SpectroTemporalEncoder outputs 128-dim, which matches UNet's emb_dim
+            cond_projected = cond
+        else:
+            cond_projected = self.cond_projector(cond)
 
         # Inject conditioning into UNet by temporarily replacing odor embedding output
         # We use a forward hook to inject our conditioning
@@ -1112,6 +1140,7 @@ def main():
     print("  3. vqvae:             Vector Quantized VAE codes")
     print("  4. freq_disentangled: Frequency-band-specific latents")
     print("  5. cycle_consistent:  Cycle-consistent latent")
+    print("  6. spectro_temporal:  FFT + temporal conv (auto-conditioning)")
     print()
 
     # Load data
