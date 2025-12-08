@@ -62,8 +62,8 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier1_screening"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_EPOCHS = 50
-TRAIN_BATCH_SIZE = 32  # Increased for better gradient estimation
-TRAIN_LR = 1e-3
+TRAIN_BATCH_SIZE = 8  # Same as train.py
+TRAIN_LR = 0.0002  # Same as train.py
 
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
 ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
@@ -352,7 +352,7 @@ def main():
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=0.0002)
     parser.add_argument("--n-odors", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -571,7 +571,7 @@ if __name__ == "__main__":
         parser.add_argument("--data-dir", required=True)
         parser.add_argument("--epochs", type=int, default=50)
         parser.add_argument("--batch-size", type=int, default=8)
-        parser.add_argument("--lr", type=float, default=1e-3)
+        parser.add_argument("--lr", type=float, default=0.0002)
         parser.add_argument("--n-odors", type=int, default=0)
         parser.add_argument("--seed", type=int, default=42)
         args, _ = parser.parse_known_args()

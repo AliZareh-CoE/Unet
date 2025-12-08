@@ -741,7 +741,7 @@ def train_with_conditioning(
     val_loader: DataLoader,
     n_epochs: int,
     device: torch.device,
-    lr: float = 1e-3,
+    lr: float = 0.0002,  # Same as train.py
     aux_loss_weight: float = 0.1,
     show_progress: bool = True,
     weight_l1: float = 1.0,
@@ -911,7 +911,7 @@ def run_tier1_5(
     conditionings: Optional[List[str]] = None,
     odor_labels: Optional[torch.Tensor] = None,
     n_epochs: int = 50,
-    batch_size: int = 32,
+    batch_size: int = 8,  # Same as train.py
     register: bool = True,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Auto-Conditioning Signal Sources (Single Run).
