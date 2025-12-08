@@ -497,6 +497,17 @@ class ConditionedTranslator(nn.Module):
                 out_channels=out_channels,
                 base=64,
                 n_odors=n_odors,
+                dropout=0.0,
+                use_attention=True,
+                attention_type="cross_freq_v2",
+                norm_type="batch",
+                cond_mode="cross_attn_gated",
+                use_spectral_shift=False,
+                n_downsample=4,
+                conv_type="modern",
+                use_se=True,
+                conv_kernel_size=7,
+                dilations=(1, 4, 16, 32),
             )
         else:
             # For other sources, we need to extract conditioning and inject it
@@ -518,6 +529,17 @@ class ConditionedTranslator(nn.Module):
                 out_channels=out_channels,
                 base=64,
                 n_odors=1,  # Minimal, we'll override the conditioning
+                dropout=0.0,
+                use_attention=True,
+                attention_type="cross_freq_v2",
+                norm_type="batch",
+                cond_mode="cross_attn_gated",
+                use_spectral_shift=False,
+                n_downsample=4,
+                conv_type="modern",
+                use_se=True,
+                conv_kernel_size=7,
+                dilations=(1, 4, 16, 32),
             )
 
             # Override the odor embedding to accept our conditioning
