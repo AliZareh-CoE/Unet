@@ -67,7 +67,7 @@ TRAIN_BATCH_SIZE = 32  # Increased for better gradient estimation
 TRAIN_LR = 1e-3
 
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
-ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer"]  # mamba removed (slow sequential scan)
+ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 
 # Loss functions (comparable with train.py)
 LOSS_FUNCTIONS = {
