@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Tier 3: Focused Ablation
-========================
+Tier 3: U-Net Component Ablation
+================================
 
-Ablates the winning configuration to determine which components are essential.
-Applies ablation feedback to remove useless components before final validation.
+Purpose: Ablate U-Net (CondUNet1D) components to find the minimal optimal architecture.
+
+After Tiers 1-2 prove U-Net with optimal loss/conditioning, this tier removes
+unnecessary components to create a lean, efficient model.
+
+Architecture: CondUNet1D (from models.py) - FIXED
 
 5 Focused Ablation Questions:
 1. Does attention help?
@@ -151,19 +155,16 @@ def create_ablated_model(
         config["use_attention"] = False
         config["conditioning_type"] = "add"
 
-    # Create model (architecture-specific handling)
+    # Create model - U-Net (CondUNet1D) is the primary architecture
     if base_arch == "unet":
-        try:
-            from models import UNet1DConditioned
-            model = UNet1DConditioned(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                base_channels=64,
-                conditioning_type=config["conditioning_type"],
-            )
-            return model.to(device)
-        except (ImportError, TypeError):
-            pass
+        from models import CondUNet1D
+        model = CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=64,
+            n_odors=7,  # Default odors for conditioning
+        )
+        return model.to(device)
 
     # Variant mapping for architectures
     VARIANT_MAP = {

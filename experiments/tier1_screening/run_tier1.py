@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Tier 1: Architecture Screening (Single Run)
-=============================================
+Tier 1: Architecture Selection - U-Net vs Competitors
+======================================================
 
-Full training for neural architectures with simple, comparable metrics.
-Compares against Tier 0 classical baselines without complex cross-validation.
+Purpose: Prove that U-Net (CondUNet1D) beats other neural architectures.
+
+This tier compares our U-Net against 7 competing architectures:
+- linear: Simple linear baseline
+- cnn: Basic CNN
+- wavenet: WaveNet-style dilated convolutions
+- fnet: Fourier-based architecture
+- vit: Vision Transformer adapted for 1D
+- performer: Efficient attention
+- mamba: State-space model
+- unet: Our CondUNet1D (should WIN!)
+
+Goal: Show that U-Net significantly outperforms all competitors,
+justifying its use as the sole architecture for Tiers 1.5+.
 
 Features:
-- Odor conditioning support
-- Single-run training (no folds/seeds to keep comparable with train.py)
-- Metrics: R², MAE, Pearson correlation, PSD error (same as tier0/train.py)
+- Odor conditioning support for all architectures
+- Single-run training per combination
+- Metrics: R², MAE, Pearson correlation, PSD error
 - Per-frequency-band R² (delta, theta, alpha, beta, gamma)
-- Checkpointing for resume
 
 Losses tested:
 - l1: Simple L1 baseline
 - huber: Robust Huber loss
-- l1_wavelet: L1 + Wavelet combo (exactly like train.py)
+- l1_wavelet: L1 + Wavelet combo
 - spectral: Multi-scale spectral loss
 
 Usage:
@@ -52,9 +63,10 @@ ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier1_screening"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_EPOCHS = 50
-TRAIN_BATCH_SIZE = 8  # For single 6GB GPU
+TRAIN_BATCH_SIZE = 32  # Increased for better gradient estimation
 TRAIN_LR = 1e-3
 
+# Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
 ARCHITECTURES = ["linear", "cnn", "wavenet", "fnet", "vit", "performer"]  # mamba removed (slow sequential scan)
 
 # Loss functions (comparable with train.py)
@@ -219,6 +231,16 @@ class OdorDataset(Dataset):
 
 
 def create_model(arch_name: str, in_channels: int, out_channels: int, n_odors: int = 0):
+    # Handle U-Net specially - use CondUNet1D from models.py
+    if arch_name == "unet":
+        from models import CondUNet1D
+        return CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=64,
+            n_odors=n_odors if n_odors > 0 else 7,
+        )
+
     VARIANT_MAP = {
         "linear": "simple",
         "cnn": "basic",
