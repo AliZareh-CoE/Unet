@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
 """
-Tier 1: Architecture Selection - U-Net vs Competitors
-======================================================
+Tier 1: Architecture + Loss Selection
+======================================
 
-Purpose: Prove that U-Net (CondUNet1D) beats other neural architectures.
+Purpose: Find the best architecture + loss combination for neural EEG prediction.
 
-This tier compares our U-Net against 7 competing architectures:
+This tier compares multiple architectures with multiple loss functions:
+
+Architectures:
 - linear: Simple linear baseline
 - cnn: Basic CNN
 - wavenet: WaveNet-style dilated convolutions
 - fnet: Fourier-based architecture
 - vit: Vision Transformer adapted for 1D
-- performer: Efficient attention
-- mamba: State-space model
-- unet: Our CondUNet1D (should WIN!)
+- unet: Our CondUNet1D (expected to WIN!)
 
-Goal: Show that U-Net significantly outperforms all competitors,
-justifying its use as the sole architecture for Tiers 1.5+.
+Loss functions:
+- l1: Simple L1/MAE loss
+- huber: Robust Huber loss
+- l1_wavelet: Combined L1 + Wavelet loss (same as train.py default)
+
+FAIR COMPARISON GUARANTEE:
+- ALL architectures (including UNet) use the SAME WORKER_SCRIPT
+- Each architecture is tested with each loss function
+- Same optimizer (AdamW), same warmup (5 epochs), same AMP, same grad clipping
+- When testing "unet + l1", UNet uses ONLY L1 loss (not wavelet)
+- When testing "unet + l1_wavelet", UNet uses combined L1+Wavelet
+
+Goal: Identify which architecture+loss combo beats the classical baseline by +0.10 R².
+The winning architecture proceeds to Tier 1.5 (conditioning analysis).
 
 Features:
 - Odor conditioning support for all architectures
 - Single-run training per combination
 - Metrics: R², MAE, Pearson correlation, PSD error
 - Per-frequency-band R² (delta, theta, alpha, beta, gamma)
-
-Losses tested:
-- l1: Simple L1 baseline
-- huber: Robust Huber loss
-- wavelet: Standalone wavelet loss
 
 Usage:
     python experiments/tier1_screening/run_tier1.py
@@ -68,10 +75,11 @@ TRAIN_LR = 0.0002  # Same as train.py
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
 ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 
-# Loss function: ALL architectures use L1 + Wavelet combined (same as train.py)
-# This ensures fair comparison - only the architecture differs, not the loss
+# Loss functions to test with each architecture
 LOSS_FUNCTIONS = {
-    "l1_wavelet": "l1_wavelet",   # L1 + Wavelet combined (same as train.py)
+    "l1": "l1",                    # Simple L1 baseline
+    "huber": "huber",              # Robust Huber loss
+    "l1_wavelet": "l1_wavelet",    # L1 + Wavelet combined (train.py default)
 }
 
 # Neural frequency bands (same as tier0)
@@ -402,13 +410,22 @@ def main():
     model = create_model(args.arch, in_channels, out_channels, args.n_odors)
     model = model.to(device)
 
-    # Loss: L1 + Wavelet combined (same as train.py for fair comparison)
-    # This ensures all architectures use the same loss, making comparison fair
-    wavelet_loss = WaveletLoss().to(device) if HAS_WAVELET else None
-
-    # Weight for wavelet loss (same as train.py default)
-    w_l1 = 1.0
-    w_wav = 1.0
+    # Create loss based on args.loss - use the SPECIFIC loss being tested
+    # Tier1 purpose: compare architectures using the SAME loss, AND compare losses
+    if args.loss == "l1_wavelet":
+        # Combined L1 + Wavelet (same as train.py default)
+        use_combined_loss = True
+        wavelet_loss_fn = WaveletLoss().to(device) if HAS_WAVELET_LOSS else None
+        w_l1 = 1.0
+        w_wav = 1.0
+    elif args.loss == "wavelet":
+        # Standalone wavelet loss
+        use_combined_loss = False
+        criterion = WaveletLoss().to(device)
+    else:
+        # l1, huber, etc. - use the specified loss
+        use_combined_loss = False
+        criterion = create_loss(args.loss).to(device)
 
     # Optimizer with warmup
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -424,7 +441,7 @@ def main():
     best_val_loss = float('inf')
     best_model_state = None
 
-    epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+l1_wavelet", unit="epoch",
+    epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+{args.loss}", unit="epoch",
                       dynamic_ncols=True, leave=True)
 
     for epoch in epoch_pbar:
@@ -455,13 +472,18 @@ def main():
                 except TypeError:
                     y_pred = model(x)
 
-                # L1 + Wavelet combined loss (same as train.py)
-                l1_loss = F.l1_loss(y_pred, y_batch)
-                if wavelet_loss is not None:
-                    wav_loss = wavelet_loss(y_pred, y_batch)
-                    loss = w_l1 * l1_loss + w_wav * wav_loss
+                # Use the SPECIFIC loss being tested
+                if use_combined_loss:
+                    # L1 + Wavelet combined (for l1_wavelet)
+                    l1_loss = F.l1_loss(y_pred, y_batch)
+                    if wavelet_loss_fn is not None:
+                        wav_loss = wavelet_loss_fn(y_pred, y_batch)
+                        loss = w_l1 * l1_loss + w_wav * wav_loss
+                    else:
+                        loss = l1_loss
                 else:
-                    loss = l1_loss
+                    # Single loss (l1, huber, or wavelet)
+                    loss = criterion(y_pred, y_batch)
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 scaler.scale(loss).backward()
@@ -492,13 +514,16 @@ def main():
                         y_pred = model(x, odor_ids)
                     except TypeError:
                         y_pred = model(x)
-                    # L1 + Wavelet combined loss (same as train.py)
-                    l1_loss = F.l1_loss(y_pred, y_batch)
-                    if wavelet_loss is not None:
-                        wav_loss = wavelet_loss(y_pred, y_batch)
-                        loss = w_l1 * l1_loss + w_wav * wav_loss
+                    # Use the SPECIFIC loss being tested
+                    if use_combined_loss:
+                        l1_loss = F.l1_loss(y_pred, y_batch)
+                        if wavelet_loss_fn is not None:
+                            wav_loss = wavelet_loss_fn(y_pred, y_batch)
+                            loss = w_l1 * l1_loss + w_wav * wav_loss
+                        else:
+                            loss = l1_loss
                     else:
-                        loss = l1_loss
+                        loss = criterion(y_pred, y_batch)
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     val_loss += loss.item()
                     val_batches += 1
@@ -756,25 +781,9 @@ def run_single_experiment(
 ) -> Dict[str, Any]:
     """Run ONE experiment (single run, no folds).
 
-    For UNet: Uses torchrun train.py with --no-bidirectional for fair comparison.
-    For other architectures: Uses embedded WORKER_SCRIPT.
+    All architectures (including UNet) use WORKER_SCRIPT to ensure fair comparison.
+    Each architecture is tested with each loss function specified in LOSS_FUNCTIONS.
     """
-
-    # =========================================================================
-    # UNet: Use train.py via torchrun for fair comparison
-    # =========================================================================
-    if arch == "unet":
-        print(f"  [UNet] Using torchrun train.py with --no-bidirectional --skip-spectral-finetune")
-        return run_unet_via_train_py(
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            base_channels=64,  # Same as other tier1 architectures
-        )
-
-    # =========================================================================
-    # Other architectures: Use embedded worker script
-    # =========================================================================
 
     # Write worker script
     worker_path = ARTIFACTS_DIR / "worker.py"
@@ -898,10 +907,11 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("TIER 1: Architecture Screening (Single Run)")
+    print("TIER 1: Architecture + Loss Selection (Fair Comparison)")
     print("=" * 60)
-    print("Losses: l1, huber, wavelet")
+    print("Losses: l1, huber, l1_wavelet")
     print("Metrics: R², MAE, Pearson, PSD error, per-band R²")
+    print("Note: ALL architectures (including UNet) use same training loop")
     print()
 
     # Find Python with PyTorch
