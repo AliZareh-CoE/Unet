@@ -68,11 +68,10 @@ TRAIN_LR = 0.0002  # Same as train.py
 # Architectures to compare - includes our U-Net (CondUNet1D) as the candidate to beat others
 ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 
-# Loss functions (comparable with train.py)
+# Loss function: ALL architectures use L1 + Wavelet combined (same as train.py)
+# This ensures fair comparison - only the architecture differs, not the loss
 LOSS_FUNCTIONS = {
-    "l1": "l1",                    # Simple baseline
-    "huber": "huber",              # Robust baseline
-    "wavelet": "wavelet",          # Standalone wavelet loss
+    "l1_wavelet": "l1_wavelet",   # L1 + Wavelet combined (same as train.py)
 }
 
 # Neural frequency bands (same as tier0)
@@ -403,10 +402,13 @@ def main():
     model = create_model(args.arch, in_channels, out_channels, args.n_odors)
     model = model.to(device)
 
-    # Loss
-    criterion = create_loss(args.loss)
-    if hasattr(criterion, 'to'):
-        criterion = criterion.to(device)
+    # Loss: L1 + Wavelet combined (same as train.py for fair comparison)
+    # This ensures all architectures use the same loss, making comparison fair
+    wavelet_loss = WaveletLoss().to(device) if HAS_WAVELET else None
+
+    # Weight for wavelet loss (same as train.py default)
+    w_l1 = 1.0
+    w_wav = 1.0
 
     # Optimizer with warmup
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -422,7 +424,7 @@ def main():
     best_val_loss = float('inf')
     best_model_state = None
 
-    epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+{args.loss}", unit="epoch",
+    epoch_pbar = tqdm(range(args.epochs), desc=f"{args.arch}+l1_wavelet", unit="epoch",
                       dynamic_ncols=True, leave=True)
 
     for epoch in epoch_pbar:
@@ -453,10 +455,13 @@ def main():
                 except TypeError:
                     y_pred = model(x)
 
-                try:
-                    loss = criterion(y_pred, y_batch)
-                except Exception as e:
-                    loss = F.l1_loss(y_pred, y_batch)
+                # L1 + Wavelet combined loss (same as train.py)
+                l1_loss = F.l1_loss(y_pred, y_batch)
+                if wavelet_loss is not None:
+                    wav_loss = wavelet_loss(y_pred, y_batch)
+                    loss = w_l1 * l1_loss + w_wav * wav_loss
+                else:
+                    loss = l1_loss
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 scaler.scale(loss).backward()
@@ -487,10 +492,13 @@ def main():
                         y_pred = model(x, odor_ids)
                     except TypeError:
                         y_pred = model(x)
-                    try:
-                        loss = criterion(y_pred, y_batch)
-                    except Exception:
-                        loss = F.l1_loss(y_pred, y_batch)
+                    # L1 + Wavelet combined loss (same as train.py)
+                    l1_loss = F.l1_loss(y_pred, y_batch)
+                    if wavelet_loss is not None:
+                        wav_loss = wavelet_loss(y_pred, y_batch)
+                        loss = w_l1 * l1_loss + w_wav * wav_loss
+                    else:
+                        loss = l1_loss
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     val_loss += loss.item()
                     val_batches += 1
