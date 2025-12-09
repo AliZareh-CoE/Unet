@@ -15,8 +15,10 @@ Conditioning Sources Tested:
     2. cpc: Contrastive Predictive Coding embeddings (self-supervised)
     3. vqvae: Vector Quantized VAE discrete codes
     4. freq_disentangled: Frequency-band-specific latents (delta/theta/alpha/beta/gamma)
-    5. cycle_consistent: Latent with cycle-consistency reconstruction constraint
-    6. spectro_temporal: SpectroTemporalEncoder - FFT + multi-scale temporal conv (auto-conditioning)
+    5. spectro_temporal: SpectroTemporalEncoder - FFT + multi-scale temporal conv (auto-conditioning)
+
+NOTE: cycle_consistent is NOT tested here - it requires bidirectional training (OB↔PCx)
+which causes data leakage and train/test mismatch in forward-only mode.
 
 This tier uses U-Net ONLY - no architecture comparison.
 Now uses train.py via torchrun for fair comparison with other tiers.
@@ -58,12 +60,14 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Conditioning SOURCES to test (what to condition on)
 # These map to --conditioning argument in train.py
+# NOTE: cycle_consistent REMOVED - requires bidirectional training (OB↔PCx)
+# which we're not doing in tier1.5. It causes data leakage (uses target
+# during training) and train/test mismatch.
 CONDITIONING_SOURCES = [
     "odor_onehot",        # One-hot odor identity (baseline)
     "cpc",                # Contrastive Predictive Coding embeddings
     "vqvae",              # Vector Quantized VAE codes
     "freq_disentangled",  # Frequency-band-specific latents
-    "cycle_consistent",   # Cycle-consistent latent
     "spectro_temporal",   # SpectroTemporalEncoder (auto-conditioning from signal dynamics)
 ]
 
