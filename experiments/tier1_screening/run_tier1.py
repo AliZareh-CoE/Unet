@@ -21,11 +21,13 @@ Loss functions:
 - l1_wavelet: Combined L1 + Wavelet loss (same as train.py default)
 
 FAIR COMPARISON GUARANTEE:
-- ALL architectures (including UNet) use the SAME WORKER_SCRIPT
+- UNet uses train.py via torchrun with --loss argument (proper infrastructure)
+- Other architectures use WORKER_SCRIPT with same loss logic
 - Each architecture is tested with each loss function
 - Same optimizer (AdamW), same warmup (5 epochs), same AMP, same grad clipping
-- When testing "unet + l1", UNet uses ONLY L1 loss (not wavelet)
-- When testing "unet + l1_wavelet", UNet uses combined L1+Wavelet
+- When testing "unet + l1", train.py uses ONLY L1 loss (not wavelet)
+- When testing "unet + huber", train.py uses ONLY Huber loss (not wavelet)
+- When testing "unet + l1_wavelet", train.py uses combined L1+Wavelet
 
 Goal: Identify which architecture+loss combo beats the classical baseline by +0.10 R².
 The winning architecture proceeds to Tier 1.5 (conditioning analysis).
@@ -620,6 +622,7 @@ if __name__ == "__main__":
 
 
 def run_unet_via_train_py(
+    loss_name: str,
     n_epochs: int,
     batch_size: int,
     lr: float,
@@ -630,9 +633,20 @@ def run_unet_via_train_py(
     Uses --no-bidirectional and --skip-spectral-finetune for fair comparison
     with other architectures that don't have these features.
 
+    Args:
+        loss_name: Loss function to use ("l1", "huber", or "l1_wavelet")
+        n_epochs: Number of training epochs
+        batch_size: Batch size
+        lr: Learning rate
+        base_channels: Base channels for model
+
     Returns metrics from the training run.
     """
     import re
+
+    # Map tier1 loss names to train.py --loss argument
+    # tier1 uses "l1_wavelet" which maps directly to train.py's "l1_wavelet"
+    loss_arg = loss_name  # l1, huber, l1_wavelet are all valid for train.py
 
     # Use torchrun for proper distributed training setup (even with 1 GPU)
     cmd = [
@@ -643,6 +657,7 @@ def run_unet_via_train_py(
         f"--batch-size={batch_size}",
         f"--lr={lr}",
         f"--base-channels={base_channels}",
+        f"--loss={loss_arg}",           # Use specific loss for this experiment
         "--no-bidirectional",           # Fair comparison: no reverse model
         "--skip-spectral-finetune",     # Fair comparison: no Stage 2
         "--eval-stage1",                # Evaluate after Stage 1
@@ -781,9 +796,27 @@ def run_single_experiment(
 ) -> Dict[str, Any]:
     """Run ONE experiment (single run, no folds).
 
-    All architectures (including UNet) use WORKER_SCRIPT to ensure fair comparison.
-    Each architecture is tested with each loss function specified in LOSS_FUNCTIONS.
+    UNet uses train.py via torchrun with --loss argument for proper infrastructure.
+    Other architectures use WORKER_SCRIPT with fair loss selection.
     """
+
+    # =========================================================================
+    # UNet: Use train.py via torchrun with --loss argument
+    # This uses the proper train.py infrastructure with the specific loss
+    # =========================================================================
+    if arch == "unet":
+        print(f"  [UNet] Using train.py with --loss={loss_name}")
+        return run_unet_via_train_py(
+            loss_name=loss_name,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            base_channels=64,  # Same as other tier1 architectures
+        )
+
+    # =========================================================================
+    # Other architectures: Use embedded worker script
+    # =========================================================================
 
     # Write worker script
     worker_path = ARTIFACTS_DIR / "worker.py"
