@@ -16,10 +16,9 @@ Architectures:
 - unet: Our CondUNet1D (expected to WIN!)
 
 Loss functions:
-- l1: Simple L1/MAE loss
-- huber: Robust Huber loss
-- wavelet: Wavelet loss only
-- l1_wavelet: Combined L1 + Wavelet loss (same as train.py default)
+- l1: L1/MAE only
+- huber: Huber only
+- wavelet: Wavelet only
 
 FAIR COMPARISON GUARANTEE:
 - UNet uses train.py via torchrun with --loss argument (proper infrastructure)
@@ -79,11 +78,11 @@ TRAIN_LR = 0.0002  # Same as train.py
 ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 
 # Loss functions to test with each architecture
+# Testing individual losses only - NOT combined (that's for full training)
 LOSS_FUNCTIONS = {
-    "l1": "l1",                    # Simple L1 baseline
-    "huber": "huber",              # Robust Huber loss
+    "l1": "l1",                    # L1/MAE only
+    "huber": "huber",              # Huber only
     "wavelet": "wavelet",          # Wavelet only
-    "l1_wavelet": "l1_wavelet",    # L1 + Wavelet combined (train.py default)
 }
 
 # Neural frequency bands (same as tier0)
@@ -944,7 +943,7 @@ def main():
     print("=" * 60)
     print("TIER 1: Architecture + Loss Selection (Fair Comparison)")
     print("=" * 60)
-    print("Losses: l1, huber, wavelet, l1_wavelet")
+    print("Losses: l1, huber, wavelet")
     print("Metrics: R², MAE, Pearson, PSD error, per-band R²")
     print("Note: UNet uses train.py, others use WORKER_SCRIPT (same loss logic)")
     print()
