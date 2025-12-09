@@ -2307,6 +2307,10 @@ def parse_args():
     parser.add_argument("--load-checkpoint", type=str, default=None,
                         help="Path to checkpoint to load for stage2-only mode")
 
+    # Training mode control
+    parser.add_argument("--no-bidirectional", action="store_true",
+                        help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
+
     return parser.parse_args()
 
 
@@ -2420,6 +2424,12 @@ def main():
 
     # Stage 1 evaluation flag
     config["eval_stage1"] = args.eval_stage1
+
+    # Disable bidirectional training if requested (for fair architecture comparison)
+    if args.no_bidirectional:
+        config["use_bidirectional"] = False
+        if is_primary():
+            print("Bidirectional training DISABLED (--no-bidirectional)")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
