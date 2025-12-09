@@ -1894,11 +1894,16 @@ def train(
                 print(f"  Correlation: {test_metrics_stage1['corr']:.4f}")
                 print(f"  MAE: {test_metrics_stage1['mae']:.4f}")
                 print(f"  NRMSE: {test_metrics_stage1.get('nrmse', 'N/A')}")
+                if 'psd_err_db' in test_metrics_stage1:
+                    print(f"  PSD Error: {test_metrics_stage1['psd_err_db']:.2f} dB")
 
-                # Machine-parseable results
+                # Machine-parseable results (for tier1/tier1.5 scripts)
                 print(f"STAGE1_RESULT_R2={test_metrics_stage1['r2']:.4f}")
                 print(f"STAGE1_RESULT_CORR={test_metrics_stage1['corr']:.4f}")
+                print(f"STAGE1_RESULT_MAE={test_metrics_stage1['mae']:.4f}")
                 print(f"STAGE1_RESULT_LOSS={best_val_loss:.4f}")
+                if 'psd_err_db' in test_metrics_stage1:
+                    print(f"STAGE1_RESULT_PSD_ERR_DB={test_metrics_stage1['psd_err_db']:.4f}")
 
     # =============================================================================
     # STAGE 2: FREEZE best UNet, fine-tune ONLY SpectralShift (if enabled)

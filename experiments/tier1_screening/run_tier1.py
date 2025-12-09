@@ -655,6 +655,14 @@ def run_unet_via_train_py(
                 corr_match = re.search(r"STAGE1_RESULT_CORR=([0-9.-]+)", line)
                 if corr_match:
                     metrics["pearson"] = float(corr_match.group(1))
+            if "STAGE1_RESULT_MAE=" in line:
+                mae_match = re.search(r"STAGE1_RESULT_MAE=([0-9.-]+)", line)
+                if mae_match:
+                    metrics["mae"] = float(mae_match.group(1))
+            if "STAGE1_RESULT_PSD_ERR_DB=" in line:
+                psd_match = re.search(r"STAGE1_RESULT_PSD_ERR_DB=([0-9.-]+)", line)
+                if psd_match:
+                    metrics["psd_error_db"] = float(psd_match.group(1))
 
             # Human-readable format: "  R²: 0.xxxx" or "  MAE: 0.xxxx"
             if "R²:" in line:
@@ -670,6 +678,10 @@ def run_unet_via_train_py(
                 mae_match = re.search(r"MAE:\s*([0-9.-]+)", line)
                 if mae_match:
                     metrics["mae"] = float(mae_match.group(1))
+            if "PSD Error:" in line:
+                psd_match = re.search(r"PSD Error:\s*([0-9.-]+)", line)
+                if psd_match:
+                    metrics["psd_error_db"] = float(psd_match.group(1))
 
         # If we didn't find metrics in output, try to load from checkpoint
         if not metrics["success"]:
