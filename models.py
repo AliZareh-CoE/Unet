@@ -1906,14 +1906,15 @@ class CPCEncoder(nn.Module):
             nn.Linear(embed_dim, embed_dim) for _ in range(n_steps)
         ])
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [B, C, T] input signal
 
         Returns:
-            context: [B, embed_dim] context embedding
-            z_seq: [B, T', embed_dim] latent sequence for CPC loss
+            context_mean: [B, embed_dim] mean context embedding (for conditioning)
+            z_seq: [B, T', embed_dim] latent sequence (for CPC loss)
+            context_seq: [B, T', embed_dim] full context sequence (for CPC loss)
         """
         # Encode
         z = self.encoder(x)  # [B, embed_dim, T']
@@ -1925,7 +1926,7 @@ class CPCEncoder(nn.Module):
         # Use mean context as conditioning
         context_mean = context.mean(dim=1)  # [B, embed_dim]
 
-        return context_mean, z
+        return context_mean, z, context
 
     def cpc_loss(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """Compute CPC InfoNCE loss."""
