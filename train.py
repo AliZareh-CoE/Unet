@@ -1068,10 +1068,15 @@ def train_epoch(
             else:
                 loss = torch.tensor(0.0, device=device)
         else:
-            # Stage 1: L1 + wavelet (spectral disabled if disable_spectral=True)
-            # L1 loss (forward) - uses pred_raw (no SpectralShift gradient)
-            loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
-            loss_components["l1_fwd"] = loss_components["l1_fwd"] + loss.detach()
+            # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+            # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
+            loss_type = config.get("loss_type", "l1_wavelet")
+            if loss_type == "huber":
+                recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
+            else:
+                recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
+            loss = recon_loss
+            loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
 
             # Wavelet loss (forward) - uses pred_raw (no SpectralShift gradient)
             if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
@@ -1120,9 +1125,13 @@ def train_epoch(
                     loss = loss + spec_loss_rev
                     loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
             else:
-                # Stage 1: L1 + wavelet (spectral disabled if disable_spectral=True)
-                # L1 loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
-                rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
+                # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+                # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
+                loss_type = config.get("loss_type", "l1_wavelet")
+                if loss_type == "huber":
+                    rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
+                else:
+                    rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
                 loss = loss + rev_loss
                 loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
 
@@ -2316,6 +2325,13 @@ def parse_args():
     parser.add_argument("--no-bidirectional", action="store_true",
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
+    # Loss function selection (for tier1 fair comparison)
+    LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet"]
+    parser.add_argument("--loss", type=str, default="l1_wavelet",
+                        choices=LOSS_CHOICES,
+                        help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only), "
+                             "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet combined, default)")
+
     return parser.parse_args()
 
 
@@ -2435,6 +2451,30 @@ def main():
         config["use_bidirectional"] = False
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
+
+    # Loss function selection (for tier1 fair comparison)
+    # --loss l1: L1 only (no wavelet)
+    # --loss huber: Huber only (no wavelet)
+    # --loss wavelet: Wavelet only (no L1)
+    # --loss l1_wavelet: L1 + Wavelet combined (default)
+    config["loss_type"] = args.loss  # "l1", "huber", "wavelet", or "l1_wavelet"
+    if args.loss == "l1":
+        config["use_wavelet_loss"] = False
+        if is_primary():
+            print("Loss: L1 only (--loss l1)")
+    elif args.loss == "huber":
+        config["use_wavelet_loss"] = False
+        if is_primary():
+            print("Loss: Huber only (--loss huber)")
+    elif args.loss == "wavelet":
+        config["use_wavelet_loss"] = True
+        config["weight_l1"] = 0.0  # Disable L1, use only wavelet
+        if is_primary():
+            print("Loss: Wavelet only (--loss wavelet)")
+    elif args.loss == "l1_wavelet":
+        config["use_wavelet_loss"] = True
+        if is_primary():
+            print("Loss: L1 + Wavelet combined (--loss l1_wavelet)")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
