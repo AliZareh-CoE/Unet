@@ -1862,6 +1862,355 @@ class SpectroTemporalEncoder(nn.Module):
 
 
 # =============================================================================
+# Additional Auto-Conditioning Encoders
+# =============================================================================
+
+# Frequency bands for FreqDisentangledEncoder
+FREQ_BANDS = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta": (12, 30),
+    "gamma": (30, 100),
+}
+
+
+class CPCEncoder(nn.Module):
+    """Contrastive Predictive Coding encoder.
+
+    Learns predictive representations by maximizing mutual information
+    between context and future timesteps.
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int = 128, n_steps: int = 4):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.n_steps = n_steps
+
+        # Encoder: signal -> latent
+        self.encoder = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(128, embed_dim, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+
+        # Context aggregator (GRU)
+        self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
+
+        # Predictive heads for each future step
+        self.predictors = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim) for _ in range(n_steps)
+        ])
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, C, T] input signal
+
+        Returns:
+            context: [B, embed_dim] context embedding
+            z_seq: [B, T', embed_dim] latent sequence for CPC loss
+        """
+        # Encode
+        z = self.encoder(x)  # [B, embed_dim, T']
+        z = z.transpose(1, 2)  # [B, T', embed_dim]
+
+        # Context aggregation
+        context, _ = self.gru(z)  # [B, T', embed_dim]
+
+        # Use mean context as conditioning
+        context_mean = context.mean(dim=1)  # [B, embed_dim]
+
+        return context_mean, z
+
+    def cpc_loss(self, z: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Compute CPC InfoNCE loss."""
+        B, T, D = z.shape
+        loss = 0.0
+
+        for k, predictor in enumerate(self.predictors, 1):
+            if T - k < 1:
+                continue
+
+            # Predict k steps ahead
+            c_t = context[:, :-k]  # [B, T-k, D]
+            z_tk = z[:, k:]        # [B, T-k, D] (positive samples)
+
+            pred = predictor(c_t)  # [B, T-k, D]
+
+            # InfoNCE: positive vs all negatives in batch
+            pos = (pred * z_tk).sum(dim=-1)  # [B, T-k]
+
+            # Negatives: all other z in batch
+            neg = torch.bmm(pred, z.transpose(1, 2))  # [B, T-k, T]
+
+            logits = torch.cat([pos.unsqueeze(-1), neg], dim=-1)
+            labels = torch.zeros(B, T - k, dtype=torch.long, device=z.device)
+
+            loss += F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        return loss / len(self.predictors)
+
+
+class VQVAEEncoder(nn.Module):
+    """Vector Quantized VAE encoder.
+
+    Learns discrete codebook representations of the signal.
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int = 128, n_codes: int = 512):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.n_codes = n_codes
+
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(128, embed_dim, kernel_size=3, stride=2, padding=1),
+        )
+
+        # Codebook
+        self.codebook = nn.Embedding(n_codes, embed_dim)
+        self.codebook.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
+
+        # Decoder (for reconstruction loss)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose1d(embed_dim, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose1d(64, in_channels, kernel_size=4, stride=2, padding=1),
+        )
+
+    def quantize(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize latents to nearest codebook entries (optimized with cdist)."""
+        B, D, T = z.shape
+        z_flat = z.transpose(1, 2).reshape(-1, D)  # [B*T, D]
+
+        # Use cdist for efficient distance computation
+        distances = torch.cdist(z_flat, self.codebook.weight, p=2).pow(2)  # [B*T, n_codes]
+
+        # Nearest codes
+        indices = distances.argmin(dim=1)
+        z_q = self.codebook(indices)  # [B*T, D]
+
+        # Reshape back
+        z_q = z_q.reshape(B, T, D).transpose(1, 2)  # [B, D, T]
+        indices = indices.reshape(B, T)
+
+        return z_q, indices, distances
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args:
+            x: [B, C, T] input signal
+
+        Returns:
+            conditioning: [B, embed_dim] mean quantized embedding
+            losses: dict with vq_loss, commitment_loss, recon_loss
+        """
+        # Encode
+        z_e = self.encoder(x)  # [B, D, T']
+
+        # Quantize
+        z_q, indices, _ = self.quantize(z_e)
+
+        # Straight-through estimator
+        z_q_st = z_e + (z_q - z_e).detach()
+
+        # Decode for reconstruction loss
+        x_recon = self.decoder(z_q_st)
+
+        # Losses
+        vq_loss = F.mse_loss(z_q.detach(), z_e)  # Codebook learning
+        commitment_loss = F.mse_loss(z_e.detach(), z_q)  # Encoder commitment
+
+        # Pad/crop for reconstruction loss
+        T_orig = x.shape[-1]
+        T_recon = x_recon.shape[-1]
+        if T_recon < T_orig:
+            x_crop = x[..., :T_recon]
+            recon_loss = F.mse_loss(x_recon, x_crop)
+        else:
+            x_recon_crop = x_recon[..., :T_orig]
+            recon_loss = F.mse_loss(x_recon_crop, x)
+
+        # Mean pooled embedding for conditioning
+        conditioning = z_q_st.mean(dim=-1)  # [B, D]
+
+        return conditioning, {
+            "vq_loss": vq_loss,
+            "commitment_loss": commitment_loss,
+            "recon_loss": recon_loss,
+        }
+
+
+class FreqDisentangledEncoder(nn.Module):
+    """Frequency-disentangled encoder.
+
+    Learns separate latent representations for each frequency band.
+    """
+
+    def __init__(self, in_channels: int, embed_dim: int = 128, fs: float = 1000.0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.fs = fs
+
+        # Per-band encoders
+        self.band_encoders = nn.ModuleDict()
+        band_dim = embed_dim // len(FREQ_BANDS)
+
+        for band_name in FREQ_BANDS:
+            self.band_encoders[band_name] = nn.Sequential(
+                nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3),
+                nn.ReLU(),
+                nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(64, band_dim),
+            )
+
+        # Final projection
+        self.proj = nn.Linear(band_dim * len(FREQ_BANDS), embed_dim)
+
+    def bandpass_filter(self, x: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        """Apply bandpass filter using FFT."""
+        # FFT
+        X = torch.fft.rfft(x, dim=-1)
+        freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
+
+        # Create bandpass mask
+        mask = ((freqs >= low) & (freqs <= high)).float()
+        mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, F]
+
+        # Apply mask
+        X_filtered = X * mask
+
+        # Inverse FFT
+        return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T] input signal
+
+        Returns:
+            [B, embed_dim] frequency-disentangled embedding
+        """
+        band_embeddings = []
+
+        for band_name, (low, high) in FREQ_BANDS.items():
+            # Filter signal to band
+            x_band = self.bandpass_filter(x, low, high)
+
+            # Encode band
+            z_band = self.band_encoders[band_name](x_band)
+            band_embeddings.append(z_band)
+
+        # Concatenate all band embeddings
+        z_concat = torch.cat(band_embeddings, dim=-1)
+
+        # Project to final embedding
+        return self.proj(z_concat)
+
+
+class CycleConsistentEncoder(nn.Module):
+    """Cycle-consistent latent encoder.
+
+    Learns latent that can reconstruct both input and output,
+    enforcing cycle consistency.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, embed_dim: int = 128):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.embed_dim = embed_dim
+
+        # Encoder for input (OB)
+        self.encoder_x = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(128, embed_dim, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+        # Encoder for target (PCx) - for cycle consistency
+        self.encoder_y = nn.Sequential(
+            nn.Conv1d(out_channels, 64, kernel_size=7, stride=2, padding=3),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(128, embed_dim, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+        # Decoder back to input (for cycle consistency)
+        self.decoder_x = nn.Sequential(
+            nn.Linear(embed_dim, 128 * 8),
+            nn.Unflatten(1, (128, 8)),
+            nn.ConvTranspose1d(128, 64, kernel_size=4, stride=4),
+            nn.ReLU(),
+            nn.ConvTranspose1d(64, 32, kernel_size=4, stride=4),
+            nn.ReLU(),
+            nn.ConvTranspose1d(32, in_channels, kernel_size=4, stride=4),
+        )
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args:
+            x: [B, C_in, T] input signal
+            y: [B, C_out, T] target signal (for training)
+
+        Returns:
+            conditioning: [B, embed_dim] cycle-consistent embedding
+            losses: dict with cycle_loss
+        """
+        # Encode input
+        z_x = self.encoder_x(x)  # [B, embed_dim]
+
+        losses = {}
+
+        if y is not None:
+            # Encode target
+            z_y = self.encoder_y(y)  # [B, embed_dim]
+
+            # Cycle consistency: z_x and z_y should be similar
+            cycle_loss = F.mse_loss(z_x, z_y)
+
+            # Reconstruction cycle: x -> z_x -> x_recon
+            x_recon = self.decoder_x(z_x)
+            T_orig = x.shape[-1]
+            T_recon = x_recon.shape[-1]
+
+            if T_recon >= T_orig:
+                recon_loss = F.mse_loss(x_recon[..., :T_orig], x)
+            else:
+                recon_loss = F.mse_loss(x_recon, x[..., :T_recon])
+
+            losses["cycle_loss"] = cycle_loss
+            losses["recon_loss"] = recon_loss
+
+        return z_x, losses
+
+
+# =============================================================================
 # Main Model: CondUNet1D
 # =============================================================================
 
@@ -2031,17 +2380,23 @@ class CondUNet1D(nn.Module):
         self,
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
+        cond_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             ob: Input signal [B, C, T]
-            odor_ids: Odor class indices [B] for conditioning
+            odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
+            cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
+                      If provided, odor_ids is ignored.
 
         Returns:
             Predicted signal [B, C, T]
         """
-        if self.embed is not None and odor_ids is not None:
+        # Use external embeddings if provided, otherwise use internal odor embedding
+        if cond_emb is not None:
+            emb = cond_emb
+        elif self.embed is not None and odor_ids is not None:
             emb = self.embed(odor_ids)
         else:
             emb = None

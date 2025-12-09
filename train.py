@@ -62,6 +62,12 @@ from models import (
     psd_error_db_torch,
     psd_diff_db_torch,
     MAX_FREQ_HZ,
+    # Conditioning encoders
+    SpectroTemporalEncoder,
+    CPCEncoder,
+    VQVAEEncoder,
+    FreqDisentangledEncoder,
+    CycleConsistentEncoder,
 )
 from data import (
     prepare_data,
@@ -649,6 +655,7 @@ def evaluate(
     disable_spectral: bool = False,
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
+    cond_encoder: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -659,10 +666,13 @@ def evaluate(
         disable_spectral: If True, disable SpectralShift and exclude spectral from composite loss (Stage 1 mode)
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
+        cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
     model.eval()
     if reverse_model is not None:
         reverse_model.eval()
+    if cond_encoder is not None:
+        cond_encoder.eval()
     if spectral_shift_fwd is not None:
         spectral_shift_fwd.eval()
     if spectral_shift_rev is not None:
@@ -696,8 +706,26 @@ def evaluate(
             pcx = pcx.to(device, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
 
-            # Forward: OB → PCx
-            pred = model(ob, odor)
+            # Compute conditioning embedding if using auto-conditioning
+            cond_emb = None
+            if cond_encoder is not None:
+                cond_source = config.get("conditioning_source", "odor_onehot") if config else "odor_onehot"
+                if cond_source == "spectro_temporal":
+                    cond_emb = cond_encoder(ob)
+                elif cond_source == "cpc":
+                    cond_emb, _ = cond_encoder(ob)
+                elif cond_source == "vqvae":
+                    cond_emb, _ = cond_encoder(ob)
+                elif cond_source == "freq_disentangled":
+                    cond_emb = cond_encoder(ob)
+                elif cond_source == "cycle_consistent":
+                    cond_emb, _ = cond_encoder(ob, pcx)
+
+            # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
+            if cond_emb is not None:
+                pred = model(ob, cond_emb=cond_emb)
+            else:
+                pred = model(ob, odor)
 
             # Apply spectral shift OUTSIDE the model (FSDP-safe)
             # Pass odor_ids for conditional spectral shift
@@ -762,7 +790,10 @@ def evaluate(
 
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
-                pred_rev = reverse_model(pcx, odor)
+                if cond_emb is not None:
+                    pred_rev = reverse_model(pcx, cond_emb=cond_emb)
+                else:
+                    pred_rev = reverse_model(pcx, odor)
 
                 # Apply spectral shift with SEPARATE reverse module
                 # Each direction learns independently - no inverse constraint
@@ -928,16 +959,20 @@ def train_epoch(
     spectral_shift_rev: Optional[nn.Module] = None,
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
+    cond_encoder: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
         stage2_spectral_only: If True, ONLY use spectral loss (Stage 2 mode where UNet is frozen)
         disable_spectral: If True, disable SpectralShift application and spectral loss (Stage 1 mode)
+        cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
     model.train()
     if reverse_model is not None:
         reverse_model.train()
+    if cond_encoder is not None:
+        cond_encoder.train()
     if spectral_shift_fwd is not None:
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
@@ -964,8 +999,38 @@ def train_epoch(
         pcx = pcx.to(device, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
 
-        # Forward: OB → PCx
-        pred_raw = model(ob, odor)
+        # Compute conditioning embedding
+        cond_emb = None
+        cond_loss = 0.0
+        if cond_encoder is not None:
+            cond_source = config.get("conditioning_source", "odor_onehot")
+            if cond_source == "spectro_temporal":
+                # SpectroTemporalEncoder: signal -> embedding
+                cond_emb = cond_encoder(ob)
+            elif cond_source == "cpc":
+                # CPCEncoder: returns (embedding, z_seq) - use embedding for conditioning
+                cond_emb, z_seq = cond_encoder(ob)
+                # CPC loss for contrastive learning (optional auxiliary loss)
+                # cond_loss = cond_encoder.cpc_loss(z_seq, z_seq)  # Disabled for now
+            elif cond_source == "vqvae":
+                # VQVAEEncoder: returns (embedding, losses_dict)
+                cond_emb, vq_losses = cond_encoder(ob)
+                # Add VQ-VAE auxiliary losses
+                cond_loss = vq_losses["vq_loss"] + 0.25 * vq_losses["commitment_loss"]
+            elif cond_source == "freq_disentangled":
+                # FreqDisentangledEncoder: signal -> embedding
+                cond_emb = cond_encoder(ob)
+            elif cond_source == "cycle_consistent":
+                # CycleConsistentEncoder: (input, target) -> (embedding, losses_dict)
+                cond_emb, cycle_losses = cond_encoder(ob, pcx)
+                if "cycle_loss" in cycle_losses:
+                    cond_loss = 0.1 * cycle_losses["cycle_loss"]
+
+        # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
+        if cond_emb is not None:
+            pred_raw = model(ob, cond_emb=cond_emb)
+        else:
+            pred_raw = model(ob, odor)
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -1013,10 +1078,18 @@ def train_epoch(
                 loss = loss + spec_loss
                 loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + spec_loss.detach()
 
+        # Add conditioning encoder auxiliary loss if present
+        if cond_loss != 0.0:
+            loss = loss + cond_loss
+            loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
+
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
-            # Reverse: PCx → OB
-            pred_rev_raw = reverse_model(pcx, odor)
+            # Reverse: PCx → OB (use same cond_emb from forward - conditioning is symmetric)
+            if cond_emb is not None:
+                pred_rev_raw = reverse_model(pcx, cond_emb=cond_emb)
+            else:
+                pred_rev_raw = reverse_model(pcx, odor)
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
@@ -1060,14 +1133,20 @@ def train_epoch(
 
                 # Cycle consistency: OB → PCx → OB (use raw, no spectral shift in cycle)
                 # Skip in Stage 2 since UNet is frozen
-                cycle_ob = reverse_model(pred_raw, odor)
+                if cond_emb is not None:
+                    cycle_ob = reverse_model(pred_raw, cond_emb=cond_emb)
+                else:
+                    cycle_ob = reverse_model(pred_raw, odor)
                 cycle_ob_c = crop_to_target_torch(cycle_ob)
                 cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
                 loss = loss + cycle_loss_ob
                 loss_components["cycle_ob"] = loss_components["cycle_ob"] + cycle_loss_ob.detach()
 
                 # Cycle consistency: PCx → OB → PCx (use raw, no spectral shift in cycle)
-                cycle_pcx = model(pred_rev_raw, odor)
+                if cond_emb is not None:
+                    cycle_pcx = model(pred_rev_raw, cond_emb=cond_emb)
+                else:
+                    cycle_pcx = model(pred_rev_raw, odor)
                 cycle_pcx_c = crop_to_target_torch(cycle_pcx)
                 cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
                 loss = loss + cycle_loss_pcx
@@ -1077,6 +1156,8 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
+        if cond_encoder is not None:
+            torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
         # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
         # They have only 32 params each with high lr (0.1), clipping would prevent convergence.
         # The spectral loss gradient is naturally bounded by log PSD differences.
@@ -1221,6 +1302,48 @@ def train(
             if conv_type == "modern":
                 print(f"Using MODERN convolutions: dilations={config.get('conv_dilations', (1, 4, 16, 32))}, kernel_size={config.get('conv_kernel_size', 7)}, SE={config.get('use_se', True)}")
 
+    # Create conditioning encoder for auto-conditioning modes
+    cond_source = config.get("conditioning_source", "odor_onehot")
+    cond_encoder = None
+    emb_dim = 128  # Must match model's emb_dim
+
+    if cond_source != "odor_onehot":
+        if is_primary():
+            print(f"Using auto-conditioning: {cond_source}")
+
+        if cond_source == "spectro_temporal":
+            cond_encoder = SpectroTemporalEncoder(
+                in_channels=in_channels,
+                emb_dim=emb_dim,
+            )
+        elif cond_source == "cpc":
+            cond_encoder = CPCEncoder(
+                in_channels=in_channels,
+                embed_dim=emb_dim,
+            )
+        elif cond_source == "vqvae":
+            cond_encoder = VQVAEEncoder(
+                in_channels=in_channels,
+                embed_dim=emb_dim,
+            )
+        elif cond_source == "freq_disentangled":
+            cond_encoder = FreqDisentangledEncoder(
+                in_channels=in_channels,
+                embed_dim=emb_dim,
+            )
+        elif cond_source == "cycle_consistent":
+            cond_encoder = CycleConsistentEncoder(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                embed_dim=emb_dim,
+            )
+        else:
+            raise ValueError(f"Unknown conditioning source: {cond_source}")
+
+        if is_primary():
+            cond_params = sum(p.numel() for p in cond_encoder.parameters())
+            print(f"Conditioning encoder parameters: {cond_params:,}")
+
     # Log U-Net depth and frequency resolution
     n_downsample = config.get("n_downsample", 2)
     base_ch = config.get("base_channels", 128)
@@ -1260,6 +1383,9 @@ def train(
                     sharding_strategy=fsdp_strategy,
                     compile_model=compile_model,
                 )
+            # Conditioning encoder: just move to device (too small for FSDP sharding)
+            if cond_encoder is not None:
+                cond_encoder = cond_encoder.to(device)
             is_fsdp_wrapped = True
             if is_primary():
                 print(f"Using FSDP with {get_world_size()} GPUs")
@@ -1270,6 +1396,9 @@ def train(
             if reverse_model is not None:
                 reverse_model = reverse_model.to(device)
                 reverse_model = DDP(reverse_model, device_ids=[local_rank])
+            if cond_encoder is not None:
+                cond_encoder = cond_encoder.to(device)
+                cond_encoder = DDP(cond_encoder, device_ids=[local_rank])
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs")
             dist.barrier()
@@ -1277,6 +1406,8 @@ def train(
         model = wrap_model_fsdp(model, local_rank, use_fsdp=False, compile_model=compile_model)
         if reverse_model is not None:
             reverse_model = wrap_model_fsdp(reverse_model, local_rank, use_fsdp=False, compile_model=compile_model)
+        if cond_encoder is not None:
+            cond_encoder = cond_encoder.to(device)
 
     # Create SpectralShift modules OUTSIDE of FSDP (too small for sharding overhead)
     # but DO wrap with DDP for gradient synchronization in distributed training
@@ -1414,6 +1545,9 @@ def train(
     ]
     if reverse_model is not None:
         param_groups.append({"params": list(reverse_model.parameters()), "lr": lr})
+    if cond_encoder is not None:
+        # Conditioning encoder uses same lr as model
+        param_groups.append({"params": list(cond_encoder.parameters()), "lr": lr, "name": "cond_encoder"})
     if spectral_shift_fwd is not None:
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
@@ -1533,6 +1667,7 @@ def train(
                 reverse_model, epoch, num_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
+                cond_encoder=cond_encoder,
             )
 
             barrier()
@@ -1544,6 +1679,7 @@ def train(
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
                 fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                cond_encoder=cond_encoder,
             )
 
             # Sync val_loss across ranks (for early stopping)
@@ -1843,6 +1979,7 @@ def train(
                 reverse_model, epoch, spectral_finetune_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
                 stage2_spectral_only=True,  # ONLY spectral loss - UNet frozen, pure PSD optimization
+                cond_encoder=cond_encoder,
             )
 
             barrier()
@@ -1854,6 +1991,7 @@ def train(
                 spectral_only=True,  # Stage 2: Early stopping based on ONLY spectral loss
                 fast_mode=False,  # Include PSD metrics to monitor frequency reconstruction
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                cond_encoder=cond_encoder,
             )
 
             # Sync val_loss across ranks
@@ -1922,6 +2060,7 @@ def train(
         spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
         fast_mode=False,  # Full metrics for final evaluation
         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+        cond_encoder=cond_encoder,
     )
 
     if is_primary():
@@ -2118,6 +2257,15 @@ def parse_args():
                         choices=COND_MODES,
                         help="Override conditioning mode")
 
+    # Conditioning source: how conditioning embeddings are derived
+    COND_SOURCES = ["odor_onehot", "spectro_temporal", "cpc", "vqvae", "freq_disentangled", "cycle_consistent"]
+    parser.add_argument("--conditioning", type=str, default="odor_onehot",
+                        choices=COND_SOURCES,
+                        help="Conditioning source: 'odor_onehot' (default, uses odor labels), "
+                             "'spectro_temporal' (auto-conditioning from signal dynamics), "
+                             "'cpc' (contrastive predictive coding), 'vqvae' (vector quantized), "
+                             "'freq_disentangled' (per-band encoding), 'cycle_consistent' (cycle loss)")
+
     # Stage 1 evaluation
     parser.add_argument("--eval-stage1", action="store_true",
                         help="Evaluate and save metrics after stage 1 (before spectral fine-tuning)")
@@ -2230,9 +2378,10 @@ def main():
         config["out_channels"] = 32  # PCx channels
         config["sampling_rate"] = SAMPLING_RATE_HZ
 
-    # Conditioning mode from CLI
+    # Conditioning from CLI
     if args.cond_mode is not None:
         config["cond_mode"] = args.cond_mode
+    config["conditioning_source"] = args.conditioning  # odor_onehot, spectro_temporal, etc.
     if args.spectral_finetune_epochs is not None:
         config["spectral_finetune_epochs"] = args.spectral_finetune_epochs
 
