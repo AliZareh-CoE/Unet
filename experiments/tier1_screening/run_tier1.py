@@ -18,6 +18,7 @@ Architectures:
 Loss functions:
 - l1: Simple L1/MAE loss
 - huber: Robust Huber loss
+- wavelet: Wavelet loss only
 - l1_wavelet: Combined L1 + Wavelet loss (same as train.py default)
 
 FAIR COMPARISON GUARANTEE:
@@ -81,6 +82,7 @@ ARCHITECTURES = ["unet", "linear", "cnn", "wavenet", "fnet", "vit"]
 LOSS_FUNCTIONS = {
     "l1": "l1",                    # Simple L1 baseline
     "huber": "huber",              # Robust Huber loss
+    "wavelet": "wavelet",          # Wavelet only
     "l1_wavelet": "l1_wavelet",    # L1 + Wavelet combined (train.py default)
 }
 
@@ -942,9 +944,9 @@ def main():
     print("=" * 60)
     print("TIER 1: Architecture + Loss Selection (Fair Comparison)")
     print("=" * 60)
-    print("Losses: l1, huber, l1_wavelet")
+    print("Losses: l1, huber, wavelet, l1_wavelet")
     print("Metrics: R², MAE, Pearson, PSD error, per-band R²")
-    print("Note: ALL architectures (including UNet) use same training loop")
+    print("Note: UNet uses train.py, others use WORKER_SCRIPT (same loss logic)")
     print()
 
     # Find Python with PyTorch

@@ -2326,11 +2326,11 @@ def parse_args():
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
     # Loss function selection (for tier1 fair comparison)
-    LOSS_CHOICES = ["l1", "huber", "l1_wavelet"]
+    LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet"]
     parser.add_argument("--loss", type=str, default="l1_wavelet",
                         choices=LOSS_CHOICES,
                         help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only), "
-                             "'l1_wavelet' (L1 + Wavelet combined, default)")
+                             "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet combined, default)")
 
     return parser.parse_args()
 
@@ -2455,8 +2455,9 @@ def main():
     # Loss function selection (for tier1 fair comparison)
     # --loss l1: L1 only (no wavelet)
     # --loss huber: Huber only (no wavelet)
+    # --loss wavelet: Wavelet only (no L1)
     # --loss l1_wavelet: L1 + Wavelet combined (default)
-    config["loss_type"] = args.loss  # "l1", "huber", or "l1_wavelet"
+    config["loss_type"] = args.loss  # "l1", "huber", "wavelet", or "l1_wavelet"
     if args.loss == "l1":
         config["use_wavelet_loss"] = False
         if is_primary():
@@ -2465,6 +2466,11 @@ def main():
         config["use_wavelet_loss"] = False
         if is_primary():
             print("Loss: Huber only (--loss huber)")
+    elif args.loss == "wavelet":
+        config["use_wavelet_loss"] = True
+        config["weight_l1"] = 0.0  # Disable L1, use only wavelet
+        if is_primary():
+            print("Loss: Wavelet only (--loss wavelet)")
     elif args.loss == "l1_wavelet":
         config["use_wavelet_loss"] = True
         if is_primary():
