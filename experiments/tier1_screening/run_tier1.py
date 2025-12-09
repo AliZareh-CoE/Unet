@@ -692,12 +692,32 @@ def run_unet_via_train_py(
                 except Exception as e:
                     print(f"  Warning: Could not load checkpoint: {e}")
 
+        # If still no success, show full output for debugging
+        if not metrics["success"]:
+            print("\n" + "="*60)
+            print("FAILED TO PARSE METRICS - FULL OUTPUT:")
+            print("="*60)
+            print(output[-3000:] if len(output) > 3000 else output)  # Last 3000 chars
+            print("="*60)
+            metrics["error"] = f"Could not parse metrics. Last output: {output[-500:]}"
+
         return metrics
 
     except subprocess.CalledProcessError as e:
-        print(f"  train.py failed with exit code {e.returncode}")
-        print(f"  stderr: {e.stderr[:500] if e.stderr else 'None'}")
-        return {"r2": float("-inf"), "success": False, "error": f"Exit code {e.returncode}"}
+        print("\n" + "="*60)
+        print(f"train.py FAILED with exit code {e.returncode}")
+        print("="*60)
+        if e.stdout:
+            print("STDOUT:")
+            print(e.stdout[-2000:] if len(e.stdout) > 2000 else e.stdout)
+        if e.stderr:
+            print("STDERR:")
+            print(e.stderr[-2000:] if len(e.stderr) > 2000 else e.stderr)
+        print("="*60)
+        error_msg = f"Exit code {e.returncode}"
+        if e.stderr:
+            error_msg += f": {e.stderr[-200:]}"
+        return {"r2": float("-inf"), "success": False, "error": error_msg}
     except subprocess.TimeoutExpired:
         return {"r2": float("-inf"), "success": False, "error": "Timeout (4h)"}
     except Exception as e:
