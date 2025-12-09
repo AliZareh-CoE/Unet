@@ -713,7 +713,7 @@ def evaluate(
                 if cond_source == "spectro_temporal":
                     cond_emb = cond_encoder(ob)
                 elif cond_source == "cpc":
-                    cond_emb, _ = cond_encoder(ob)
+                    cond_emb, _, _ = cond_encoder(ob)  # Ignore z_seq, context_seq at eval
                 elif cond_source == "vqvae":
                     cond_emb, _ = cond_encoder(ob)
                 elif cond_source == "freq_disentangled":
@@ -1009,11 +1009,10 @@ def train_epoch(
                 # SpectroTemporalEncoder: signal -> embedding
                 cond_emb = cond_encoder(ob)
             elif cond_source == "cpc":
-                # CPCEncoder: returns (embedding, z_seq) - use embedding for conditioning
-                cond_emb, z_seq = cond_encoder(ob)
-                # Note: CPC contrastive loss is disabled. To enable, CPCEncoder would need
-                # to return full context sequence (not just mean), then call:
-                # cond_loss = cond_encoder.cpc_loss(z_seq, context_full)
+                # CPCEncoder: returns (embedding, z_seq, context_seq)
+                cond_emb, z_seq, context_seq = cond_encoder(ob)
+                # CPC InfoNCE contrastive loss - learns predictive representations
+                cond_loss = 0.1 * cond_encoder.cpc_loss(z_seq, context_seq)
             elif cond_source == "vqvae":
                 # VQVAEEncoder: returns (embedding, losses_dict)
                 cond_emb, vq_losses = cond_encoder(ob)
