@@ -2058,6 +2058,7 @@ class FreqDisentangledEncoder(nn.Module):
     """Frequency-disentangled encoder.
 
     Learns separate latent representations for each frequency band.
+    Uses smooth Gaussian bandpass filters and LayerNorm for stable embeddings.
     """
 
     def __init__(self, in_channels: int, embed_dim: int = 128, fs: float = 1000.0):
@@ -2066,9 +2067,11 @@ class FreqDisentangledEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.fs = fs
 
-        # Per-band encoders
+        # Per-band encoders with LayerNorm for stable embeddings
         self.band_encoders = nn.ModuleDict()
+        self.band_norms = nn.ModuleDict()
         band_dim = embed_dim // len(FREQ_BANDS)
+        self.band_dim = band_dim
 
         for band_name in FREQ_BANDS:
             self.band_encoders[band_name] = nn.Sequential(
@@ -2080,18 +2083,31 @@ class FreqDisentangledEncoder(nn.Module):
                 nn.Flatten(),
                 nn.Linear(64, band_dim),
             )
+            # LayerNorm per band for stable scale
+            self.band_norms[band_name] = nn.LayerNorm(band_dim)
 
-        # Final projection
+        # Final projection with normalization
         self.proj = nn.Linear(band_dim * len(FREQ_BANDS), embed_dim)
+        self.output_norm = nn.LayerNorm(embed_dim)
 
     def bandpass_filter(self, x: torch.Tensor, low: float, high: float) -> torch.Tensor:
-        """Apply bandpass filter using FFT."""
+        """Apply smooth bandpass filter using FFT with Gaussian rolloff.
+
+        Uses a smooth Gaussian rolloff instead of hard cutoff to avoid
+        ringing artifacts (Gibbs phenomenon) and preserve signal amplitude.
+        """
         # FFT
         X = torch.fft.rfft(x, dim=-1)
         freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
 
-        # Create bandpass mask
-        mask = ((freqs >= low) & (freqs <= high)).float()
+        # Compute band center and width for Gaussian rolloff
+        center = (low + high) / 2.0
+        bandwidth = high - low
+        # Use 1/4 bandwidth as sigma for smooth rolloff (95% energy in band)
+        sigma = bandwidth / 4.0 + 1e-6  # Avoid division by zero
+
+        # Smooth Gaussian bandpass mask
+        mask = torch.exp(-0.5 * ((freqs - center) / sigma) ** 2)
         mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, F]
 
         # Apply mask
@@ -2116,13 +2132,16 @@ class FreqDisentangledEncoder(nn.Module):
 
             # Encode band
             z_band = self.band_encoders[band_name](x_band)
+            # Normalize each band embedding for stable scale
+            z_band = self.band_norms[band_name](z_band)
             band_embeddings.append(z_band)
 
         # Concatenate all band embeddings
         z_concat = torch.cat(band_embeddings, dim=-1)
 
-        # Project to final embedding
-        return self.proj(z_concat)
+        # Project to final embedding with normalization
+        z_out = self.proj(z_concat)
+        return self.output_norm(z_out)
 
 
 class CycleConsistentEncoder(nn.Module):
