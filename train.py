@@ -719,7 +719,8 @@ def evaluate(
                 elif cond_source == "freq_disentangled":
                     cond_emb = cond_encoder(ob)
                 elif cond_source == "cycle_consistent":
-                    cond_emb, _ = cond_encoder(ob, pcx)
+                    # At eval time, only use input (no target needed for embedding)
+                    cond_emb, _ = cond_encoder(ob, None)
 
             # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
             if cond_emb is not None:
@@ -1010,21 +1011,28 @@ def train_epoch(
             elif cond_source == "cpc":
                 # CPCEncoder: returns (embedding, z_seq) - use embedding for conditioning
                 cond_emb, z_seq = cond_encoder(ob)
-                # CPC loss for contrastive learning (optional auxiliary loss)
-                # cond_loss = cond_encoder.cpc_loss(z_seq, z_seq)  # Disabled for now
+                # Note: CPC contrastive loss is disabled. To enable, CPCEncoder would need
+                # to return full context sequence (not just mean), then call:
+                # cond_loss = cond_encoder.cpc_loss(z_seq, context_full)
             elif cond_source == "vqvae":
                 # VQVAEEncoder: returns (embedding, losses_dict)
                 cond_emb, vq_losses = cond_encoder(ob)
-                # Add VQ-VAE auxiliary losses
-                cond_loss = vq_losses["vq_loss"] + 0.25 * vq_losses["commitment_loss"]
+                # Add VQ-VAE auxiliary losses (vq + commitment + reconstruction)
+                cond_loss = (vq_losses["vq_loss"] +
+                            0.25 * vq_losses["commitment_loss"] +
+                            0.1 * vq_losses["recon_loss"])
             elif cond_source == "freq_disentangled":
                 # FreqDisentangledEncoder: signal -> embedding
                 cond_emb = cond_encoder(ob)
             elif cond_source == "cycle_consistent":
                 # CycleConsistentEncoder: (input, target) -> (embedding, losses_dict)
                 cond_emb, cycle_losses = cond_encoder(ob, pcx)
+                # Add cycle consistency + reconstruction losses
+                cond_loss = 0.0
                 if "cycle_loss" in cycle_losses:
-                    cond_loss = 0.1 * cycle_losses["cycle_loss"]
+                    cond_loss = cond_loss + 0.1 * cycle_losses["cycle_loss"]
+                if "recon_loss" in cycle_losses:
+                    cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
         if cond_emb is not None:
