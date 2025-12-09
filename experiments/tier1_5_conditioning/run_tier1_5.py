@@ -67,8 +67,7 @@ CONDITIONING_SOURCES = [
     "spectro_temporal",   # SpectroTemporalEncoder (auto-conditioning from signal dynamics)
 ]
 
-# Fast subset for dry-run
-FAST_SOURCES = ["odor_onehot", "spectro_temporal"]
+# Dry-run uses ALL sources but fewer epochs (no subset)
 
 
 # =============================================================================
@@ -424,9 +423,9 @@ def main():
     if args.sources:
         conditionings = args.sources
     elif args.dry_run:
-        conditionings = FAST_SOURCES
-        args.epochs = 5
-        print("[DRY-RUN] Using subset of sources and 5 epochs\n")
+        conditionings = CONDITIONING_SOURCES  # Test ALL sources
+        args.epochs = 3                       # But with fewer epochs
+        print("[DRY-RUN] Testing ALL conditioning sources with 3 epochs each\n")
     else:
         conditionings = CONDITIONING_SOURCES
 

@@ -876,9 +876,9 @@ def main():
         y = np.random.randn(N, C, T).astype(np.float32)
         odors = np.random.randint(0, 7, size=N).astype(np.int64)
         n_odors = 7
-        architectures = ["cnn", "wavenet"]  # Quick test
-        losses = {"l1": "l1", "huber": "huber"}
-        n_epochs = 3
+        architectures = ARCHITECTURES  # Test ALL architectures
+        losses = LOSS_FUNCTIONS         # Test ALL losses
+        n_epochs = 3                    # But with fewer epochs
     else:
         from data import prepare_data
         data = prepare_data()
