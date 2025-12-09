@@ -586,6 +586,112 @@ if __name__ == "__main__":
 '''
 
 
+def run_unet_via_train_py(
+    n_epochs: int,
+    batch_size: int,
+    lr: float,
+    base_channels: int = 64,
+) -> Dict[str, Any]:
+    """Run UNet via torchrun train.py with fair comparison flags.
+
+    Uses --no-bidirectional and --skip-spectral-finetune for fair comparison
+    with other architectures that don't have these features.
+
+    Returns metrics from the training run.
+    """
+    import re
+
+    # Use torchrun for proper distributed training setup (even with 1 GPU)
+    cmd = [
+        "torchrun",
+        "--nproc_per_node=1",
+        str(PROJECT_ROOT / "train.py"),
+        f"--epochs={n_epochs}",
+        f"--batch-size={batch_size}",
+        f"--lr={lr}",
+        f"--base-channels={base_channels}",
+        "--no-bidirectional",           # Fair comparison: no reverse model
+        "--skip-spectral-finetune",     # Fair comparison: no Stage 2
+        "--eval-stage1",                # Evaluate after Stage 1
+    ]
+
+    print(f"  Running: {' '.join(cmd)}")
+
+    try:
+        # Run train.py and capture output
+        result = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            check=True,
+            timeout=14400,  # 4 hours
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout + result.stderr
+
+        # Parse metrics from train.py output
+        # Look for Stage 1 final evaluation output like:
+        # [Stage1 Final] R²=0.xxxx | Pearson=0.xxxx | MAE=0.xxxx | ...
+        metrics = {
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "pearson": 0.0,
+            "psd_error_db": float("inf"),
+            "success": False,
+        }
+
+        # Try to find Stage 1 final metrics
+        for line in output.split("\n"):
+            # Match lines with metrics
+            if "R²=" in line or "r2=" in line.lower():
+                # Parse R²
+                r2_match = re.search(r"R²=([0-9.-]+)", line)
+                if r2_match:
+                    metrics["r2"] = float(r2_match.group(1))
+                    metrics["success"] = True
+
+                # Parse Pearson
+                pearson_match = re.search(r"Pearson=([0-9.-]+)", line, re.IGNORECASE)
+                if pearson_match:
+                    metrics["pearson"] = float(pearson_match.group(1))
+
+                # Parse MAE
+                mae_match = re.search(r"MAE=([0-9.-]+)", line, re.IGNORECASE)
+                if mae_match:
+                    metrics["mae"] = float(mae_match.group(1))
+
+                # Parse PSD error
+                psd_match = re.search(r"psd_err(?:_db)?=([0-9.-]+)", line, re.IGNORECASE)
+                if psd_match:
+                    metrics["psd_error_db"] = float(psd_match.group(1))
+
+        # If we didn't find metrics in output, try to load from checkpoint
+        if not metrics["success"]:
+            checkpoint_path = PROJECT_ROOT / "artifacts" / "checkpoints" / "best_model.pt"
+            if checkpoint_path.exists():
+                import torch
+                ckpt = torch.load(checkpoint_path, map_location="cpu")
+                if "metrics" in ckpt:
+                    m = ckpt["metrics"]
+                    metrics["r2"] = m.get("r2", m.get("corr", float("-inf")))
+                    metrics["mae"] = m.get("mae", float("inf"))
+                    metrics["pearson"] = m.get("corr", 0.0)
+                    metrics["psd_error_db"] = m.get("psd_err_db", float("inf"))
+                    metrics["success"] = True
+
+        return metrics
+
+    except subprocess.CalledProcessError as e:
+        print(f"  train.py failed with exit code {e.returncode}")
+        print(f"  stderr: {e.stderr[:500] if e.stderr else 'None'}")
+        return {"r2": float("-inf"), "success": False, "error": f"Exit code {e.returncode}"}
+    except subprocess.TimeoutExpired:
+        return {"r2": float("-inf"), "success": False, "error": "Timeout (4h)"}
+    except Exception as e:
+        return {"r2": float("-inf"), "success": False, "error": str(e)}
+
+
 def run_single_experiment(
     arch: str,
     loss_name: str,
@@ -596,7 +702,27 @@ def run_single_experiment(
     n_odors: int,
     python_path: str,
 ) -> Dict[str, Any]:
-    """Run ONE experiment (single run, no folds)."""
+    """Run ONE experiment (single run, no folds).
+
+    For UNet: Uses torchrun train.py with --no-bidirectional for fair comparison.
+    For other architectures: Uses embedded WORKER_SCRIPT.
+    """
+
+    # =========================================================================
+    # UNet: Use train.py via torchrun for fair comparison
+    # =========================================================================
+    if arch == "unet":
+        print(f"  [UNet] Using torchrun train.py with --no-bidirectional --skip-spectral-finetune")
+        return run_unet_via_train_py(
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            base_channels=64,  # Same as other tier1 architectures
+        )
+
+    # =========================================================================
+    # Other architectures: Use embedded worker script
+    # =========================================================================
 
     # Write worker script
     worker_path = ARTIFACTS_DIR / "worker.py"
