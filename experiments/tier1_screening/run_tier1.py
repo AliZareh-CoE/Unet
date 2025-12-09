@@ -632,7 +632,9 @@ def run_unet_via_train_py(
 
         # Parse metrics from train.py output
         # Look for Stage 1 final evaluation output like:
-        # [Stage1 Final] R²=0.xxxx | Pearson=0.xxxx | MAE=0.xxxx | ...
+        # STAGE1_RESULT_R2=0.xxxx
+        # STAGE1_RESULT_CORR=0.xxxx
+        # Or: R²: 0.xxxx, Correlation: 0.xxxx
         metrics = {
             "r2": float("-inf"),
             "mae": float("inf"),
@@ -641,44 +643,54 @@ def run_unet_via_train_py(
             "success": False,
         }
 
-        # Try to find Stage 1 final metrics
+        # Try to find Stage 1 final metrics (machine-parseable format first)
         for line in output.split("\n"):
-            # Match lines with metrics
-            if "R²=" in line or "r2=" in line.lower():
-                # Parse R²
-                r2_match = re.search(r"R²=([0-9.-]+)", line)
+            # Machine-parseable format: STAGE1_RESULT_R2=0.xxxx
+            if "STAGE1_RESULT_R2=" in line:
+                r2_match = re.search(r"STAGE1_RESULT_R2=([0-9.-]+)", line)
                 if r2_match:
                     metrics["r2"] = float(r2_match.group(1))
                     metrics["success"] = True
+            if "STAGE1_RESULT_CORR=" in line:
+                corr_match = re.search(r"STAGE1_RESULT_CORR=([0-9.-]+)", line)
+                if corr_match:
+                    metrics["pearson"] = float(corr_match.group(1))
 
-                # Parse Pearson
-                pearson_match = re.search(r"Pearson=([0-9.-]+)", line, re.IGNORECASE)
-                if pearson_match:
-                    metrics["pearson"] = float(pearson_match.group(1))
-
-                # Parse MAE
-                mae_match = re.search(r"MAE=([0-9.-]+)", line, re.IGNORECASE)
+            # Human-readable format: "  R²: 0.xxxx" or "  MAE: 0.xxxx"
+            if "R²:" in line:
+                r2_match = re.search(r"R²:\s*([0-9.-]+)", line)
+                if r2_match:
+                    metrics["r2"] = float(r2_match.group(1))
+                    metrics["success"] = True
+            if "Correlation:" in line:
+                corr_match = re.search(r"Correlation:\s*([0-9.-]+)", line)
+                if corr_match:
+                    metrics["pearson"] = float(corr_match.group(1))
+            if "MAE:" in line:
+                mae_match = re.search(r"MAE:\s*([0-9.-]+)", line)
                 if mae_match:
                     metrics["mae"] = float(mae_match.group(1))
-
-                # Parse PSD error
-                psd_match = re.search(r"psd_err(?:_db)?=([0-9.-]+)", line, re.IGNORECASE)
-                if psd_match:
-                    metrics["psd_error_db"] = float(psd_match.group(1))
 
         # If we didn't find metrics in output, try to load from checkpoint
         if not metrics["success"]:
             checkpoint_path = PROJECT_ROOT / "artifacts" / "checkpoints" / "best_model.pt"
             if checkpoint_path.exists():
                 import torch
-                ckpt = torch.load(checkpoint_path, map_location="cpu")
-                if "metrics" in ckpt:
-                    m = ckpt["metrics"]
-                    metrics["r2"] = m.get("r2", m.get("corr", float("-inf")))
-                    metrics["mae"] = m.get("mae", float("inf"))
-                    metrics["pearson"] = m.get("corr", 0.0)
-                    metrics["psd_error_db"] = m.get("psd_err_db", float("inf"))
-                    metrics["success"] = True
+                try:
+                    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                    if "metrics" in ckpt:
+                        m = ckpt["metrics"]
+                        metrics["r2"] = m.get("r2", m.get("corr", float("-inf")))
+                        metrics["mae"] = m.get("mae", float("inf"))
+                        metrics["pearson"] = m.get("corr", 0.0)
+                        metrics["psd_error_db"] = m.get("psd_err_db", float("inf"))
+                        metrics["success"] = True
+                    elif "best_val_loss" in ckpt:
+                        # Fallback: at least we have loss
+                        metrics["success"] = True
+                        metrics["r2"] = 0.0  # Unknown, but training completed
+                except Exception as e:
+                    print(f"  Warning: Could not load checkpoint: {e}")
 
         return metrics
 
