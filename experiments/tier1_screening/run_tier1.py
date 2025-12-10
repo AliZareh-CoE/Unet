@@ -62,6 +62,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+from scipy import stats  # For statistical tests
 
 # =============================================================================
 # Configuration
@@ -1129,6 +1130,97 @@ def main():
         print("\n[!] No neural methods beat the gate threshold.")
         print("    Consider: more epochs, hyperparameter tuning, or architectural changes.")
 
+    # ==========================================================================
+    # Statistical Analysis (using 3 losses per architecture as replicates)
+    # ==========================================================================
+    print(f"\n{'='*80}")
+    print("STATISTICAL ANALYSIS")
+    print(f"{'='*80}")
+    print("Each architecture tested with 3 losses → paired comparisons possible")
+
+    # Collect R² scores per architecture (across losses)
+    arch_scores = {}
+    for key, r in results.items():
+        arch = r.get("architecture", "?")
+        r2 = r.get("r2_mean", np.nan)
+        if not np.isnan(r2) and r2 != float("-inf"):
+            if arch not in arch_scores:
+                arch_scores[arch] = []
+            arch_scores[arch].append(r2)
+
+    # Per-architecture mean ± std
+    print(f"\n{'Architecture':<12} {'Mean R²':>10} {'Std':>8} {'n':>4}")
+    print("-" * 40)
+    arch_stats = {}
+    for arch in architectures:
+        if arch in arch_scores and len(arch_scores[arch]) > 0:
+            scores = np.array(arch_scores[arch])
+            mean_r2 = np.mean(scores)
+            std_r2 = np.std(scores, ddof=1) if len(scores) > 1 else 0.0
+            arch_stats[arch] = {"mean": mean_r2, "std": std_r2, "scores": scores}
+            print(f"{arch:<12} {mean_r2:>10.4f} {std_r2:>8.4f} {len(scores):>4}")
+        else:
+            print(f"{arch:<12} {'N/A':>10} {'N/A':>8} {0:>4}")
+
+    # Statistical tests: UNet vs each other architecture
+    if "unet" in arch_stats and len(arch_stats["unet"]["scores"]) >= 2:
+        unet_scores = arch_stats["unet"]["scores"]
+        print(f"\n{'='*60}")
+        print("Paired t-tests: UNet vs Others (paired by loss)")
+        print(f"{'='*60}")
+        print(f"{'Comparison':<25} {'t-stat':>8} {'p-value':>10} {'Cohens d':>10} {'Sig':>6}")
+        print("-" * 60)
+
+        stat_results = {}
+        for arch in architectures:
+            if arch == "unet" or arch not in arch_stats:
+                continue
+            other_scores = arch_stats[arch]["scores"]
+
+            # Need same number of samples for paired test
+            n = min(len(unet_scores), len(other_scores))
+            if n < 2:
+                continue
+
+            u_scores = unet_scores[:n]
+            o_scores = other_scores[:n]
+
+            # Paired t-test
+            t_stat, p_value = stats.ttest_rel(u_scores, o_scores)
+
+            # Cohen's d (effect size)
+            diff = u_scores - o_scores
+            cohens_d = np.mean(diff) / (np.std(diff, ddof=1) + 1e-10)
+
+            sig = "***" if p_value < 0.001 else "**" if p_value < 0.01 else "*" if p_value < 0.05 else "ns"
+
+            stat_results[arch] = {
+                "t_stat": float(t_stat),
+                "p_value": float(p_value),
+                "cohens_d": float(cohens_d),
+                "significant": p_value < 0.05,
+            }
+
+            print(f"UNet vs {arch:<17} {t_stat:>8.3f} {p_value:>10.4f} {cohens_d:>10.2f} {sig:>6}")
+
+        print("-" * 60)
+        print("Significance: *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
+        print(f"Cohen's d: |d|>0.8 large, |d|>0.5 medium, |d|>0.2 small")
+
+        # One-way ANOVA across all architectures
+        if len(arch_stats) >= 2:
+            all_groups = [arch_stats[a]["scores"] for a in arch_stats if len(arch_stats[a]["scores"]) > 0]
+            if len(all_groups) >= 2:
+                f_stat, anova_p = stats.f_oneway(*all_groups)
+                print(f"\nOne-way ANOVA (architecture effect): F={f_stat:.3f}, p={anova_p:.4f}")
+                if anova_p < 0.05:
+                    print("  → Significant difference between architectures")
+                else:
+                    print("  → No significant difference between architectures")
+    else:
+        stat_results = {}
+        print("\n[!] Not enough data for statistical tests (need ≥2 losses per architecture)")
+
     # Save final results
     final_results = {
         "tier": 1,
@@ -1145,6 +1237,12 @@ def main():
         "results": results,
         "passing_gate": [{"arch": a, "loss": l, "r2": r, "pearson": p, "psd_error_db": e} for a, l, r, p, e in passing_gate],
         "best_neural": sorted_results[0] if sorted_results else None,
+        # Statistical analysis
+        "statistics": {
+            "arch_summary": {a: {"mean_r2": s["mean"], "std_r2": s["std"], "n": len(s["scores"])}
+                           for a, s in arch_stats.items()},
+            "paired_ttests_vs_unet": stat_results if stat_results else {},
+        },
     }
 
     out_path = ARTIFACTS_DIR / f"tier1_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
