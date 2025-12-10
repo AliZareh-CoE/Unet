@@ -73,6 +73,8 @@ from models import (
     VQVAEEncoder,
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
+    # Distribution correction block
+    ConditionalDistributionBlock,
 )
 from data import (
     prepare_data,
@@ -182,6 +184,19 @@ DEFAULT_CONFIG = {
     "spectral_shift_band_width_hz": 2,  # None=use predefined neuro bands, or float (e.g., 2.0 for 2Hz uniform bands)
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
+
+    # Conditional distribution correction block (experimental)
+    # Enforces Rayleigh envelope distribution while preserving correlation/R²
+    # IMPORTANT: Distribution block gradients are isolated from UNet via .detach()
+    "use_distribution_block": False,  # Enable distribution correction (experimental)
+    "distribution_block_alpha_init": 0.1,  # Initial correction strength
+    "distribution_block_learnable_alpha": True,  # If False, use fixed alpha
+    "distribution_block_hidden_dim": 64,  # Hidden dim for alpha MLP
+    "distribution_block_soft_rank_temp": 0.1,  # Temperature for soft ranking
+    "distribution_block_lambda_envelope": 0.1,  # Weight for envelope (Rayleigh) loss
+    "distribution_block_lambda_phase": 0.05,  # Weight for phase (Uniform) loss
+    "distribution_block_separate_optimizer": True,  # Use separate optimizer (recommended)
+    "distribution_block_lr": 1e-3,  # Learning rate for distribution block
 
     # Recording system (for Nature Methods publication)
     # WARNING: Recording is VERY slow - only enable for final runs!
@@ -1008,6 +1023,8 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
+    distribution_block: Optional[nn.Module] = None,
+    distribution_optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1015,6 +1032,8 @@ def train_epoch(
         stage2_spectral_only: If True, ONLY use spectral loss (Stage 2 mode where UNet is frozen)
         disable_spectral: If True, disable SpectralShift application and spectral loss (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
+        distribution_block: Optional ConditionalDistributionBlock for envelope correction
+        distribution_optimizer: Optional separate optimizer for distribution block
     """
     model.train()
     if reverse_model is not None:
@@ -1025,6 +1044,8 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
+    if distribution_block is not None:
+        distribution_block.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1225,6 +1246,41 @@ def train_epoch(
                 cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
                 loss = loss + cycle_loss_pcx
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
+
+        # =====================================================================
+        # Distribution Correction Block (experimental)
+        # CRITICAL: Input is DETACHED to ensure gradient isolation
+        # Distribution losses train ONLY the distribution block, not UNet
+        # =====================================================================
+        distribution_loss = torch.tensor(0.0, device=device)
+        if distribution_block is not None and cond_emb is not None:
+            # Apply distribution correction with DETACHED input
+            # This prevents distribution gradients from flowing back to UNet
+            y_corrected = distribution_block(pred_raw.detach(), cond_emb.detach())
+
+            # Compute distribution matching losses
+            # Get the module (unwrap DDP if needed)
+            dist_module = distribution_block.module if hasattr(distribution_block, 'module') else distribution_block
+            dist_losses = dist_module.compute_losses(y_corrected)
+
+            # Weighted loss
+            lambda_env = config.get("distribution_block_lambda_envelope", 0.1)
+            lambda_phase = config.get("distribution_block_lambda_phase", 0.05)
+            distribution_loss = lambda_env * dist_losses["envelope_loss"] + lambda_phase * dist_losses["phase_loss"]
+
+            loss_components["dist_envelope"] = loss_components["dist_envelope"] + dist_losses["envelope_loss"].detach()
+            loss_components["dist_phase"] = loss_components["dist_phase"] + dist_losses["phase_loss"].detach()
+
+            # Handle separate optimizer case
+            if distribution_optimizer is not None:
+                # Separate backward/step for distribution block
+                distribution_loss.backward()
+                torch.nn.utils.clip_grad_norm_(distribution_block.parameters(), GRAD_CLIP)
+                distribution_optimizer.step()
+                distribution_optimizer.zero_grad(set_to_none=True)
+            else:
+                # Add to main loss (gradients isolated by detach anyway)
+                loss = loss + distribution_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -1606,6 +1662,43 @@ def train(
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
             print(f"SpectralShift created{ddp_str} mode={mode_str} (fwd init: {init_shift_fwd:+.1f}dB, rev init: {init_shift_rev:+.1f}dB)")
 
+    # Create distribution correction block (experimental)
+    # IMPORTANT: Gradient isolation - distribution block input is DETACHED from UNet
+    # This ensures UNet training is not affected by distribution losses
+    distribution_block = None
+    distribution_optimizer = None
+    if config.get("use_distribution_block", False):
+        # Requires spectro_temporal conditioning to work
+        if cond_source != "spectro_temporal":
+            if is_primary():
+                print("WARNING: Distribution block requires spectro_temporal conditioning. Disabling.")
+        else:
+            distribution_block = ConditionalDistributionBlock(
+                condition_dim=emb_dim,
+                alpha_init=config.get("distribution_block_alpha_init", 0.1),
+                learnable_alpha=config.get("distribution_block_learnable_alpha", True),
+                soft_rank_temperature=config.get("distribution_block_soft_rank_temp", 0.1),
+                hidden_dim=config.get("distribution_block_hidden_dim", 64),
+            ).to(device)
+
+            # Wrap with DDP for distributed training
+            if is_distributed:
+                distribution_block = DDP(distribution_block, device_ids=[local_rank])
+
+            if is_primary():
+                dist_params = sum(p.numel() for p in distribution_block.parameters())
+                print(f"Distribution block created: {dist_params:,} params, alpha_init={config.get('distribution_block_alpha_init', 0.1)}")
+
+            # Create separate optimizer if configured (recommended for gradient isolation)
+            if config.get("distribution_block_separate_optimizer", True):
+                distribution_optimizer = AdamW(
+                    distribution_block.parameters(),
+                    lr=config.get("distribution_block_lr", 1e-3),
+                    betas=betas,
+                )
+                if is_primary():
+                    print(f"Distribution block using separate optimizer, lr={config.get('distribution_block_lr', 1e-3)}")
+
     # Create loss functions
     wavelet_loss = None
     if config.get("use_wavelet_loss", True):
@@ -1644,6 +1737,10 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
+    # Add distribution block to main optimizer if not using separate optimizer
+    if distribution_block is not None and distribution_optimizer is None:
+        distribution_block_lr = config.get("distribution_block_lr", 1e-3)
+        param_groups.append({"params": list(distribution_block.parameters()), "lr": distribution_block_lr, "name": "distribution_block"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
     if is_primary():
@@ -1760,6 +1857,8 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
+                distribution_block=distribution_block,
+                distribution_optimizer=distribution_optimizer,
             )
 
             barrier()
@@ -2104,6 +2203,8 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 stage2_spectral_only=True,  # ONLY spectral loss - UNet frozen, pure PSD optimization
                 cond_encoder=cond_encoder,
+                distribution_block=distribution_block,
+                distribution_optimizer=distribution_optimizer,
             )
 
             barrier()
