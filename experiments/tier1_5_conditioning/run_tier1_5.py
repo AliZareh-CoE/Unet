@@ -375,6 +375,7 @@ def run_tier1_5(
     base_channels: int = 64,
     seed: int = 42,
     debug: bool = False,
+    previous_results: Optional[List[Dict]] = None,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Test different conditioning sources for UNet.
 
@@ -388,6 +389,7 @@ def run_tier1_5(
         base_channels: UNet base channels
         seed: Random seed for reproducibility (default: 42)
         debug: If True, enable verbose debugging for distributed training
+        previous_results: Optional list of successful results from previous run (for --retry-failed)
 
     Returns:
         Tier1_5Result with comparison of all conditioning sources
@@ -397,7 +399,24 @@ def run_tier1_5(
     print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}, Seed: {seed}")
     print()
 
+    # Start with previous successful results if provided (for --retry-failed)
     all_results: List[ConditioningRunResult] = []
+    if previous_results:
+        for r in previous_results:
+            all_results.append(ConditioningRunResult(
+                conditioning=r["conditioning"],
+                r2=r.get("r2", float("-inf")),
+                mae=r.get("mae", float("inf")),
+                pearson=r.get("pearson", 0.0),
+                psd_error_db=r.get("psd_error_db", float("inf")),
+                val_r2=r.get("val_r2", float("-inf")),
+                val_mae=r.get("val_mae", float("inf")),
+                val_pearson=r.get("val_pearson", 0.0),
+                val_psd_error_db=r.get("val_psd_error_db", float("inf")),
+                training_time=r.get("training_time", 0.0),
+                success=True,
+            ))
+        print(f"Loaded {len(previous_results)} successful results from previous run")
 
     for i, cond_source in enumerate(conditionings):
         # CRITICAL: Clean up GPU memory before each run to prevent crashes
@@ -554,6 +573,8 @@ def main():
                         help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debugging for distributed training errors")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Only rerun failed experiments from previous run")
 
     args = parser.parse_args()
 
@@ -568,6 +589,46 @@ def main():
     for i, src in enumerate(CONDITIONING_SOURCES, 1):
         print(f"  {i}. {src}")
     print()
+
+    # Handle --retry-failed: load checkpoint and only run failed ones
+    if args.retry_failed:
+        checkpoint_path = ARTIFACTS_DIR / "tier1_5_checkpoint.json"
+        if not checkpoint_path.exists():
+            print("ERROR: No checkpoint found. Run without --retry-failed first.")
+            return
+
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+
+        # Find failed experiments
+        completed = checkpoint.get("completed", [])
+        failed_sources = [r["conditioning"] for r in completed if not r.get("success", False)]
+        successful_results = [r for r in completed if r.get("success", False)]
+
+        if not failed_sources:
+            print("No failed experiments to retry!")
+            print(f"All {len(completed)} experiments completed successfully.")
+            return
+
+        print(f"[RETRY-FAILED] Found {len(failed_sources)} failed experiments:")
+        for src in failed_sources:
+            print(f"  - {src}")
+        print(f"\nKeeping {len(successful_results)} successful results from previous run.\n")
+
+        conditionings = failed_sources
+
+        # Run only failed ones
+        result = run_tier1_5(
+            conditionings=conditionings,
+            n_epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            base_channels=args.base_channels,
+            seed=args.seed,
+            debug=args.debug,
+            previous_results=successful_results,  # Pass previous successful results
+        )
+        return
 
     # Select conditioning sources
     if args.sources:
