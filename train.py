@@ -1553,9 +1553,12 @@ def train(
 
         # Wrap with DDP for distributed training (gradient sync across ranks)
         # Note: NOT using FSDP since these are tiny
+        # CRITICAL: Must use find_unused_parameters=True because in Stage 1 (two-stage training)
+        # SpectralShift modules are created but NOT used in forward pass (disable_spectral=True).
+        # Without this flag, DDP hangs waiting for gradient sync on unused parameters.
         if is_distributed:
-            spectral_shift_fwd = DDP(spectral_shift_fwd, device_ids=[local_rank])
-            spectral_shift_rev = DDP(spectral_shift_rev, device_ids=[local_rank])
+            spectral_shift_fwd = DDP(spectral_shift_fwd, device_ids=[local_rank], find_unused_parameters=True)
+            spectral_shift_rev = DDP(spectral_shift_rev, device_ids=[local_rank], find_unused_parameters=True)
 
         if is_primary():
             ddp_str = " (DDP-wrapped)" if is_distributed else ""

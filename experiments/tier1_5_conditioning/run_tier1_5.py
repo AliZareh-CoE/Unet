@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import re
 import subprocess
 import sys
@@ -151,6 +152,7 @@ def run_conditioning_via_train_py(
     batch_size: int,
     lr: float,
     base_channels: int = 64,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """Run UNet with specific conditioning via torchrun train.py.
 
@@ -162,6 +164,7 @@ def run_conditioning_via_train_py(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        debug: If True, enable verbose debugging for distributed training
 
     Returns:
         Dict with r2, mae, pearson, psd_error_db, success, error
@@ -184,6 +187,18 @@ def run_conditioning_via_train_py(
         "--eval-stage1",                 # Evaluate after Stage 1
     ]
 
+    # Set up environment with debugging options
+    env = os.environ.copy()
+    if debug:
+        # Enable detailed PyTorch distributed debugging
+        env["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+        env["NCCL_DEBUG"] = "WARN"
+        env["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+        # CUDA_LAUNCH_BLOCKING=1 helps debug CUDA errors but slows training
+        # Only enable if needed for CUDA-specific errors
+        # env["CUDA_LAUNCH_BLOCKING"] = "1"
+        print(f"  [DEBUG MODE] TORCH_DISTRIBUTED_DEBUG=DETAIL, NCCL_DEBUG=WARN")
+
     print(f"  Running: {' '.join(cmd)}")
 
     try:
@@ -197,6 +212,7 @@ def run_conditioning_via_train_py(
             timeout=14400,  # 4 hours
             capture_output=True,
             text=True,
+            env=env,
         )
 
         elapsed = time.time() - start_time
@@ -343,6 +359,7 @@ def run_tier1_5(
     batch_size: int = 8,
     lr: float = 0.0002,
     base_channels: int = 64,
+    debug: bool = False,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Test different conditioning sources for UNet.
 
@@ -354,6 +371,7 @@ def run_tier1_5(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        debug: If True, enable verbose debugging for distributed training
 
     Returns:
         Tier1_5Result with comparison of all conditioning sources
@@ -380,6 +398,7 @@ def run_tier1_5(
             batch_size=batch_size,
             lr=lr,
             base_channels=base_channels,
+            debug=debug,
         )
 
         if metrics.get("success", False):
@@ -506,6 +525,8 @@ def main():
     parser.add_argument("--base-channels", type=int, default=64, help="UNet base channels")
     parser.add_argument("--sources", type=str, nargs="+", default=None,
                         help="Specific conditioning sources to test (default: all)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose debugging for distributed training errors")
 
     args = parser.parse_args()
 
@@ -537,6 +558,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         base_channels=args.base_channels,
+        debug=args.debug,
     )
 
 
