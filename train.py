@@ -625,6 +625,29 @@ def barrier() -> None:
             dist.barrier()
 
 
+def sync_gradients_manual(model: nn.Module) -> None:
+    """Manually synchronize gradients across all ranks using all_reduce.
+
+    This is an alternative to DDP for small modules that have compatibility issues
+    with DDP (like auto-conditioning encoders with auxiliary losses).
+
+    Args:
+        model: The model whose gradients should be synchronized
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return
+
+    # All-reduce gradients across all ranks
+    for param in model.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
+
+
 def set_seed(seed: int = 42) -> None:
     """Set random seeds for reproducibility."""
     rank = get_rank()
@@ -1176,6 +1199,8 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
+            # Manual gradient sync for cond_encoder (not wrapped in DDP)
+            sync_gradients_manual(cond_encoder)
         # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
         # They have only 32 params each with high lr (0.1), clipping would prevent convergence.
         # The spectral loss gradient is naturally bounded by log PSD differences.
@@ -1416,9 +1441,11 @@ def train(
                 reverse_model = DDP(reverse_model, device_ids=[local_rank])
             if cond_encoder is not None:
                 cond_encoder = cond_encoder.to(device)
-                # find_unused_parameters=True needed for auto-conditioning encoders
-                # (CPC, VQVAE, FreqDisentangled have auxiliary losses that don't use all params)
-                cond_encoder = DDP(cond_encoder, device_ids=[local_rank], find_unused_parameters=True)
+                # NOTE: We intentionally do NOT wrap cond_encoder in DDP.
+                # Auto-conditioning encoders (CPC, VQVAE, FreqDisentangled, SpectroTemporal)
+                # have complex forward passes with auxiliary losses that cause DDP crashes
+                # even with find_unused_parameters=True. Instead, we manually sync gradients
+                # using sync_gradients_manual() after backward() but before optimizer.step().
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs")
             dist.barrier()
