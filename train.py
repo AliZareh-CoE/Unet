@@ -760,7 +760,11 @@ def evaluate(
                 elif cond_source == "vqvae":
                     cond_emb, _ = cond_encoder(ob)
                 elif cond_source == "freq_disentangled":
-                    cond_emb, _ = cond_encoder(ob)  # Ignore band_info at eval
+                    # FFT operations require float32, cast input if bfloat16
+                    ob_fft = ob.float() if ob.dtype == torch.bfloat16 else ob
+                    cond_emb, _ = cond_encoder(ob_fft)  # Ignore band_info at eval
+                    if ob.dtype == torch.bfloat16:
+                        cond_emb = cond_emb.to(torch.bfloat16)
                 elif cond_source == "cycle_consistent":
                     # At eval time, only use input (no target needed for embedding)
                     cond_emb, _ = cond_encoder(ob, None)
@@ -1069,7 +1073,12 @@ def train_epoch(
                             0.1 * vq_losses["recon_loss"])
             elif cond_source == "freq_disentangled":
                 # FreqDisentangledEncoder: signal -> (embedding, band_info)
-                cond_emb, band_info = cond_encoder(ob)
+                # IMPORTANT: FFT operations require float32, cast input if bfloat16
+                ob_fft = ob.float() if ob.dtype == torch.bfloat16 else ob
+                cond_emb, band_info = cond_encoder(ob_fft)
+                # Cast output back to compute dtype for consistency
+                if ob.dtype == torch.bfloat16:
+                    cond_emb = cond_emb.to(torch.bfloat16)
                 # Add band power reconstruction loss (ensures meaningful embeddings)
                 cond_loss = 0.1 * cond_encoder.recon_loss(band_info)
             elif cond_source == "cycle_consistent":
