@@ -114,8 +114,8 @@ DEFAULT_CONFIG = {
     "seed": 42,
 
     # Loss weights
-    "weight_l1": 1.0,
-    "weight_wavelet": 10.0,
+    "weight_l1": 1.0,  # Also used for Huber weight
+    "weight_wavelet": 3.0,  # Reduced from 10.0 for better balance
     "weight_spectral": 5.0,  # Increased for better PSD matching
     "cycle_lambda": 1.0,  # Cycle consistency weight
 
@@ -1071,8 +1071,8 @@ def train_epoch(
         else:
             # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
             # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
-            loss_type = config.get("loss_type", "l1_wavelet")
-            if loss_type == "huber":
+            loss_type = config.get("loss_type", "huber_wavelet")
+            if loss_type in ("huber", "huber_wavelet"):
                 recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
             else:
                 recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
@@ -1128,8 +1128,8 @@ def train_epoch(
             else:
                 # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
                 # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
-                loss_type = config.get("loss_type", "l1_wavelet")
-                if loss_type == "huber":
+                loss_type = config.get("loss_type", "huber_wavelet")
+                if loss_type in ("huber", "huber_wavelet"):
                     rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
                 else:
                     rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
@@ -2327,11 +2327,12 @@ def parse_args():
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
     # Loss function selection (for tier1 fair comparison)
-    LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet"]
-    parser.add_argument("--loss", type=str, default="l1_wavelet",
+    LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
+    parser.add_argument("--loss", type=str, default="huber_wavelet",
                         choices=LOSS_CHOICES,
                         help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only), "
-                             "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet combined, default)")
+                             "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet), "
+                             "'huber_wavelet' (Huber + Wavelet combined, default)")
 
     return parser.parse_args()
 
@@ -2457,8 +2458,9 @@ def main():
     # --loss l1: L1 only (no wavelet)
     # --loss huber: Huber only (no wavelet)
     # --loss wavelet: Wavelet only (no L1)
-    # --loss l1_wavelet: L1 + Wavelet combined (default)
-    config["loss_type"] = args.loss  # "l1", "huber", "wavelet", or "l1_wavelet"
+    # --loss l1_wavelet: L1 + Wavelet combined
+    # --loss huber_wavelet: Huber + Wavelet combined (default)
+    config["loss_type"] = args.loss
     if args.loss == "l1":
         config["use_wavelet_loss"] = False
         if is_primary():
@@ -2469,13 +2471,17 @@ def main():
             print("Loss: Huber only (--loss huber)")
     elif args.loss == "wavelet":
         config["use_wavelet_loss"] = True
-        config["weight_l1"] = 0.0  # Disable L1, use only wavelet
+        config["weight_l1"] = 0.0  # Disable L1/Huber, use only wavelet
         if is_primary():
             print("Loss: Wavelet only (--loss wavelet)")
     elif args.loss == "l1_wavelet":
         config["use_wavelet_loss"] = True
         if is_primary():
             print("Loss: L1 + Wavelet combined (--loss l1_wavelet)")
+    elif args.loss == "huber_wavelet":
+        config["use_wavelet_loss"] = True
+        if is_primary():
+            print(f"Loss: Huber + Wavelet combined (--loss huber_wavelet, wavelet_weight={config['weight_wavelet']})")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
