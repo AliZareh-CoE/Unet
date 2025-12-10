@@ -64,6 +64,52 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 from scipy import stats  # For statistical tests
 
+
+def cleanup_gpu_memory():
+    """Force cleanup of GPU memory between runs.
+
+    This is CRITICAL for multi-GPU training to prevent memory leaks
+    and zombie processes from previous runs causing crashes.
+    """
+    # Force Python garbage collection
+    gc.collect()
+
+    # Clear CUDA cache if torch is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Reset peak memory stats
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(i)
+    except ImportError:
+        pass
+
+    # Kill any zombie torchrun/python processes that might be holding GPU memory
+    try:
+        # Find and kill any orphaned torchrun processes
+        subprocess.run(
+            ["pkill", "-9", "-f", "torch.distributed.run"],
+            capture_output=True,
+            timeout=5,
+        )
+        # Also kill any orphaned train.py processes
+        subprocess.run(
+            ["pkill", "-9", "-f", "train.py"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass  # Ignore errors - processes might not exist
+
+    # Wait for GPU memory to be fully released
+    time.sleep(5)
+
+    # Force another garbage collection after sleep
+    gc.collect()
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -1040,6 +1086,10 @@ def main():
 
     # Run experiments
     for i, (arch, loss_cat, loss_name) in enumerate(combos):
+        # CRITICAL: Clean up GPU memory before each run to prevent crashes
+        print(f"\n  Cleaning up GPU memory before run...")
+        cleanup_gpu_memory()
+
         print(f"\n[{i+1}/{len(combos)}] {arch} + {loss_cat}")
 
         result = evaluate_architecture(
