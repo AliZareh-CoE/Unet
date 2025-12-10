@@ -167,6 +167,7 @@ def run_conditioning_via_train_py(
         Dict with r2, mae, pearson, psd_error_db, success, error
     """
     # Use torchrun for distributed training (8x A100)
+    # FSDP with grad_op strategy is more stable than DDP for 8 GPUs
     cmd = [
         "torchrun",
         "--nproc_per_node=8",
@@ -176,9 +177,11 @@ def run_conditioning_via_train_py(
         f"--lr={lr}",
         f"--base-channels={base_channels}",
         f"--conditioning={conditioning}",
-        "--no-bidirectional",           # Fair comparison: no reverse model
-        "--skip-spectral-finetune",     # Fair comparison: no Stage 2
-        "--eval-stage1",                # Evaluate after Stage 1
+        "--fsdp",                        # Use FSDP instead of DDP
+        "--fsdp-strategy=grad_op",       # grad_op recommended for 8x A100
+        "--no-bidirectional",            # Fair comparison: no reverse model
+        "--skip-spectral-finetune",      # Fair comparison: no Stage 2
+        "--eval-stage1",                 # Evaluate after Stage 1
     ]
 
     print(f"  Running: {' '.join(cmd)}")
