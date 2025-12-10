@@ -2059,6 +2059,8 @@ class FreqDisentangledEncoder(nn.Module):
 
     Learns separate latent representations for each frequency band.
     Uses smooth Gaussian bandpass filters and LayerNorm for stable embeddings.
+
+    Includes auxiliary reconstruction loss to ensure meaningful embeddings.
     """
 
     def __init__(self, in_channels: int, embed_dim: int = 128, fs: float = 1000.0):
@@ -2070,6 +2072,7 @@ class FreqDisentangledEncoder(nn.Module):
         # Per-band encoders with LayerNorm for stable embeddings
         self.band_encoders = nn.ModuleDict()
         self.band_norms = nn.ModuleDict()
+        self.band_decoders = nn.ModuleDict()  # For reconstruction loss
         band_dim = embed_dim // len(FREQ_BANDS)
         self.band_dim = band_dim
 
@@ -2085,6 +2088,8 @@ class FreqDisentangledEncoder(nn.Module):
             )
             # LayerNorm per band for stable scale
             self.band_norms[band_name] = nn.LayerNorm(band_dim)
+            # Decoder to reconstruct band log-power (for auxiliary loss)
+            self.band_decoders[band_name] = nn.Linear(band_dim, in_channels)
 
         # Final projection with normalization
         self.proj = nn.Linear(band_dim * len(FREQ_BANDS), embed_dim)
@@ -2116,32 +2121,89 @@ class FreqDisentangledEncoder(nn.Module):
         # Inverse FFT
         return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _compute_band_power(self, x: torch.Tensor, low: float, high: float) -> torch.Tensor:
+        """Compute log power in frequency band for each channel.
+
+        Args:
+            x: [B, C, T] input signal
+            low: Low frequency bound
+            high: High frequency bound
+
+        Returns:
+            [B, C] log power per channel in the band
+        """
+        X = torch.fft.rfft(x, dim=-1)
+        freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
+
+        # Band mask
+        mask = ((freqs >= low) & (freqs <= high)).float()
+
+        # Compute power in band
+        power = (X.abs().square() * mask).sum(dim=-1)  # [B, C]
+
+        # Log scale for better dynamic range
+        return torch.log(power + 1e-10)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Args:
             x: [B, C, T] input signal
 
         Returns:
-            [B, embed_dim] frequency-disentangled embedding
+            embedding: [B, embed_dim] frequency-disentangled embedding
+            band_info: dict with band embeddings and targets for auxiliary loss
         """
         band_embeddings = []
+        band_info = {"embeddings": {}, "targets": {}}
 
         for band_name, (low, high) in FREQ_BANDS.items():
             # Filter signal to band
             x_band = self.bandpass_filter(x, low, high)
 
-            # Encode band
-            z_band = self.band_encoders[band_name](x_band)
-            # Normalize each band embedding for stable scale
-            z_band = self.band_norms[band_name](z_band)
+            # Encode band (before normalization, for reconstruction)
+            z_band_raw = self.band_encoders[band_name](x_band)
+            # Normalize for stable conditioning
+            z_band = self.band_norms[band_name](z_band_raw)
             band_embeddings.append(z_band)
+
+            # Store for auxiliary loss
+            band_info["embeddings"][band_name] = z_band_raw  # Use pre-norm for recon
+            band_info["targets"][band_name] = self._compute_band_power(x, low, high)
 
         # Concatenate all band embeddings
         z_concat = torch.cat(band_embeddings, dim=-1)
 
         # Project to final embedding with normalization
         z_out = self.proj(z_concat)
-        return self.output_norm(z_out)
+        return self.output_norm(z_out), band_info
+
+    def recon_loss(self, band_info: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute auxiliary reconstruction loss.
+
+        Each band embedding should be able to predict the log power
+        in that frequency band. This ensures embeddings are meaningful.
+
+        Args:
+            band_info: dict from forward() with embeddings and targets
+
+        Returns:
+            Scalar reconstruction loss
+        """
+        total_loss = 0.0
+        n_bands = 0
+
+        for band_name in FREQ_BANDS.keys():
+            z_band = band_info["embeddings"][band_name]  # [B, band_dim]
+            target = band_info["targets"][band_name]  # [B, C]
+
+            # Predict band power from embedding
+            pred = self.band_decoders[band_name](z_band)  # [B, C]
+
+            # MSE loss
+            total_loss = total_loss + F.mse_loss(pred, target)
+            n_bands += 1
+
+        return total_loss / n_bands
 
 
 class CycleConsistentEncoder(nn.Module):

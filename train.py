@@ -717,7 +717,7 @@ def evaluate(
                 elif cond_source == "vqvae":
                     cond_emb, _ = cond_encoder(ob)
                 elif cond_source == "freq_disentangled":
-                    cond_emb = cond_encoder(ob)
+                    cond_emb, _ = cond_encoder(ob)  # Ignore band_info at eval
                 elif cond_source == "cycle_consistent":
                     # At eval time, only use input (no target needed for embedding)
                     cond_emb, _ = cond_encoder(ob, None)
@@ -1021,8 +1021,10 @@ def train_epoch(
                             0.25 * vq_losses["commitment_loss"] +
                             0.1 * vq_losses["recon_loss"])
             elif cond_source == "freq_disentangled":
-                # FreqDisentangledEncoder: signal -> embedding
-                cond_emb = cond_encoder(ob)
+                # FreqDisentangledEncoder: signal -> (embedding, band_info)
+                cond_emb, band_info = cond_encoder(ob)
+                # Add band power reconstruction loss (ensures meaningful embeddings)
+                cond_loss = 0.1 * cond_encoder.recon_loss(band_info)
             elif cond_source == "cycle_consistent":
                 # CycleConsistentEncoder: (input, target) -> (embedding, losses_dict)
                 cond_emb, cycle_losses = cond_encoder(ob, pcx)
