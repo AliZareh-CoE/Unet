@@ -124,6 +124,15 @@ DEFAULT_CONFIG = {
     "weight_spectral": 5.0,  # Increased for better PSD matching
     "cycle_lambda": 1.0,  # Cycle consistency weight
 
+    # Loss type selection
+    # Options: "l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"
+    #   - "l1": L1/MAE only
+    #   - "huber": Huber only (smooth L1, robust to outliers)
+    #   - "wavelet": Wavelet only (time-frequency)
+    #   - "l1_wavelet": L1 + Wavelet combined
+    #   - "huber_wavelet": Huber + Wavelet combined (default, recommended)
+    "loss_type": "huber_wavelet",
+
     # Two-stage training: UNet convergence → SpectralShift fine-tuning
     "use_two_stage": True,        # Enable two-stage training (UNet converge → freeze → SpectralShift fine-tune)
     "spectral_finetune_epochs": 20,  # Extra epochs to fine-tune ONLY SpectralShift after UNet converges
@@ -150,12 +159,14 @@ DEFAULT_CONFIG = {
     "conv_kernel_size": 7,  # Kernel size for modern convs (ConvNeXt-style)
     "conv_dilations": (1, 4, 16, 32),  # Multi-scale dilation rates tuned for LFP bands
 
-    # Wavelet loss
+    # Wavelet loss configuration
     "wavelet_family": "morlet",
     "wavelet_omega0": 3.0,
     "use_complex_morlet": False,
-    "use_wavelet_loss": True,
-    "use_spectral_loss": True,
+
+    # Loss toggles (set False to disable)
+    "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
+    "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
