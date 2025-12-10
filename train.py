@@ -1947,8 +1947,19 @@ def train(
 
             barrier()
 
-            # Evaluate on test set - ALL ranks must call this (FSDP requirement)
-            # Use fast_mode=False for stage evaluation (full metrics)
+            # Evaluate on VALIDATION set - ALL ranks must call this (FSDP requirement)
+            val_metrics_stage1 = evaluate(
+                model, loaders["val"], device, wavelet_loss, spectral_loss,
+                compute_phase=True, reverse_model=reverse_model, config=config,
+                spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+                disable_spectral=use_two_stage,
+                fast_mode=False,  # Full metrics for stage evaluation
+                sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+            )
+
+            barrier()
+
+            # Evaluate on TEST set - ALL ranks must call this (FSDP requirement)
             test_metrics_stage1 = evaluate(
                 model, loaders["test"], device, wavelet_loss, spectral_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
@@ -1961,6 +1972,15 @@ def train(
             barrier()
 
             if is_primary():
+                # Validation set metrics
+                print(f"Stage 1 Validation Metrics:")
+                print(f"  R²: {val_metrics_stage1['r2']:.4f}")
+                print(f"  Correlation: {val_metrics_stage1['corr']:.4f}")
+                print(f"  MAE: {val_metrics_stage1['mae']:.4f}")
+                if 'psd_err_db' in val_metrics_stage1:
+                    print(f"  PSD Error: {val_metrics_stage1['psd_err_db']:.2f} dB")
+
+                # Test set metrics
                 print(f"Stage 1 Test Metrics:")
                 print(f"  R²: {test_metrics_stage1['r2']:.4f}")
                 print(f"  Correlation: {test_metrics_stage1['corr']:.4f}")
@@ -1970,6 +1990,13 @@ def train(
                     print(f"  PSD Error: {test_metrics_stage1['psd_err_db']:.2f} dB")
 
                 # Machine-parseable results (for tier1/tier1.5 scripts)
+                # Validation metrics
+                print(f"STAGE1_VAL_R2={val_metrics_stage1['r2']:.4f}")
+                print(f"STAGE1_VAL_CORR={val_metrics_stage1['corr']:.4f}")
+                print(f"STAGE1_VAL_MAE={val_metrics_stage1['mae']:.4f}")
+                if 'psd_err_db' in val_metrics_stage1:
+                    print(f"STAGE1_VAL_PSD_ERR_DB={val_metrics_stage1['psd_err_db']:.4f}")
+                # Test metrics (keeping original names for backward compatibility)
                 print(f"STAGE1_RESULT_R2={test_metrics_stage1['r2']:.4f}")
                 print(f"STAGE1_RESULT_CORR={test_metrics_stage1['corr']:.4f}")
                 print(f"STAGE1_RESULT_MAE={test_metrics_stage1['mae']:.4f}")
