@@ -129,9 +129,9 @@ DEFAULT_CONFIG = {
     #   - "l1": L1/MAE only
     #   - "huber": Huber only (smooth L1, robust to outliers)
     #   - "wavelet": Wavelet only (time-frequency)
-    #   - "l1_wavelet": L1 + Wavelet combined
-    #   - "huber_wavelet": Huber + Wavelet combined (default, recommended)
-    "loss_type": "huber_wavelet",
+    #   - "l1_wavelet": L1 + Wavelet combined (default)
+    #   - "huber_wavelet": Huber + Wavelet combined
+    "loss_type": "l1_wavelet",
 
     # Two-stage training: UNet convergence → SpectralShift fine-tuning
     "use_two_stage": True,        # Enable two-stage training (UNet converge → freeze → SpectralShift fine-tune)
