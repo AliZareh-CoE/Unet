@@ -10,10 +10,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import functools
 import os
 import sys
+import traceback
 import warnings
+
+# Enable faulthandler for better crash diagnostics in distributed training
+faulthandler.enable()
 from collections import defaultdict
 from datetime import datetime, timedelta
 from io import TextIOWrapper
@@ -723,10 +728,14 @@ def evaluate(
     # For composite loss (forward)
     spectral_list = []
 
+    # Determine compute dtype for FSDP mixed precision compatibility
+    use_bf16 = config.get("fsdp_bf16", False) if config else False
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
     with torch.inference_mode():  # Faster than no_grad() - disables view tracking
         for ob, pcx, odor in loader:
-            ob = ob.to(device, non_blocking=True)
-            pcx = pcx.to(device, non_blocking=True)
+            ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
+            pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
 
             # Compute conditioning embedding if using auto-conditioning
@@ -1017,10 +1026,14 @@ def train_epoch(
         disable=not is_primary(),
         file=sys.stdout,
     )
+    # Determine compute dtype for FSDP mixed precision compatibility
+    use_bf16 = config.get("fsdp_bf16", False)
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
     for ob, pcx, odor in pbar:
         # non_blocking=True enables async CPU->GPU transfer (overlaps with compute)
-        ob = ob.to(device, non_blocking=True)
-        pcx = pcx.to(device, non_blocking=True)
+        ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
+        pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
 
         # Compute conditioning embedding
@@ -1427,9 +1440,15 @@ def train(
                     compile_model=compile_model,
                 )
             # Conditioning encoder: just move to device (too small for FSDP sharding)
+            # Also convert to bf16 if FSDP uses mixed precision
             if cond_encoder is not None:
-                cond_encoder = cond_encoder.to(device)
+                if check_bf16_support():
+                    cond_encoder = cond_encoder.to(device, dtype=torch.bfloat16)
+                else:
+                    cond_encoder = cond_encoder.to(device)
             is_fsdp_wrapped = True
+            # Set flag for train_epoch to use bf16 for data tensors
+            config["fsdp_bf16"] = check_bf16_support()
             if is_primary():
                 print(f"Using FSDP with {get_world_size()} GPUs")
             dist.barrier()
@@ -2565,4 +2584,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Print detailed traceback for debugging distributed training crashes
+        rank = int(os.environ.get("RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        print(f"\n{'='*70}", file=sys.stderr, flush=True)
+        print(f"FATAL ERROR on rank {rank} (local_rank {local_rank})", file=sys.stderr, flush=True)
+        print(f"{'='*70}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        print(f"{'='*70}\n", file=sys.stderr, flush=True)
+        sys.stderr.flush()
+        raise
