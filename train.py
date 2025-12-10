@@ -2383,10 +2383,10 @@ def parse_args():
 
     # Conditioning source: how conditioning embeddings are derived
     COND_SOURCES = ["odor_onehot", "spectro_temporal", "cpc", "vqvae", "freq_disentangled", "cycle_consistent"]
-    parser.add_argument("--conditioning", type=str, default="odor_onehot",
+    parser.add_argument("--conditioning", type=str, default="spectro_temporal",
                         choices=COND_SOURCES,
-                        help="Conditioning source: 'odor_onehot' (default, uses odor labels), "
-                             "'spectro_temporal' (auto-conditioning from signal dynamics), "
+                        help="Conditioning source: 'spectro_temporal' (default, auto-conditioning from signal dynamics), "
+                             "'odor_onehot' (uses odor labels), "
                              "'cpc' (contrastive predictive coding), 'vqvae' (vector quantized), "
                              "'freq_disentangled' (per-band encoding), 'cycle_consistent' (cycle loss)")
 
