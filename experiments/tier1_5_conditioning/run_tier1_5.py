@@ -51,6 +51,51 @@ from experiments.common.config_registry import (
 )
 
 
+def cleanup_gpu_memory():
+    """Force cleanup of GPU memory between runs.
+
+    This is CRITICAL for multi-GPU training to prevent memory leaks
+    and zombie processes from previous runs causing crashes.
+    """
+    # Force Python garbage collection
+    gc.collect()
+
+    # Clear CUDA cache if torch is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Reset peak memory stats
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(i)
+    except ImportError:
+        pass
+
+    # Kill any zombie torchrun/python processes that might be holding GPU memory
+    try:
+        # Find and kill any orphaned torchrun processes
+        result = subprocess.run(
+            ["pkill", "-9", "-f", "torch.distributed.run"],
+            capture_output=True,
+            timeout=5,
+        )
+        # Also kill any orphaned train.py processes
+        result = subprocess.run(
+            ["pkill", "-9", "-f", "train.py"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass  # Ignore errors - processes might not exist
+
+    # Wait for GPU memory to be fully released
+    time.sleep(5)
+
+    # Force another garbage collection after sleep
+    gc.collect()
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -122,6 +167,7 @@ def run_conditioning_via_train_py(
         Dict with r2, mae, pearson, psd_error_db, success, error
     """
     # Use torchrun for distributed training (8x A100)
+    # FSDP with grad_op strategy is more stable than DDP for 8 GPUs
     cmd = [
         "torchrun",
         "--nproc_per_node=8",
@@ -131,9 +177,11 @@ def run_conditioning_via_train_py(
         f"--lr={lr}",
         f"--base-channels={base_channels}",
         f"--conditioning={conditioning}",
-        "--no-bidirectional",           # Fair comparison: no reverse model
-        "--skip-spectral-finetune",     # Fair comparison: no Stage 2
-        "--eval-stage1",                # Evaluate after Stage 1
+        "--fsdp",                        # Use FSDP instead of DDP
+        "--fsdp-strategy=grad_op",       # grad_op recommended for 8x A100
+        "--no-bidirectional",            # Fair comparison: no reverse model
+        "--skip-spectral-finetune",      # Fair comparison: no Stage 2
+        "--eval-stage1",                 # Evaluate after Stage 1
     ]
 
     print(f"  Running: {' '.join(cmd)}")
@@ -318,6 +366,10 @@ def run_tier1_5(
     all_results: List[ConditioningRunResult] = []
 
     for i, cond_source in enumerate(conditionings):
+        # CRITICAL: Clean up GPU memory before each run to prevent crashes
+        print(f"\n  Cleaning up GPU memory before run...")
+        cleanup_gpu_memory()
+
         print(f"\n{'='*60}")
         print(f"[{i+1}/{len(conditionings)}] Conditioning: {cond_source}")
         print(f"{'='*60}")
