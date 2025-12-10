@@ -128,10 +128,17 @@ CONDITIONING_SOURCES = [
 class ConditioningRunResult:
     """Result from a single conditioning run."""
     conditioning: str
+    # Test set metrics (primary for publication)
     r2: float
     mae: float
     pearson: float
     psd_error_db: float
+    # Validation set metrics (for training diagnostics)
+    val_r2: float = 0.0
+    val_mae: float = 0.0
+    val_pearson: float = 0.0
+    val_psd_error_db: float = 0.0
+    # Per-band R² (test set)
     r2_delta: Optional[float] = None
     r2_theta: Optional[float] = None
     r2_alpha: Optional[float] = None
@@ -152,6 +159,7 @@ def run_conditioning_via_train_py(
     batch_size: int,
     lr: float,
     base_channels: int = 64,
+    seed: int = 42,
     debug: bool = False,
 ) -> Dict[str, Any]:
     """Run UNet with specific conditioning via torchrun train.py.
@@ -164,6 +172,7 @@ def run_conditioning_via_train_py(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        seed: Random seed for reproducibility (default: 42)
         debug: If True, enable verbose debugging for distributed training
 
     Returns:
@@ -180,6 +189,7 @@ def run_conditioning_via_train_py(
         f"--lr={lr}",
         f"--base-channels={base_channels}",
         f"--conditioning={conditioning}",
+        f"--seed={seed}",                # Fixed seed for reproducibility
         "--fsdp",                        # Use FSDP instead of DDP
         "--fsdp-strategy=grad_op",       # grad_op recommended for 8x A100
         "--no-bidirectional",            # Fair comparison: no reverse model
@@ -220,21 +230,44 @@ def run_conditioning_via_train_py(
 
         # Parse metrics from train.py output
         # Look for Stage 1 final evaluation output like:
-        # STAGE1_RESULT_R2=0.xxxx
-        # STAGE1_RESULT_CORR=0.xxxx
-        # Or: R²: 0.xxxx, Correlation: 0.xxxx
+        # STAGE1_VAL_R2=0.xxxx (validation set)
+        # STAGE1_RESULT_R2=0.xxxx (test set)
         metrics = {
+            # Test set metrics (primary for publication)
             "r2": float("-inf"),
             "mae": float("inf"),
             "pearson": 0.0,
             "psd_error_db": float("inf"),
+            # Validation set metrics (for training diagnostics)
+            "val_r2": float("-inf"),
+            "val_mae": float("inf"),
+            "val_pearson": 0.0,
+            "val_psd_error_db": float("inf"),
             "training_time": elapsed,
             "success": False,
         }
 
-        # Try to find Stage 1 final metrics (machine-parseable format first)
+        # Try to find Stage 1 final metrics (machine-parseable format)
         for line in output.split("\n"):
-            # Machine-parseable format: STAGE1_RESULT_R2=0.xxxx
+            # VALIDATION metrics: STAGE1_VAL_*
+            if "STAGE1_VAL_R2=" in line:
+                match = re.search(r"STAGE1_VAL_R2=([0-9.-]+)", line)
+                if match:
+                    metrics["val_r2"] = float(match.group(1))
+            if "STAGE1_VAL_CORR=" in line:
+                match = re.search(r"STAGE1_VAL_CORR=([0-9.-]+)", line)
+                if match:
+                    metrics["val_pearson"] = float(match.group(1))
+            if "STAGE1_VAL_MAE=" in line:
+                match = re.search(r"STAGE1_VAL_MAE=([0-9.-]+)", line)
+                if match:
+                    metrics["val_mae"] = float(match.group(1))
+            if "STAGE1_VAL_PSD_ERR_DB=" in line:
+                match = re.search(r"STAGE1_VAL_PSD_ERR_DB=([0-9.-]+)", line)
+                if match:
+                    metrics["val_psd_error_db"] = float(match.group(1))
+
+            # TEST metrics: STAGE1_RESULT_* (primary for publication)
             if "STAGE1_RESULT_R2=" in line:
                 r2_match = re.search(r"STAGE1_RESULT_R2=([0-9.-]+)", line)
                 if r2_match:
@@ -250,25 +283,6 @@ def run_conditioning_via_train_py(
                     metrics["mae"] = float(mae_match.group(1))
             if "STAGE1_RESULT_PSD_ERR_DB=" in line:
                 psd_match = re.search(r"STAGE1_RESULT_PSD_ERR_DB=([0-9.-]+)", line)
-                if psd_match:
-                    metrics["psd_error_db"] = float(psd_match.group(1))
-
-            # Human-readable format: "  R²: 0.xxxx" or "  MAE: 0.xxxx"
-            if "R²:" in line:
-                r2_match = re.search(r"R²:\s*([0-9.-]+)", line)
-                if r2_match:
-                    metrics["r2"] = float(r2_match.group(1))
-                    metrics["success"] = True
-            if "Correlation:" in line:
-                corr_match = re.search(r"Correlation:\s*([0-9.-]+)", line)
-                if corr_match:
-                    metrics["pearson"] = float(corr_match.group(1))
-            if "MAE:" in line:
-                mae_match = re.search(r"MAE:\s*([0-9.-]+)", line)
-                if mae_match:
-                    metrics["mae"] = float(mae_match.group(1))
-            if "PSD Error:" in line:
-                psd_match = re.search(r"PSD Error:\s*([0-9.-]+)", line)
                 if psd_match:
                     metrics["psd_error_db"] = float(psd_match.group(1))
 
@@ -359,6 +373,7 @@ def run_tier1_5(
     batch_size: int = 8,
     lr: float = 0.0002,
     base_channels: int = 64,
+    seed: int = 42,
     debug: bool = False,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Test different conditioning sources for UNet.
@@ -371,6 +386,7 @@ def run_tier1_5(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        seed: Random seed for reproducibility (default: 42)
         debug: If True, enable verbose debugging for distributed training
 
     Returns:
@@ -378,7 +394,7 @@ def run_tier1_5(
     """
     print(f"\nTesting {len(conditionings)} conditioning sources")
     print(f"Using train.py with --no-bidirectional --skip-spectral-finetune")
-    print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}")
+    print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}, Seed: {seed}")
     print()
 
     all_results: List[ConditioningRunResult] = []
@@ -398,20 +414,28 @@ def run_tier1_5(
             batch_size=batch_size,
             lr=lr,
             base_channels=base_channels,
+            seed=seed,
             debug=debug,
         )
 
         if metrics.get("success", False):
             result = ConditioningRunResult(
                 conditioning=cond_source,
+                # Test set metrics (primary)
                 r2=metrics["r2"],
                 mae=metrics.get("mae", float("inf")),
                 pearson=metrics.get("pearson", 0.0),
                 psd_error_db=metrics.get("psd_error_db", float("inf")),
+                # Validation set metrics
+                val_r2=metrics.get("val_r2", float("-inf")),
+                val_mae=metrics.get("val_mae", float("inf")),
+                val_pearson=metrics.get("val_pearson", 0.0),
+                val_psd_error_db=metrics.get("val_psd_error_db", float("inf")),
                 training_time=metrics.get("training_time", 0.0),
                 success=True,
             )
-            print(f"  SUCCESS: R²={metrics['r2']:.4f}, Pearson={metrics.get('pearson', 0):.4f}")
+            val_r2 = metrics.get("val_r2", 0)
+            print(f"  SUCCESS: Val R²={val_r2:.4f}, Test R²={metrics['r2']:.4f}, Test Pearson={metrics.get('pearson', 0):.4f}")
         else:
             result = ConditioningRunResult(
                 conditioning=cond_source,
@@ -470,22 +494,22 @@ def run_tier1_5(
         print(f"  Warning: Could not register results: {e}")
 
     # Print summary
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 100)
     print("TIER 1.5 RESULTS: Conditioning Source Comparison")
-    print("=" * 70)
-    print(f"{'Conditioning':<20} {'R²':>10} {'Pearson':>10} {'MAE':>10} {'PSD_err':>10} {'Time':>10}")
-    print("-" * 70)
+    print("=" * 100)
+    print(f"{'Conditioning':<20} {'Val R²':>10} {'Val r':>10} {'Test R²':>10} {'Test r':>10} {'Test MAE':>10} {'Time':>10}")
+    print("-" * 100)
 
     sorted_results = sorted(all_results, key=lambda x: x.r2 if x.success else float("-inf"), reverse=True)
     for r in sorted_results:
         if r.success:
             marker = " <-- BEST" if r.conditioning == best_cond.conditioning else ""
-            print(f"{r.conditioning:<20} {r.r2:>10.4f} {r.pearson:>10.4f} {r.mae:>10.4f} {r.psd_error_db:>10.2f} {r.training_time:>9.1f}s{marker}")
+            print(f"{r.conditioning:<20} {r.val_r2:>10.4f} {r.val_pearson:>10.4f} {r.r2:>10.4f} {r.pearson:>10.4f} {r.mae:>10.4f} {r.training_time:>9.1f}s{marker}")
         else:
-            print(f"{r.conditioning:<20} {'FAILED':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10}  [{r.error}]")
+            print(f"{r.conditioning:<20} {'FAILED':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10}  [{r.error}]")
 
-    print("=" * 70)
-    print(f"\nBest conditioning: {best_cond.conditioning} (R²={best_cond.r2_mean:.4f})")
+    print("=" * 100)
+    print(f"\nBest conditioning: {best_cond.conditioning} (Test R²={best_cond.r2_mean:.4f})")
 
     # Save final results
     final_output = {
@@ -497,6 +521,7 @@ def run_tier1_5(
             "batch_size": batch_size,
             "lr": lr,
             "base_channels": base_channels,
+            "seed": seed,
             "conditionings": conditionings,
         },
         "results": [asdict(r) for r in all_results],
@@ -525,6 +550,8 @@ def main():
     parser.add_argument("--base-channels", type=int, default=64, help="UNet base channels")
     parser.add_argument("--sources", type=str, nargs="+", default=None,
                         help="Specific conditioning sources to test (default: all)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debugging for distributed training errors")
 
@@ -558,6 +585,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         base_channels=args.base_channels,
+        seed=args.seed,
         debug=args.debug,
     )
 
