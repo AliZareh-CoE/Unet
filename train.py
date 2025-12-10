@@ -1682,7 +1682,15 @@ def train(
                 learnable_alpha=config.get("distribution_block_learnable_alpha", True),
                 soft_rank_temperature=config.get("distribution_block_soft_rank_temp", 0.1),
                 hidden_dim=config.get("distribution_block_hidden_dim", 64),
-            ).to(device)
+            )
+
+            # Convert to bf16 if FSDP uses mixed precision (match cond_encoder dtype)
+            # NOTE: Distribution block uses FFT internally which needs float32,
+            # but the alpha_net (Linear layers) should match input dtype
+            if config.get("fsdp_bf16", False):
+                distribution_block = distribution_block.to(device, dtype=torch.bfloat16)
+            else:
+                distribution_block = distribution_block.to(device)
 
             # Wrap with DDP for distributed training
             if is_distributed:
