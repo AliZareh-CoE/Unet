@@ -1461,10 +1461,13 @@ def train(
                 )
             # Conditioning encoder: just move to device (too small for FSDP sharding)
             # Also convert to bf16 if FSDP uses mixed precision
+            # EXCEPTION: freq_disentangled uses FFT which requires float32
             if cond_encoder is not None:
-                if check_bf16_support():
+                cond_source = config.get("conditioning_source", "odor_onehot")
+                if check_bf16_support() and cond_source != "freq_disentangled":
                     cond_encoder = cond_encoder.to(device, dtype=torch.bfloat16)
                 else:
+                    # Keep in float32 for FFT-based encoders or non-bf16 systems
                     cond_encoder = cond_encoder.to(device)
             is_fsdp_wrapped = True
             # Set flag for train_epoch to use bf16 for data tensors
