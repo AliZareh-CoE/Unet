@@ -649,10 +649,10 @@ def run_unet_via_train_py(
     # tier1 uses "l1_wavelet" which maps directly to train.py's "l1_wavelet"
     loss_arg = loss_name  # l1, huber, l1_wavelet are all valid for train.py
 
-    # Use torchrun for proper distributed training setup (8x A100)
+    # Use torchrun with single GPU for fair comparison with other architectures
     cmd = [
         "torchrun",
-        "--nproc_per_node=8",
+        "--nproc_per_node=1",
         str(PROJECT_ROOT / "train.py"),
         f"--epochs={n_epochs}",
         f"--batch-size={batch_size}",
