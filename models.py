@@ -1978,9 +1978,10 @@ class VQVAEEncoder(nn.Module):
             nn.Conv1d(128, embed_dim, kernel_size=3, stride=2, padding=1),
         )
 
-        # Codebook
+        # Codebook - better initialization for stable training
         self.codebook = nn.Embedding(n_codes, embed_dim)
-        self.codebook.weight.data.uniform_(-1.0 / n_codes, 1.0 / n_codes)
+        # Initialize with unit normal (std=1) scaled by 1/sqrt(embed_dim)
+        nn.init.normal_(self.codebook.weight, mean=0, std=1.0 / math.sqrt(embed_dim))
 
         # Decoder (for reconstruction loss)
         self.decoder = nn.Sequential(
@@ -1990,6 +1991,9 @@ class VQVAEEncoder(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose1d(64, in_channels, kernel_size=4, stride=2, padding=1),
         )
+
+        # Output normalization for stable conditioning (like other encoders)
+        self.output_norm = nn.LayerNorm(embed_dim)
 
     def quantize(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize latents to nearest codebook entries (optimized with cdist)."""
@@ -2044,8 +2048,9 @@ class VQVAEEncoder(nn.Module):
             x_recon_crop = x_recon[..., :T_orig]
             recon_loss = F.mse_loss(x_recon_crop, x)
 
-        # Mean pooled embedding for conditioning
+        # Mean pooled embedding for conditioning with normalization
         conditioning = z_q_st.mean(dim=-1)  # [B, D]
+        conditioning = self.output_norm(conditioning)  # Normalize for stable conditioning
 
         return conditioning, {
             "vq_loss": vq_loss,
