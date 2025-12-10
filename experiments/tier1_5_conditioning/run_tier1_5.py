@@ -152,6 +152,7 @@ def run_conditioning_via_train_py(
     batch_size: int,
     lr: float,
     base_channels: int = 64,
+    seed: int = 42,
     debug: bool = False,
 ) -> Dict[str, Any]:
     """Run UNet with specific conditioning via torchrun train.py.
@@ -164,6 +165,7 @@ def run_conditioning_via_train_py(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        seed: Random seed for reproducibility (default: 42)
         debug: If True, enable verbose debugging for distributed training
 
     Returns:
@@ -180,6 +182,7 @@ def run_conditioning_via_train_py(
         f"--lr={lr}",
         f"--base-channels={base_channels}",
         f"--conditioning={conditioning}",
+        f"--seed={seed}",                # Fixed seed for reproducibility
         "--fsdp",                        # Use FSDP instead of DDP
         "--fsdp-strategy=grad_op",       # grad_op recommended for 8x A100
         "--no-bidirectional",            # Fair comparison: no reverse model
@@ -359,6 +362,7 @@ def run_tier1_5(
     batch_size: int = 8,
     lr: float = 0.0002,
     base_channels: int = 64,
+    seed: int = 42,
     debug: bool = False,
 ) -> Tier1_5Result:
     """Run Tier 1.5: Test different conditioning sources for UNet.
@@ -371,6 +375,7 @@ def run_tier1_5(
         batch_size: Batch size
         lr: Learning rate
         base_channels: UNet base channels
+        seed: Random seed for reproducibility (default: 42)
         debug: If True, enable verbose debugging for distributed training
 
     Returns:
@@ -378,7 +383,7 @@ def run_tier1_5(
     """
     print(f"\nTesting {len(conditionings)} conditioning sources")
     print(f"Using train.py with --no-bidirectional --skip-spectral-finetune")
-    print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}")
+    print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}, Seed: {seed}")
     print()
 
     all_results: List[ConditioningRunResult] = []
@@ -398,6 +403,7 @@ def run_tier1_5(
             batch_size=batch_size,
             lr=lr,
             base_channels=base_channels,
+            seed=seed,
             debug=debug,
         )
 
@@ -525,6 +531,8 @@ def main():
     parser.add_argument("--base-channels", type=int, default=64, help="UNet base channels")
     parser.add_argument("--sources", type=str, nargs="+", default=None,
                         help="Specific conditioning sources to test (default: all)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debugging for distributed training errors")
 
@@ -558,6 +566,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         base_channels=args.base_channels,
+        seed=args.seed,
         debug=args.debug,
     )
 
