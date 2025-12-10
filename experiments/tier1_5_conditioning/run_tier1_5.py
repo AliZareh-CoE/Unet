@@ -121,10 +121,10 @@ def run_conditioning_via_train_py(
     Returns:
         Dict with r2, mae, pearson, psd_error_db, success, error
     """
-    # Use torchrun with single GPU (auto-conditioning encoders have DDP issues with 8 GPUs)
+    # Use torchrun for distributed training (8x A100)
     cmd = [
         "torchrun",
-        "--nproc_per_node=1",
+        "--nproc_per_node=8",
         str(PROJECT_ROOT / "train.py"),
         f"--epochs={n_epochs}",
         f"--batch-size={batch_size}",
