@@ -1416,7 +1416,9 @@ def train(
                 reverse_model = DDP(reverse_model, device_ids=[local_rank])
             if cond_encoder is not None:
                 cond_encoder = cond_encoder.to(device)
-                cond_encoder = DDP(cond_encoder, device_ids=[local_rank])
+                # find_unused_parameters=True needed for auto-conditioning encoders
+                # (CPC, VQVAE, FreqDisentangled have auxiliary losses that don't use all params)
+                cond_encoder = DDP(cond_encoder, device_ids=[local_rank], find_unused_parameters=True)
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs")
             dist.barrier()

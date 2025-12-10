@@ -121,7 +121,7 @@ def run_conditioning_via_train_py(
     Returns:
         Dict with r2, mae, pearson, psd_error_db, success, error
     """
-    # Use torchrun for proper distributed training setup (8x A100)
+    # Use torchrun for distributed training (8x A100)
     cmd = [
         "torchrun",
         "--nproc_per_node=8",
