@@ -2399,23 +2399,27 @@ def train(
             all_targets = []
             all_odor_ids = []
 
+            # Use BOTH train and val data for bias computation (never test!)
+            bias_loaders = [("train", loaders["train"]), ("val", loaders["val"])]
+
             with torch.no_grad():
-                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing bias", disable=not is_primary()):
-                    ob_batch = ob_batch.to(device)
-                    pcx_batch = pcx_batch.to(device)
-                    odor_batch = odor_batch.to(device)
+                for loader_name, loader in bias_loaders:
+                    for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing bias ({loader_name})", disable=not is_primary()):
+                        ob_batch = ob_batch.to(device)
+                        pcx_batch = pcx_batch.to(device)
+                        odor_batch = odor_batch.to(device)
 
-                    # Apply per-channel normalization if enabled
-                    if config.get("per_channel_norm", True):
-                        ob_batch = per_channel_normalize(ob_batch)
-                        pcx_batch = per_channel_normalize(pcx_batch)
+                        # Apply per-channel normalization if enabled
+                        if config.get("per_channel_norm", True):
+                            ob_batch = per_channel_normalize(ob_batch)
+                            pcx_batch = per_channel_normalize(pcx_batch)
 
-                    # Forward pass through UNet (frozen)
-                    unet_out = model(ob_batch, odor_batch)
+                        # Forward pass through UNet (frozen)
+                        unet_out = model(ob_batch, odor_batch)
 
-                    all_unet_outputs.append(unet_out.cpu())
-                    all_targets.append(pcx_batch.cpu())
-                    all_odor_ids.append(odor_batch.cpu())
+                        all_unet_outputs.append(unet_out.cpu())
+                        all_targets.append(pcx_batch.cpu())
+                        all_odor_ids.append(odor_batch.cpu())
 
             # Concatenate all batches
             all_unet_outputs = torch.cat(all_unet_outputs, dim=0)
@@ -2440,22 +2444,23 @@ def train(
                 all_rev_odor_ids = []
 
                 with torch.no_grad():
-                    for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing reverse bias", disable=not is_primary()):
-                        ob_batch = ob_batch.to(device)
-                        pcx_batch = pcx_batch.to(device)
-                        odor_batch = odor_batch.to(device)
+                    for loader_name, loader in bias_loaders:
+                        for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing reverse bias ({loader_name})", disable=not is_primary()):
+                            ob_batch = ob_batch.to(device)
+                            pcx_batch = pcx_batch.to(device)
+                            odor_batch = odor_batch.to(device)
 
-                        # Apply per-channel normalization if enabled
-                        if config.get("per_channel_norm", True):
-                            ob_batch = per_channel_normalize(ob_batch)
-                            pcx_batch = per_channel_normalize(pcx_batch)
+                            # Apply per-channel normalization if enabled
+                            if config.get("per_channel_norm", True):
+                                ob_batch = per_channel_normalize(ob_batch)
+                                pcx_batch = per_channel_normalize(pcx_batch)
 
-                        # Reverse pass: PCx -> OB
-                        rev_out = reverse_model(pcx_batch, odor_batch)
+                            # Reverse pass: PCx -> OB
+                            rev_out = reverse_model(pcx_batch, odor_batch)
 
-                        all_rev_outputs.append(rev_out.cpu())
-                        all_rev_targets.append(ob_batch.cpu())
-                        all_rev_odor_ids.append(odor_batch.cpu())
+                            all_rev_outputs.append(rev_out.cpu())
+                            all_rev_targets.append(ob_batch.cpu())
+                            all_rev_odor_ids.append(odor_batch.cpu())
 
                 all_rev_outputs = torch.cat(all_rev_outputs, dim=0)
                 all_rev_targets = torch.cat(all_rev_targets, dim=0)
