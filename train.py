@@ -186,6 +186,19 @@ DEFAULT_CONFIG = {
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
 
+    # Enhanced odor conditioning options for AdaptiveSpectralShift
+    "spectral_shift_use_odor_base": True,   # Per-odor learnable base shifts per frequency band
+    "spectral_shift_use_odor_scale": True,  # Per-odor learnable scale factors
+    "spectral_shift_use_film": True,        # FiLM-style odor modulation of band features
+    "spectral_shift_film_hidden_mult": 2,   # Hidden dim multiplier for FiLM network (hidden_dim * mult)
+
+    # Envelope loss (for spectral shift training, helps match signal envelope distribution)
+    # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
+    "use_envelope_loss": True,              # Enable envelope distribution matching loss
+    "envelope_loss_weight": 1.0,            # Weight for envelope loss
+    "envelope_loss_n_bins": 64,             # Number of histogram bins for distribution matching
+    "envelope_loss_type": "kl",             # Loss type: "kl" (KL divergence), "wasserstein", "mse"
+
     # Output scaling correction (learnable per-channel scale and bias)
     # Helps match target distribution, especially important for probabilistic losses
     "use_output_scaling": True,
@@ -1108,6 +1121,7 @@ def train_epoch(
     residual_corrector: Optional[nn.Module] = None,
     residual_optimizer: Optional[torch.optim.Optimizer] = None,
     prob_loss: Optional[nn.Module] = None,
+    envelope_loss: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1117,6 +1131,7 @@ def train_epoch(
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
         residual_corrector: Optional ResidualDistributionCorrector for envelope correction
         residual_optimizer: Optional separate optimizer for residual corrector
+        envelope_loss: Optional envelope distribution matching loss (for SpectralShift)
     """
     model.train()
     if reverse_model is not None:
@@ -1233,6 +1248,13 @@ def train_epoch(
                 loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + loss.detach()
             else:
                 loss = torch.tensor(0.0, device=device)
+
+            # Envelope loss (forward) - helps SpectralShift match envelope distribution
+            # Uses pred_shifted (SpectralShift gets gradients)
+            if config.get("use_envelope_loss", True) and envelope_loss is not None:
+                env_loss = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_shifted_c, pcx_c)
+                loss = loss + env_loss
+                loss_components["envelope_fwd"] = loss_components["envelope_fwd"] + env_loss.detach()
         else:
             # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
             # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
@@ -1256,6 +1278,13 @@ def train_epoch(
                 spec_loss = config.get("weight_spectral", 1.0) * spectral_loss(pred_shifted_c, pcx_c)
                 loss = loss + spec_loss
                 loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + spec_loss.detach()
+
+            # Envelope loss (forward) - DISABLED in Stage 1, enabled in joint training
+            # Uses pred_shifted (SpectralShift gets gradients)
+            if not disable_spectral and config.get("use_envelope_loss", True) and envelope_loss is not None:
+                env_loss = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_shifted_c, pcx_c)
+                loss = loss + env_loss
+                loss_components["envelope_fwd"] = loss_components["envelope_fwd"] + env_loss.detach()
 
             # Probabilistic loss (forward) - for tier 2.5, added ON TOP of base loss
             if prob_loss is not None:
@@ -1296,6 +1325,12 @@ def train_epoch(
                     spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
                     loss = loss + spec_loss_rev
                     loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
+
+                # Envelope loss (reverse) - helps SpectralShift match envelope distribution
+                if config.get("use_envelope_loss", True) and envelope_loss is not None:
+                    env_loss_rev = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_rev_shifted_c, ob_c)
+                    loss = loss + env_loss_rev
+                    loss_components["envelope_rev"] = loss_components["envelope_rev"] + env_loss_rev.detach()
             else:
                 # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
                 # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
@@ -1319,6 +1354,12 @@ def train_epoch(
                     spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
                     loss = loss + spec_loss_rev
                     loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
+
+                # Envelope loss (reverse) - DISABLED in Stage 1, enabled in joint training
+                if not disable_spectral and config.get("use_envelope_loss", True) and envelope_loss is not None:
+                    env_loss_rev = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_rev_shifted_c, ob_c)
+                    loss = loss + env_loss_rev
+                    loss_components["envelope_rev"] = loss_components["envelope_rev"] + env_loss_rev.detach()
 
                 # Probabilistic loss (reverse) - for tier 2.5
                 if prob_loss is not None:
@@ -1698,6 +1739,12 @@ def train(
             band_width_hz = config.get("spectral_shift_band_width_hz", None)
             max_shift_db = config.get("spectral_shift_max_db", 12.0)
             hidden_dim = config.get("spectral_shift_hidden_dim", 64)
+            # Enhanced odor conditioning options
+            use_odor_base = config.get("spectral_shift_use_odor_base", True)
+            use_odor_scale = config.get("spectral_shift_use_odor_scale", True)
+            use_film = config.get("spectral_shift_use_film", True)
+            film_hidden_mult = config.get("spectral_shift_film_hidden_mult", 2)
+
             spectral_shift_fwd = AdaptiveSpectralShift(
                 n_channels=fwd_out_channels,
                 n_odors=n_odors,
@@ -1707,6 +1754,10 @@ def train(
                 band_width_hz=band_width_hz,
                 max_shift_db=max_shift_db,
                 per_channel=shift_per_channel,
+                use_odor_base=use_odor_base,
+                use_odor_scale=use_odor_scale,
+                use_film=use_film,
+                film_hidden_mult=film_hidden_mult,
             ).to(device)
             spectral_shift_rev = AdaptiveSpectralShift(
                 n_channels=rev_out_channels,
@@ -1717,6 +1768,10 @@ def train(
                 band_width_hz=band_width_hz,
                 max_shift_db=max_shift_db,
                 per_channel=shift_per_channel,
+                use_odor_base=use_odor_base,
+                use_odor_scale=use_odor_scale,
+                use_film=use_film,
+                film_hidden_mult=film_hidden_mult,
             ).to(device)
             if band_width_hz is not None:
                 band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
@@ -1840,6 +1895,18 @@ def train(
             max_freq=MAX_FREQ_HZ,
             use_log_psd=True,
         ).to(device)
+
+    # Envelope loss (for SpectralShift training - matches envelope distribution)
+    # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
+    envelope_loss = None
+    if config.get("use_envelope_loss", True):
+        from models import EnvelopeLoss
+        envelope_loss = EnvelopeLoss(
+            n_bins=config.get("envelope_loss_n_bins", 64),
+            loss_type=config.get("envelope_loss_type", "kl"),
+        ).to(device)
+        if is_primary():
+            print(f"Envelope loss: {config.get('envelope_loss_type', 'kl')} (weight={config.get('envelope_loss_weight', 1.0)}, bins={config.get('envelope_loss_n_bins', 64)})")
 
     # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
     prob_loss = None
@@ -2002,6 +2069,7 @@ def train(
                 residual_corrector=residual_corrector,
                 residual_optimizer=residual_optimizer,
                 prob_loss=prob_loss,
+                envelope_loss=envelope_loss,
             )
 
             barrier()
@@ -2350,6 +2418,7 @@ def train(
                 residual_corrector=residual_corrector,
                 residual_optimizer=residual_optimizer,
                 prob_loss=prob_loss,
+                envelope_loss=envelope_loss,
             )
 
             barrier()
@@ -2686,6 +2755,35 @@ def parse_args():
     parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
                         help="Disable output scaling correction in model")
 
+    # Enhanced odor conditioning options for AdaptiveSpectralShift
+    parser.add_argument("--spectral-shift-odor-base", action="store_true", default=True,
+                        help="Enable per-odor learnable base shifts (default: True)")
+    parser.add_argument("--no-spectral-shift-odor-base", action="store_false", dest="spectral_shift_odor_base",
+                        help="Disable per-odor base shifts")
+    parser.add_argument("--spectral-shift-odor-scale", action="store_true", default=True,
+                        help="Enable per-odor learnable scale factors (default: True)")
+    parser.add_argument("--no-spectral-shift-odor-scale", action="store_false", dest="spectral_shift_odor_scale",
+                        help="Disable per-odor scale factors")
+    parser.add_argument("--spectral-shift-film", action="store_true", default=True,
+                        help="Enable FiLM-style odor modulation (default: True)")
+    parser.add_argument("--no-spectral-shift-film", action="store_false", dest="spectral_shift_film",
+                        help="Disable FiLM modulation")
+    parser.add_argument("--spectral-shift-film-hidden-mult", type=int, default=2,
+                        help="Hidden dim multiplier for FiLM network (default: 2)")
+
+    # Envelope loss (for SpectralShift training)
+    parser.add_argument("--envelope-loss", action="store_true", default=True,
+                        help="Enable envelope distribution matching loss (default: True)")
+    parser.add_argument("--no-envelope-loss", action="store_false", dest="envelope_loss",
+                        help="Disable envelope loss")
+    parser.add_argument("--envelope-loss-weight", type=float, default=1.0,
+                        help="Weight for envelope loss (default: 1.0)")
+    parser.add_argument("--envelope-loss-bins", type=int, default=64,
+                        help="Number of histogram bins for envelope loss (default: 64)")
+    parser.add_argument("--envelope-loss-type", type=str, default="kl",
+                        choices=["kl", "wasserstein", "mse"],
+                        help="Envelope loss type: kl, wasserstein, or mse (default: kl)")
+
     # Loss function selection (for tier1 fair comparison)
     LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
     parser.add_argument("--loss", type=str, default=None,
@@ -2888,6 +2986,18 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
+
+    # Enhanced odor conditioning for SpectralShift
+    config["spectral_shift_use_odor_base"] = getattr(args, 'spectral_shift_odor_base', True)
+    config["spectral_shift_use_odor_scale"] = getattr(args, 'spectral_shift_odor_scale', True)
+    config["spectral_shift_use_film"] = getattr(args, 'spectral_shift_film', True)
+    config["spectral_shift_film_hidden_mult"] = getattr(args, 'spectral_shift_film_hidden_mult', 2)
+
+    # Envelope loss configuration
+    config["use_envelope_loss"] = getattr(args, 'envelope_loss', True)
+    config["envelope_loss_weight"] = getattr(args, 'envelope_loss_weight', 1.0)
+    config["envelope_loss_n_bins"] = getattr(args, 'envelope_loss_bins', 64)
+    config["envelope_loss_type"] = getattr(args, 'envelope_loss_type', 'kl')
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
