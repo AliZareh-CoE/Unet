@@ -186,6 +186,10 @@ DEFAULT_CONFIG = {
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
 
+    # Output scaling correction (learnable per-channel scale and bias)
+    # Helps match target distribution, especially important for probabilistic losses
+    "use_output_scaling": True,
+
     # Residual distribution correction (replaces old Rayleigh-based approach)
     # Learns to correct systematic distributional errors in UNet envelope output
     # Key insight: Learn from actual target distribution, not a theoretical prior
@@ -396,6 +400,32 @@ def get_checkpoint_cond_mode(path: Path) -> Optional[str]:
         return None
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     return checkpoint.get("cond_mode", None)
+
+
+# =============================================================================
+# Per-Channel Normalization
+# =============================================================================
+
+def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Apply per-channel z-score normalization to a batch of signals.
+
+    Each channel is normalized independently using its own mean and std
+    computed over the time dimension.
+
+    Args:
+        x: Input tensor of shape (batch, channels, time)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized tensor with same shape, where each channel has
+        approximately zero mean and unit variance.
+    """
+    # Compute mean and std per channel (over time dimension)
+    # Shape: (batch, channels, 1)
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True).clamp(min=eps)
+
+    return (x - mean) / std
 
 
 def load_checkpoint(
@@ -772,6 +802,11 @@ def evaluate(
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
 
+            # Apply per-channel normalization if enabled (default: True)
+            if config is not None and config.get("per_channel_norm", True):
+                ob = per_channel_normalize(ob)
+                pcx = per_channel_normalize(pcx)
+
             # Compute conditioning embedding if using auto-conditioning
             cond_emb = None
             if cond_encoder is not None:
@@ -1118,6 +1153,11 @@ def train_epoch(
         ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
+
+        # Apply per-channel normalization if enabled (default: True)
+        if config.get("per_channel_norm", True):
+            ob = per_channel_normalize(ob)
+            pcx = per_channel_normalize(pcx)
 
         # Compute conditioning embedding
         cond_emb = None
@@ -1473,6 +1513,8 @@ def train(
         use_se=config.get("use_se", True),
         conv_kernel_size=config.get("conv_kernel_size", 7),
         dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+        # Output scaling correction
+        use_output_scaling=config.get("use_output_scaling", True),
     )
 
     # Create reverse model (target → source) for bidirectional training
@@ -1496,6 +1538,8 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+            # Output scaling correction
+            use_output_scaling=config.get("use_output_scaling", True),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2627,6 +2671,18 @@ def parse_args():
     parser.add_argument("--no-bidirectional", action="store_true",
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
+    # Per-channel normalization (applied during training)
+    parser.add_argument("--per-channel-norm", action="store_true", default=True,
+                        help="Apply per-channel z-score normalization to each batch (default: True)")
+    parser.add_argument("--no-per-channel-norm", action="store_false", dest="per_channel_norm",
+                        help="Disable per-channel normalization")
+
+    # Output scaling correction (learnable per-channel scale and bias in model)
+    parser.add_argument("--output-scaling", action="store_true", default=True,
+                        help="Enable learnable per-channel output scaling in model (default: True)")
+    parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
+                        help="Disable output scaling correction in model")
+
     # Loss function selection (for tier1 fair comparison)
     LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
     parser.add_argument("--loss", type=str, default=None,
@@ -2819,6 +2875,16 @@ def main():
     config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 1.0
     if config["prob_loss_type"] != "none" and is_primary():
         print(f"Probabilistic loss: {config['prob_loss_type']} (weight={config['prob_loss_weight']})")
+
+    # Per-channel normalization (default: enabled)
+    config["per_channel_norm"] = args.per_channel_norm if hasattr(args, 'per_channel_norm') else True
+    if is_primary():
+        print(f"Per-channel normalization: {'ENABLED' if config['per_channel_norm'] else 'DISABLED'}")
+
+    # Output scaling correction in model (default: enabled)
+    config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
+    if is_primary():
+        print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
