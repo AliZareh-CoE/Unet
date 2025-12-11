@@ -2399,23 +2399,27 @@ def train(
             all_targets = []
             all_odor_ids = []
 
+            # Use BOTH train and val data for bias computation (never test!)
+            bias_loaders = [("train", loaders["train"]), ("val", loaders["val"])]
+
             with torch.no_grad():
-                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing bias", disable=not is_primary()):
-                    ob_batch = ob_batch.to(device)
-                    pcx_batch = pcx_batch.to(device)
-                    odor_batch = odor_batch.to(device)
+                for loader_name, loader in bias_loaders:
+                    for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing bias ({loader_name})", disable=not is_primary()):
+                        ob_batch = ob_batch.to(device)
+                        pcx_batch = pcx_batch.to(device)
+                        odor_batch = odor_batch.to(device)
 
-                    # Apply per-channel normalization if enabled
-                    if config.get("per_channel_norm", True):
-                        ob_batch = per_channel_normalize(ob_batch)
-                        pcx_batch = per_channel_normalize(pcx_batch)
+                        # Apply per-channel normalization if enabled
+                        if config.get("per_channel_norm", True):
+                            ob_batch = per_channel_normalize(ob_batch)
+                            pcx_batch = per_channel_normalize(pcx_batch)
 
-                    # Forward pass through UNet (frozen)
-                    unet_out = model(ob_batch, odor_batch)
+                        # Forward pass through UNet (frozen)
+                        unet_out = model(ob_batch, odor_batch)
 
-                    all_unet_outputs.append(unet_out.cpu())
-                    all_targets.append(pcx_batch.cpu())
-                    all_odor_ids.append(odor_batch.cpu())
+                        all_unet_outputs.append(unet_out.cpu())
+                        all_targets.append(pcx_batch.cpu())
+                        all_odor_ids.append(odor_batch.cpu())
 
             # Concatenate all batches
             all_unet_outputs = torch.cat(all_unet_outputs, dim=0)
@@ -2440,22 +2444,23 @@ def train(
                 all_rev_odor_ids = []
 
                 with torch.no_grad():
-                    for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing reverse bias", disable=not is_primary()):
-                        ob_batch = ob_batch.to(device)
-                        pcx_batch = pcx_batch.to(device)
-                        odor_batch = odor_batch.to(device)
+                    for loader_name, loader in bias_loaders:
+                        for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing reverse bias ({loader_name})", disable=not is_primary()):
+                            ob_batch = ob_batch.to(device)
+                            pcx_batch = pcx_batch.to(device)
+                            odor_batch = odor_batch.to(device)
 
-                        # Apply per-channel normalization if enabled
-                        if config.get("per_channel_norm", True):
-                            ob_batch = per_channel_normalize(ob_batch)
-                            pcx_batch = per_channel_normalize(pcx_batch)
+                            # Apply per-channel normalization if enabled
+                            if config.get("per_channel_norm", True):
+                                ob_batch = per_channel_normalize(ob_batch)
+                                pcx_batch = per_channel_normalize(pcx_batch)
 
-                        # Reverse pass: PCx -> OB
-                        rev_out = reverse_model(pcx_batch, odor_batch)
+                            # Reverse pass: PCx -> OB
+                            rev_out = reverse_model(pcx_batch, odor_batch)
 
-                        all_rev_outputs.append(rev_out.cpu())
-                        all_rev_targets.append(ob_batch.cpu())
-                        all_rev_odor_ids.append(odor_batch.cpu())
+                            all_rev_outputs.append(rev_out.cpu())
+                            all_rev_targets.append(ob_batch.cpu())
+                            all_rev_odor_ids.append(odor_batch.cpu())
 
                 all_rev_outputs = torch.cat(all_rev_outputs, dim=0)
                 all_rev_targets = torch.cat(all_rev_targets, dim=0)
@@ -2483,9 +2488,15 @@ def train(
         two_stage_enabled = config.get("spectral_shift_two_stage", True)
         bias_epochs_config = config.get("spectral_shift_bias_epochs", 5)
 
-        # If bias_epochs >= phase_epochs: all epochs are bias-only (no network phase)
-        # This allows testing bias-only training without network refinement
-        if two_stage_enabled:
+        # If we computed bias from data, SKIP bias-only training (bias is already optimal)
+        # Only do network-only training for refinement
+        if compute_bias_from_data:
+            bias_epochs = 0  # Bias already set from data, no gradient-based bias training
+            network_epochs = phase_epochs
+            bias_only_mode = False
+            if is_primary():
+                print("\n[NOTE] Bias computed from data - skipping bias-only training phase")
+        elif two_stage_enabled:
             bias_epochs = min(bias_epochs_config, phase_epochs)
             network_epochs = phase_epochs - bias_epochs
             bias_only_mode = (bias_epochs >= phase_epochs)
@@ -2497,7 +2508,9 @@ def train(
         if is_primary():
             print(f"\n{'='*70}")
             print(f"PHASE 2a: Training FORWARD SpectralShift ({phase_epochs} epochs)")
-            if two_stage_enabled:
+            if compute_bias_from_data:
+                print(f"  NETWORK-ONLY Mode: {phase_epochs} epochs (bias pre-computed from data)")
+            elif two_stage_enabled:
                 if bias_only_mode:
                     print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
                     print(f"  To add network training: increase --spectral-finetune-epochs or decrease --spectral-shift-bias-epochs")
@@ -2510,9 +2523,17 @@ def train(
             for param in spectral_shift_rev.parameters():
                 param.requires_grad = False
 
-        # For two-stage: start with bias-only training
-        if two_stage_enabled:
+        # Set up training mode based on whether bias was computed from data
+        if compute_bias_from_data:
+            # Bias already computed - freeze it, train only network
+            get_module(spectral_shift_fwd).freeze_bias()  # Network trainable, bias frozen
+            stage_desc = "(network-only, bias pre-computed)"
+        elif two_stage_enabled:
+            # Two-stage: start with bias-only training
             get_module(spectral_shift_fwd).freeze_network()  # Only odor_bias trainable
+            stage_desc = "(bias-only)"
+        else:
+            stage_desc = ""
 
         # Optimizer with ONLY forward SpectralShift parameters
         optimizer_2a = AdamW(
@@ -2523,7 +2544,6 @@ def train(
         if is_primary():
             fwd_params = count_trainable_params(spectral_shift_fwd)
             rev_params = count_total_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
-            stage_desc = "(bias-only)" if two_stage_enabled else ""
             print(f"Trainable: Forward SpectralShift = {fwd_params} params {stage_desc}")
             print(f"Frozen: Reverse SpectralShift = {rev_params} params (frozen), UNet = frozen\n")
 
@@ -2639,7 +2659,9 @@ def train(
             if is_primary():
                 print(f"\n{'='*70}")
                 print(f"PHASE 2b: Training REVERSE SpectralShift ({phase_epochs} epochs)")
-                if two_stage_enabled:
+                if compute_bias_from_data:
+                    print(f"  NETWORK-ONLY Mode: {phase_epochs} epochs (bias pre-computed from data)")
+                elif two_stage_enabled:
                     if bias_only_mode:
                         print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
                     else:
@@ -2650,13 +2672,20 @@ def train(
             for param in spectral_shift_fwd.parameters():
                 param.requires_grad = False
 
-            # For two-stage: start with bias-only training
-            if two_stage_enabled:
+            # Set up training mode based on whether bias was computed from data
+            if compute_bias_from_data:
+                # Bias already computed - freeze it, train only network
+                get_module(spectral_shift_rev).freeze_bias()  # Network trainable, bias frozen
+                stage_desc = "(network-only, bias pre-computed)"
+            elif two_stage_enabled:
+                # Two-stage: start with bias-only training
                 get_module(spectral_shift_rev).freeze_network()  # Only odor_bias trainable
+                stage_desc = "(bias-only)"
             else:
                 # Unfreeze all reverse SpectralShift
                 for param in spectral_shift_rev.parameters():
                     param.requires_grad = True
+                stage_desc = ""
 
             # Optimizer with ONLY reverse SpectralShift parameters
             optimizer_2b = AdamW(
@@ -2667,7 +2696,6 @@ def train(
             if is_primary():
                 fwd_params = count_total_params(spectral_shift_fwd)
                 rev_params = count_trainable_params(spectral_shift_rev)
-                stage_desc = "(bias-only)" if two_stage_enabled else ""
                 print(f"Trainable: Reverse SpectralShift = {rev_params} params {stage_desc}")
                 print(f"Frozen: Forward SpectralShift = {fwd_params} params (frozen), UNet = frozen\n")
 
