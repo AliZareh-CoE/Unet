@@ -1307,11 +1307,6 @@ class AdaptiveSpectralShift(nn.Module):
         max_freq_hz: float = 100.0,
         max_shift_db: float = 12.0,
         per_channel: bool = False,
-        # Enhanced odor conditioning options (controllable via config)
-        use_odor_base: bool = True,      # Per-odor learnable base shifts
-        use_odor_scale: bool = True,     # Per-odor learnable scale factors
-        use_film: bool = True,           # FiLM-style odor modulation
-        film_hidden_mult: int = 2,       # Hidden dim multiplier for FiLM
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -1322,11 +1317,6 @@ class AdaptiveSpectralShift(nn.Module):
         self.min_freq_hz = min_freq_hz
         self.max_freq_hz = max_freq_hz
         self.per_channel = per_channel
-
-        # Store odor conditioning flags
-        self.use_odor_base = use_odor_base
-        self.use_odor_scale = use_odor_scale
-        self.use_film = use_film
 
         # Maximum shift in log-scale (for tanh clamping)
         self.max_log_scale = max_shift_db * math.log(10) / 20.0
@@ -1340,46 +1330,13 @@ class AdaptiveSpectralShift(nn.Module):
         self.band_names = list(self.freq_bands.keys())
         self.n_bands = len(self.freq_bands)
 
-        # =================================================================
-        # ENHANCED Odor Conditioning - stronger odor-specific shifts
-        # All components are OPTIONAL and controlled via flags
-        # =================================================================
-
-        # Odor embedding (always needed)
+        # Odor embedding
         self.embed = nn.Embedding(n_odors, emb_dim)
-
-        # Per-odor learnable BASE shifts (OPTIONAL)
-        # Each odor gets its own starting point per frequency band
-        if use_odor_base:
-            self.odor_base_shifts = nn.Parameter(torch.zeros(n_odors, self.n_bands))
-        else:
-            self.register_buffer('odor_base_shifts', torch.zeros(n_odors, self.n_bands))
-
-        # Per-odor learnable SCALE factors (OPTIONAL)
-        # Allows odors to have different dynamic ranges
-        if use_odor_scale:
-            self.odor_scale_factors = nn.Parameter(torch.ones(n_odors, self.n_bands))
-        else:
-            self.register_buffer('odor_scale_factors', torch.ones(n_odors, self.n_bands))
 
         # Feature extraction: band powers -> features
         # Input: n_bands (mean power per band, log-scaled)
         # We also add statistics: mean, std, max across bands
         band_feature_dim = self.n_bands + 3  # band powers + stats
-
-        # FiLM-style odor modulation (OPTIONAL)
-        # Odor embedding generates scale & bias to modulate band features
-        if use_film:
-            film_hidden = hidden_dim * film_hidden_mult
-            self.odor_film = nn.Sequential(
-                nn.Linear(emb_dim, film_hidden),
-                nn.GELU(),
-                nn.Linear(film_hidden, film_hidden),
-                nn.GELU(),
-                nn.Linear(film_hidden, band_feature_dim * 2),  # scale + bias
-            )
-        else:
-            self.odor_film = None
 
         if per_channel:
             # Per-channel mode: process each channel's band powers
@@ -1390,7 +1347,7 @@ class AdaptiveSpectralShift(nn.Module):
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
             )
-            # Combine with odor embedding - deeper network
+            # Combine with odor embedding
             self.shift_predictor = nn.Sequential(
                 nn.Linear(hidden_dim + emb_dim, hidden_dim * 2),
                 nn.GELU(),
@@ -1409,7 +1366,7 @@ class AdaptiveSpectralShift(nn.Module):
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
             )
-            # Combine with odor embedding - deeper network
+            # Combine with odor embedding
             self.shift_predictor = nn.Sequential(
                 nn.Linear(hidden_dim + emb_dim, hidden_dim * 2),
                 nn.GELU(),
@@ -1554,39 +1511,16 @@ class AdaptiveSpectralShift(nn.Module):
             max_power = band_power_log.amax(dim=-1, keepdim=True)
             band_features = torch.cat([band_power_log, mean_power, std_power, max_power], dim=-1)
 
-        # === Step 2: Get odor embedding and per-odor parameters ===
+        # === Step 2: Get odor embedding ===
         if odor_ids is not None:
             odor_emb = self.embed(odor_ids)  # [B, emb_dim]
-            # Get per-odor base shifts and scale factors
-            odor_base = self.odor_base_shifts[odor_ids]  # [B, n_bands]
-            odor_scale = self.odor_scale_factors[odor_ids]  # [B, n_bands]
         else:
             odor_emb = x_float.new_zeros(B, self.emb_dim)
-            odor_base = x_float.new_zeros(B, self.n_bands)
-            odor_scale = x_float.new_ones(B, self.n_bands)
-
-        # === Step 2b: Apply FiLM modulation to band features (OPTIONAL) ===
-        if self.use_film and self.odor_film is not None:
-            # Odor embedding generates scale and bias to modulate band features
-            film_params = self.odor_film(odor_emb)  # [B, band_feature_dim * 2]
-            film_scale = film_params[..., :band_features.shape[-1]]  # [B, band_feature_dim]
-            film_bias = film_params[..., band_features.shape[-1]:]   # [B, band_feature_dim]
-        else:
-            film_scale = None
-            film_bias = None
 
         # === Step 3: Predict per-band shifts ===
         if self.per_channel:
-            # Apply FiLM if enabled
-            if film_scale is not None:
-                film_scale_exp = film_scale.unsqueeze(1)  # [B, 1, band_feature_dim]
-                film_bias_exp = film_bias.unsqueeze(1)    # [B, 1, band_feature_dim]
-                modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
-            else:
-                modulated_features = band_features
-
-            # Encode each channel's (modulated) band features
-            band_encoded = self.band_encoder(modulated_features)  # [B, C, hidden_dim]
+            # Encode each channel's band features
+            band_encoded = self.band_encoder(band_features)  # [B, C, hidden_dim]
 
             # Expand odor embedding to match: [B, C, emb_dim]
             odor_emb_expanded = odor_emb.unsqueeze(1).expand(-1, C, -1)
@@ -1595,28 +1529,18 @@ class AdaptiveSpectralShift(nn.Module):
             combined = torch.cat([band_encoded, odor_emb_expanded], dim=-1)
             predicted_shifts = self.shift_predictor(combined)  # [B, C, n_bands] in [-1, 1]
 
-            # Expand odor_base and odor_scale for per-channel
-            odor_base_exp = odor_base.unsqueeze(1)   # [B, 1, n_bands]
-            odor_scale_exp = odor_scale.unsqueeze(1)  # [B, 1, n_bands]
-
-            # Combine: base + scale * predicted (allows each odor different range)
-            log_scales = odor_base_exp + odor_scale_exp * predicted_shifts * self.max_log_scale
+            # Scale to max shift range
+            log_scales = predicted_shifts * self.max_log_scale
         else:
-            # Apply FiLM if enabled
-            if film_scale is not None:
-                modulated_features = (1 + film_scale) * band_features + film_bias
-            else:
-                modulated_features = band_features
-
-            # Encode global (modulated) band features
-            band_encoded = self.band_encoder(modulated_features)  # [B, hidden_dim]
+            # Encode global band features
+            band_encoded = self.band_encoder(band_features)  # [B, hidden_dim]
 
             # Concatenate with odor embedding
             combined = torch.cat([band_encoded, odor_emb], dim=-1)
             predicted_shifts = self.shift_predictor(combined)  # [B, n_bands] in [-1, 1]
 
-            # Combine: base + scale * predicted (allows each odor different range)
-            log_scales = odor_base + odor_scale * predicted_shifts * self.max_log_scale
+            # Scale to max shift range
+            log_scales = predicted_shifts * self.max_log_scale
 
         # === Step 4: Apply inverse if needed ===
         if inverse:
@@ -1666,49 +1590,20 @@ class AdaptiveSpectralShift(nn.Module):
 
         if odor_ids is not None:
             odor_emb = self.embed(odor_ids)
-            odor_base = self.odor_base_shifts[odor_ids]
-            odor_scale = self.odor_scale_factors[odor_ids]
         else:
             odor_emb = torch.zeros(B, self.emb_dim, device=device, dtype=x.dtype)
-            odor_base = torch.zeros(B, self.n_bands, device=device, dtype=x.dtype)
-            odor_scale = torch.ones(B, self.n_bands, device=device, dtype=x.dtype)
-
-        # Apply FiLM modulation (if enabled)
-        if self.use_film and self.odor_film is not None:
-            film_params = self.odor_film(odor_emb)
-            film_scale = film_params[..., :band_features.shape[-1]]
-            film_bias = film_params[..., band_features.shape[-1]:]
-        else:
-            film_scale = None
-            film_bias = None
 
         if self.per_channel:
-            if film_scale is not None:
-                film_scale_exp = film_scale.unsqueeze(1)
-                film_bias_exp = film_bias.unsqueeze(1)
-                modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
-            else:
-                modulated_features = band_features
-
-            band_encoded = self.band_encoder(modulated_features)
+            band_encoded = self.band_encoder(band_features)
             odor_emb_expanded = odor_emb.unsqueeze(1).expand(-1, C, -1)
             combined = torch.cat([band_encoded, odor_emb_expanded], dim=-1)
             predicted_shifts = self.shift_predictor(combined)
-
-            odor_base_exp = odor_base.unsqueeze(1)
-            odor_scale_exp = odor_scale.unsqueeze(1)
-            log_scales = odor_base_exp + odor_scale_exp * predicted_shifts * self.max_log_scale
+            log_scales = predicted_shifts * self.max_log_scale
         else:
-            if film_scale is not None:
-                modulated_features = (1 + film_scale) * band_features + film_bias
-            else:
-                modulated_features = band_features
-
-            band_encoded = self.band_encoder(modulated_features)
+            band_encoded = self.band_encoder(band_features)
             combined = torch.cat([band_encoded, odor_emb], dim=-1)
             predicted_shifts = self.shift_predictor(combined)
-
-            log_scales = odor_base + odor_scale * predicted_shifts * self.max_log_scale
+            log_scales = predicted_shifts * self.max_log_scale
 
         # Convert to dB
         return 20.0 * log_scales / math.log(10)
