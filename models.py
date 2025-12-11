@@ -1333,6 +1333,11 @@ class AdaptiveSpectralShift(nn.Module):
         # Odor embedding
         self.embed = nn.Embedding(n_odors, emb_dim)
 
+        # Per-odor bias: learnable fixed spectral correction per odor per band
+        # This captures the fixed OB→PCx spectral difference for each odor
+        # The signal-adaptive part (predicted_shifts) provides refinement
+        self.odor_bias = nn.Parameter(torch.zeros(n_odors, self.n_bands))
+
         # Feature extraction: band powers -> features
         # Input: n_bands (mean power per band, log-scaled)
         # We also add statistics: mean, std, max across bands
@@ -1511,11 +1516,13 @@ class AdaptiveSpectralShift(nn.Module):
             max_power = band_power_log.amax(dim=-1, keepdim=True)
             band_features = torch.cat([band_power_log, mean_power, std_power, max_power], dim=-1)
 
-        # === Step 2: Get odor embedding ===
+        # === Step 2: Get odor embedding and bias ===
         if odor_ids is not None:
             odor_emb = self.embed(odor_ids)  # [B, emb_dim]
+            odor_bias = self.odor_bias[odor_ids]  # [B, n_bands]
         else:
             odor_emb = x_float.new_zeros(B, self.emb_dim)
+            odor_bias = x_float.new_zeros(B, self.n_bands)
 
         # === Step 3: Predict per-band shifts ===
         if self.per_channel:
@@ -1529,8 +1536,8 @@ class AdaptiveSpectralShift(nn.Module):
             combined = torch.cat([band_encoded, odor_emb_expanded], dim=-1)
             predicted_shifts = self.shift_predictor(combined)  # [B, C, n_bands] in [-1, 1]
 
-            # Scale to max shift range
-            log_scales = predicted_shifts * self.max_log_scale
+            # Combine: odor_bias (fixed per-odor correction) + signal-adaptive refinement
+            log_scales = odor_bias.unsqueeze(1) + predicted_shifts * self.max_log_scale
         else:
             # Encode global band features
             band_encoded = self.band_encoder(band_features)  # [B, hidden_dim]
@@ -1539,8 +1546,8 @@ class AdaptiveSpectralShift(nn.Module):
             combined = torch.cat([band_encoded, odor_emb], dim=-1)
             predicted_shifts = self.shift_predictor(combined)  # [B, n_bands] in [-1, 1]
 
-            # Scale to max shift range
-            log_scales = predicted_shifts * self.max_log_scale
+            # Combine: odor_bias (fixed per-odor correction) + signal-adaptive refinement
+            log_scales = odor_bias + predicted_shifts * self.max_log_scale
 
         # === Step 4: Apply inverse if needed ===
         if inverse:
@@ -1590,20 +1597,22 @@ class AdaptiveSpectralShift(nn.Module):
 
         if odor_ids is not None:
             odor_emb = self.embed(odor_ids)
+            odor_bias = self.odor_bias[odor_ids]  # [B, n_bands]
         else:
             odor_emb = torch.zeros(B, self.emb_dim, device=device, dtype=x.dtype)
+            odor_bias = torch.zeros(B, self.n_bands, device=device, dtype=x.dtype)
 
         if self.per_channel:
             band_encoded = self.band_encoder(band_features)
             odor_emb_expanded = odor_emb.unsqueeze(1).expand(-1, C, -1)
             combined = torch.cat([band_encoded, odor_emb_expanded], dim=-1)
             predicted_shifts = self.shift_predictor(combined)
-            log_scales = predicted_shifts * self.max_log_scale
+            log_scales = odor_bias.unsqueeze(1) + predicted_shifts * self.max_log_scale
         else:
             band_encoded = self.band_encoder(band_features)
             combined = torch.cat([band_encoded, odor_emb], dim=-1)
             predicted_shifts = self.shift_predictor(combined)
-            log_scales = predicted_shifts * self.max_log_scale
+            log_scales = odor_bias + predicted_shifts * self.max_log_scale
 
         # Convert to dB
         return 20.0 * log_scales / math.log(10)
