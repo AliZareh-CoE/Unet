@@ -1307,6 +1307,11 @@ class AdaptiveSpectralShift(nn.Module):
         max_freq_hz: float = 100.0,
         max_shift_db: float = 12.0,
         per_channel: bool = False,
+        # Enhanced odor conditioning options (controllable via config)
+        use_odor_base: bool = True,      # Per-odor learnable base shifts
+        use_odor_scale: bool = True,     # Per-odor learnable scale factors
+        use_film: bool = True,           # FiLM-style odor modulation
+        film_hidden_mult: int = 2,       # Hidden dim multiplier for FiLM
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -1317,6 +1322,11 @@ class AdaptiveSpectralShift(nn.Module):
         self.min_freq_hz = min_freq_hz
         self.max_freq_hz = max_freq_hz
         self.per_channel = per_channel
+
+        # Store odor conditioning flags
+        self.use_odor_base = use_odor_base
+        self.use_odor_scale = use_odor_scale
+        self.use_film = use_film
 
         # Maximum shift in log-scale (for tanh clamping)
         self.max_log_scale = max_shift_db * math.log(10) / 20.0
@@ -1332,34 +1342,44 @@ class AdaptiveSpectralShift(nn.Module):
 
         # =================================================================
         # ENHANCED Odor Conditioning - stronger odor-specific shifts
+        # All components are OPTIONAL and controlled via flags
         # =================================================================
 
-        # Odor embedding (larger for more expressive odor representations)
+        # Odor embedding (always needed)
         self.embed = nn.Embedding(n_odors, emb_dim)
 
-        # Per-odor learnable BASE shifts - each odor gets its own starting point
-        # This allows odors to have very different spectral profiles
-        # Shape: [n_odors, n_bands] - direct dB shift per odor per band
-        self.odor_base_shifts = nn.Parameter(torch.zeros(n_odors, self.n_bands))
+        # Per-odor learnable BASE shifts (OPTIONAL)
+        # Each odor gets its own starting point per frequency band
+        if use_odor_base:
+            self.odor_base_shifts = nn.Parameter(torch.zeros(n_odors, self.n_bands))
+        else:
+            self.register_buffer('odor_base_shifts', torch.zeros(n_odors, self.n_bands))
 
-        # Per-odor learnable SCALE factors for fine-tuning
+        # Per-odor learnable SCALE factors (OPTIONAL)
         # Allows odors to have different dynamic ranges
-        self.odor_scale_factors = nn.Parameter(torch.ones(n_odors, self.n_bands))
+        if use_odor_scale:
+            self.odor_scale_factors = nn.Parameter(torch.ones(n_odors, self.n_bands))
+        else:
+            self.register_buffer('odor_scale_factors', torch.ones(n_odors, self.n_bands))
 
         # Feature extraction: band powers -> features
         # Input: n_bands (mean power per band, log-scaled)
         # We also add statistics: mean, std, max across bands
         band_feature_dim = self.n_bands + 3  # band powers + stats
 
-        # FiLM-style odor modulation: odor embedding generates scale & bias
-        # to modulate the band features before shift prediction
-        self.odor_film = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, band_feature_dim * 2),  # scale + bias
-        )
+        # FiLM-style odor modulation (OPTIONAL)
+        # Odor embedding generates scale & bias to modulate band features
+        if use_film:
+            film_hidden = hidden_dim * film_hidden_mult
+            self.odor_film = nn.Sequential(
+                nn.Linear(emb_dim, film_hidden),
+                nn.GELU(),
+                nn.Linear(film_hidden, film_hidden),
+                nn.GELU(),
+                nn.Linear(film_hidden, band_feature_dim * 2),  # scale + bias
+            )
+        else:
+            self.odor_film = None
 
         if per_channel:
             # Per-channel mode: process each channel's band powers
@@ -1545,23 +1565,27 @@ class AdaptiveSpectralShift(nn.Module):
             odor_base = x_float.new_zeros(B, self.n_bands)
             odor_scale = x_float.new_ones(B, self.n_bands)
 
-        # === Step 2b: Apply FiLM modulation to band features ===
-        # Odor embedding generates scale and bias to modulate band features
-        # This makes the feature encoding odor-aware from the start
-        film_params = self.odor_film(odor_emb)  # [B, band_feature_dim * 2]
-        film_scale = film_params[..., :band_features.shape[-1]]  # [B, band_feature_dim]
-        film_bias = film_params[..., band_features.shape[-1]:]   # [B, band_feature_dim]
+        # === Step 2b: Apply FiLM modulation to band features (OPTIONAL) ===
+        if self.use_film and self.odor_film is not None:
+            # Odor embedding generates scale and bias to modulate band features
+            film_params = self.odor_film(odor_emb)  # [B, band_feature_dim * 2]
+            film_scale = film_params[..., :band_features.shape[-1]]  # [B, band_feature_dim]
+            film_bias = film_params[..., band_features.shape[-1]:]   # [B, band_feature_dim]
+        else:
+            film_scale = None
+            film_bias = None
 
-        # === Step 3: Predict per-band shifts with FiLM modulation ===
+        # === Step 3: Predict per-band shifts ===
         if self.per_channel:
-            # Expand FiLM params for per-channel: [B, 1, band_feature_dim] -> broadcast
-            film_scale_exp = film_scale.unsqueeze(1)  # [B, 1, band_feature_dim]
-            film_bias_exp = film_bias.unsqueeze(1)    # [B, 1, band_feature_dim]
+            # Apply FiLM if enabled
+            if film_scale is not None:
+                film_scale_exp = film_scale.unsqueeze(1)  # [B, 1, band_feature_dim]
+                film_bias_exp = film_bias.unsqueeze(1)    # [B, 1, band_feature_dim]
+                modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
+            else:
+                modulated_features = band_features
 
-            # Apply FiLM: modulated_features = scale * features + bias
-            modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
-
-            # Encode each channel's modulated band features
+            # Encode each channel's (modulated) band features
             band_encoded = self.band_encoder(modulated_features)  # [B, C, hidden_dim]
 
             # Expand odor embedding to match: [B, C, emb_dim]
@@ -1578,10 +1602,13 @@ class AdaptiveSpectralShift(nn.Module):
             # Combine: base + scale * predicted (allows each odor different range)
             log_scales = odor_base_exp + odor_scale_exp * predicted_shifts * self.max_log_scale
         else:
-            # Apply FiLM: modulated_features = scale * features + bias
-            modulated_features = (1 + film_scale) * band_features + film_bias
+            # Apply FiLM if enabled
+            if film_scale is not None:
+                modulated_features = (1 + film_scale) * band_features + film_bias
+            else:
+                modulated_features = band_features
 
-            # Encode global modulated band features
+            # Encode global (modulated) band features
             band_encoded = self.band_encoder(modulated_features)  # [B, hidden_dim]
 
             # Concatenate with odor embedding
@@ -1646,15 +1673,22 @@ class AdaptiveSpectralShift(nn.Module):
             odor_base = torch.zeros(B, self.n_bands, device=device, dtype=x.dtype)
             odor_scale = torch.ones(B, self.n_bands, device=device, dtype=x.dtype)
 
-        # Apply FiLM modulation
-        film_params = self.odor_film(odor_emb)
-        film_scale = film_params[..., :band_features.shape[-1]]
-        film_bias = film_params[..., band_features.shape[-1]:]
+        # Apply FiLM modulation (if enabled)
+        if self.use_film and self.odor_film is not None:
+            film_params = self.odor_film(odor_emb)
+            film_scale = film_params[..., :band_features.shape[-1]]
+            film_bias = film_params[..., band_features.shape[-1]:]
+        else:
+            film_scale = None
+            film_bias = None
 
         if self.per_channel:
-            film_scale_exp = film_scale.unsqueeze(1)
-            film_bias_exp = film_bias.unsqueeze(1)
-            modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
+            if film_scale is not None:
+                film_scale_exp = film_scale.unsqueeze(1)
+                film_bias_exp = film_bias.unsqueeze(1)
+                modulated_features = (1 + film_scale_exp) * band_features + film_bias_exp
+            else:
+                modulated_features = band_features
 
             band_encoded = self.band_encoder(modulated_features)
             odor_emb_expanded = odor_emb.unsqueeze(1).expand(-1, C, -1)
@@ -1665,7 +1699,10 @@ class AdaptiveSpectralShift(nn.Module):
             odor_scale_exp = odor_scale.unsqueeze(1)
             log_scales = odor_base_exp + odor_scale_exp * predicted_shifts * self.max_log_scale
         else:
-            modulated_features = (1 + film_scale) * band_features + film_bias
+            if film_scale is not None:
+                modulated_features = (1 + film_scale) * band_features + film_bias
+            else:
+                modulated_features = band_features
 
             band_encoded = self.band_encoder(modulated_features)
             combined = torch.cat([band_encoded, odor_emb], dim=-1)
@@ -1682,6 +1719,198 @@ class AdaptiveSpectralShift(nn.Module):
             f"n_channels={self.n_channels}, n_bands={self.n_bands}, "
             f"per_channel={self.per_channel}, max_shift={max_db:.1f}dB"
         )
+
+
+# =============================================================================
+# Envelope Distribution Loss (for SpectralShift training)
+# =============================================================================
+
+class EnvelopeLoss(nn.Module):
+    """Envelope distribution matching loss for spectral shift training.
+
+    Computes the envelope (magnitude of analytic signal via Hilbert transform)
+    of predicted and target signals, then matches their distributions.
+
+    This helps SpectralShift learn to match not just spectral content but also
+    the amplitude envelope distribution of the target signal.
+
+    IMPORTANT: This loss should be applied with detached UNet output so only
+    SpectralShift gets gradients, not the UNet.
+
+    Args:
+        n_bins: Number of histogram bins for distribution comparison (default: 64)
+        loss_type: Distribution matching method:
+            - "kl": KL divergence (default)
+            - "wasserstein": Wasserstein/Earth Mover's Distance
+            - "mse": MSE between histograms
+        eps: Small constant for numerical stability
+    """
+
+    def __init__(
+        self,
+        n_bins: int = 64,
+        loss_type: str = "kl",
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.n_bins = n_bins
+        self.loss_type = loss_type
+        self.eps = eps
+
+    def _get_eps(self, dtype: torch.dtype) -> float:
+        """Get appropriate epsilon for dtype."""
+        if dtype in (torch.bfloat16, torch.float16):
+            return 1e-4
+        return self.eps
+
+    def _compute_envelope(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute signal envelope using Hilbert transform.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            Envelope [B, C, T]
+        """
+        # Work in float32 for FFT stability
+        original_dtype = x.dtype
+        x_float = x.float()
+
+        # Hilbert transform via FFT
+        # 1. Compute FFT
+        n = x_float.shape[-1]
+        X = torch.fft.fft(x_float, dim=-1)
+
+        # 2. Create Hilbert multiplier (double positive frequencies, zero negative)
+        h = torch.zeros(n, device=x.device, dtype=x_float.dtype)
+        if n % 2 == 0:
+            h[0] = 1
+            h[1:n//2] = 2
+            h[n//2] = 1
+        else:
+            h[0] = 1
+            h[1:(n+1)//2] = 2
+
+        # 3. Apply and inverse FFT to get analytic signal
+        analytic = torch.fft.ifft(X * h.unsqueeze(0).unsqueeze(0), dim=-1)
+
+        # 4. Envelope is magnitude of analytic signal
+        envelope = analytic.abs()
+
+        return envelope.to(original_dtype)
+
+    def _soft_histogram(
+        self,
+        x: torch.Tensor,
+        n_bins: int,
+        min_val: float,
+        max_val: float,
+    ) -> torch.Tensor:
+        """Compute differentiable soft histogram.
+
+        Args:
+            x: Input values [N] (flattened)
+            n_bins: Number of bins
+            min_val: Minimum bin edge
+            max_val: Maximum bin edge
+
+        Returns:
+            Soft histogram [n_bins]
+        """
+        eps = self._get_eps(x.dtype)
+
+        # Bin centers and width
+        bin_width = (max_val - min_val) / n_bins
+        bin_centers = torch.linspace(
+            min_val + bin_width/2,
+            max_val - bin_width/2,
+            n_bins,
+            device=x.device,
+            dtype=x.dtype
+        )
+
+        # Soft assignment using Gaussian kernel
+        # sigma controls softness (smaller = sharper)
+        sigma = bin_width * 0.5
+
+        # x: [N], bin_centers: [n_bins] -> distances: [N, n_bins]
+        x_flat = x.reshape(-1, 1)
+        distances = (x_flat - bin_centers.unsqueeze(0)) ** 2
+        weights = torch.exp(-distances / (2 * sigma ** 2 + eps))
+
+        # Normalize weights per sample
+        weights = weights / (weights.sum(dim=1, keepdim=True) + eps)
+
+        # Sum to get histogram
+        hist = weights.sum(dim=0)
+
+        # Normalize to probability distribution
+        hist = hist / (hist.sum() + eps)
+
+        return hist
+
+    @torch.amp.autocast('cuda', enabled=False)
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute envelope distribution matching loss.
+
+        Args:
+            pred: Predicted signal [B, C, T]
+            target: Target signal [B, C, T]
+
+        Returns:
+            Scalar loss value
+        """
+        # Work in float32 for numerical stability
+        pred_float = pred.float()
+        target_float = target.float()
+        eps = self._get_eps(pred.dtype)
+
+        # Compute envelopes
+        pred_env = self._compute_envelope(pred_float)
+        target_env = self._compute_envelope(target_float)
+
+        # Get range for histogram bins (use target range as reference)
+        with torch.no_grad():
+            min_val = min(pred_env.min().item(), target_env.min().item())
+            max_val = max(pred_env.max().item(), target_env.max().item())
+            # Add small margin
+            margin = (max_val - min_val) * 0.05 + eps
+            min_val -= margin
+            max_val += margin
+
+        # Compute soft histograms
+        pred_hist = self._soft_histogram(pred_env, self.n_bins, min_val, max_val)
+        target_hist = self._soft_histogram(target_env, self.n_bins, min_val, max_val)
+
+        # Compute distribution matching loss
+        if self.loss_type == "kl":
+            # KL divergence: D_KL(target || pred)
+            # Avoid log(0) by adding eps
+            loss = F.kl_div(
+                (pred_hist + eps).log(),
+                target_hist + eps,
+                reduction='sum',
+                log_target=False
+            )
+        elif self.loss_type == "wasserstein":
+            # Wasserstein distance (1D case = integral of |CDF difference|)
+            pred_cdf = torch.cumsum(pred_hist, dim=0)
+            target_cdf = torch.cumsum(target_hist, dim=0)
+            loss = torch.abs(pred_cdf - target_cdf).mean()
+        elif self.loss_type == "mse":
+            # MSE between histograms
+            loss = F.mse_loss(pred_hist, target_hist)
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        return loss
+
+    def extra_repr(self) -> str:
+        return f"n_bins={self.n_bins}, loss_type='{self.loss_type}'"
 
 
 # =============================================================================
