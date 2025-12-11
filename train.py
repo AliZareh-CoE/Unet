@@ -2400,10 +2400,15 @@ def train(
             all_odor_ids = []
 
             with torch.no_grad():
-                for batch in tqdm(loaders["train"], desc="Computing bias", disable=not is_primary()):
-                    ob_batch = batch["ob"].to(device)
-                    pcx_batch = batch["pcx"].to(device)
-                    odor_batch = batch["odor"].to(device)
+                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing bias", disable=not is_primary()):
+                    ob_batch = ob_batch.to(device)
+                    pcx_batch = pcx_batch.to(device)
+                    odor_batch = odor_batch.to(device)
+
+                    # Apply per-channel normalization if enabled
+                    if config.get("per_channel_norm", True):
+                        ob_batch = per_channel_normalize(ob_batch)
+                        pcx_batch = per_channel_normalize(pcx_batch)
 
                     # Forward pass through UNet (frozen)
                     unet_out = model(ob_batch, odor_batch)
@@ -2435,10 +2440,15 @@ def train(
                 all_rev_odor_ids = []
 
                 with torch.no_grad():
-                    for batch in tqdm(loaders["train"], desc="Computing reverse bias", disable=not is_primary()):
-                        ob_batch = batch["ob"].to(device)
-                        pcx_batch = batch["pcx"].to(device)
-                        odor_batch = batch["odor"].to(device)
+                    for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Computing reverse bias", disable=not is_primary()):
+                        ob_batch = ob_batch.to(device)
+                        pcx_batch = pcx_batch.to(device)
+                        odor_batch = odor_batch.to(device)
+
+                        # Apply per-channel normalization if enabled
+                        if config.get("per_channel_norm", True):
+                            ob_batch = per_channel_normalize(ob_batch)
+                            pcx_batch = per_channel_normalize(pcx_batch)
 
                         # Reverse pass: PCx -> OB
                         rev_out = reverse_model(pcx_batch, odor_batch)
