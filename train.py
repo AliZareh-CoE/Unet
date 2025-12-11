@@ -710,7 +710,6 @@ def evaluate(
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
-    distribution_block: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -722,7 +721,6 @@ def evaluate(
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        distribution_block: Optional distribution correction block for envelope correction
     """
     model.eval()
     if reverse_model is not None:
@@ -733,8 +731,6 @@ def evaluate(
         spectral_shift_fwd.eval()
     if spectral_shift_rev is not None:
         spectral_shift_rev.eval()
-    if distribution_block is not None:
-        distribution_block.eval()
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -799,11 +795,6 @@ def evaluate(
             # NOTE: Skip in Stage 1 (disable_spectral=True)
             if spectral_shift_fwd is not None and not disable_spectral:
                 pred = spectral_shift_fwd(pred, odor_ids=odor)
-
-            # Apply distribution correction block (envelope Rayleigh correction)
-            # This is the FINAL output that should be used for metrics
-            if distribution_block is not None and cond_emb is not None:
-                pred = distribution_block(pred, cond_emb)
 
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
@@ -1891,7 +1882,6 @@ def train(
                 fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                distribution_block=distribution_block,
             )
 
             # Sync val_loss across ranks (for early stopping)
@@ -2238,7 +2228,6 @@ def train(
                 fast_mode=False,  # Include PSD metrics to monitor frequency reconstruction
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                distribution_block=distribution_block,
             )
 
             # Sync val_loss across ranks
