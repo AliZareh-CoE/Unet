@@ -187,6 +187,7 @@ DEFAULT_CONFIG = {
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
     "spectral_shift_two_stage": True,  # Two-stage training: first bias-only, then network-only
     "spectral_shift_bias_epochs": 5,   # Epochs for bias-only training (Stage 2a-1, 2b-1)
+    "spectral_shift_compute_bias": True,  # Compute optimal bias directly from UNet output vs target PSD
 
     # Envelope loss (for spectral shift training, helps match signal envelope distribution)
     # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
@@ -2379,17 +2380,119 @@ def train(
             phase_epochs = spectral_finetune_epochs  # If only 1 epoch, use it for both
 
         # =====================================================================
+        # COMPUTE OPTIMAL BIAS FROM DATA (if enabled)
+        # =====================================================================
+        compute_bias_from_data = config.get("spectral_shift_compute_bias", True)
+
+        if compute_bias_from_data and spectral_shift_fwd is not None:
+            if is_primary():
+                print(f"\n{'='*70}")
+                print("COMPUTING OPTIMAL BIAS FROM UNet OUTPUT vs TARGET PSD")
+                print(f"{'='*70}")
+
+            # Collect UNet outputs and targets for all training data
+            model.eval()
+            if reverse_model is not None:
+                reverse_model.eval()
+
+            all_unet_outputs = []
+            all_targets = []
+            all_odor_ids = []
+
+            with torch.no_grad():
+                for batch in tqdm(loaders["train"], desc="Computing bias", disable=not is_primary()):
+                    ob_batch = batch["ob"].to(device)
+                    pcx_batch = batch["pcx"].to(device)
+                    odor_batch = batch["odor"].to(device)
+
+                    # Forward pass through UNet (frozen)
+                    unet_out = model(ob_batch, odor_batch)
+
+                    all_unet_outputs.append(unet_out.cpu())
+                    all_targets.append(pcx_batch.cpu())
+                    all_odor_ids.append(odor_batch.cpu())
+
+            # Concatenate all batches
+            all_unet_outputs = torch.cat(all_unet_outputs, dim=0)
+            all_targets = torch.cat(all_targets, dim=0)
+            all_odor_ids = torch.cat(all_odor_ids, dim=0)
+
+            if is_primary():
+                print(f"Collected {len(all_unet_outputs)} samples")
+
+            # Compute and set optimal bias for FORWARD SpectralShift
+            spectral_shift_fwd_module = get_module(spectral_shift_fwd)
+            spectral_shift_fwd_module.set_bias_from_data(
+                all_unet_outputs.to(device),
+                all_targets.to(device),
+                all_odor_ids.to(device),
+            )
+
+            # Also compute for REVERSE if exists
+            if spectral_shift_rev is not None and reverse_model is not None:
+                all_rev_outputs = []
+                all_rev_targets = []
+                all_rev_odor_ids = []
+
+                with torch.no_grad():
+                    for batch in tqdm(loaders["train"], desc="Computing reverse bias", disable=not is_primary()):
+                        ob_batch = batch["ob"].to(device)
+                        pcx_batch = batch["pcx"].to(device)
+                        odor_batch = batch["odor"].to(device)
+
+                        # Reverse pass: PCx -> OB
+                        rev_out = reverse_model(pcx_batch, odor_batch)
+
+                        all_rev_outputs.append(rev_out.cpu())
+                        all_rev_targets.append(ob_batch.cpu())
+                        all_rev_odor_ids.append(odor_batch.cpu())
+
+                all_rev_outputs = torch.cat(all_rev_outputs, dim=0)
+                all_rev_targets = torch.cat(all_rev_targets, dim=0)
+                all_rev_odor_ids = torch.cat(all_rev_odor_ids, dim=0)
+
+                spectral_shift_rev_module = get_module(spectral_shift_rev)
+                spectral_shift_rev_module.set_bias_from_data(
+                    all_rev_outputs.to(device),
+                    all_rev_targets.to(device),
+                    all_rev_odor_ids.to(device),
+                )
+
+            # Clean up
+            del all_unet_outputs, all_targets, all_odor_ids
+            if spectral_shift_rev is not None:
+                del all_rev_outputs, all_rev_targets, all_rev_odor_ids
+            torch.cuda.empty_cache()
+
+            barrier()
+
+        # =====================================================================
         # PHASE 2a: Train FORWARD SpectralShift only (reverse frozen)
         # =====================================================================
         # Two-stage training config
         two_stage_enabled = config.get("spectral_shift_two_stage", True)
-        bias_epochs = config.get("spectral_shift_bias_epochs", 5)
+        bias_epochs_config = config.get("spectral_shift_bias_epochs", 5)
+
+        # If bias_epochs >= phase_epochs: all epochs are bias-only (no network phase)
+        # This allows testing bias-only training without network refinement
+        if two_stage_enabled:
+            bias_epochs = min(bias_epochs_config, phase_epochs)
+            network_epochs = phase_epochs - bias_epochs
+            bias_only_mode = (bias_epochs >= phase_epochs)
+        else:
+            bias_epochs = 0
+            network_epochs = phase_epochs
+            bias_only_mode = False
 
         if is_primary():
             print(f"\n{'='*70}")
             print(f"PHASE 2a: Training FORWARD SpectralShift ({phase_epochs} epochs)")
             if two_stage_enabled:
-                print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
+                if bias_only_mode:
+                    print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
+                    print(f"  To add network training: increase --spectral-finetune-epochs or decrease --spectral-shift-bias-epochs")
+                else:
+                    print(f"  Two-Stage Mode: {bias_epochs} bias-only + {network_epochs} network-only")
             print(f"{'='*70}")
 
         # Freeze reverse SpectralShift
@@ -2527,7 +2630,10 @@ def train(
                 print(f"\n{'='*70}")
                 print(f"PHASE 2b: Training REVERSE SpectralShift ({phase_epochs} epochs)")
                 if two_stage_enabled:
-                    print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
+                    if bias_only_mode:
+                        print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
+                    else:
+                        print(f"  Two-Stage Mode: {bias_epochs} bias-only + {network_epochs} network-only")
                 print(f"{'='*70}")
 
             # Freeze forward SpectralShift (now trained)
@@ -2918,6 +3024,10 @@ def parse_args():
                         help="Disable two-stage training (train all parameters together)")
     parser.add_argument("--spectral-shift-bias-epochs", type=int, default=None,
                         help="Number of epochs for bias-only training in two-stage mode (default: 5)")
+    parser.add_argument("--spectral-shift-compute-bias", action="store_true", default=True,
+                        help="Compute optimal bias from UNet output vs target PSD (default: True)")
+    parser.add_argument("--no-spectral-shift-compute-bias", action="store_false", dest="spectral_shift_compute_bias",
+                        help="Disable automatic bias computation (learn bias through training)")
 
     # Stage control
     parser.add_argument("--skip-spectral-finetune", action="store_true",
@@ -3090,6 +3200,7 @@ def main():
     config["spectral_shift_two_stage"] = getattr(args, 'spectral_shift_two_stage', True)
     if args.spectral_shift_bias_epochs is not None:
         config["spectral_shift_bias_epochs"] = args.spectral_shift_bias_epochs
+    config["spectral_shift_compute_bias"] = getattr(args, 'spectral_shift_compute_bias', True)
 
     # Stage control from CLI
     if args.skip_spectral_finetune:
