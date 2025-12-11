@@ -47,6 +47,21 @@ from .literature_losses import (
     MultiObjectiveLoss,
     create_literature_loss,
 )
+from .neural_probabilistic_losses import (
+    GaussianNLLProbLoss,
+    LaplacianNLLProbLoss,
+    RayleighProbLoss,
+    VonMisesProbLoss,
+    KLDivergenceProbLoss,
+    CauchyNLLProbLoss,
+    StudentTNLLProbLoss,
+    GumbelProbLoss,
+    GammaProbLoss,
+    LogNormalProbLoss,
+    GaussianMixtureProbLoss,
+    NEURAL_PROB_LOSS_REGISTRY,
+    create_neural_prob_loss,
+)
 
 __all__ = [
     # Huber losses
@@ -81,6 +96,20 @@ __all__ = [
     "NeuralPerceptualLoss",
     "MultiObjectiveLoss",
     "create_literature_loss",
+    # Neural probabilistic losses
+    "GaussianNLLProbLoss",
+    "LaplacianNLLProbLoss",
+    "RayleighProbLoss",
+    "VonMisesProbLoss",
+    "KLDivergenceProbLoss",
+    "CauchyNLLProbLoss",
+    "StudentTNLLProbLoss",
+    "GumbelProbLoss",
+    "GammaProbLoss",
+    "LogNormalProbLoss",
+    "GaussianMixtureProbLoss",
+    "NEURAL_PROB_LOSS_REGISTRY",
+    "create_neural_prob_loss",
     # Registry
     "LOSS_REGISTRY",
     "create_loss",
@@ -123,6 +152,18 @@ LOSS_REGISTRY = {
     "wasserstein": lambda **kw: create_literature_loss("wasserstein", **kw),
     "swd": lambda **kw: create_literature_loss("swd", **kw),  # Alias
     "perceptual": lambda **kw: create_literature_loss("perceptual", **kw),
+    # Neural probabilistic losses (for tier 2.5)
+    "prob_gaussian_nll": lambda **kw: create_neural_prob_loss("gaussian_nll", **kw),
+    "prob_laplacian_nll": lambda **kw: create_neural_prob_loss("laplacian_nll", **kw),
+    "prob_rayleigh": lambda **kw: create_neural_prob_loss("rayleigh", **kw),
+    "prob_von_mises": lambda **kw: create_neural_prob_loss("von_mises", **kw),
+    "prob_kl_divergence": lambda **kw: create_neural_prob_loss("kl_divergence", **kw),
+    "prob_cauchy_nll": lambda **kw: create_neural_prob_loss("cauchy_nll", **kw),
+    "prob_student_t_nll": lambda **kw: create_neural_prob_loss("student_t_nll", **kw),
+    "prob_gumbel": lambda **kw: create_neural_prob_loss("gumbel", **kw),
+    "prob_gamma": lambda **kw: create_neural_prob_loss("gamma", **kw),
+    "prob_log_normal": lambda **kw: create_neural_prob_loss("log_normal", **kw),
+    "prob_mixture": lambda **kw: create_neural_prob_loss("mixture", **kw),
 }
 
 
