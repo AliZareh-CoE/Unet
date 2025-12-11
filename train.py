@@ -2655,8 +2655,8 @@ def parse_args():
                         choices=PROB_LOSS_CHOICES,
                         help="Probabilistic loss to ADD on top of base loss (for tier 2.5). "
                              "Default: 'none' (no probabilistic loss)")
-    parser.add_argument("--prob-loss-weight", type=float, default=0.1,
-                        help="Weight for probabilistic loss (default: 0.1)")
+    parser.add_argument("--prob-loss-weight", type=float, default=1.0,
+                        help="Weight for probabilistic loss (default: 1.0)")
 
     return parser.parse_args()
 

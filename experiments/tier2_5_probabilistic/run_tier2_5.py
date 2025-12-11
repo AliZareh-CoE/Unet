@@ -580,8 +580,8 @@ def main():
                         help="Specific probabilistic losses to test (default: all)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--prob-loss-weight", type=float, default=0.1,
-                        help="Weight for probabilistic loss (default: 0.1)")
+    parser.add_argument("--prob-loss-weight", type=float, default=1.0,
+                        help="Weight for probabilistic loss (default: 1.0)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debugging for distributed training errors")
     parser.add_argument("--retry-failed", action="store_true",
