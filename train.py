@@ -73,8 +73,8 @@ from models import (
     VQVAEEncoder,
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
-    # Residual distribution correction
-    ResidualDistributionCorrector,
+    # Distribution correction block
+    ConditionalDistributionBlock,
     hilbert_torch,
 )
 from data import (
@@ -186,16 +186,18 @@ DEFAULT_CONFIG = {
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
 
-    # Residual distribution correction (replaces old Rayleigh-based approach)
-    # Learns to correct systematic distributional errors in UNet envelope output
-    # Key insight: Learn from actual target distribution, not a theoretical prior
-    # IMPORTANT: Gradients are isolated from UNet via .detach()
-    "use_residual_correction": False,  # Enable residual distribution correction
-    "residual_correction_n_bins": 32,  # Number of quantile bins for correction curve
-    "residual_correction_hidden_dim": 64,  # Hidden dim for correction network
-    "residual_correction_max": 0.5,  # Maximum correction (±50%)
-    "residual_correction_lambda": 0.1,  # Weight for distribution loss
-    "residual_correction_lr": 1e-3,  # Learning rate (separate optimizer)
+    # Conditional distribution correction block (experimental)
+    # Enforces Rayleigh envelope distribution while preserving correlation/R²
+    # IMPORTANT: Distribution block gradients are isolated from UNet via .detach()
+    "use_distribution_block": False,  # Enable distribution correction (experimental)
+    "distribution_block_alpha_init": 0.1,  # Initial correction strength
+    "distribution_block_learnable_alpha": True,  # If False, use fixed alpha
+    "distribution_block_hidden_dim": 64,  # Hidden dim for alpha MLP
+    "distribution_block_soft_rank_temp": 0.1,  # Temperature for soft ranking
+    "distribution_block_lambda_envelope": 0.1,  # Weight for envelope (Rayleigh) loss
+    "distribution_block_lambda_phase": 0.05,  # Weight for phase (Uniform) loss
+    "distribution_block_separate_optimizer": True,  # Use separate optimizer (recommended)
+    "distribution_block_lr": 1e-3,  # Learning rate for distribution block
 
     # Recording system (for Nature Methods publication)
     # WARNING: Recording is VERY slow - only enable for final runs!
@@ -709,7 +711,7 @@ def evaluate(
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
-    residual_corrector: Optional[nn.Module] = None,
+    distribution_block: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -721,7 +723,7 @@ def evaluate(
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        residual_corrector: Optional ResidualDistributionCorrector for envelope correction
+        distribution_block: Optional distribution correction block for envelope correction
     """
     model.eval()
     if reverse_model is not None:
@@ -732,8 +734,8 @@ def evaluate(
         spectral_shift_fwd.eval()
     if spectral_shift_rev is not None:
         spectral_shift_rev.eval()
-    if residual_corrector is not None:
-        residual_corrector.eval()
+    if distribution_block is not None:
+        distribution_block.eval()
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -757,10 +759,10 @@ def evaluate(
     # For composite loss (forward)
     spectral_list = []
 
-    # Envelope metrics (residual correction)
-    env_cv2_list = []  # Envelope CV² of prediction
+    # Envelope metrics (distribution block)
+    env_cv2_list = []  # Envelope CV² - should be ~0.273 for Rayleigh
     env_cv2_target_list = []  # Target envelope CV² (ground truth)
-    mean_correction_list = []  # Mean correction magnitude
+    alpha_list = []  # Distribution block alpha (correction strength)
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
@@ -804,10 +806,10 @@ def evaluate(
             if spectral_shift_fwd is not None and not disable_spectral:
                 pred = spectral_shift_fwd(pred, odor_ids=odor)
 
-            # Apply residual distribution correction (learns to match target envelope)
+            # Apply distribution correction block (envelope Rayleigh correction)
             # This is the FINAL output that should be used for metrics
-            if residual_corrector is not None and cond_emb is not None:
-                pred = residual_corrector(pred, cond_emb)
+            if distribution_block is not None and cond_emb is not None:
+                pred = distribution_block(pred, cond_emb)
 
                 # Compute envelope metrics for monitoring
                 with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -821,7 +823,7 @@ def evaluate(
                     analytic_target = hilbert_torch(pcx_f32_env)
                     envelope_target = torch.abs(analytic_target)
 
-                    # Envelope CV² = Var(A) / Mean(A)²
+                    # Envelope CV² = Var(A) / Mean(A)² (Rayleigh target ≈ 0.273)
                     env_mean = envelope_pred.mean(dim=-1, keepdim=True).clamp(min=1e-8)
                     env_var = ((envelope_pred - env_mean) ** 2).mean(dim=-1)
                     env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
@@ -833,10 +835,10 @@ def evaluate(
                     tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
                     env_cv2_target_list.append(tgt_cv2.item())
 
-                    # Get mean correction magnitude
-                    corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-                    mean_corr = corr_module.get_mean_correction(cond_emb.detach()).mean()
-                    mean_correction_list.append(mean_corr.item())
+                    # Get alpha (correction strength)
+                    dist_module = distribution_block.module if hasattr(distribution_block, 'module') else distribution_block
+                    alpha = dist_module.get_alpha(cond_emb.detach()).mean()
+                    alpha_list.append(alpha.item())
 
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
@@ -990,13 +992,13 @@ def evaluate(
     if baseline_pli_list:
         results["baseline_pli"] = float(np.mean(baseline_pli_list))
 
-    # Envelope metrics (residual correction)
+    # Envelope metrics (distribution block)
     if env_cv2_list:
-        results["env_cv2"] = float(np.mean(env_cv2_list))  # Pred envelope CV²
+        results["env_cv2"] = float(np.mean(env_cv2_list))  # Pred envelope CV² (Rayleigh ≈ 0.273)
     if env_cv2_target_list:
         results["env_cv2_target"] = float(np.mean(env_cv2_target_list))  # Target envelope CV²
-    if mean_correction_list:
-        results["mean_correction"] = float(np.mean(mean_correction_list))  # Mean correction magnitude
+    if alpha_list:
+        results["dist_alpha"] = float(np.mean(alpha_list))  # Distribution correction strength
 
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
@@ -1073,8 +1075,8 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
-    residual_corrector: Optional[nn.Module] = None,
-    residual_optimizer: Optional[torch.optim.Optimizer] = None,
+    distribution_block: Optional[nn.Module] = None,
+    distribution_optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1082,8 +1084,8 @@ def train_epoch(
         stage2_spectral_only: If True, ONLY use spectral loss (Stage 2 mode where UNet is frozen)
         disable_spectral: If True, disable SpectralShift application and spectral loss (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        residual_corrector: Optional ResidualDistributionCorrector for envelope correction
-        residual_optimizer: Optional separate optimizer for residual corrector
+        distribution_block: Optional ConditionalDistributionBlock for envelope correction
+        distribution_optimizer: Optional separate optimizer for distribution block
     """
     model.train()
     if reverse_model is not None:
@@ -1094,8 +1096,8 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
-    if residual_corrector is not None:
-        residual_corrector.train()
+    if distribution_block is not None:
+        distribution_block.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1298,34 +1300,39 @@ def train_epoch(
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
         # =====================================================================
-        # Residual Distribution Correction (experimental)
+        # Distribution Correction Block (experimental)
         # CRITICAL: Input is DETACHED to ensure gradient isolation
-        # Distribution losses train ONLY the corrector, not UNet
-        # Key: Learns to match actual target distribution, not a theoretical prior
+        # Distribution losses train ONLY the distribution block, not UNet
         # =====================================================================
-        residual_loss = torch.tensor(0.0, device=device)
-        if residual_corrector is not None and cond_emb is not None:
-            # Apply residual correction with DETACHED input
-            # This prevents correction gradients from flowing back to UNet
-            y_corrected = residual_corrector(pred_raw.detach(), cond_emb.detach())
+        distribution_loss = torch.tensor(0.0, device=device)
+        if distribution_block is not None and cond_emb is not None:
+            # Apply distribution correction with DETACHED input
+            # This prevents distribution gradients from flowing back to UNet
+            y_corrected = distribution_block(pred_raw.detach(), cond_emb.detach())
 
-            # Compute distribution matching loss against TARGET (not a prior!)
+            # Compute distribution matching losses
             # Get the module (unwrap DDP if needed)
-            corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-            corr_losses = corr_module.compute_loss(y_corrected, pcx_c)
+            dist_module = distribution_block.module if hasattr(distribution_block, 'module') else distribution_block
+            dist_losses = dist_module.compute_losses(y_corrected)
 
             # Weighted loss
-            lambda_dist = config.get("residual_correction_lambda", 0.1)
-            residual_loss = lambda_dist * corr_losses["distribution_loss"]
+            lambda_env = config.get("distribution_block_lambda_envelope", 0.1)
+            lambda_phase = config.get("distribution_block_lambda_phase", 0.05)
+            distribution_loss = lambda_env * dist_losses["envelope_loss"] + lambda_phase * dist_losses["phase_loss"]
 
-            loss_components["dist_loss"] = loss_components["dist_loss"] + corr_losses["distribution_loss"].detach()
+            loss_components["dist_envelope"] = loss_components["dist_envelope"] + dist_losses["envelope_loss"].detach()
+            loss_components["dist_phase"] = loss_components["dist_phase"] + dist_losses["phase_loss"].detach()
 
-            # Separate backward/step for residual corrector (always use separate optimizer)
-            if residual_optimizer is not None:
-                residual_loss.backward()
-                torch.nn.utils.clip_grad_norm_(residual_corrector.parameters(), GRAD_CLIP)
-                residual_optimizer.step()
-                residual_optimizer.zero_grad(set_to_none=True)
+            # Handle separate optimizer case
+            if distribution_optimizer is not None:
+                # Separate backward/step for distribution block
+                distribution_loss.backward()
+                torch.nn.utils.clip_grad_norm_(distribution_block.parameters(), GRAD_CLIP)
+                distribution_optimizer.step()
+                distribution_optimizer.zero_grad(set_to_none=True)
+            else:
+                # Add to main loss (gradients isolated by detach anyway)
+                loss = loss + distribution_loss
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -1710,49 +1717,50 @@ def train(
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
-    # Create residual distribution corrector (experimental)
-    # IMPORTANT: Gradient isolation - corrector input is DETACHED from UNet
+    # Create distribution correction block (experimental)
+    # IMPORTANT: Gradient isolation - distribution block input is DETACHED from UNet
     # This ensures UNet training is not affected by distribution losses
-    # Key improvement: Learns to match actual target distribution, not a theoretical prior
-    residual_corrector = None
-    residual_optimizer = None
-    if config.get("use_residual_correction", False):
+    distribution_block = None
+    distribution_optimizer = None
+    if config.get("use_distribution_block", False):
         # Requires spectro_temporal conditioning to work
         if cond_source != "spectro_temporal":
             if is_primary():
-                print("WARNING: Residual correction requires spectro_temporal conditioning. Disabling.")
+                print("WARNING: Distribution block requires spectro_temporal conditioning. Disabling.")
         else:
-            residual_corrector = ResidualDistributionCorrector(
+            distribution_block = ConditionalDistributionBlock(
                 condition_dim=emb_dim,
-                n_bins=config.get("residual_correction_n_bins", 32),
-                hidden_dim=config.get("residual_correction_hidden_dim", 64),
-                max_correction=config.get("residual_correction_max", 0.5),
+                alpha_init=config.get("distribution_block_alpha_init", 0.1),
+                learnable_alpha=config.get("distribution_block_learnable_alpha", True),
+                soft_rank_temperature=config.get("distribution_block_soft_rank_temp", 0.1),
+                hidden_dim=config.get("distribution_block_hidden_dim", 64),
             )
 
             # Convert to bf16 if FSDP uses mixed precision (match cond_encoder dtype)
-            # NOTE: Correction uses FFT internally which needs float32,
-            # but the correction_net (Linear layers) should match input dtype
+            # NOTE: Distribution block uses FFT internally which needs float32,
+            # but the alpha_net (Linear layers) should match input dtype
             if config.get("fsdp_bf16", False):
-                residual_corrector = residual_corrector.to(device, dtype=torch.bfloat16)
+                distribution_block = distribution_block.to(device, dtype=torch.bfloat16)
             else:
-                residual_corrector = residual_corrector.to(device)
+                distribution_block = distribution_block.to(device)
 
             # Wrap with DDP for distributed training
             if is_distributed:
-                residual_corrector = DDP(residual_corrector, device_ids=[local_rank])
+                distribution_block = DDP(distribution_block, device_ids=[local_rank])
 
             if is_primary():
-                corr_params = sum(p.numel() for p in residual_corrector.parameters())
-                print(f"Residual corrector created: {corr_params:,} params, n_bins={config.get('residual_correction_n_bins', 32)}, max_correction={config.get('residual_correction_max', 0.5)}")
+                dist_params = sum(p.numel() for p in distribution_block.parameters())
+                print(f"Distribution block created: {dist_params:,} params, alpha_init={config.get('distribution_block_alpha_init', 0.1)}")
 
-            # Always use separate optimizer for gradient isolation
-            residual_optimizer = AdamW(
-                residual_corrector.parameters(),
-                lr=config.get("residual_correction_lr", 1e-3),
-                betas=betas,
-            )
-            if is_primary():
-                print(f"Residual corrector using separate optimizer, lr={config.get('residual_correction_lr', 1e-3)}")
+            # Create separate optimizer if configured (recommended for gradient isolation)
+            if config.get("distribution_block_separate_optimizer", True):
+                distribution_optimizer = AdamW(
+                    distribution_block.parameters(),
+                    lr=config.get("distribution_block_lr", 1e-3),
+                    betas=betas,
+                )
+                if is_primary():
+                    print(f"Distribution block using separate optimizer, lr={config.get('distribution_block_lr', 1e-3)}")
 
     # Create loss functions
     wavelet_loss = None
@@ -1792,7 +1800,10 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
-    # Note: Residual corrector always uses separate optimizer for gradient isolation
+    # Add distribution block to main optimizer if not using separate optimizer
+    if distribution_block is not None and distribution_optimizer is None:
+        distribution_block_lr = config.get("distribution_block_lr", 1e-3)
+        param_groups.append({"params": list(distribution_block.parameters()), "lr": distribution_block_lr, "name": "distribution_block"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
     if is_primary():
@@ -1909,8 +1920,8 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
-                residual_optimizer=residual_optimizer,
+                distribution_block=distribution_block,
+                distribution_optimizer=distribution_optimizer,
             )
 
             barrier()
@@ -1923,7 +1934,7 @@ def train(
                 fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
+                distribution_block=distribution_block,
             )
 
             # Sync val_loss across ranks (for early stopping)
@@ -2256,8 +2267,8 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 stage2_spectral_only=True,  # ONLY spectral loss - UNet frozen, pure PSD optimization
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
-                residual_optimizer=residual_optimizer,
+                distribution_block=distribution_block,
+                distribution_optimizer=distribution_optimizer,
             )
 
             barrier()
@@ -2270,7 +2281,7 @@ def train(
                 fast_mode=False,  # Include PSD metrics to monitor frequency reconstruction
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
+                distribution_block=distribution_block,
             )
 
             # Sync val_loss across ranks

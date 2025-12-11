@@ -2328,251 +2328,308 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
     return torch.fft.ifft(X * h, dim=-1)
 
 
-def soft_histogram(x: torch.Tensor, n_bins: int = 50, min_val: float = 0.0, max_val: float = None) -> torch.Tensor:
-    """Differentiable soft histogram using Gaussian kernel.
+def soft_rank(x: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Differentiable soft ranking using pairwise comparisons.
+
+    Uses a sigmoid approximation to make ranking differentiable.
 
     Args:
-        x: Input tensor [B, C, T] or [B, T]
-        n_bins: Number of histogram bins
-        min_val: Minimum value for histogram range
-        max_val: Maximum value (if None, use max of x)
+        x: Input tensor [..., T]
+        temperature: Softness of ranking (lower = harder, default 1.0)
 
     Returns:
-        Soft histogram [B, n_bins] normalized to sum to 1
+        Soft ranks in [0, T-1] range [..., T]
     """
-    if max_val is None:
-        max_val = x.max().item() + 1e-5
+    # Pairwise differences: how many values is each element greater than?
+    # Shape: [..., T, 1] - [..., 1, T] = [..., T, T]
+    diffs = x.unsqueeze(-1) - x.unsqueeze(-2)
 
-    # Flatten to [B, -1]
-    B = x.shape[0]
-    x_flat = x.view(B, -1)  # [B, N]
+    # Soft comparison: sigmoid(diff / temperature) ∈ [0, 1]
+    soft_comparisons = torch.sigmoid(diffs / temperature)
 
-    # Bin centers
-    bin_centers = torch.linspace(min_val, max_val, n_bins, device=x.device, dtype=x.dtype)  # [n_bins]
-    bin_width = (max_val - min_val) / (n_bins - 1 + 1e-8)
+    # Sum over comparisons gives soft rank
+    # Subtract 0.5 * T to center, since diagonal contributes 0.5 each
+    ranks = soft_comparisons.sum(dim=-1) - 0.5
 
-    # Compute soft assignments using Gaussian kernel
-    # x_flat: [B, N, 1], bin_centers: [1, 1, n_bins]
-    x_expanded = x_flat.unsqueeze(-1)  # [B, N, 1]
-    centers_expanded = bin_centers.view(1, 1, -1)  # [1, 1, n_bins]
-
-    # Gaussian kernel: exp(-0.5 * ((x - center) / sigma)^2)
-    sigma = bin_width * 0.5  # Controls softness
-    weights = torch.exp(-0.5 * ((x_expanded - centers_expanded) / (sigma + 1e-8)) ** 2)  # [B, N, n_bins]
-
-    # Normalize weights per sample (each sample sums to 1 across bins)
-    histogram = weights.sum(dim=1)  # [B, n_bins]
-    histogram = histogram / (histogram.sum(dim=-1, keepdim=True) + 1e-8)
-
-    return histogram
+    return ranks
 
 
-class ResidualDistributionCorrector(nn.Module):
-    """Learns to correct systematic distributional errors in UNet envelope output.
+def rayleigh_quantile(p: torch.Tensor, sigma: float = 1.0, eps: float = 1e-8) -> torch.Tensor:
+    """Rayleigh distribution inverse CDF (quantile function).
 
-    Key insight: Instead of assuming a prior (Rayleigh), learn the DIFFERENCE
-    between what UNet produces and what it should produce.
-
-    The UNet systematically:
-    - Overproduces small envelope values (too "safe")
-    - Underproduces large envelope values (misses heavy tail)
-
-    This block learns a conditional correction curve that compensates for these biases.
+    F^{-1}(p) = σ * sqrt(-2 * ln(1 - p))
 
     Args:
-        condition_dim: Dimension of conditioning vector (from spectro-temporal encoder)
-        n_bins: Number of quantile bins for correction curve
-        hidden_dim: Hidden dimension for correction network
-        max_correction: Maximum multiplicative correction (e.g., 0.5 means ±50%)
+        p: Probability values in [0, 1)
+        sigma: Scale parameter
+        eps: Small value to avoid log(0)
+
+    Returns:
+        Quantile values
+    """
+    # Clamp p to avoid numerical issues at boundaries
+    p_clamped = torch.clamp(p, eps, 1.0 - eps)
+    return sigma * torch.sqrt(-2.0 * torch.log(1.0 - p_clamped))
+
+
+class ConditionalDistributionBlock(nn.Module):
+    """Post-processing block that enforces Rayleigh envelope distribution.
+
+    This block applies optimal transport to map the UNet output envelope
+    toward a Rayleigh distribution while preserving phase. A learned α(x)
+    controls the correction strength based on spectro-temporal conditioning.
+
+    The correction is applied as:
+        1. Decompose ŷ into envelope A(t) and phase φ(t) using Hilbert transform
+        2. Apply OT correction: Ã(t) = (1-α)·A(t) + α·F_R^{-1}(F_A(A(t)))
+        3. Reconstruct: ỹ(t) = Ã(t) · cos(φ(t))
+
+    IMPORTANT: This block is designed for gradient isolation:
+        - Input should be DETACHED from UNet to prevent distribution gradients
+          from affecting UNet training
+        - Distribution losses train ONLY this block's parameters
+
+    Args:
+        condition_dim: Dimension of conditioning vector (default: 128)
+        alpha_init: Initial α value (default: 0.1)
+        learnable_alpha: If False, α is fixed at alpha_init (default: True)
+        soft_rank_temperature: Temperature for soft ranking (default: 0.1)
+        hidden_dim: Hidden dimension for alpha MLP (default: 64)
     """
 
     def __init__(
         self,
         condition_dim: int = 128,
-        n_bins: int = 32,
+        alpha_init: float = 0.1,
+        learnable_alpha: bool = True,
+        soft_rank_temperature: float = 0.1,
         hidden_dim: int = 64,
-        max_correction: float = 0.5,
     ):
         super().__init__()
         self.condition_dim = condition_dim
-        self.n_bins = n_bins
-        self.max_correction_init = max_correction
+        self.alpha_init = alpha_init
+        self.learnable_alpha = learnable_alpha
+        self.soft_rank_temperature = soft_rank_temperature
 
-        # Network that predicts correction curve conditioned on input
-        # Output: one correction value per quantile bin
-        self.correction_net = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_bins),
-            nn.Tanh(),  # Bounded to [-1, 1], scaled by max_correction
-        )
+        if learnable_alpha:
+            # MLP that predicts α from conditioning
+            # Initialize bias to produce alpha_init via sigmoid
+            init_bias = math.log(alpha_init / (1.0 - alpha_init + 1e-8))
+            self.alpha_net = nn.Sequential(
+                nn.Linear(condition_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            # Initialize final layer to output alpha_init
+            nn.init.zeros_(self.alpha_net[-1].weight)
+            nn.init.constant_(self.alpha_net[-1].bias, init_bias)
+        else:
+            self.register_buffer("fixed_alpha", torch.tensor(alpha_init))
 
-        # Learnable maximum correction scale (starts at max_correction)
-        self.max_correction = nn.Parameter(torch.tensor(max_correction))
-
-        # Initialize to near-zero correction (start conservative)
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize to produce near-zero corrections initially."""
-        # Initialize final layer to output small values
-        nn.init.zeros_(self.correction_net[-2].weight)
-        nn.init.zeros_(self.correction_net[-2].bias)
-
-    def _compute_envelope(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute envelope using Hilbert transform.
+    def _compute_envelope_phase(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute envelope and phase using Hilbert transform.
 
         Args:
             x: Input signal [B, C, T]
 
         Returns:
             envelope: Instantaneous amplitude [B, C, T]
+            phase: Instantaneous phase [B, C, T]
         """
         # Hilbert transform requires float32
         x_float = x.float()
-        analytic = hilbert_torch(x_float)
-        envelope = torch.abs(analytic)
-        return envelope.to(x.dtype)
 
-    def _compute_phase(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute phase using Hilbert transform.
+        # Compute analytic signal
+        analytic = hilbert_torch(x_float)
+
+        # Envelope = |analytic signal|
+        envelope = torch.abs(analytic)
+
+        # Phase = angle(analytic signal)
+        phase = torch.angle(analytic)
+
+        # Convert back to original dtype
+        return envelope.to(x.dtype), phase.to(x.dtype)
+
+    def _estimate_rayleigh_sigma(self, envelope: torch.Tensor) -> torch.Tensor:
+        """Estimate Rayleigh scale parameter from envelope.
+
+        For Rayleigh distribution: E[A²] = 2σ²
+        Therefore: σ = sqrt(E[A²] / 2)
 
         Args:
-            x: Input signal [B, C, T]
+            envelope: Envelope signal [B, C, T]
 
         Returns:
-            phase: Instantaneous phase [B, C, T]
+            sigma: Scale parameter [B, C, 1]
         """
-        x_float = x.float()
-        analytic = hilbert_torch(x_float)
-        phase = torch.angle(analytic)
-        return phase.to(x.dtype)
+        # Mean of squared envelope
+        mean_squared = envelope.pow(2).mean(dim=-1, keepdim=True)
+        # Rayleigh σ = sqrt(mean(A²) / 2)
+        sigma = torch.sqrt(mean_squared / 2.0 + 1e-8)
+        return sigma
+
+    def _apply_ot_correction(
+        self,
+        envelope: torch.Tensor,
+        sigma: torch.Tensor,
+        alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply optimal transport correction to envelope.
+
+        Maps envelope distribution toward Rayleigh using:
+        Ã(t) = (1 - α) · A(t) + α · F_R^{-1}(F_A(A(t)))
+
+        Args:
+            envelope: Original envelope [B, C, T]
+            sigma: Rayleigh scale parameter [B, C, 1]
+            alpha: Correction strength [B, 1, 1]
+
+        Returns:
+            Corrected envelope [B, C, T]
+        """
+        B, C, T = envelope.shape
+
+        # Compute soft ranks (differentiable empirical CDF)
+        # Shape: [B, C, T]
+        ranks = soft_rank(envelope, self.soft_rank_temperature)
+
+        # Convert ranks to probabilities in (0, 1)
+        # p_i = (rank_i + 0.5) / T to avoid 0 and 1
+        probabilities = (ranks + 0.5) / T
+
+        # Apply Rayleigh inverse CDF
+        # F_R^{-1}(p) = σ · sqrt(-2·ln(1-p))
+        rayleigh_quantiles = rayleigh_quantile(probabilities, sigma=1.0)
+
+        # Scale by estimated σ
+        rayleigh_quantiles = rayleigh_quantiles * sigma
+
+        # Blend original and corrected envelope
+        # alpha: [B, 1, 1], envelope: [B, C, T], rayleigh_quantiles: [B, C, T]
+        corrected = (1.0 - alpha) * envelope + alpha * rayleigh_quantiles
+
+        return corrected
+
+    def _reconstruct_signal(
+        self,
+        envelope: torch.Tensor,
+        phase: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct signal from envelope and phase.
+
+        ỹ(t) = Ã(t) · cos(φ(t))
+
+        Args:
+            envelope: Corrected envelope [B, C, T]
+            phase: Original phase [B, C, T]
+
+        Returns:
+            Reconstructed signal [B, C, T]
+        """
+        return envelope * torch.cos(phase)
 
     def forward(
         self,
         y_hat: torch.Tensor,
         condition: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply residual distribution correction.
+        """Apply conditional distribution correction.
 
         Args:
-            y_hat: UNet output signal [B, C, T]
-            condition: Conditioning vector [B, condition_dim]
+            y_hat: UNet output [B, C, T] (should be DETACHED from UNet!)
+            condition: Spectro-temporal conditioning [B, condition_dim]
 
         Returns:
             Corrected signal [B, C, T]
         """
         B, C, T = y_hat.shape
 
+        # Compute α from conditioning
+        if self.learnable_alpha:
+            # alpha_net outputs logit, apply sigmoid
+            alpha = torch.sigmoid(self.alpha_net(condition))  # [B, 1]
+            alpha = alpha.unsqueeze(-1)  # [B, 1, 1]
+        else:
+            alpha = self.fixed_alpha.expand(B, 1, 1)
+
         # Decompose into envelope and phase
-        envelope = self._compute_envelope(y_hat)
-        phase = self._compute_phase(y_hat)
+        envelope, phase = self._compute_envelope_phase(y_hat)
 
-        # Get correction curve from conditioning: [B, n_bins]
-        correction_curve = self.correction_net(condition) * torch.abs(self.max_correction)
+        # Estimate Rayleigh σ from data
+        sigma = self._estimate_rayleigh_sigma(envelope)
 
-        # Normalize envelope to [0, 1] for bin assignment
-        env_min = envelope.min(dim=-1, keepdim=True)[0].min(dim=1, keepdim=True)[0]  # [B, 1, 1]
-        env_max = envelope.max(dim=-1, keepdim=True)[0].max(dim=1, keepdim=True)[0]  # [B, 1, 1]
-        env_range = env_max - env_min + 1e-8
-        env_normalized = (envelope - env_min) / env_range  # [B, C, T] in [0, 1]
-
-        # Compute bin indices: [B, C, T]
-        bin_indices = (env_normalized * (self.n_bins - 1)).long().clamp(0, self.n_bins - 1)
-
-        # Gather corrections for each position
-        # correction_curve: [B, n_bins] → expand to [B, C, n_bins]
-        correction_curve_expanded = correction_curve.unsqueeze(1).expand(B, C, self.n_bins)
-
-        # Gather: [B, C, T] indices into [B, C, n_bins] → [B, C, T] corrections
-        corrections = torch.gather(correction_curve_expanded, dim=-1, index=bin_indices)
-
-        # Apply multiplicative correction to envelope
-        corrected_envelope = envelope * (1.0 + corrections)
-
-        # Ensure envelope stays positive
-        corrected_envelope = F.relu(corrected_envelope) + 1e-8
+        # Apply OT correction to envelope
+        corrected_envelope = self._apply_ot_correction(envelope, sigma, alpha)
 
         # Reconstruct signal
-        y_corrected = corrected_envelope * torch.cos(phase)
+        y_corrected = self._reconstruct_signal(corrected_envelope, phase)
 
         return y_corrected
 
-    def compute_loss(
+    def compute_losses(
         self,
         y_corrected: torch.Tensor,
-        y_target: torch.Tensor,
-        n_bins: int = 50,
     ) -> Dict[str, torch.Tensor]:
-        """Compute distribution matching loss.
+        """Compute distribution matching losses.
 
-        The loss encourages the corrected envelope distribution to match
-        the target envelope distribution.
+        Losses:
+        1. Envelope loss: Rayleigh moment matching
+           For Rayleigh: Var(A)/Mean(A)² = (4-π)/π ≈ 0.273
+
+        2. Phase loss: Uniform moment matching
+           For Uniform[-π,π]: Mean=0, Var=π²/3
 
         Args:
             y_corrected: Corrected signal [B, C, T]
-            y_target: Target signal [B, C, T]
-            n_bins: Number of bins for histogram comparison
 
         Returns:
-            Dict with 'distribution_loss' and diagnostic values
+            Dict with 'envelope_loss' and 'phase_loss'
         """
-        # Get envelopes
-        env_corrected = self._compute_envelope(y_corrected)
-        env_target = self._compute_envelope(y_target)
+        # Get envelope and phase of corrected signal
+        envelope, phase = self._compute_envelope_phase(y_corrected)
 
-        # Compute soft histograms
-        # Use same range for both (target's range)
-        max_val = env_target.max().item() + 0.1
+        # Envelope loss: Rayleigh coefficient of variation
+        # Target: Var(A) / Mean(A)² = (4 - π) / π ≈ 0.2732
+        target_cv_squared = (4.0 - math.pi) / math.pi
+        env_mean = envelope.mean(dim=-1)  # [B, C]
+        env_var = envelope.var(dim=-1)    # [B, C]
+        cv_squared = env_var / (env_mean.pow(2) + 1e-8)
+        envelope_loss = (cv_squared - target_cv_squared).pow(2).mean()
 
-        hist_corrected = soft_histogram(env_corrected, n_bins=n_bins, max_val=max_val)
-        hist_target = soft_histogram(env_target, n_bins=n_bins, max_val=max_val)
-
-        # Distribution loss: L1 distance between histograms
-        # This approximates Wasserstein distance for 1D distributions
-        distribution_loss = F.l1_loss(hist_corrected, hist_target)
-
-        # Also compute KL divergence for monitoring (not used in loss)
-        kl_div = F.kl_div(
-            (hist_corrected + 1e-8).log(),
-            hist_target + 1e-8,
-            reduction='batchmean'
-        )
+        # Phase loss: Uniform distribution moments
+        # Mean should be 0, Var should be π²/3 ≈ 3.29
+        target_phase_var = (math.pi ** 2) / 3.0
+        phase_mean = phase.mean(dim=-1)      # [B, C]
+        phase_var = phase.var(dim=-1)        # [B, C]
+        phase_loss = phase_mean.pow(2).mean() + (phase_var - target_phase_var).pow(2).mean()
 
         return {
-            "distribution_loss": distribution_loss,
-            "kl_divergence": kl_div.detach(),
-            "max_correction_used": self.max_correction.detach(),
+            "envelope_loss": envelope_loss,
+            "phase_loss": phase_loss,
         }
 
-    def get_correction_curve(self, condition: torch.Tensor) -> torch.Tensor:
-        """Get the learned correction curve for visualization.
+    def get_alpha(self, condition: torch.Tensor) -> torch.Tensor:
+        """Get the current α value for given conditioning.
 
         Args:
             condition: Conditioning vector [B, condition_dim]
 
         Returns:
-            Correction curve [B, n_bins] with values in [-max_corr, +max_corr]
+            Alpha values [B]
         """
-        return self.correction_net(condition) * torch.abs(self.max_correction)
-
-    def get_mean_correction(self, condition: torch.Tensor) -> torch.Tensor:
-        """Get the mean absolute correction for monitoring.
-
-        Args:
-            condition: Conditioning vector [B, condition_dim]
-
-        Returns:
-            Mean absolute correction value [B]
-        """
-        curve = self.get_correction_curve(condition)
-        return curve.abs().mean(dim=-1)
+        if self.learnable_alpha:
+            return torch.sigmoid(self.alpha_net(condition)).squeeze(-1)
+        else:
+            return self.fixed_alpha.expand(condition.shape[0])
 
     def extra_repr(self) -> str:
-        return (f"condition_dim={self.condition_dim}, n_bins={self.n_bins}, "
-                f"max_correction={self.max_correction_init}")
+        return (
+            f"condition_dim={self.condition_dim}, "
+            f"alpha_init={self.alpha_init}, "
+            f"learnable_alpha={self.learnable_alpha}, "
+            f"soft_rank_temp={self.soft_rank_temperature}"
+        )
 
 
 # =============================================================================
