@@ -4,7 +4,7 @@ Usage:
     # Train model (single GPU)
     python train.py --epochs 80
 
-    # Distributed training with FSDP
+    # Distributed training with FSDP1
     torchrun --nproc_per_node=4 train.py --epochs 80 --fsdp
 """
 from __future__ import annotations
