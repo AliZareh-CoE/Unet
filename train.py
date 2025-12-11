@@ -75,7 +75,6 @@ from models import (
     CycleConsistentEncoder,
     # Distribution correction block
     ConditionalDistributionBlock,
-    hilbert_torch,
 )
 from data import (
     prepare_data,
@@ -759,11 +758,6 @@ def evaluate(
     # For composite loss (forward)
     spectral_list = []
 
-    # Envelope metrics (distribution block)
-    env_cv2_list = []  # Envelope CV² - should be ~0.273 for Rayleigh
-    env_cv2_target_list = []  # Target envelope CV² (ground truth)
-    alpha_list = []  # Distribution block alpha (correction strength)
-
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -810,35 +804,6 @@ def evaluate(
             # This is the FINAL output that should be used for metrics
             if distribution_block is not None and cond_emb is not None:
                 pred = distribution_block(pred, cond_emb)
-
-                # Compute envelope metrics for monitoring
-                with torch.amp.autocast(device_type='cuda', enabled=False):
-                    pred_f32_env = pred.float()
-                    pcx_f32_env = pcx.float()
-
-                    # Compute envelope using Hilbert transform
-                    analytic_pred = hilbert_torch(pred_f32_env)
-                    envelope_pred = torch.abs(analytic_pred)
-
-                    analytic_target = hilbert_torch(pcx_f32_env)
-                    envelope_target = torch.abs(analytic_target)
-
-                    # Envelope CV² = Var(A) / Mean(A)² (Rayleigh target ≈ 0.273)
-                    env_mean = envelope_pred.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                    env_var = ((envelope_pred - env_mean) ** 2).mean(dim=-1)
-                    env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
-                    env_cv2_list.append(env_cv2.item())
-
-                    # Target envelope CV² for comparison
-                    tgt_mean = envelope_target.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                    tgt_var = ((envelope_target - tgt_mean) ** 2).mean(dim=-1)
-                    tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
-                    env_cv2_target_list.append(tgt_cv2.item())
-
-                    # Get alpha (correction strength)
-                    dist_module = distribution_block.module if hasattr(distribution_block, 'module') else distribution_block
-                    alpha = dist_module.get_alpha(cond_emb.detach()).mean()
-                    alpha_list.append(alpha.item())
 
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
@@ -991,14 +956,6 @@ def evaluate(
         results["baseline_plv"] = float(np.mean(baseline_plv_list))
     if baseline_pli_list:
         results["baseline_pli"] = float(np.mean(baseline_pli_list))
-
-    # Envelope metrics (distribution block)
-    if env_cv2_list:
-        results["env_cv2"] = float(np.mean(env_cv2_list))  # Pred envelope CV² (Rayleigh ≈ 0.273)
-    if env_cv2_target_list:
-        results["env_cv2_target"] = float(np.mean(env_cv2_target_list))  # Target envelope CV²
-    if alpha_list:
-        results["dist_alpha"] = float(np.mean(alpha_list))  # Distribution correction strength
 
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
