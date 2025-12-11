@@ -2504,20 +2504,17 @@ class ResidualDistributionCorrector(nn.Module):
         self,
         y_corrected: torch.Tensor,
         y_target: torch.Tensor,
+        n_bins: int = 50,
     ) -> Dict[str, torch.Tensor]:
-        """Compute distribution matching loss using 1D optimal transport.
+        """Compute distribution matching loss.
 
-        Uses sorted-signal comparison which is:
-        1. True 1D optimal transport (Wasserstein-1 distance)
-        2. More gradient-friendly than histogram comparison
-        3. Ensures distribution matching while being differentiable
-
-        Key insight: Sorting both envelopes and comparing directly forces
-        matching distributions without the histogram's loss of temporal info.
+        The loss encourages the corrected envelope distribution to match
+        the target envelope distribution.
 
         Args:
-            y_corrected: Corrected signal [B, C, T] (should be cropped to match target!)
+            y_corrected: Corrected signal [B, C, T]
             y_target: Target signal [B, C, T]
+            n_bins: Number of bins for histogram comparison
 
         Returns:
             Dict with 'distribution_loss' and diagnostic values
@@ -2526,32 +2523,27 @@ class ResidualDistributionCorrector(nn.Module):
         env_corrected = self._compute_envelope(y_corrected)
         env_target = self._compute_envelope(y_target)
 
-        # Flatten to [B, C*T] for sorting
-        B = env_corrected.shape[0]
-        env_corrected_flat = env_corrected.view(B, -1)
-        env_target_flat = env_target.view(B, -1)
+        # Compute soft histograms
+        # Use same range for both (target's range)
+        max_val = env_target.max().item() + 0.1
 
-        # Sort both envelopes - this is 1D optimal transport!
-        # Matching sorted values = matching quantile functions = matching distributions
-        env_corrected_sorted, _ = torch.sort(env_corrected_flat, dim=-1)
-        env_target_sorted, _ = torch.sort(env_target_flat, dim=-1)
+        hist_corrected = soft_histogram(env_corrected, n_bins=n_bins, max_val=max_val)
+        hist_target = soft_histogram(env_target, n_bins=n_bins, max_val=max_val)
 
-        # 1D Wasserstein distance = L1 between sorted values
-        distribution_loss = F.l1_loss(env_corrected_sorted, env_target_sorted)
+        # Distribution loss: L1 distance between histograms
+        # This approximates Wasserstein distance for 1D distributions
+        distribution_loss = F.l1_loss(hist_corrected, hist_target)
 
-        # Compute envelope CV² for monitoring
-        env_mean = env_corrected.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-        env_var = ((env_corrected - env_mean) ** 2).mean(dim=-1)
-        env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
-
-        tgt_mean = env_target.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-        tgt_var = ((env_target - tgt_mean) ** 2).mean(dim=-1)
-        tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
+        # Also compute KL divergence for monitoring (not used in loss)
+        kl_div = F.kl_div(
+            (hist_corrected + 1e-8).log(),
+            hist_target + 1e-8,
+            reduction='batchmean'
+        )
 
         return {
             "distribution_loss": distribution_loss,
-            "env_cv2_corrected": env_cv2.detach(),
-            "env_cv2_target": tgt_cv2.detach(),
+            "kl_divergence": kl_div.detach(),
             "max_correction_used": self.max_correction.detach(),
         }
 

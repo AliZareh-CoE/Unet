@@ -809,6 +809,35 @@ def evaluate(
             if residual_corrector is not None and cond_emb is not None:
                 pred = residual_corrector(pred, cond_emb)
 
+                # Compute envelope metrics for monitoring
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    pred_f32_env = pred.float()
+                    pcx_f32_env = pcx.float()
+
+                    # Compute envelope using Hilbert transform
+                    analytic_pred = hilbert_torch(pred_f32_env)
+                    envelope_pred = torch.abs(analytic_pred)
+
+                    analytic_target = hilbert_torch(pcx_f32_env)
+                    envelope_target = torch.abs(analytic_target)
+
+                    # Envelope CV² = Var(A) / Mean(A)²
+                    env_mean = envelope_pred.mean(dim=-1, keepdim=True).clamp(min=1e-8)
+                    env_var = ((envelope_pred - env_mean) ** 2).mean(dim=-1)
+                    env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
+                    env_cv2_list.append(env_cv2.item())
+
+                    # Target envelope CV² for comparison
+                    tgt_mean = envelope_target.mean(dim=-1, keepdim=True).clamp(min=1e-8)
+                    tgt_var = ((envelope_target - tgt_mean) ** 2).mean(dim=-1)
+                    tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
+                    env_cv2_target_list.append(tgt_cv2.item())
+
+                    # Get mean correction magnitude
+                    corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
+                    mean_corr = corr_module.get_mean_correction(cond_emb.detach()).mean()
+                    mean_correction_list.append(mean_corr.item())
+
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
             ob_c = crop_to_target_torch(ob)
@@ -841,32 +870,6 @@ def evaluate(
             if not fast_mode:
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
                 psd_diff_list.append(psd_diff_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
-
-            # Envelope metrics for residual correction monitoring (on CROPPED signals)
-            if residual_corrector is not None and cond_emb is not None:
-                # Compute envelope using Hilbert transform
-                analytic_pred = hilbert_torch(pred_f32)
-                envelope_pred = torch.abs(analytic_pred)
-
-                analytic_target = hilbert_torch(pcx_f32)
-                envelope_target = torch.abs(analytic_target)
-
-                # Envelope CV² = Var(A) / Mean(A)²
-                env_mean = envelope_pred.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                env_var = ((envelope_pred - env_mean) ** 2).mean(dim=-1)
-                env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
-                env_cv2_list.append(env_cv2.item())
-
-                # Target envelope CV² for comparison
-                tgt_mean = envelope_target.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                tgt_var = ((envelope_target - tgt_mean) ** 2).mean(dim=-1)
-                tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
-                env_cv2_target_list.append(tgt_cv2.item())
-
-                # Get mean correction magnitude
-                corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-                mean_corr = corr_module.get_mean_correction(cond_emb.detach()).mean()
-                mean_correction_list.append(mean_corr.item())
 
             # Baseline metrics: Compare raw source vs target
             # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
@@ -1299,31 +1302,17 @@ def train_epoch(
         # CRITICAL: Input is DETACHED to ensure gradient isolation
         # Distribution losses train ONLY the corrector, not UNet
         # Key: Learns to match actual target distribution, not a theoretical prior
-        #
-        # IMPORTANT: Apply corrector AFTER spectral shift to match evaluation flow!
-        # Training:   UNet → SpectralShift → ResidualCorrector → Loss
-        # Evaluation: UNet → SpectralShift → ResidualCorrector → Metrics
         # =====================================================================
         residual_loss = torch.tensor(0.0, device=device)
         if residual_corrector is not None and cond_emb is not None:
-            # Use spectral-shifted output if available, otherwise raw output
-            # This matches the evaluation pipeline exactly
-            if spectral_shift_fwd is not None and not disable_spectral:
-                corrector_input = pred_shifted.detach()
-            else:
-                corrector_input = pred_raw.detach()
-
             # Apply residual correction with DETACHED input
-            # This prevents correction gradients from flowing back to UNet/SpectralShift
-            y_corrected = residual_corrector(corrector_input, cond_emb.detach())
+            # This prevents correction gradients from flowing back to UNet
+            y_corrected = residual_corrector(pred_raw.detach(), cond_emb.detach())
 
-            # IMPORTANT: Crop BEFORE computing loss to match target dimensions!
-            y_corrected_c = crop_to_target_torch(y_corrected)
-
-            # Compute distribution matching loss against TARGET
-            # Uses 1D optimal transport (sorted envelope comparison)
+            # Compute distribution matching loss against TARGET (not a prior!)
+            # Get the module (unwrap DDP if needed)
             corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-            corr_losses = corr_module.compute_loss(y_corrected_c, pcx_c)
+            corr_losses = corr_module.compute_loss(y_corrected, pcx_c)
 
             # Weighted loss
             lambda_dist = config.get("residual_correction_lambda", 0.1)
