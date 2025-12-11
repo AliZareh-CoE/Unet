@@ -1763,6 +1763,7 @@ def train(
                 use_odor_scale=use_odor_scale,
                 use_film=use_film,
                 film_hidden_mult=film_hidden_mult,
+                init_base_db=init_shift_fwd,  # Initialize base shift (helps correct UNet over-attenuation)
             ).to(device)
             spectral_shift_rev = AdaptiveSpectralShift(
                 n_channels=rev_out_channels,
@@ -1777,6 +1778,7 @@ def train(
                 use_odor_scale=use_odor_scale,
                 use_film=use_film,
                 film_hidden_mult=film_hidden_mult,
+                init_base_db=init_shift_rev,  # Initialize base shift (helps correct UNet over-attenuation)
             ).to(device)
             if band_width_hz is not None:
                 band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"

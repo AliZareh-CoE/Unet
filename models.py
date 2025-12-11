@@ -1312,6 +1312,7 @@ class AdaptiveSpectralShift(nn.Module):
         use_odor_scale: bool = True,     # Per-odor learnable scale factors
         use_film: bool = True,           # FiLM-style odor modulation
         film_hidden_mult: int = 2,       # Hidden dim multiplier for FiLM
+        init_base_db: float = 0.0,       # Initial base shift in dB (helps correct UNet over-attenuation)
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -1322,6 +1323,7 @@ class AdaptiveSpectralShift(nn.Module):
         self.min_freq_hz = min_freq_hz
         self.max_freq_hz = max_freq_hz
         self.per_channel = per_channel
+        self.init_base_db = init_base_db
 
         # Store odor conditioning flags
         self.use_odor_base = use_odor_base
@@ -1350,10 +1352,12 @@ class AdaptiveSpectralShift(nn.Module):
 
         # Per-odor learnable BASE shifts (OPTIONAL)
         # Each odor gets its own starting point per frequency band
+        # Initialize to init_base_db (converted to log-scale) to help correct UNet over-attenuation
+        init_log_scale = init_base_db * math.log(10) / 20.0  # dB to log-scale
         if use_odor_base:
-            self.odor_base_shifts = nn.Parameter(torch.zeros(n_odors, self.n_bands))
+            self.odor_base_shifts = nn.Parameter(torch.full((n_odors, self.n_bands), init_log_scale))
         else:
-            self.register_buffer('odor_base_shifts', torch.zeros(n_odors, self.n_bands))
+            self.register_buffer('odor_base_shifts', torch.full((n_odors, self.n_bands), init_log_scale))
 
         # Per-odor learnable SCALE factors (OPTIONAL)
         # Allows odors to have different dynamic ranges
