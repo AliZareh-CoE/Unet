@@ -186,12 +186,6 @@ DEFAULT_CONFIG = {
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
 
-    # Enhanced odor conditioning options for AdaptiveSpectralShift
-    "spectral_shift_use_odor_base": True,   # Per-odor learnable base shifts per frequency band
-    "spectral_shift_use_odor_scale": True,  # Per-odor learnable scale factors
-    "spectral_shift_use_film": True,        # FiLM-style odor modulation of band features
-    "spectral_shift_film_hidden_mult": 2,   # Hidden dim multiplier for FiLM network (hidden_dim * mult)
-
     # Envelope loss (for spectral shift training, helps match signal envelope distribution)
     # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
     "use_envelope_loss": True,              # Enable envelope distribution matching loss
@@ -1744,11 +1738,6 @@ def train(
             band_width_hz = config.get("spectral_shift_band_width_hz", None)
             max_shift_db = config.get("spectral_shift_max_db", 12.0)
             hidden_dim = config.get("spectral_shift_hidden_dim", 64)
-            # Enhanced odor conditioning options
-            use_odor_base = config.get("spectral_shift_use_odor_base", True)
-            use_odor_scale = config.get("spectral_shift_use_odor_scale", True)
-            use_film = config.get("spectral_shift_use_film", True)
-            film_hidden_mult = config.get("spectral_shift_film_hidden_mult", 2)
 
             spectral_shift_fwd = AdaptiveSpectralShift(
                 n_channels=fwd_out_channels,
@@ -1759,11 +1748,6 @@ def train(
                 band_width_hz=band_width_hz,
                 max_shift_db=max_shift_db,
                 per_channel=shift_per_channel,
-                use_odor_base=use_odor_base,
-                use_odor_scale=use_odor_scale,
-                use_film=use_film,
-                film_hidden_mult=film_hidden_mult,
-                init_base_db=init_shift_fwd,  # Initialize base shift (helps correct UNet over-attenuation)
             ).to(device)
             spectral_shift_rev = AdaptiveSpectralShift(
                 n_channels=rev_out_channels,
@@ -1774,11 +1758,6 @@ def train(
                 band_width_hz=band_width_hz,
                 max_shift_db=max_shift_db,
                 per_channel=shift_per_channel,
-                use_odor_base=use_odor_base,
-                use_odor_scale=use_odor_scale,
-                use_film=use_film,
-                film_hidden_mult=film_hidden_mult,
-                init_base_db=init_shift_rev,  # Initialize base shift (helps correct UNet over-attenuation)
             ).to(device)
             if band_width_hz is not None:
                 band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
@@ -2893,22 +2872,6 @@ def parse_args():
     parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
                         help="Disable output scaling correction in model")
 
-    # Enhanced odor conditioning options for AdaptiveSpectralShift
-    parser.add_argument("--spectral-shift-odor-base", action="store_true", default=True,
-                        help="Enable per-odor learnable base shifts (default: True)")
-    parser.add_argument("--no-spectral-shift-odor-base", action="store_false", dest="spectral_shift_odor_base",
-                        help="Disable per-odor base shifts")
-    parser.add_argument("--spectral-shift-odor-scale", action="store_true", default=True,
-                        help="Enable per-odor learnable scale factors (default: True)")
-    parser.add_argument("--no-spectral-shift-odor-scale", action="store_false", dest="spectral_shift_odor_scale",
-                        help="Disable per-odor scale factors")
-    parser.add_argument("--spectral-shift-film", action="store_true", default=True,
-                        help="Enable FiLM-style odor modulation (default: True)")
-    parser.add_argument("--no-spectral-shift-film", action="store_false", dest="spectral_shift_film",
-                        help="Disable FiLM modulation")
-    parser.add_argument("--spectral-shift-film-hidden-mult", type=int, default=2,
-                        help="Hidden dim multiplier for FiLM network (default: 2)")
-
     # Envelope loss (for SpectralShift training)
     parser.add_argument("--envelope-loss", action="store_true", default=True,
                         help="Enable envelope distribution matching loss (default: True)")
@@ -3124,12 +3087,6 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
-
-    # Enhanced odor conditioning for SpectralShift
-    config["spectral_shift_use_odor_base"] = getattr(args, 'spectral_shift_odor_base', True)
-    config["spectral_shift_use_odor_scale"] = getattr(args, 'spectral_shift_odor_scale', True)
-    config["spectral_shift_use_film"] = getattr(args, 'spectral_shift_film', True)
-    config["spectral_shift_film_hidden_mult"] = getattr(args, 'spectral_shift_film_hidden_mult', 2)
 
     # Envelope loss configuration
     config["use_envelope_loss"] = getattr(args, 'envelope_loss', True)
