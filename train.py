@@ -2351,71 +2351,79 @@ def train(
 
         if is_primary():
             print(f"\n{'='*70}")
-            print(f"STAGE 2: Fine-tuning ONLY SpectralShift for PSD correction")
+            print(f"STAGE 2: Fine-tuning SpectralShift for PSD correction (TWO-PHASE)")
             print(f"{'='*70}")
+            print(f"  Phase 2a: Train FORWARD SpectralShift (reverse frozen)")
+            print(f"  Phase 2b: Train REVERSE SpectralShift (forward frozen)")
             print(f"Loading UNet from checkpoint: {checkpoint_source}")
 
         # Load UNet checkpoint
-        # In stage2_only mode: skip loading SpectralShift (use fresh init with current config)
-        # This allows changing SpectralShift architecture (band_width_hz, conditional, etc.)
-        # Also validate cond_mode matches when loading for stage2
         barrier()
         expected_cond = config.get("cond_mode") if stage2_only else None
         load_checkpoint(
             checkpoint_path,
             model, reverse_model,
             spectral_shift_fwd, spectral_shift_rev,
-            load_spectral_only=False,  # Load UNet
-            skip_spectral=stage2_only,  # Skip SpectralShift in stage2_only mode (use fresh init)
-            expected_cond_mode=expected_cond,  # Validate cond_mode for stage2_only
+            load_spectral_only=False,
+            skip_spectral=stage2_only,
+            expected_cond_mode=expected_cond,
         )
         barrier()
 
         if stage2_only and is_primary():
             print(f"SpectralShift: using FRESH initialization (not loaded from checkpoint)")
 
-        # FREEZE UNet parameters (forward and reverse)
+        # FREEZE UNet parameters (forward and reverse) - stays frozen for all of Stage 2
         freeze_model_params(model)
         if reverse_model is not None:
             freeze_model_params(reverse_model)
 
-        if is_primary():
-            unet_params = count_trainable_params(model)
-            rev_params = count_trainable_params(reverse_model) if reverse_model is not None else 0
-            shift_fwd_params = count_trainable_params(spectral_shift_fwd)
-            shift_rev_params = count_trainable_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
-            total_trainable = unet_params + rev_params + shift_fwd_params + shift_rev_params
-            print(f"\nFROZEN UNet from: {checkpoint_source}")
-            print(f"Trainable params: UNet={unet_params}, Rev={rev_params}, ShiftFwd={shift_fwd_params}, ShiftRev={shift_rev_params}")
-            print(f"Total trainable: {total_trainable} (should be ONLY SpectralShift)\n")
-
-        # Reset optimizer to ONLY SpectralShift parameters with high LR
         spectral_shift_lr_finetune = config.get("spectral_shift_lr", 0.1)
-        param_groups_stage2 = []
-        if spectral_shift_fwd is not None:
-            param_groups_stage2.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr_finetune})
+
+        # Split epochs between phases (can be configured)
+        phase_epochs = spectral_finetune_epochs // 2
+        if phase_epochs < 1:
+            phase_epochs = spectral_finetune_epochs  # If only 1 epoch, use it for both
+
+        # =====================================================================
+        # PHASE 2a: Train FORWARD SpectralShift only (reverse frozen)
+        # =====================================================================
+        if is_primary():
+            print(f"\n{'='*70}")
+            print(f"PHASE 2a: Training FORWARD SpectralShift ({phase_epochs} epochs)")
+            print(f"{'='*70}")
+
+        # Freeze reverse SpectralShift
         if spectral_shift_rev is not None:
-            param_groups_stage2.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr_finetune})
+            for param in spectral_shift_rev.parameters():
+                param.requires_grad = False
 
-        optimizer_stage2 = AdamW(param_groups_stage2, lr=spectral_shift_lr_finetune, betas=betas)
+        # Optimizer with ONLY forward SpectralShift parameters
+        optimizer_2a = AdamW(
+            [{"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr_finetune}],
+            lr=spectral_shift_lr_finetune, betas=betas
+        )
 
-        # Reset early stopping for fine-tuning phase
-        # IMPORTANT: Use PSD error (not loss) for best model selection in Stage 2
-        # SpectralShift's purpose is to correct PSD, so we should select based on PSD error!
-        best_psd_err_stage2 = float("inf")
-        best_epoch_stage2 = 0
-        patience_counter_stage2 = 0
+        if is_primary():
+            fwd_params = count_trainable_params(spectral_shift_fwd)
+            rev_params = count_trainable_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
+            print(f"Trainable: Forward SpectralShift = {fwd_params} params")
+            print(f"Frozen: Reverse SpectralShift = {rev_params} params, UNet = frozen\n")
 
-        for epoch in range(1, spectral_finetune_epochs + 1):
+        best_psd_err_2a = float("inf")
+        best_epoch_2a = 0
+        patience_counter_2a = 0
+
+        for epoch in range(1, phase_epochs + 1):
             if loaders.get("train_sampler") is not None:
                 loaders["train_sampler"].set_epoch(epoch + num_epochs)
 
             train_metrics = train_epoch(
-                model, loaders["train"], optimizer_stage2, device, config,
+                model, loaders["train"], optimizer_2a, device, config,
                 wavelet_loss, spectral_loss,
-                reverse_model, epoch, spectral_finetune_epochs,
+                reverse_model, epoch, phase_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
-                stage2_spectral_only=True,  # ONLY spectral loss - UNet frozen, pure PSD optimization
+                stage2_spectral_only=True,
                 cond_encoder=cond_encoder,
                 residual_corrector=residual_corrector,
                 residual_optimizer=residual_optimizer,
@@ -2429,44 +2437,28 @@ def train(
                 model, loaders["val"], device, wavelet_loss, spectral_loss,
                 compute_phase=False, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                spectral_only=True,  # Stage 2: Early stopping based on ONLY spectral loss
-                fast_mode=False,  # Include PSD metrics to monitor frequency reconstruction
+                spectral_only=True, fast_mode=False,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
                 residual_corrector=residual_corrector,
             )
 
-            # Sync val_loss across ranks
-            val_loss = val_metrics.get("loss", val_metrics["mae"])
-            if dist.is_initialized():
-                val_loss_tensor = torch.tensor(val_loss, device=device)
-                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-                val_loss = val_loss_tensor.item()
-                val_metrics["loss"] = val_loss
-
-            # CRITICAL: Track best based on PSD ERROR, not loss!
-            # SpectralShift's purpose is to correct PSD mismatch, so we select best model
-            # based on actual PSD reconstruction quality (lower error = better)
+            # Track best based on FORWARD PSD error only
             psd_err_fwd = val_metrics.get("psd_err_db", float("inf"))
-            psd_err_rev = val_metrics.get("psd_err_db_rev", psd_err_fwd)  # Use fwd if rev not available
-            # Average forward and reverse PSD errors for bidirectional training
-            avg_psd_err = (psd_err_fwd + psd_err_rev) / 2.0 if "psd_err_db_rev" in val_metrics else psd_err_fwd
-
-            # Sync PSD error across ranks
             if dist.is_initialized():
-                psd_err_tensor = torch.tensor(avg_psd_err, device=device)
+                psd_err_tensor = torch.tensor(psd_err_fwd, device=device)
                 dist.all_reduce(psd_err_tensor, op=dist.ReduceOp.AVG)
-                avg_psd_err = psd_err_tensor.item()
+                psd_err_fwd = psd_err_tensor.item()
 
-            is_best_stage2 = avg_psd_err < best_psd_err_stage2
-            if is_best_stage2:
-                best_psd_err_stage2 = avg_psd_err
-                best_epoch_stage2 = epoch
-                patience_counter_stage2 = 0
+            is_best_2a = psd_err_fwd < best_psd_err_2a
+            if is_best_2a:
+                best_psd_err_2a = psd_err_fwd
+                best_epoch_2a = epoch
+                patience_counter_2a = 0
                 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
                 save_checkpoint(
-                    model, optimizer_stage2, epoch,
-                    CHECKPOINT_DIR / "best_model_stage2.pt",
+                    model, optimizer_2a, epoch,
+                    CHECKPOINT_DIR / "best_model_stage2a.pt",
                     is_fsdp=is_fsdp_wrapped,
                     reverse_model=reverse_model,
                     spectral_shift_fwd=spectral_shift_fwd,
@@ -2474,41 +2466,163 @@ def train(
                     config=config,
                 )
             else:
-                patience_counter_stage2 += 1
+                patience_counter_2a += 1
 
             barrier()
 
             if is_primary():
-                rev_str = ""
-                if "corr_rev" in val_metrics:
-                    psd_err_rev_db = val_metrics.get('psd_err_db_rev', 0)
-                    psd_bias_rev = val_metrics.get('psd_diff_db_rev', 0)
-                    rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, PSD_err={psd_err_rev_db:.2f}dB (bias={psd_bias_rev:+.1f}dB)"
-
-                psd_err_fwd_db = val_metrics.get('psd_err_db', 0)
                 psd_bias_fwd = val_metrics.get('psd_diff_db', 0)
-                print(f"[Stage2] Epoch {epoch}/{spectral_finetune_epochs} | "
+                print(f"[Phase2a] Epoch {epoch}/{phase_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, PSD_err={psd_err_fwd_db:.2f}dB (bias={psd_bias_fwd:+.1f}dB){rev_str} | "
-                      f"Best PSD_err: {best_psd_err_stage2:.2f}dB [UNet FROZEN]")
+                      f"FWD PSD_err={psd_err_fwd:.2f}dB (bias={psd_bias_fwd:+.1f}dB) | "
+                      f"Best: {best_psd_err_2a:.2f}dB [REV FROZEN]")
                 sys.stdout.flush()
 
-            if patience_counter_stage2 >= early_stop_patience:
+            if patience_counter_2a >= early_stop_patience:
                 if is_primary():
-                    print(f"Early stopping at epoch {epoch} (Stage 2 complete)")
+                    print(f"Early stopping at epoch {epoch} (Phase 2a complete)")
                 break
 
-        # Load best stage2 checkpoint for final eval
+        # Load best Phase 2a checkpoint
         if is_primary():
-            print(f"\nLoading best Stage 2 checkpoint from epoch {best_epoch_stage2} (PSD_err={best_psd_err_stage2:.2f}dB)...")
+            print(f"\nLoading best Phase 2a checkpoint from epoch {best_epoch_2a} (FWD PSD_err={best_psd_err_2a:.2f}dB)...")
         barrier()
         load_checkpoint(
-            CHECKPOINT_DIR / "best_model_stage2.pt",
+            CHECKPOINT_DIR / "best_model_stage2a.pt",
             model, reverse_model,
             spectral_shift_fwd, spectral_shift_rev,
             load_spectral_only=False,
         )
         barrier()
+
+        # =====================================================================
+        # PHASE 2b: Train REVERSE SpectralShift only (forward frozen)
+        # =====================================================================
+        if spectral_shift_rev is not None:
+            if is_primary():
+                print(f"\n{'='*70}")
+                print(f"PHASE 2b: Training REVERSE SpectralShift ({phase_epochs} epochs)")
+                print(f"{'='*70}")
+
+            # Freeze forward SpectralShift (now trained)
+            for param in spectral_shift_fwd.parameters():
+                param.requires_grad = False
+
+            # Unfreeze reverse SpectralShift
+            for param in spectral_shift_rev.parameters():
+                param.requires_grad = True
+
+            # Optimizer with ONLY reverse SpectralShift parameters
+            optimizer_2b = AdamW(
+                [{"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr_finetune}],
+                lr=spectral_shift_lr_finetune, betas=betas
+            )
+
+            if is_primary():
+                fwd_params = count_trainable_params(spectral_shift_fwd)
+                rev_params = count_trainable_params(spectral_shift_rev)
+                print(f"Trainable: Reverse SpectralShift = {rev_params} params")
+                print(f"Frozen: Forward SpectralShift = {fwd_params} params, UNet = frozen\n")
+
+            best_psd_err_2b = float("inf")
+            best_epoch_2b = 0
+            patience_counter_2b = 0
+
+            for epoch in range(1, phase_epochs + 1):
+                if loaders.get("train_sampler") is not None:
+                    loaders["train_sampler"].set_epoch(epoch + num_epochs + phase_epochs)
+
+                train_metrics = train_epoch(
+                    model, loaders["train"], optimizer_2b, device, config,
+                    wavelet_loss, spectral_loss,
+                    reverse_model, epoch, phase_epochs,
+                    spectral_shift_fwd, spectral_shift_rev,
+                    stage2_spectral_only=True,
+                    cond_encoder=cond_encoder,
+                    residual_corrector=residual_corrector,
+                    residual_optimizer=residual_optimizer,
+                    prob_loss=prob_loss,
+                    envelope_loss=envelope_loss,
+                )
+
+                barrier()
+
+                val_metrics = evaluate(
+                    model, loaders["val"], device, wavelet_loss, spectral_loss,
+                    compute_phase=False, reverse_model=reverse_model, config=config,
+                    spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+                    spectral_only=True, fast_mode=False,
+                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    cond_encoder=cond_encoder,
+                    residual_corrector=residual_corrector,
+                )
+
+                # Track best based on REVERSE PSD error only
+                psd_err_rev = val_metrics.get("psd_err_db_rev", float("inf"))
+                if dist.is_initialized():
+                    psd_err_tensor = torch.tensor(psd_err_rev, device=device)
+                    dist.all_reduce(psd_err_tensor, op=dist.ReduceOp.AVG)
+                    psd_err_rev = psd_err_tensor.item()
+
+                is_best_2b = psd_err_rev < best_psd_err_2b
+                if is_best_2b:
+                    best_psd_err_2b = psd_err_rev
+                    best_epoch_2b = epoch
+                    patience_counter_2b = 0
+                    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+                    save_checkpoint(
+                        model, optimizer_2b, epoch,
+                        CHECKPOINT_DIR / "best_model_stage2.pt",  # Final checkpoint
+                        is_fsdp=is_fsdp_wrapped,
+                        reverse_model=reverse_model,
+                        spectral_shift_fwd=spectral_shift_fwd,
+                        spectral_shift_rev=spectral_shift_rev,
+                        config=config,
+                    )
+                else:
+                    patience_counter_2b += 1
+
+                barrier()
+
+                if is_primary():
+                    psd_bias_rev = val_metrics.get('psd_diff_db_rev', 0)
+                    print(f"[Phase2b] Epoch {epoch}/{phase_epochs} | "
+                          f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
+                          f"REV PSD_err={psd_err_rev:.2f}dB (bias={psd_bias_rev:+.1f}dB) | "
+                          f"Best: {best_psd_err_2b:.2f}dB [FWD FROZEN]")
+                    sys.stdout.flush()
+
+                if patience_counter_2b >= early_stop_patience:
+                    if is_primary():
+                        print(f"Early stopping at epoch {epoch} (Phase 2b complete)")
+                    break
+
+            # Load best Phase 2b (final) checkpoint
+            if is_primary():
+                print(f"\nLoading best Stage 2 checkpoint (Phase 2b, epoch {best_epoch_2b}, REV PSD_err={best_psd_err_2b:.2f}dB)...")
+            barrier()
+            load_checkpoint(
+                CHECKPOINT_DIR / "best_model_stage2.pt",
+                model, reverse_model,
+                spectral_shift_fwd, spectral_shift_rev,
+                load_spectral_only=False,
+            )
+            barrier()
+
+            if is_primary():
+                print(f"\n{'='*70}")
+                print(f"STAGE 2 COMPLETE (Two-Phase)")
+                print(f"{'='*70}")
+                print(f"  Phase 2a best: epoch {best_epoch_2a}, FWD PSD_err = {best_psd_err_2a:.2f} dB")
+                print(f"  Phase 2b best: epoch {best_epoch_2b}, REV PSD_err = {best_psd_err_2b:.2f} dB")
+                print(f"{'='*70}\n")
+        else:
+            # No reverse model - just use Phase 2a result as final
+            if is_primary():
+                print(f"\nNo reverse SpectralShift - using Phase 2a result as final")
+            # Copy 2a checkpoint to final stage2 checkpoint
+            import shutil
+            shutil.copy(CHECKPOINT_DIR / "best_model_stage2a.pt", CHECKPOINT_DIR / "best_model_stage2.pt")
 
     # Final test evaluation (full metrics, fast_mode=False)
     test_metrics = evaluate(
