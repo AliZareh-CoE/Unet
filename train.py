@@ -1102,6 +1102,11 @@ def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def count_total_params(model: nn.Module) -> int:
+    """Count total parameters in a model (regardless of requires_grad)."""
+    return sum(p.numel() for p in model.parameters())
+
+
 def train_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -2406,9 +2411,9 @@ def train(
 
         if is_primary():
             fwd_params = count_trainable_params(spectral_shift_fwd)
-            rev_params = count_trainable_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
+            rev_params = count_total_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
             print(f"Trainable: Forward SpectralShift = {fwd_params} params")
-            print(f"Frozen: Reverse SpectralShift = {rev_params} params, UNet = frozen\n")
+            print(f"Frozen: Reverse SpectralShift = {rev_params} params (frozen), UNet = frozen\n")
 
         best_psd_err_2a = float("inf")
         best_epoch_2a = 0
@@ -2519,10 +2524,10 @@ def train(
             )
 
             if is_primary():
-                fwd_params = count_trainable_params(spectral_shift_fwd)
+                fwd_params = count_total_params(spectral_shift_fwd)
                 rev_params = count_trainable_params(spectral_shift_rev)
                 print(f"Trainable: Reverse SpectralShift = {rev_params} params")
-                print(f"Frozen: Forward SpectralShift = {fwd_params} params, UNet = frozen\n")
+                print(f"Frozen: Forward SpectralShift = {fwd_params} params (frozen), UNet = frozen\n")
 
             best_psd_err_2b = float("inf")
             best_epoch_2b = 0
