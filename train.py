@@ -1103,6 +1103,11 @@ def count_total_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def get_module(model: nn.Module) -> nn.Module:
+    """Get underlying module from DDP/FSDP wrapper if present."""
+    return model.module if hasattr(model, 'module') else model
+
+
 def train_epoch(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
@@ -2394,7 +2399,7 @@ def train(
 
         # For two-stage: start with bias-only training
         if two_stage_enabled:
-            spectral_shift_fwd.freeze_network()  # Only odor_bias trainable
+            get_module(spectral_shift_fwd).freeze_network()  # Only odor_bias trainable
 
         # Optimizer with ONLY forward SpectralShift parameters
         optimizer_2a = AdamW(
@@ -2419,7 +2424,7 @@ def train(
             if two_stage_enabled and epoch == bias_epochs + 1 and not switched_to_network:
                 if is_primary():
                     print(f"\n--- Switching to network-only training (bias frozen) ---")
-                spectral_shift_fwd.freeze_bias()  # Freeze bias, unfreeze network
+                get_module(spectral_shift_fwd).freeze_bias()  # Freeze bias, unfreeze network
                 # Recreate optimizer with network parameters
                 optimizer_2a = AdamW(
                     [{"params": [p for p in spectral_shift_fwd.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
@@ -2531,7 +2536,7 @@ def train(
 
             # For two-stage: start with bias-only training
             if two_stage_enabled:
-                spectral_shift_rev.freeze_network()  # Only odor_bias trainable
+                get_module(spectral_shift_rev).freeze_network()  # Only odor_bias trainable
             else:
                 # Unfreeze all reverse SpectralShift
                 for param in spectral_shift_rev.parameters():
@@ -2560,7 +2565,7 @@ def train(
                 if two_stage_enabled and epoch == bias_epochs + 1 and not switched_to_network_2b:
                     if is_primary():
                         print(f"\n--- Switching to network-only training (bias frozen) ---")
-                    spectral_shift_rev.freeze_bias()  # Freeze bias, unfreeze network
+                    get_module(spectral_shift_rev).freeze_bias()  # Freeze bias, unfreeze network
                     # Recreate optimizer with network parameters
                     optimizer_2b = AdamW(
                         [{"params": [p for p in spectral_shift_rev.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
