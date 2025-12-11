@@ -167,7 +167,7 @@ def run_prob_loss_via_train_py(
     lr: float,
     base_channels: int = 64,
     seed: int = 42,
-    prob_loss_weight: float = 0.1,
+    prob_loss_weight: float = 1.0,
     debug: bool = False,
 ) -> Dict[str, Any]:
     """Run UNet with specific probabilistic loss via torchrun train.py.
@@ -377,7 +377,7 @@ def run_tier2_5(
     lr: float = 0.0002,
     base_channels: int = 64,
     seed: int = 42,
-    prob_loss_weight: float = 0.1,
+    prob_loss_weight: float = 1.0,
     debug: bool = False,
     previous_results: Optional[List[Dict]] = None,
 ) -> Tier2_5Result:
@@ -580,8 +580,8 @@ def main():
                         help="Specific probabilistic losses to test (default: all)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42)")
-    parser.add_argument("--prob-loss-weight", type=float, default=0.1,
-                        help="Weight for probabilistic loss (default: 0.1)")
+    parser.add_argument("--prob-loss-weight", type=float, default=1.0,
+                        help="Weight for probabilistic loss (default: 1.0)")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debugging for distributed training errors")
     parser.add_argument("--retry-failed", action="store_true",
