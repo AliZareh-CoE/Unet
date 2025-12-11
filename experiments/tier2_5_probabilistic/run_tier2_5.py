@@ -167,7 +167,7 @@ def run_prob_loss_via_train_py(
     lr: float,
     base_channels: int = 64,
     seed: int = 42,
-    prob_loss_weight: float = 0.1,
+    prob_loss_weight: float = 1.0,
     debug: bool = False,
 ) -> Dict[str, Any]:
     """Run UNet with specific probabilistic loss via torchrun train.py.
@@ -377,7 +377,7 @@ def run_tier2_5(
     lr: float = 0.0002,
     base_channels: int = 64,
     seed: int = 42,
-    prob_loss_weight: float = 0.1,
+    prob_loss_weight: float = 1.0,
     debug: bool = False,
     previous_results: Optional[List[Dict]] = None,
 ) -> Tier2_5Result:

@@ -1799,7 +1799,7 @@ def train(
     # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
     prob_loss = None
     prob_loss_type = config.get("prob_loss_type", "none")
-    prob_loss_weight = config.get("prob_loss_weight", 0.1)
+    prob_loss_weight = config.get("prob_loss_weight", 1.0)
     if prob_loss_type != "none":
         try:
             from experiments.study3_loss.losses.neural_probabilistic_losses import (
@@ -2816,7 +2816,7 @@ def main():
 
     # Probabilistic loss (tier 2.5) - added ON TOP of base loss
     config["prob_loss_type"] = args.prob_loss if hasattr(args, 'prob_loss') else "none"
-    config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 0.1
+    config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 1.0
     if config["prob_loss_type"] != "none" and is_primary():
         print(f"Probabilistic loss: {config['prob_loss_type']} (weight={config['prob_loss_weight']})")
 
