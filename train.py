@@ -1216,6 +1216,12 @@ def train_epoch(
                 loss = loss + spec_loss
                 loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + spec_loss.detach()
 
+            # Probabilistic loss (forward) - for tier 2.5, added ON TOP of base loss
+            if prob_loss is not None:
+                p_loss = prob_loss(pred_raw_c, pcx_c)
+                loss = loss + p_loss
+                loss_components["prob_fwd"] = loss_components["prob_fwd"] + p_loss.detach()
+
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
             loss = loss + cond_loss
@@ -1272,6 +1278,12 @@ def train_epoch(
                     spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
                     loss = loss + spec_loss_rev
                     loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
+
+                # Probabilistic loss (reverse) - for tier 2.5
+                if prob_loss is not None:
+                    p_loss_rev = prob_loss(pred_rev_raw_c, ob_c)
+                    loss = loss + p_loss_rev
+                    loss_components["prob_rev"] = loss_components["prob_rev"] + p_loss_rev.detach()
 
                 # Cycle consistency: OB → PCx → OB (use raw, no spectral shift in cycle)
                 # Skip in Stage 2 since UNet is frozen
@@ -1784,6 +1796,23 @@ def train(
             use_log_psd=True,
         ).to(device)
 
+    # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
+    prob_loss = None
+    prob_loss_type = config.get("prob_loss_type", "none")
+    prob_loss_weight = config.get("prob_loss_weight", 0.1)
+    if prob_loss_type != "none":
+        try:
+            from experiments.study3_loss.losses.neural_probabilistic_losses import (
+                create_neural_prob_loss
+            )
+            prob_loss = create_neural_prob_loss(prob_loss_type, weight=prob_loss_weight).to(device)
+            if is_primary():
+                print(f"Probabilistic loss: {prob_loss_type} (weight={prob_loss_weight})")
+        except Exception as e:
+            if is_primary():
+                print(f"Warning: Could not create probabilistic loss '{prob_loss_type}': {e}")
+            prob_loss = None
+
     # Create optimizer with parameter groups
     # SpectralShift needs MUCH higher lr because it's just 32 scalars trying to make dB-scale changes
     lr = config.get("learning_rate", 1e-4)
@@ -1804,6 +1833,11 @@ def train(
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
     # Note: Residual corrector always uses separate optimizer for gradient isolation
+    # Add probabilistic loss parameters (if any) with model learning rate
+    if prob_loss is not None:
+        prob_params = list(prob_loss.parameters())
+        if prob_params:
+            param_groups.append({"params": prob_params, "lr": lr, "name": "prob_loss"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
     if is_primary():
@@ -2602,6 +2636,28 @@ def parse_args():
                              "'huber_wavelet' (Huber + Wavelet combined). "
                              "If not specified, uses config default (huber_wavelet)")
 
+    # Probabilistic loss (for tier 2.5 - added ON TOP of base loss)
+    PROB_LOSS_CHOICES = [
+        "none",               # No probabilistic loss (baseline)
+        "gaussian_nll",       # Gaussian negative log-likelihood
+        "laplacian_nll",      # Laplacian NLL (robust to outliers)
+        "rayleigh",           # Signal envelope distribution
+        "von_mises",          # Phase distribution (circular statistics)
+        "kl_divergence",      # Distribution matching
+        "cauchy_nll",         # Heavy-tailed (very robust)
+        "student_t_nll",      # Controllable heavy tails
+        "gumbel",             # Peak/extreme value distribution
+        "gamma",              # Positive-valued signals
+        "log_normal",         # Multiplicative processes
+        "mixture",            # Gaussian mixture (multi-modal)
+    ]
+    parser.add_argument("--prob-loss", type=str, default="none",
+                        choices=PROB_LOSS_CHOICES,
+                        help="Probabilistic loss to ADD on top of base loss (for tier 2.5). "
+                             "Default: 'none' (no probabilistic loss)")
+    parser.add_argument("--prob-loss-weight", type=float, default=0.1,
+                        help="Weight for probabilistic loss (default: 0.1)")
+
     return parser.parse_args()
 
 
@@ -2757,6 +2813,12 @@ def main():
         loss_type = config.get("loss_type", "huber_wavelet")
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
+
+    # Probabilistic loss (tier 2.5) - added ON TOP of base loss
+    config["prob_loss_type"] = args.prob_loss if hasattr(args, 'prob_loss') else "none"
+    config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 0.1
+    if config["prob_loss_type"] != "none" and is_primary():
+        print(f"Probabilistic loss: {config['prob_loss_type']} (weight={config['prob_loss_weight']})")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")

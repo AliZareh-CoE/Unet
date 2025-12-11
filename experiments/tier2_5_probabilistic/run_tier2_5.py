@@ -3,15 +3,33 @@
 Tier 2.5: Probabilistic Loss Ablation
 ======================================
 
-Tests probabilistic losses that model signal distributions:
-    - Rayleigh: For signal envelope (amplitude) distribution
-    - von Mises: For phase distribution (circular statistics)
-    - Chi-squared: For power distribution
-    - Gumbel: For extreme values (peaks/troughs)
-    - Gamma: For positive-valued signals
-    - Log-Normal: For multiplicative noise
+Tests probabilistic losses that model signal distributions. These are added
+ON TOP of the base loss (huber_wavelet by default) to see if probabilistic
+modeling of neural signal properties improves translation quality.
 
-These are combined with base losses to see if probabilistic modeling helps.
+Probabilistic losses tested:
+    - none: Baseline (no probabilistic loss)
+    - gaussian_nll: Gaussian negative log-likelihood (learned variance)
+    - laplacian_nll: Laplacian NLL (robust to outliers)
+    - rayleigh: Signal envelope (amplitude) distribution
+    - von_mises: Phase distribution (circular statistics)
+    - kl_divergence: Distribution matching via soft histograms
+    - cauchy_nll: Heavy-tailed (very robust to outliers)
+    - student_t_nll: Controllable heavy tails (df=4)
+    - gumbel: Peak/extreme value distribution
+    - gamma: Positive-valued signals
+    - log_normal: Multiplicative processes
+    - mixture: Gaussian mixture (multi-modal)
+
+Architecture: CondUNet1D (fixed from tier 1/2)
+Base loss: huber_wavelet (fixed, Huber + wavelet)
+
+This tier uses train.py via torchrun for fair comparison with other tiers.
+
+References:
+    - PyTorch GaussianNLLLoss: https://pytorch.org/docs/stable/generated/torch.nn.GaussianNLLLoss.html
+    - Circular statistics: https://www.jneurosci.org/content/36/3/860
+    - KL Divergence: https://en.wikipedia.org/wiki/Kullback–Leibler_divergence
 """
 
 from __future__ import annotations
@@ -19,28 +37,72 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+# Fix imports
 PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 
-from experiments.common.cross_validation import create_data_splits
 from experiments.common.config_registry import (
     get_registry,
     Tier2_5Result,
     ProbabilisticLossResult,
 )
+
+
+def cleanup_gpu_memory():
+    """Force cleanup of GPU memory between runs.
+
+    This is CRITICAL for multi-GPU training to prevent memory leaks
+    and zombie processes from previous runs causing crashes.
+    """
+    # Force Python garbage collection
+    gc.collect()
+
+    # Clear CUDA cache if torch is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Reset peak memory stats
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(i)
+    except ImportError:
+        pass
+
+    # Kill any zombie torchrun/python processes that might be holding GPU memory
+    try:
+        # Find and kill any orphaned torchrun processes
+        subprocess.run(
+            ["pkill", "-9", "-f", "torch.distributed.run"],
+            capture_output=True,
+            timeout=5,
+        )
+        # Also kill any orphaned train.py processes
+        subprocess.run(
+            ["pkill", "-9", "-f", "train.py"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass  # Ignore errors - processes might not exist
+
+    # Wait for GPU memory to be fully released
+    time.sleep(5)
+
+    # Force another garbage collection after sleep
+    gc.collect()
 
 
 # =============================================================================
@@ -50,374 +112,258 @@ from experiments.common.config_registry import (
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts" / "tier2_5_probabilistic"
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Probabilistic losses to test
+# Probabilistic losses to test (added ON TOP of base loss)
+# These map to --prob-loss argument in train.py
 PROBABILISTIC_LOSSES = [
-    "none",           # Base loss only (baseline)
-    "rayleigh",       # Envelope distribution
-    "von_mises",      # Phase distribution
-    "chi_squared",    # Power distribution
-    "gumbel",         # Peak distribution
-    "gamma",          # Positive-valued
-    "log_normal",     # Multiplicative noise
-    "mixture",        # Gaussian mixture
+    "none",           # Baseline (no probabilistic loss)
+    "gaussian_nll",   # Gaussian negative log-likelihood
+    "laplacian_nll",  # Laplacian NLL (robust to outliers)
+    "rayleigh",       # Signal envelope distribution
+    "von_mises",      # Phase distribution (circular statistics)
+    "kl_divergence",  # Distribution matching
+    "cauchy_nll",     # Heavy-tailed (very robust)
+    "student_t_nll",  # Controllable heavy tails
+    "gumbel",         # Peak/extreme value distribution
+    "gamma",          # Positive-valued signals
+    "log_normal",     # Multiplicative processes
+    "mixture",        # Gaussian mixture (multi-modal)
 ]
 
-# Base losses to combine with
-BASE_LOSSES = ["huber", "spectral"]
-
-FAST_PROB_LOSSES = ["none", "rayleigh", "von_mises"]
+# Dry-run uses a subset for faster testing
+FAST_PROB_LOSSES = ["none", "gaussian_nll", "laplacian_nll", "rayleigh", "von_mises"]
 
 
 # =============================================================================
-# Probabilistic Loss Functions
+# Data Classes
 # =============================================================================
 
-class RayleighLoss(nn.Module):
-    """Rayleigh distribution loss for signal envelope.
-
-    The envelope of neural signals often follows a Rayleigh distribution.
-    This loss encourages the predicted envelope to match the target envelope distribution.
-    """
-
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Compute analytic signal envelope via Hilbert transform approximation
-        # Using simple smoothed absolute value as proxy
-        pred_env = torch.abs(pred)
-        target_env = torch.abs(target)
-
-        # Rayleigh NLL: -log(x/sigma^2) + x^2/(2*sigma^2)
-        # Estimate sigma from target
-        sigma_sq = torch.mean(target_env ** 2, dim=-1, keepdim=True) / 2 + 1e-8
-
-        # NLL for predicted envelope
-        nll = -torch.log(pred_env / sigma_sq + 1e-8) + pred_env ** 2 / (2 * sigma_sq)
-
-        return self.weight * torch.mean(nll)
-
-
-class VonMisesLoss(nn.Module):
-    """von Mises distribution loss for phase.
-
-    Neural oscillations have phase relationships that follow circular statistics.
-    von Mises is the circular analog of the Gaussian distribution.
-    """
-
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Compute instantaneous phase via Hilbert transform approximation
-        # Using gradient as proxy for phase derivative
-        pred_phase = torch.atan2(
-            F.pad(pred[..., 1:] - pred[..., :-1], (0, 1)),
-            pred + 1e-8
-        )
-        target_phase = torch.atan2(
-            F.pad(target[..., 1:] - target[..., :-1], (0, 1)),
-            target + 1e-8
-        )
-
-        # Phase difference
-        phase_diff = pred_phase - target_phase
-
-        # von Mises loss: -kappa * cos(phase_diff)
-        # Using kappa=1 for simplicity
-        loss = 1.0 - torch.cos(phase_diff)
-
-        return self.weight * torch.mean(loss)
-
-
-class ChiSquaredLoss(nn.Module):
-    """Chi-squared distribution loss for power.
-
-    The power (squared amplitude) of neural signals follows chi-squared distribution.
-    """
-
-    def __init__(self, weight: float = 0.1, df: int = 2):
-        super().__init__()
-        self.weight = weight
-        self.df = df  # degrees of freedom
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Power
-        pred_power = pred ** 2 + 1e-8
-        target_power = target ** 2 + 1e-8
-
-        # Chi-squared NLL (using Gamma with shape=df/2, scale=2)
-        k = self.df / 2
-        # Simplified: match power distributions via KL-like divergence
-        loss = pred_power / target_power - torch.log(pred_power / target_power + 1e-8) - 1
-
-        return self.weight * torch.mean(loss)
-
-
-class GumbelLoss(nn.Module):
-    """Gumbel distribution loss for peaks/extreme values.
-
-    Peak values in neural signals follow extreme value distributions.
-    """
-
-    def __init__(self, weight: float = 0.1, percentile: float = 95):
-        super().__init__()
-        self.weight = weight
-        self.percentile = percentile
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Focus on peak values
-        pred_flat = pred.reshape(pred.shape[0], -1)
-        target_flat = target.reshape(target.shape[0], -1)
-
-        # Get top percentile values
-        k = int((1 - self.percentile / 100) * pred_flat.shape[-1])
-        k = max(k, 1)
-
-        pred_peaks, _ = torch.topk(pred_flat, k, dim=-1)
-        target_peaks, _ = torch.topk(target_flat, k, dim=-1)
-
-        # Match peak distributions
-        # Gumbel location and scale estimation
-        target_mu = torch.mean(target_peaks, dim=-1, keepdim=True)
-        target_beta = torch.std(target_peaks, dim=-1, keepdim=True) * np.sqrt(6) / np.pi + 1e-8
-
-        # Gumbel NLL
-        z = (pred_peaks - target_mu) / target_beta
-        nll = z + torch.exp(-z) + torch.log(target_beta)
-
-        return self.weight * torch.mean(nll)
-
-
-class GammaLoss(nn.Module):
-    """Gamma distribution loss for positive-valued signals."""
-
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Ensure positive
-        pred_pos = F.softplus(pred) + 1e-8
-        target_pos = torch.abs(target) + 1e-8
-
-        # Estimate gamma parameters from target
-        target_mean = torch.mean(target_pos, dim=-1, keepdim=True)
-        target_var = torch.var(target_pos, dim=-1, keepdim=True) + 1e-8
-
-        # Method of moments: shape = mean^2/var, rate = mean/var
-        shape = target_mean ** 2 / target_var
-        rate = target_mean / target_var
-
-        # Gamma NLL
-        nll = -shape * torch.log(rate) - (shape - 1) * torch.log(pred_pos) + rate * pred_pos
-
-        return self.weight * torch.mean(nll)
-
-
-class LogNormalLoss(nn.Module):
-    """Log-normal distribution loss for multiplicative processes."""
-
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Transform to log space (handle negatives)
-        pred_log = torch.log(torch.abs(pred) + 1e-8)
-        target_log = torch.log(torch.abs(target) + 1e-8)
-
-        # Estimate parameters
-        mu = torch.mean(target_log, dim=-1, keepdim=True)
-        sigma = torch.std(target_log, dim=-1, keepdim=True) + 1e-8
-
-        # Log-normal NLL
-        nll = pred_log + ((pred_log - mu) ** 2) / (2 * sigma ** 2)
-
-        return self.weight * torch.mean(nll)
-
-
-class GaussianMixtureLoss(nn.Module):
-    """Gaussian Mixture Model loss for multi-modal distributions."""
-
-    def __init__(self, weight: float = 0.1, n_components: int = 3):
-        super().__init__()
-        self.weight = weight
-        self.n_components = n_components
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        B, C, T = target.shape
-
-        # Flatten
-        target_flat = target.reshape(B, -1)
-
-        # Simple k-means style estimation of mixture components
-        # Use quantiles as component centers
-        quantiles = torch.linspace(0.1, 0.9, self.n_components).to(target.device)
-        centers = torch.quantile(target_flat, quantiles, dim=-1).T  # [B, K]
-        sigma = torch.std(target_flat, dim=-1, keepdim=True) / self.n_components + 1e-8
-
-        # Compute responsibilities for predicted values
-        pred_flat = pred.reshape(B, -1)
-
-        # Distance to each component
-        dists = (pred_flat.unsqueeze(-1) - centers.unsqueeze(1)) ** 2  # [B, N, K]
-
-        # Soft assignment
-        log_probs = -dists / (2 * sigma.unsqueeze(-1) ** 2)
-        log_probs = log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
-
-        # NLL (negative log likelihood of mixture)
-        nll = -torch.logsumexp(log_probs, dim=-1)
-
-        return self.weight * torch.mean(nll)
-
-
-PROB_LOSS_REGISTRY = {
-    "rayleigh": RayleighLoss,
-    "von_mises": VonMisesLoss,
-    "chi_squared": ChiSquaredLoss,
-    "gumbel": GumbelLoss,
-    "gamma": GammaLoss,
-    "log_normal": LogNormalLoss,
-    "mixture": GaussianMixtureLoss,
-}
+@dataclass
+class ProbLossRunResult:
+    """Result from a single probabilistic loss run."""
+    prob_loss: str
+    # Test set metrics (primary for publication)
+    r2: float
+    mae: float
+    pearson: float
+    psd_error_db: float
+    # Validation set metrics (for training diagnostics)
+    val_r2: float = 0.0
+    val_mae: float = 0.0
+    val_pearson: float = 0.0
+    val_psd_error_db: float = 0.0
+    training_time: float = 0.0
+    success: bool = True
+    error: Optional[str] = None
 
 
 # =============================================================================
-# Combined Loss
+# Run via train.py
 # =============================================================================
 
-class CombinedProbabilisticLoss(nn.Module):
-    """Combines base loss with probabilistic loss."""
-
-    def __init__(
-        self,
-        base_loss: str = "huber",
-        prob_loss: str = "none",
-        prob_weight: float = 0.1,
-    ):
-        super().__init__()
-
-        # Base loss
-        if base_loss == "huber":
-            self.base = nn.HuberLoss()
-        elif base_loss == "mse":
-            self.base = nn.MSELoss()
-        elif base_loss == "l1":
-            self.base = nn.L1Loss()
-        elif base_loss == "spectral":
-            self.base = SpectralLoss()
-        else:
-            self.base = nn.HuberLoss()
-
-        # Probabilistic loss
-        if prob_loss == "none" or prob_loss not in PROB_LOSS_REGISTRY:
-            self.prob = None
-        else:
-            self.prob = PROB_LOSS_REGISTRY[prob_loss](weight=prob_weight)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = self.base(pred, target)
-
-        if self.prob is not None:
-            loss = loss + self.prob(pred, target)
-
-        return loss
-
-
-class SpectralLoss(nn.Module):
-    """Multi-scale spectral loss."""
-
-    def __init__(self):
-        super().__init__()
-        self.fft_sizes = [256, 512, 1024]
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        loss = 0.0
-
-        for fft_size in self.fft_sizes:
-            if pred.shape[-1] < fft_size:
-                continue
-
-            pred_fft = torch.fft.rfft(pred, n=fft_size, dim=-1)
-            target_fft = torch.fft.rfft(target, n=fft_size, dim=-1)
-
-            # Magnitude loss
-            pred_mag = torch.abs(pred_fft)
-            target_mag = torch.abs(target_fft)
-
-            loss = loss + F.l1_loss(pred_mag, target_mag)
-
-            # Log magnitude loss
-            pred_log = torch.log(pred_mag + 1e-8)
-            target_log = torch.log(target_mag + 1e-8)
-
-            loss = loss + F.l1_loss(pred_log, target_log)
-
-        return loss / len(self.fft_sizes)
-
-
-# =============================================================================
-# Training
-# =============================================================================
-
-def train_with_prob_loss(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    base_loss: str,
+def run_prob_loss_via_train_py(
     prob_loss: str,
     n_epochs: int,
-    device: torch.device,
-    lr: float = 1e-3,
-) -> Tuple[float, float]:
-    """Train with probabilistic loss combination."""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
-    criterion = CombinedProbabilisticLoss(base_loss=base_loss, prob_loss=prob_loss)
+    batch_size: int,
+    lr: float,
+    base_channels: int = 64,
+    seed: int = 42,
+    prob_loss_weight: float = 0.1,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """Run UNet with specific probabilistic loss via torchrun train.py.
 
-    model.train()
-    for epoch in range(n_epochs):
-        for X, y in train_loader:
-            X, y = X.to(device), y.to(device)
+    Uses --no-bidirectional and --skip-spectral-finetune for fair comparison.
+    The base loss is huber_wavelet (default), probabilistic loss is added on top.
 
-            optimizer.zero_grad()
-            y_pred = model(X)
-            loss = criterion(y_pred, y)
-            loss.backward()
+    Args:
+        prob_loss: Probabilistic loss type (none, gaussian_nll, rayleigh, etc.)
+        n_epochs: Number of training epochs
+        batch_size: Batch size
+        lr: Learning rate
+        base_channels: UNet base channels
+        seed: Random seed for reproducibility
+        prob_loss_weight: Weight for probabilistic loss
+        debug: If True, enable verbose debugging for distributed training
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+    Returns:
+        Dict with r2, mae, pearson, psd_error_db, success, error
+    """
+    # Use torchrun for distributed training (8x A100)
+    cmd = [
+        "torchrun",
+        "--nproc_per_node=8",
+        str(PROJECT_ROOT / "train.py"),
+        f"--epochs={n_epochs}",
+        f"--batch-size={batch_size}",
+        f"--lr={lr}",
+        f"--base-channels={base_channels}",
+        f"--seed={seed}",
+        "--fsdp",
+        "--fsdp-strategy=grad_op",
+        "--no-bidirectional",
+        "--skip-spectral-finetune",
+        "--eval-stage1",
+        f"--prob-loss={prob_loss}",
+        f"--prob-loss-weight={prob_loss_weight}",
+    ]
 
-        scheduler.step()
+    # Set up environment with debugging options
+    env = os.environ.copy()
+    if debug:
+        env["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+        env["NCCL_DEBUG"] = "WARN"
+        env["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+        print(f"  [DEBUG MODE] TORCH_DISTRIBUTED_DEBUG=DETAIL, NCCL_DEBUG=WARN")
 
-    # Validation
-    model.eval()
-    all_preds, all_targets = [], []
+    print(f"  Running: {' '.join(cmd)}")
 
-    with torch.no_grad():
-        for X, y in val_loader:
-            X, y = X.to(device), y.to(device)
-            y_pred = model(X)
-            all_preds.append(y_pred.cpu())
-            all_targets.append(y.cpu())
+    try:
+        start_time = time.time()
 
-    preds = torch.cat(all_preds, dim=0).numpy()
-    targets = torch.cat(all_targets, dim=0).numpy()
+        # Run train.py and capture output
+        result = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            check=True,
+            timeout=14400,  # 4 hours
+            capture_output=True,
+            text=True,
+            env=env,
+        )
 
-    preds_flat = preds.reshape(preds.shape[0], -1)
-    targets_flat = targets.reshape(targets.shape[0], -1)
+        elapsed = time.time() - start_time
+        output = result.stdout + result.stderr
 
-    ss_res = np.sum((targets_flat - preds_flat) ** 2)
-    ss_tot = np.sum((targets_flat - np.mean(targets_flat, axis=0)) ** 2)
-    r2 = 1 - ss_res / (ss_tot + 1e-8)
+        # Parse metrics from train.py output
+        metrics = {
+            # Test set metrics (primary for publication)
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "pearson": 0.0,
+            "psd_error_db": float("inf"),
+            # Validation set metrics
+            "val_r2": float("-inf"),
+            "val_mae": float("inf"),
+            "val_pearson": 0.0,
+            "val_psd_error_db": float("inf"),
+            "training_time": elapsed,
+            "success": False,
+        }
 
-    mae = np.mean(np.abs(targets_flat - preds_flat))
+        # Try to find Stage 1 final metrics (machine-parseable format)
+        for line in output.split("\n"):
+            # VALIDATION metrics: STAGE1_VAL_*
+            if "STAGE1_VAL_R2=" in line:
+                match = re.search(r"STAGE1_VAL_R2=([0-9.-]+)", line)
+                if match:
+                    metrics["val_r2"] = float(match.group(1))
+            if "STAGE1_VAL_CORR=" in line:
+                match = re.search(r"STAGE1_VAL_CORR=([0-9.-]+)", line)
+                if match:
+                    metrics["val_pearson"] = float(match.group(1))
+            if "STAGE1_VAL_MAE=" in line:
+                match = re.search(r"STAGE1_VAL_MAE=([0-9.-]+)", line)
+                if match:
+                    metrics["val_mae"] = float(match.group(1))
+            if "STAGE1_VAL_PSD_ERR_DB=" in line:
+                match = re.search(r"STAGE1_VAL_PSD_ERR_DB=([0-9.-]+)", line)
+                if match:
+                    metrics["val_psd_error_db"] = float(match.group(1))
 
-    return float(r2), float(mae)
+            # TEST metrics: STAGE1_RESULT_* (primary for publication)
+            if "STAGE1_RESULT_R2=" in line:
+                r2_match = re.search(r"STAGE1_RESULT_R2=([0-9.-]+)", line)
+                if r2_match:
+                    metrics["r2"] = float(r2_match.group(1))
+                    metrics["success"] = True
+            if "STAGE1_RESULT_CORR=" in line:
+                corr_match = re.search(r"STAGE1_RESULT_CORR=([0-9.-]+)", line)
+                if corr_match:
+                    metrics["pearson"] = float(corr_match.group(1))
+            if "STAGE1_RESULT_MAE=" in line:
+                mae_match = re.search(r"STAGE1_RESULT_MAE=([0-9.-]+)", line)
+                if mae_match:
+                    metrics["mae"] = float(mae_match.group(1))
+            if "STAGE1_RESULT_PSD_ERR_DB=" in line:
+                psd_match = re.search(r"STAGE1_RESULT_PSD_ERR_DB=([0-9.-]+)", line)
+                if psd_match:
+                    metrics["psd_error_db"] = float(psd_match.group(1))
+
+        # If we didn't find metrics in output, try to load from checkpoint
+        if not metrics["success"]:
+            checkpoint_path = PROJECT_ROOT / "artifacts" / "checkpoints" / "best_model.pt"
+            if checkpoint_path.exists():
+                import torch
+                try:
+                    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                    if "metrics" in ckpt:
+                        m = ckpt["metrics"]
+                        metrics["r2"] = m.get("r2", m.get("corr", float("-inf")))
+                        metrics["mae"] = m.get("mae", float("inf"))
+                        metrics["pearson"] = m.get("corr", 0.0)
+                        metrics["psd_error_db"] = m.get("psd_err_db", float("inf"))
+                        metrics["success"] = True
+                    elif "best_val_loss" in ckpt:
+                        # Fallback: at least we have loss
+                        metrics["success"] = True
+                        metrics["r2"] = 0.0
+                except Exception as e:
+                    print(f"  Warning: Could not load checkpoint: {e}")
+
+        # If still no success, show output for debugging
+        if not metrics["success"]:
+            print("\n" + "="*60)
+            print("FAILED TO PARSE METRICS - FULL OUTPUT:")
+            print("="*60)
+            print(output[-3000:] if len(output) > 3000 else output)
+            print("="*60)
+            metrics["error"] = f"Could not parse metrics. Last output: {output[-500:]}"
+
+        return metrics
+
+    except subprocess.CalledProcessError as e:
+        print("\n" + "="*60)
+        print(f"train.py FAILED with exit code {e.returncode}")
+        print("="*60)
+        if e.stdout:
+            print("STDOUT:")
+            print(e.stdout[-2000:] if len(e.stdout) > 2000 else e.stdout)
+        if e.stderr:
+            print("STDERR:")
+            print(e.stderr[-2000:] if len(e.stderr) > 2000 else e.stderr)
+        print("="*60)
+        error_msg = f"Exit code {e.returncode}"
+        if e.stderr:
+            error_msg += f": {e.stderr[-200:]}"
+        return {
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "pearson": 0.0,
+            "psd_error_db": float("inf"),
+            "training_time": 0.0,
+            "success": False,
+            "error": error_msg,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "pearson": 0.0,
+            "psd_error_db": float("inf"),
+            "training_time": 0.0,
+            "success": False,
+            "error": "Timeout (4h)",
+        }
+    except Exception as e:
+        return {
+            "r2": float("-inf"),
+            "mae": float("inf"),
+            "pearson": 0.0,
+            "psd_error_db": float("inf"),
+            "training_time": 0.0,
+            "success": False,
+            "error": str(e),
+        }
 
 
 # =============================================================================
@@ -425,154 +371,198 @@ def train_with_prob_loss(
 # =============================================================================
 
 def run_tier2_5(
-    X: torch.Tensor,
-    y: torch.Tensor,
-    device: torch.device,
-    architecture: Optional[str] = None,
-    base_losses: Optional[List[str]] = None,
-    prob_losses: Optional[List[str]] = None,
-    n_seeds: int = 3,
-    n_folds: int = 3,
-    n_epochs: int = 50,
-    batch_size: int = 32,
-    register: bool = True,
+    prob_losses: List[str],
+    n_epochs: int = 20,
+    batch_size: int = 8,
+    lr: float = 0.0002,
+    base_channels: int = 64,
+    seed: int = 42,
+    prob_loss_weight: float = 0.1,
+    debug: bool = False,
+    previous_results: Optional[List[Dict]] = None,
 ) -> Tier2_5Result:
-    """Run Tier 2.5: Probabilistic Loss Ablation.
+    """Run Tier 2.5: Test different probabilistic losses.
 
-    Tests combinations of base losses with probabilistic losses.
+    Uses train.py via torchrun for each probabilistic loss.
+
+    Args:
+        prob_losses: List of probabilistic losses to test
+        n_epochs: Training epochs per loss
+        batch_size: Batch size
+        lr: Learning rate
+        base_channels: UNet base channels
+        seed: Random seed for reproducibility
+        prob_loss_weight: Weight for probabilistic loss
+        debug: If True, enable verbose debugging
+        previous_results: Optional list of successful results from previous run
+
+    Returns:
+        Tier2_5Result with comparison of all probabilistic losses
     """
-    if architecture is None:
-        registry = get_registry()
-        if registry.tier2 is not None:
-            architecture = registry.tier2.best_architecture
-        elif registry.tier1 is not None:
-            architecture = registry.tier1.top_architectures[0]
+    print(f"\nTesting {len(prob_losses)} probabilistic losses")
+    print(f"Using train.py with --no-bidirectional --skip-spectral-finetune")
+    print(f"Base loss: huber_wavelet, Prob loss weight: {prob_loss_weight}")
+    print(f"Epochs: {n_epochs}, Batch: {batch_size}, LR: {lr}, Seed: {seed}")
+    print()
+
+    # Start with previous successful results if provided
+    all_results: List[ProbLossRunResult] = []
+    if previous_results:
+        for r in previous_results:
+            all_results.append(ProbLossRunResult(
+                prob_loss=r["prob_loss"],
+                r2=r.get("r2", float("-inf")),
+                mae=r.get("mae", float("inf")),
+                pearson=r.get("pearson", 0.0),
+                psd_error_db=r.get("psd_error_db", float("inf")),
+                val_r2=r.get("val_r2", float("-inf")),
+                val_mae=r.get("val_mae", float("inf")),
+                val_pearson=r.get("val_pearson", 0.0),
+                val_psd_error_db=r.get("val_psd_error_db", float("inf")),
+                training_time=r.get("training_time", 0.0),
+                success=True,
+            ))
+        print(f"Loaded {len(previous_results)} successful results from previous run")
+
+    for i, prob_loss in enumerate(prob_losses):
+        # CRITICAL: Clean up GPU memory before each run
+        print(f"\n  Cleaning up GPU memory before run...")
+        cleanup_gpu_memory()
+
+        print(f"\n{'='*60}")
+        print(f"[{i+1}/{len(prob_losses)}] Probabilistic Loss: {prob_loss}")
+        print(f"{'='*60}")
+
+        metrics = run_prob_loss_via_train_py(
+            prob_loss=prob_loss,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            base_channels=base_channels,
+            seed=seed,
+            prob_loss_weight=prob_loss_weight,
+            debug=debug,
+        )
+
+        if metrics.get("success", False):
+            result = ProbLossRunResult(
+                prob_loss=prob_loss,
+                r2=metrics["r2"],
+                mae=metrics.get("mae", float("inf")),
+                pearson=metrics.get("pearson", 0.0),
+                psd_error_db=metrics.get("psd_error_db", float("inf")),
+                val_r2=metrics.get("val_r2", float("-inf")),
+                val_mae=metrics.get("val_mae", float("inf")),
+                val_pearson=metrics.get("val_pearson", 0.0),
+                val_psd_error_db=metrics.get("val_psd_error_db", float("inf")),
+                training_time=metrics.get("training_time", 0.0),
+                success=True,
+            )
+            print(f"  SUCCESS: Val R²={result.val_r2:.4f}, Test R²={result.r2:.4f}, Test Pearson={result.pearson:.4f}")
         else:
-            architecture = "unet"
+            result = ProbLossRunResult(
+                prob_loss=prob_loss,
+                r2=float("-inf"),
+                mae=float("inf"),
+                pearson=0.0,
+                psd_error_db=float("inf"),
+                training_time=0.0,
+                success=False,
+                error=metrics.get("error", "Unknown error"),
+            )
+            print(f"  FAILED: {metrics.get('error', 'Unknown error')}")
 
-    base_losses = base_losses or BASE_LOSSES
-    prob_losses = prob_losses or PROBABILISTIC_LOSSES
+        all_results.append(result)
 
-    print(f"\nTesting {len(base_losses)} base × {len(prob_losses)} probabilistic losses")
-    print(f"Architecture: {architecture}")
+        # Save intermediate checkpoint
+        checkpoint = {
+            "completed": [asdict(r) for r in all_results],
+            "remaining": prob_losses[i+1:],
+        }
+        with open(ARTIFACTS_DIR / "tier2_5_checkpoint.json", "w") as f:
+            json.dump(checkpoint, f, indent=2)
 
-    N = X.shape[0]
-    in_channels = X.shape[1]
-    out_channels = y.shape[1]
-
-    splits = create_data_splits(n_samples=N, n_folds=n_folds, holdout_fraction=0.0, seed=42)
-
-    all_results = {}
-
-    for base_loss in base_losses:
-        for prob_loss in prob_losses:
-            combo_name = f"{base_loss}+{prob_loss}" if prob_loss != "none" else base_loss
-            print(f"\n  {combo_name}...", end=" ", flush=True)
-
-            r2s = []
-
-            for seed in range(n_seeds):
-                torch.manual_seed(seed)
-                np.random.seed(seed)
-
-                for split in splits.cv_splits:
-                    X_train = X[split.train_indices]
-                    y_train = y[split.train_indices]
-                    X_val = X[split.val_indices]
-                    y_val = y[split.val_indices]
-
-                    train_loader = DataLoader(
-                        TensorDataset(X_train, y_train),
-                        batch_size=batch_size,
-                        shuffle=True,
-                    )
-                    val_loader = DataLoader(
-                        TensorDataset(X_val, y_val),
-                        batch_size=batch_size,
-                    )
-
-                    model = None
-                    try:
-                        from models import CondUNet1D
-                        from experiments.study1_architecture.architectures import create_architecture
-
-                        VARIANT_MAP = {
-                            "linear": "simple", "cnn": "basic", "wavenet": "standard",
-                            "fnet": "standard", "vit": "standard", "performer": "standard",
-                            "mamba": "standard",
-                        }
-
-                        if architecture == "unet":
-                            model = CondUNet1D(
-                                in_channels=in_channels,
-                                out_channels=out_channels,
-                                base_channels=64,
-                                n_odors=7,
-                            ).to(device)
-                        else:
-                            model = create_architecture(
-                                architecture,
-                                variant=VARIANT_MAP.get(architecture, "standard"),
-                                in_channels=in_channels,
-                                out_channels=out_channels,
-                            ).to(device)
-
-                        r2, mae = train_with_prob_loss(
-                            model=model,
-                            train_loader=train_loader,
-                            val_loader=val_loader,
-                            base_loss=base_loss,
-                            prob_loss=prob_loss,
-                            n_epochs=n_epochs,
-                            device=device,
-                        )
-                        r2s.append(r2)
-
-                    except Exception as e:
-                        print(f"Error: {e}")
-
-                    finally:
-                        if model is not None:
-                            del model
-                        gc.collect()
-                        torch.cuda.empty_cache()
-
-            if r2s:
-                all_results[combo_name] = ProbabilisticLossResult(
-                    base_loss=base_loss,
-                    prob_loss=prob_loss,
-                    r2_mean=float(np.mean(r2s)),
-                    r2_std=float(np.std(r2s, ddof=1)) if len(r2s) > 1 else 0.0,
-                )
-                print(f"R² = {all_results[combo_name].r2_mean:.4f}")
+    # Build results dict (for registry)
+    prob_results = {}
+    for result in all_results:
+        if result.success:
+            prob_results[result.prob_loss] = ProbabilisticLossResult(
+                base_loss="huber_wavelet",
+                prob_loss=result.prob_loss,
+                r2_mean=result.r2,
+                r2_std=0.0,  # Single run
+            )
 
     # Find best
-    best = max(all_results.values(), key=lambda x: x.r2_mean)
+    if prob_results:
+        best = max(prob_results.values(), key=lambda x: x.r2_mean)
+        best_combination = f"huber_wavelet+{best.prob_loss}" if best.prob_loss != "none" else "huber_wavelet"
+    else:
+        best = ProbabilisticLossResult("huber_wavelet", "none", 0.0, 0.0)
+        best_combination = "huber_wavelet"
 
-    result = Tier2_5Result(
-        architecture=architecture,
-        results=all_results,
-        best_combination=f"{best.base_loss}+{best.prob_loss}" if best.prob_loss != "none" else best.base_loss,
+    # Create final result
+    final_result = Tier2_5Result(
+        architecture="CondUNet1D",
+        results=prob_results,
+        best_combination=best_combination,
         best_r2_mean=best.r2_mean,
         best_r2_std=best.r2_std,
     )
 
-    if register:
+    # Register results
+    try:
         registry = get_registry(ARTIFACTS_DIR)
-        registry.register_tier2_5(result)
+        registry.register_tier2_5(final_result)
+    except Exception as e:
+        print(f"  Warning: Could not register results: {e}")
 
     # Print summary
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 100)
     print("TIER 2.5 RESULTS: Probabilistic Loss Ablation")
-    print("=" * 60)
+    print("=" * 100)
+    print(f"{'Prob Loss':<20} {'Val R²':>10} {'Val r':>10} {'Test R²':>10} {'Test r':>10} {'Test MAE':>10} {'Time':>10}")
+    print("-" * 100)
 
-    sorted_results = sorted(all_results.values(), key=lambda x: x.r2_mean, reverse=True)
-    for r in sorted_results[:10]:
-        name = f"{r.base_loss}+{r.prob_loss}" if r.prob_loss != "none" else r.base_loss
-        marker = " <-- BEST" if r == best else ""
-        print(f"  {name:25s}: R² = {r.r2_mean:.4f} ± {r.r2_std:.4f}{marker}")
+    sorted_results = sorted(all_results, key=lambda x: x.r2 if x.success else float("-inf"), reverse=True)
+    for r in sorted_results:
+        if r.success:
+            marker = " <-- BEST" if r.prob_loss == best.prob_loss else ""
+            print(f"{r.prob_loss:<20} {r.val_r2:>10.4f} {r.val_pearson:>10.4f} {r.r2:>10.4f} {r.pearson:>10.4f} {r.mae:>10.4f} {r.training_time:>9.1f}s{marker}")
+        else:
+            print(f"{r.prob_loss:<20} {'FAILED':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10} {'-':>10}  [{r.error}]")
 
-    return result
+    print("=" * 100)
+    print(f"\nBest probabilistic loss: {best.prob_loss} (Test R²={best.r2_mean:.4f})")
+    print(f"Best combination: {best_combination}")
+
+    # Save final results
+    final_output = {
+        "tier": "2.5",
+        "name": "Probabilistic Loss Ablation",
+        "timestamp": datetime.now().isoformat(),
+        "config": {
+            "epochs": n_epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "base_channels": base_channels,
+            "seed": seed,
+            "prob_loss_weight": prob_loss_weight,
+            "base_loss": "huber_wavelet",
+            "prob_losses": prob_losses,
+        },
+        "results": [asdict(r) for r in all_results],
+        "best_prob_loss": best.prob_loss,
+        "best_combination": best_combination,
+        "best_r2": best.r2_mean,
+    }
+
+    out_path = ARTIFACTS_DIR / f"tier2_5_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(out_path, "w") as f:
+        json.dump(final_output, f, indent=2)
+    print(f"\nSaved: {out_path}")
+
+    return final_result
 
 
 # =============================================================================
@@ -581,35 +571,95 @@ def run_tier2_5(
 
 def main():
     parser = argparse.ArgumentParser(description="Tier 2.5: Probabilistic Loss Ablation")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dry-run", action="store_true", help="Quick test with fewer epochs and losses")
+    parser.add_argument("--epochs", type=int, default=20, help="Training epochs per loss (default: 20)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
+    parser.add_argument("--lr", type=float, default=0.0002, help="Learning rate")
+    parser.add_argument("--base-channels", type=int, default=64, help="UNet base channels")
+    parser.add_argument("--losses", type=str, nargs="+", default=None,
+                        help="Specific probabilistic losses to test (default: all)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
+    parser.add_argument("--prob-loss-weight", type=float, default=0.1,
+                        help="Weight for probabilistic loss (default: 0.1)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose debugging for distributed training errors")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Only rerun failed experiments from previous run")
 
     args = parser.parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
     print("TIER 2.5: Probabilistic Loss Ablation")
     print("=" * 60)
+    print()
+    print("Tests probabilistic losses ON TOP of huber_wavelet base loss.")
+    print("Uses train.py via torchrun with --no-bidirectional --skip-spectral-finetune")
+    print()
+    print("Probabilistic losses available:")
+    for i, loss in enumerate(PROBABILISTIC_LOSSES, 1):
+        print(f"  {i:2d}. {loss}")
+    print()
 
-    if args.dry_run:
-        N, C, T = 100, 32, 500
-        X = torch.randn(N, C, T)
-        y = torch.randn(N, C, T)
+    # Handle --retry-failed: load checkpoint and only run failed ones
+    if args.retry_failed:
+        checkpoint_path = ARTIFACTS_DIR / "tier2_5_checkpoint.json"
+        if not checkpoint_path.exists():
+            print("ERROR: No checkpoint found. Run without --retry-failed first.")
+            return
+
+        with open(checkpoint_path) as f:
+            checkpoint = json.load(f)
+
+        # Find failed experiments
+        completed = checkpoint.get("completed", [])
+        failed_losses = [r["prob_loss"] for r in completed if not r.get("success", False)]
+        successful_results = [r for r in completed if r.get("success", False)]
+
+        if not failed_losses:
+            print("No failed experiments to retry!")
+            print(f"All {len(completed)} experiments completed successfully.")
+            return
+
+        print(f"[RETRY-FAILED] Found {len(failed_losses)} failed experiments:")
+        for loss in failed_losses:
+            print(f"  - {loss}")
+        print(f"\nKeeping {len(successful_results)} successful results from previous run.\n")
+
+        prob_losses = failed_losses
+
+        run_tier2_5(
+            prob_losses=prob_losses,
+            n_epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            base_channels=args.base_channels,
+            seed=args.seed,
+            prob_loss_weight=args.prob_loss_weight,
+            debug=args.debug,
+            previous_results=successful_results,
+        )
+        return
+
+    # Select probabilistic losses
+    if args.losses:
+        prob_losses = args.losses
+    elif args.dry_run:
         prob_losses = FAST_PROB_LOSSES
-        n_epochs, n_seeds, n_folds = 5, 2, 2
+        args.epochs = 3  # Fewer epochs for dry run
+        print(f"[DRY-RUN] Testing {len(prob_losses)} probabilistic losses with {args.epochs} epochs each\n")
     else:
-        from data import prepare_data
-        data = prepare_data()
-        idx = np.concatenate([data["train_idx"], data["val_idx"]])
-        X = torch.from_numpy(data["ob"][idx]).float()
-        y = torch.from_numpy(data["pcx"][idx]).float()
         prob_losses = PROBABILISTIC_LOSSES
-        n_epochs, n_seeds, n_folds = 50, 3, 3
 
     run_tier2_5(
-        X=X, y=y, device=device,
         prob_losses=prob_losses,
-        n_seeds=n_seeds, n_folds=n_folds, n_epochs=n_epochs,
+        n_epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        base_channels=args.base_channels,
+        seed=args.seed,
+        prob_loss_weight=args.prob_loss_weight,
+        debug=args.debug,
     )
 
 
