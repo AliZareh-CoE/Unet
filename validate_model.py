@@ -670,8 +670,10 @@ def generate_signals(
             source_pred = spectral_shift_rev(source_pred, odor_ids=condition)
 
             # Crop to target window
-            source_cropped = crop_to_target_torch(source)
-            target_cropped = crop_to_target_torch(target)
+            # IMPORTANT: Use normalized versions for fair comparison with model outputs
+            # Model was trained on normalized data, so predictions are in normalized space
+            source_cropped = crop_to_target_torch(source_norm)
+            target_cropped = crop_to_target_torch(target_norm)
             target_pred_cropped = crop_to_target_torch(target_pred)
             source_pred_cropped = crop_to_target_torch(source_pred)
 
