@@ -99,6 +99,7 @@ DEFAULT_MODEL_CONFIG = {
     "conv_kernel_size": DEFAULT_CONFIG["conv_kernel_size"],
     "conv_dilations": DEFAULT_CONFIG["conv_dilations"],
     "n_downsample": DEFAULT_CONFIG["n_downsample"],
+    "use_output_scaling": DEFAULT_CONFIG.get("use_output_scaling", True),
 }
 
 # Spectral shift config derived from train.py DEFAULT_CONFIG
@@ -115,6 +116,25 @@ DEFAULT_SPECTRAL_SHIFT_CONFIG = {
     "hidden_dim": DEFAULT_CONFIG["spectral_shift_hidden_dim"],
     "max_shift_db": DEFAULT_CONFIG["spectral_shift_max_db"],
 }
+
+
+def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Apply per-channel z-score normalization to a batch of signals.
+
+    For each channel independently, normalize to zero mean and unit variance.
+    This helps handle amplitude variations across channels and recordings.
+
+    Args:
+        x: Input tensor of shape [B, C, T]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized tensor of same shape
+    """
+    # Compute mean and std per channel (over time dimension)
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True).clamp(min=eps)
+    return (x - mean) / std
 
 
 def get_dataset_config(dataset_type: DatasetType) -> Dict[str, Any]:
@@ -381,6 +401,7 @@ def create_model(config: Dict[str, Any], device: torch.device) -> CondUNet1D:
         conv_kernel_size=config["conv_kernel_size"],
         dilations=config["conv_dilations"],
         n_downsample=config["n_downsample"],
+        use_output_scaling=config.get("use_output_scaling", True),
     )
     return model.to(device)
 
@@ -636,12 +657,16 @@ def generate_signals(
             target = target.to(device)
             condition = condition.to(device)
 
+            # Apply per-channel normalization (same as training)
+            source_norm = per_channel_normalize(source)
+            target_norm = per_channel_normalize(target)
+
             # Forward: source → target
-            target_pred = model_fwd(source, condition)
+            target_pred = model_fwd(source_norm, condition)
             target_pred = spectral_shift_fwd(target_pred, odor_ids=condition)
 
             # Reverse: target → source
-            source_pred = model_rev(target, condition)
+            source_pred = model_rev(target_norm, condition)
             source_pred = spectral_shift_rev(source_pred, odor_ids=condition)
 
             # Crop to target window
@@ -4999,8 +5024,11 @@ def run_gradient_analysis(
         model_fwd.eval()
         model_rev.eval()
         with torch.no_grad():
-            target_gen = model_fwd(source_real, condition_ids)
-            source_gen = model_rev(target_real, condition_ids)
+            # Apply per-channel normalization (same as training)
+            source_norm = per_channel_normalize(source_real)
+            target_norm = per_channel_normalize(target_real)
+            target_gen = model_fwd(source_norm, condition_ids)
+            source_gen = model_rev(target_norm, condition_ids)
             if spectral_shift_fwd is not None:
                 target_gen = spectral_shift_fwd(target_gen, condition_ids)
             if spectral_shift_rev is not None:
