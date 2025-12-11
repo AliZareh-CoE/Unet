@@ -1654,6 +1654,90 @@ class AdaptiveSpectralShift(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
 
+    @torch.no_grad()
+    def compute_optimal_bias(
+        self,
+        unet_outputs: torch.Tensor,
+        targets: torch.Tensor,
+        odor_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute optimal per-odor bias by directly measuring PSD difference.
+
+        Instead of learning bias through gradient descent, directly measure
+        what shift is needed: target_psd - unet_output_psd per band per odor.
+
+        Args:
+            unet_outputs: UNet output signals [N, C, T]
+            targets: Target signals [N, C, T]
+            odor_ids: Odor indices [N]
+
+        Returns:
+            Optimal bias in log-scale [n_odors, n_bands]
+        """
+        device = unet_outputs.device
+        N, C, T = unet_outputs.shape
+
+        # Build frequency masks
+        masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
+
+        # Compute PSD for both (in log scale)
+        unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
+        target_fft = torch.fft.rfft(targets.float(), dim=-1)
+
+        unet_power = unet_fft.abs().square()  # [N, C, n_freq]
+        target_power = target_fft.abs().square()
+
+        # Per-band power
+        unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
+        target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
+
+        # Log scale (dB-like)
+        unet_log = torch.log(unet_band_power + 1e-10)
+        target_log = torch.log(target_band_power + 1e-10)
+
+        # Difference: how much to shift UNet output to match target
+        diff_log = target_log - unet_log  # [N, C, n_bands]
+
+        # Average across channels
+        diff_log = diff_log.mean(dim=1)  # [N, n_bands]
+
+        # Accumulate per odor
+        optimal_bias = torch.zeros(self.n_odors, self.n_bands, device=device)
+        counts = torch.zeros(self.n_odors, device=device)
+
+        for i in range(N):
+            odor = odor_ids[i].item()
+            optimal_bias[odor] += diff_log[i]
+            counts[odor] += 1
+
+        # Average per odor
+        for odor in range(self.n_odors):
+            if counts[odor] > 0:
+                optimal_bias[odor] /= counts[odor]
+
+        return optimal_bias
+
+    def set_bias_from_data(
+        self,
+        unet_outputs: torch.Tensor,
+        targets: torch.Tensor,
+        odor_ids: torch.Tensor,
+    ) -> None:
+        """Set odor_bias directly from measured PSD difference.
+
+        Args:
+            unet_outputs: UNet output signals [N, C, T]
+            targets: Target signals [N, C, T]
+            odor_ids: Odor indices [N]
+        """
+        optimal_bias = self.compute_optimal_bias(unet_outputs, targets, odor_ids)
+        self.odor_bias.data.copy_(optimal_bias)
+
+        # Convert to dB for logging
+        bias_db = optimal_bias * 20.0 / math.log(10)
+        print(f"Set odor_bias from data: mean={bias_db.mean():.2f}dB, "
+              f"range=[{bias_db.min():.2f}, {bias_db.max():.2f}]dB")
+
     def extra_repr(self) -> str:
         max_db = self.max_log_scale * 20.0 / math.log(10)
         return (
