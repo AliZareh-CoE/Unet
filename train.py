@@ -2400,7 +2400,9 @@ def train(
         optimizer_stage2 = AdamW(param_groups_stage2, lr=spectral_shift_lr_finetune, betas=betas)
 
         # Reset early stopping for fine-tuning phase
-        best_val_loss_stage2 = float("inf")
+        # IMPORTANT: Use PSD error (not loss) for best model selection in Stage 2
+        # SpectralShift's purpose is to correct PSD, so we should select based on PSD error!
+        best_psd_err_stage2 = float("inf")
         best_epoch_stage2 = 0
         patience_counter_stage2 = 0
 
@@ -2442,10 +2444,23 @@ def train(
                 val_loss = val_loss_tensor.item()
                 val_metrics["loss"] = val_loss
 
-            # Track best
-            is_best_stage2 = val_loss < best_val_loss_stage2
+            # CRITICAL: Track best based on PSD ERROR, not loss!
+            # SpectralShift's purpose is to correct PSD mismatch, so we select best model
+            # based on actual PSD reconstruction quality (lower error = better)
+            psd_err_fwd = val_metrics.get("psd_err_db", float("inf"))
+            psd_err_rev = val_metrics.get("psd_err_db_rev", psd_err_fwd)  # Use fwd if rev not available
+            # Average forward and reverse PSD errors for bidirectional training
+            avg_psd_err = (psd_err_fwd + psd_err_rev) / 2.0 if "psd_err_db_rev" in val_metrics else psd_err_fwd
+
+            # Sync PSD error across ranks
+            if dist.is_initialized():
+                psd_err_tensor = torch.tensor(avg_psd_err, device=device)
+                dist.all_reduce(psd_err_tensor, op=dist.ReduceOp.AVG)
+                avg_psd_err = psd_err_tensor.item()
+
+            is_best_stage2 = avg_psd_err < best_psd_err_stage2
             if is_best_stage2:
-                best_val_loss_stage2 = val_loss
+                best_psd_err_stage2 = avg_psd_err
                 best_epoch_stage2 = epoch
                 patience_counter_stage2 = 0
                 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2466,14 +2481,16 @@ def train(
             if is_primary():
                 rev_str = ""
                 if "corr_rev" in val_metrics:
+                    psd_err_rev_db = val_metrics.get('psd_err_db_rev', 0)
                     psd_bias_rev = val_metrics.get('psd_diff_db_rev', 0)
-                    rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, PSD={psd_bias_rev:+.1f}dB"
+                    rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, PSD_err={psd_err_rev_db:.2f}dB (bias={psd_bias_rev:+.1f}dB)"
 
+                psd_err_fwd_db = val_metrics.get('psd_err_db', 0)
                 psd_bias_fwd = val_metrics.get('psd_diff_db', 0)
                 print(f"[Stage2] Epoch {epoch}/{spectral_finetune_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, PSD={psd_bias_fwd:+.1f}dB{rev_str} | "
-                      f"Best: {best_val_loss_stage2:.3f} [UNet FROZEN]")
+                      f"Fwd: r={val_metrics['corr']:.3f}, PSD_err={psd_err_fwd_db:.2f}dB (bias={psd_bias_fwd:+.1f}dB){rev_str} | "
+                      f"Best PSD_err: {best_psd_err_stage2:.2f}dB [UNet FROZEN]")
                 sys.stdout.flush()
 
             if patience_counter_stage2 >= early_stop_patience:
@@ -2483,7 +2500,7 @@ def train(
 
         # Load best stage2 checkpoint for final eval
         if is_primary():
-            print(f"\nLoading best Stage 2 checkpoint from epoch {best_epoch_stage2}...")
+            print(f"\nLoading best Stage 2 checkpoint from epoch {best_epoch_stage2} (PSD_err={best_psd_err_stage2:.2f}dB)...")
         barrier()
         load_checkpoint(
             CHECKPOINT_DIR / "best_model_stage2.pt",
