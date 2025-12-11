@@ -1107,6 +1107,7 @@ def train_epoch(
     cond_encoder: Optional[nn.Module] = None,
     residual_corrector: Optional[nn.Module] = None,
     residual_optimizer: Optional[torch.optim.Optimizer] = None,
+    prob_loss: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -2000,6 +2001,7 @@ def train(
                 cond_encoder=cond_encoder,
                 residual_corrector=residual_corrector,
                 residual_optimizer=residual_optimizer,
+                prob_loss=prob_loss,
             )
 
             barrier()
@@ -2347,6 +2349,7 @@ def train(
                 cond_encoder=cond_encoder,
                 residual_corrector=residual_corrector,
                 residual_optimizer=residual_optimizer,
+                prob_loss=prob_loss,
             )
 
             barrier()
