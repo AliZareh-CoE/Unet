@@ -185,6 +185,8 @@ DEFAULT_CONFIG = {
     "spectral_shift_band_width_hz": 2,  # None=use predefined neuro bands, or float (e.g., 2.0 for 2Hz uniform bands)
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
+    "spectral_shift_two_stage": True,  # Two-stage training: first bias-only, then network-only
+    "spectral_shift_bias_epochs": 5,   # Epochs for bias-only training (Stage 2a-1, 2b-1)
 
     # Envelope loss (for spectral shift training, helps match signal envelope distribution)
     # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
@@ -2374,9 +2376,15 @@ def train(
         # =====================================================================
         # PHASE 2a: Train FORWARD SpectralShift only (reverse frozen)
         # =====================================================================
+        # Two-stage training config
+        two_stage_enabled = config.get("spectral_shift_two_stage", True)
+        bias_epochs = config.get("spectral_shift_bias_epochs", 5)
+
         if is_primary():
             print(f"\n{'='*70}")
             print(f"PHASE 2a: Training FORWARD SpectralShift ({phase_epochs} epochs)")
+            if two_stage_enabled:
+                print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
             print(f"{'='*70}")
 
         # Freeze reverse SpectralShift
@@ -2384,23 +2392,43 @@ def train(
             for param in spectral_shift_rev.parameters():
                 param.requires_grad = False
 
+        # For two-stage: start with bias-only training
+        if two_stage_enabled:
+            spectral_shift_fwd.freeze_network()  # Only odor_bias trainable
+
         # Optimizer with ONLY forward SpectralShift parameters
         optimizer_2a = AdamW(
-            [{"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr_finetune}],
+            [{"params": [p for p in spectral_shift_fwd.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
             lr=spectral_shift_lr_finetune, betas=betas
         )
 
         if is_primary():
             fwd_params = count_trainable_params(spectral_shift_fwd)
             rev_params = count_total_params(spectral_shift_rev) if spectral_shift_rev is not None else 0
-            print(f"Trainable: Forward SpectralShift = {fwd_params} params")
+            stage_desc = "(bias-only)" if two_stage_enabled else ""
+            print(f"Trainable: Forward SpectralShift = {fwd_params} params {stage_desc}")
             print(f"Frozen: Reverse SpectralShift = {rev_params} params (frozen), UNet = frozen\n")
 
         best_psd_err_2a = float("inf")
         best_epoch_2a = 0
         patience_counter_2a = 0
+        switched_to_network = False  # Track if we've switched to network-only
 
         for epoch in range(1, phase_epochs + 1):
+            # Two-stage: switch from bias-only to network-only after bias_epochs
+            if two_stage_enabled and epoch == bias_epochs + 1 and not switched_to_network:
+                if is_primary():
+                    print(f"\n--- Switching to network-only training (bias frozen) ---")
+                spectral_shift_fwd.freeze_bias()  # Freeze bias, unfreeze network
+                # Recreate optimizer with network parameters
+                optimizer_2a = AdamW(
+                    [{"params": [p for p in spectral_shift_fwd.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
+                    lr=spectral_shift_lr_finetune, betas=betas
+                )
+                switched_to_network = True
+                if is_primary():
+                    fwd_params = count_trainable_params(spectral_shift_fwd)
+                    print(f"Trainable: Forward SpectralShift = {fwd_params} params (network-only)\n")
             if loaders.get("train_sampler") is not None:
                 loaders["train_sampler"].set_epoch(epoch + num_epochs)
 
@@ -2458,7 +2486,12 @@ def train(
 
             if is_primary():
                 psd_bias_fwd = val_metrics.get('psd_diff_db', 0)
-                print(f"[Phase2a] Epoch {epoch}/{phase_epochs} | "
+                # Show current stage for two-stage training
+                if two_stage_enabled:
+                    stage_str = "BIAS" if epoch <= bias_epochs else "NET"
+                else:
+                    stage_str = "ALL"
+                print(f"[Phase2a-{stage_str}] Epoch {epoch}/{phase_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
                       f"FWD PSD_err={psd_err_fwd:.2f}dB (bias={psd_bias_fwd:+.1f}dB) | "
                       f"Best: {best_psd_err_2a:.2f}dB [REV FROZEN]")
@@ -2488,33 +2521,55 @@ def train(
             if is_primary():
                 print(f"\n{'='*70}")
                 print(f"PHASE 2b: Training REVERSE SpectralShift ({phase_epochs} epochs)")
+                if two_stage_enabled:
+                    print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
                 print(f"{'='*70}")
 
             # Freeze forward SpectralShift (now trained)
             for param in spectral_shift_fwd.parameters():
                 param.requires_grad = False
 
-            # Unfreeze reverse SpectralShift
-            for param in spectral_shift_rev.parameters():
-                param.requires_grad = True
+            # For two-stage: start with bias-only training
+            if two_stage_enabled:
+                spectral_shift_rev.freeze_network()  # Only odor_bias trainable
+            else:
+                # Unfreeze all reverse SpectralShift
+                for param in spectral_shift_rev.parameters():
+                    param.requires_grad = True
 
             # Optimizer with ONLY reverse SpectralShift parameters
             optimizer_2b = AdamW(
-                [{"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr_finetune}],
+                [{"params": [p for p in spectral_shift_rev.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
                 lr=spectral_shift_lr_finetune, betas=betas
             )
 
             if is_primary():
                 fwd_params = count_total_params(spectral_shift_fwd)
                 rev_params = count_trainable_params(spectral_shift_rev)
-                print(f"Trainable: Reverse SpectralShift = {rev_params} params")
+                stage_desc = "(bias-only)" if two_stage_enabled else ""
+                print(f"Trainable: Reverse SpectralShift = {rev_params} params {stage_desc}")
                 print(f"Frozen: Forward SpectralShift = {fwd_params} params (frozen), UNet = frozen\n")
 
             best_psd_err_2b = float("inf")
             best_epoch_2b = 0
             patience_counter_2b = 0
+            switched_to_network_2b = False  # Track if we've switched to network-only
 
             for epoch in range(1, phase_epochs + 1):
+                # Two-stage: switch from bias-only to network-only after bias_epochs
+                if two_stage_enabled and epoch == bias_epochs + 1 and not switched_to_network_2b:
+                    if is_primary():
+                        print(f"\n--- Switching to network-only training (bias frozen) ---")
+                    spectral_shift_rev.freeze_bias()  # Freeze bias, unfreeze network
+                    # Recreate optimizer with network parameters
+                    optimizer_2b = AdamW(
+                        [{"params": [p for p in spectral_shift_rev.parameters() if p.requires_grad], "lr": spectral_shift_lr_finetune}],
+                        lr=spectral_shift_lr_finetune, betas=betas
+                    )
+                    switched_to_network_2b = True
+                    if is_primary():
+                        rev_params = count_trainable_params(spectral_shift_rev)
+                        print(f"Trainable: Reverse SpectralShift = {rev_params} params (network-only)\n")
                 if loaders.get("train_sampler") is not None:
                     loaders["train_sampler"].set_epoch(epoch + num_epochs + phase_epochs)
 
@@ -2572,7 +2627,12 @@ def train(
 
                 if is_primary():
                     psd_bias_rev = val_metrics.get('psd_diff_db_rev', 0)
-                    print(f"[Phase2b] Epoch {epoch}/{phase_epochs} | "
+                    # Show current stage for two-stage training
+                    if two_stage_enabled:
+                        stage_str = "BIAS" if epoch <= bias_epochs else "NET"
+                    else:
+                        stage_str = "ALL"
+                    print(f"[Phase2b-{stage_str}] Epoch {epoch}/{phase_epochs} | "
                           f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
                           f"REV PSD_err={psd_err_rev:.2f}dB (bias={psd_bias_rev:+.1f}dB) | "
                           f"Best: {best_psd_err_2b:.2f}dB [FWD FROZEN]")
@@ -2847,6 +2907,12 @@ def parse_args():
                         help="Initial dB shift value for spectral shift block")
     parser.add_argument("--spectral-shift-lr", type=float, default=None,
                         help="Learning rate for spectral shift parameters")
+    parser.add_argument("--spectral-shift-two-stage", action="store_true", default=True,
+                        help="Enable two-stage training: bias-only first, then network-only (default: True)")
+    parser.add_argument("--no-spectral-shift-two-stage", action="store_false", dest="spectral_shift_two_stage",
+                        help="Disable two-stage training (train all parameters together)")
+    parser.add_argument("--spectral-shift-bias-epochs", type=int, default=None,
+                        help="Number of epochs for bias-only training in two-stage mode (default: 5)")
 
     # Stage control
     parser.add_argument("--skip-spectral-finetune", action="store_true",
@@ -3015,6 +3081,10 @@ def main():
         config["spectral_shift_init_fwd"] = args.spectral_shift_init_db
     if args.spectral_shift_lr is not None:
         config["spectral_shift_lr"] = args.spectral_shift_lr
+    # Two-stage training for SpectralShift
+    config["spectral_shift_two_stage"] = getattr(args, 'spectral_shift_two_stage', True)
+    if args.spectral_shift_bias_epochs is not None:
+        config["spectral_shift_bias_epochs"] = args.spectral_shift_bias_epochs
 
     # Stage control from CLI
     if args.skip_spectral_finetune:

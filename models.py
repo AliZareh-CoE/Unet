@@ -1617,6 +1617,43 @@ class AdaptiveSpectralShift(nn.Module):
         # Convert to dB
         return 20.0 * log_scales / math.log(10)
 
+    def freeze_network(self) -> None:
+        """Freeze the network, only train odor_bias.
+
+        Use this for Stage 1 of two-stage training to learn
+        the fixed per-odor spectral correction first.
+        """
+        # Freeze network components
+        for param in self.embed.parameters():
+            param.requires_grad = False
+        for param in self.band_encoder.parameters():
+            param.requires_grad = False
+        for param in self.shift_predictor.parameters():
+            param.requires_grad = False
+        # Unfreeze bias
+        self.odor_bias.requires_grad = True
+
+    def freeze_bias(self) -> None:
+        """Freeze odor_bias, only train the network.
+
+        Use this for Stage 2 of two-stage training to learn
+        signal-adaptive refinements on top of the fixed bias.
+        """
+        # Freeze bias
+        self.odor_bias.requires_grad = False
+        # Unfreeze network components
+        for param in self.embed.parameters():
+            param.requires_grad = True
+        for param in self.band_encoder.parameters():
+            param.requires_grad = True
+        for param in self.shift_predictor.parameters():
+            param.requires_grad = True
+
+    def unfreeze_all(self) -> None:
+        """Unfreeze all parameters."""
+        for param in self.parameters():
+            param.requires_grad = True
+
     def extra_repr(self) -> str:
         max_db = self.max_log_scale * 20.0 / math.log(10)
         return (
