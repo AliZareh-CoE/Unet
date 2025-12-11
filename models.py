@@ -1680,24 +1680,25 @@ class AdaptiveSpectralShift(nn.Module):
         # Build frequency masks
         masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
 
-        # Compute AMPLITUDE (not power!) for both
-        # We apply scales to FFT amplitude, so compute amplitude ratio directly
+        # Compute POWER for both (PSD = |FFT|²)
         unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
         target_fft = torch.fft.rfft(targets.float(), dim=-1)
 
-        unet_amp = unet_fft.abs()  # [N, C, n_freq] - AMPLITUDE, not squared
-        target_amp = target_fft.abs()
+        unet_power = unet_fft.abs().square()  # [N, C, n_freq] - POWER
+        target_power = target_fft.abs().square()
 
-        # Per-band amplitude (sum within band, weighted by mask)
-        unet_band_amp = torch.einsum('ncf,kf->nck', unet_amp, masks)  # [N, C, n_bands]
-        target_band_amp = torch.einsum('ncf,kf->nck', target_amp, masks)
+        # Per-band power (weighted sum within band)
+        unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
+        target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
 
-        # Log amplitude ratio - directly what we multiply FFT by
-        unet_log = torch.log(unet_band_amp + 1e-10)
-        target_log = torch.log(target_band_amp + 1e-10)
+        # Log power
+        unet_log = torch.log(unet_band_power + 1e-10)
+        target_log = torch.log(target_band_power + 1e-10)
 
-        # Amplitude ratio needed (no /2 since we use amplitude, not power)
-        diff_log = target_log - unet_log  # [N, C, n_bands] - log amplitude ratio
+        # We want to correct POWER, but we multiply AMPLITUDE
+        # Power scales by amplitude², so: amplitude_scale = sqrt(power_ratio)
+        # In log: log(amplitude_scale) = log(power_ratio) / 2
+        diff_log = (target_log - unet_log) / 2  # log amplitude scale for power correction
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
@@ -1932,24 +1933,25 @@ class OptimalSpectralBias(nn.Module):
         # Build frequency masks
         masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
 
-        # Compute AMPLITUDE (not power!) for both
-        # We apply scales to FFT amplitude, so compute amplitude ratio directly
+        # Compute POWER for both (PSD = |FFT|²)
         unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
         target_fft = torch.fft.rfft(targets.float(), dim=-1)
 
-        unet_amp = unet_fft.abs()  # [N, C, n_freq] - AMPLITUDE, not squared
-        target_amp = target_fft.abs()
+        unet_power = unet_fft.abs().square()  # [N, C, n_freq] - POWER
+        target_power = target_fft.abs().square()
 
-        # Per-band amplitude (sum within band, weighted by mask)
-        unet_band_amp = torch.einsum('ncf,kf->nck', unet_amp, masks)  # [N, C, n_bands]
-        target_band_amp = torch.einsum('ncf,kf->nck', target_amp, masks)
+        # Per-band power (weighted sum within band)
+        unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
+        target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
 
-        # Log amplitude ratio - directly what we multiply FFT by
-        unet_log = torch.log(unet_band_amp + 1e-10)
-        target_log = torch.log(target_band_amp + 1e-10)
+        # Log power
+        unet_log = torch.log(unet_band_power + 1e-10)
+        target_log = torch.log(target_band_power + 1e-10)
 
-        # Amplitude ratio needed (no /2 since we use amplitude, not power)
-        diff_log = target_log - unet_log  # [N, C, n_bands] - log amplitude ratio
+        # We want to correct POWER, but we multiply AMPLITUDE
+        # Power scales by amplitude², so: amplitude_scale = sqrt(power_ratio)
+        # In log: log(amplitude_scale) = log(power_ratio) / 2
+        diff_log = (target_log - unet_log) / 2  # log amplitude scale for power correction
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
