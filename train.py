@@ -1662,9 +1662,6 @@ def train(
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
             print(f"SpectralShift created{ddp_str} mode={mode_str} (fwd init: {init_shift_fwd:+.1f}dB, rev init: {init_shift_rev:+.1f}dB)")
 
-    # Define betas early since it's used by multiple optimizers
-    betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
-
     # Create distribution correction block (experimental)
     # IMPORTANT: Gradient isolation - distribution block input is DETACHED from UNet
     # This ensures UNet training is not affected by distribution losses
@@ -1725,7 +1722,7 @@ def train(
     # SpectralShift needs MUCH higher lr because it's just 32 scalars trying to make dB-scale changes
     lr = config.get("learning_rate", 1e-4)
     spectral_shift_lr = config.get("spectral_shift_lr", 0.1)  # 500x higher for fast amplitude adaptation
-    # Note: betas is defined earlier (before distribution block) since it's used by multiple optimizers
+    betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
     # Build parameter groups with different learning rates
     param_groups = [
