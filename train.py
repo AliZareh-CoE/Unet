@@ -2383,13 +2383,28 @@ def train(
         # =====================================================================
         # Two-stage training config
         two_stage_enabled = config.get("spectral_shift_two_stage", True)
-        bias_epochs = config.get("spectral_shift_bias_epochs", 5)
+        bias_epochs_config = config.get("spectral_shift_bias_epochs", 5)
+
+        # If bias_epochs >= phase_epochs: all epochs are bias-only (no network phase)
+        # This allows testing bias-only training without network refinement
+        if two_stage_enabled:
+            bias_epochs = min(bias_epochs_config, phase_epochs)
+            network_epochs = phase_epochs - bias_epochs
+            bias_only_mode = (bias_epochs >= phase_epochs)
+        else:
+            bias_epochs = 0
+            network_epochs = phase_epochs
+            bias_only_mode = False
 
         if is_primary():
             print(f"\n{'='*70}")
             print(f"PHASE 2a: Training FORWARD SpectralShift ({phase_epochs} epochs)")
             if two_stage_enabled:
-                print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
+                if bias_only_mode:
+                    print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
+                    print(f"  To add network training: increase --spectral-finetune-epochs or decrease --spectral-shift-bias-epochs")
+                else:
+                    print(f"  Two-Stage Mode: {bias_epochs} bias-only + {network_epochs} network-only")
             print(f"{'='*70}")
 
         # Freeze reverse SpectralShift
@@ -2527,7 +2542,10 @@ def train(
                 print(f"\n{'='*70}")
                 print(f"PHASE 2b: Training REVERSE SpectralShift ({phase_epochs} epochs)")
                 if two_stage_enabled:
-                    print(f"  Two-Stage Mode: {bias_epochs} bias-only + {phase_epochs - bias_epochs} network-only")
+                    if bias_only_mode:
+                        print(f"  BIAS-ONLY Mode: {phase_epochs} epochs (no network training)")
+                    else:
+                        print(f"  Two-Stage Mode: {bias_epochs} bias-only + {network_epochs} network-only")
                 print(f"{'='*70}")
 
             # Freeze forward SpectralShift (now trained)
