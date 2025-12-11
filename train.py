@@ -186,6 +186,10 @@ DEFAULT_CONFIG = {
     "spectral_shift_max_db": 12.0,  # Maximum allowed shift in dB (for adaptive mode)
     "spectral_shift_hidden_dim": 128,  # Hidden dimension for adaptive mode network
 
+    # Output scaling correction (learnable per-channel scale and bias)
+    # Helps match target distribution, especially important for probabilistic losses
+    "use_output_scaling": True,
+
     # Residual distribution correction (replaces old Rayleigh-based approach)
     # Learns to correct systematic distributional errors in UNet envelope output
     # Key insight: Learn from actual target distribution, not a theoretical prior
@@ -1509,6 +1513,8 @@ def train(
         use_se=config.get("use_se", True),
         conv_kernel_size=config.get("conv_kernel_size", 7),
         dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+        # Output scaling correction
+        use_output_scaling=config.get("use_output_scaling", True),
     )
 
     # Create reverse model (target → source) for bidirectional training
@@ -1532,6 +1538,8 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+            # Output scaling correction
+            use_output_scaling=config.get("use_output_scaling", True),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2669,6 +2677,12 @@ def parse_args():
     parser.add_argument("--no-per-channel-norm", action="store_false", dest="per_channel_norm",
                         help="Disable per-channel normalization")
 
+    # Output scaling correction (learnable per-channel scale and bias in model)
+    parser.add_argument("--output-scaling", action="store_true", default=True,
+                        help="Enable learnable per-channel output scaling in model (default: True)")
+    parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
+                        help="Disable output scaling correction in model")
+
     # Loss function selection (for tier1 fair comparison)
     LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
     parser.add_argument("--loss", type=str, default=None,
@@ -2866,6 +2880,11 @@ def main():
     config["per_channel_norm"] = args.per_channel_norm if hasattr(args, 'per_channel_norm') else True
     if is_primary():
         print(f"Per-channel normalization: {'ENABLED' if config['per_channel_norm'] else 'DISABLED'}")
+
+    # Output scaling correction in model (default: enabled)
+    config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
+    if is_primary():
+        print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")

@@ -2633,6 +2633,8 @@ class CondUNet1D(nn.Module):
         use_se: bool = True,  # SE attention in conv blocks (only for modern)
         conv_kernel_size: int = 7,  # Kernel size for modern convs
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
+        # Output scaling correction (helps match target distribution)
+        use_output_scaling: bool = True,  # Learnable per-channel scale and bias
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2728,6 +2730,14 @@ class CondUNet1D(nn.Module):
         # backwards compatibility but is no longer used internally.
         self.use_spectral_shift = use_spectral_shift
 
+        # Output scaling correction: learnable per-channel scale and bias
+        # Helps match target distribution, especially important for probabilistic losses
+        self.use_output_scaling = use_output_scaling
+        if use_output_scaling:
+            # Initialize scale to 1.0 and bias to 0.0 (identity at init)
+            self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
+            self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
+
     def _build_attention(self, channels: int, attention_type: str) -> nn.Module:
         """Build attention module based on type.
 
@@ -2795,6 +2805,11 @@ class CondUNet1D(nn.Module):
             out = ob + delta
         else:
             out = self.residual_conv(ob) + delta
+
+        # Apply output scaling correction if enabled
+        # This helps match the target distribution, especially for probabilistic losses
+        if self.use_output_scaling:
+            out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
         return out
