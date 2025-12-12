@@ -405,13 +405,16 @@ def train_dual_band(
     else:
         is_fsdp_wrapped = False
 
-    # Loss function
+    # Loss function - use same weights as train.py
     loss_fn = DualBandLoss(
-        base_loss=nn.L1Loss(),
-        lambda_low=config.get("lambda_low", 0.5),
-        lambda_high=config.get("lambda_high", 0.5),
+        weight_l1=config.get("weight_l1", 1.0),
+        weight_wavelet=config.get("weight_wavelet", 3.0),
+        weight_spectral=config.get("weight_spectral", 5.0),
+        lambda_low=config.get("lambda_low", 0.3),
+        lambda_high=config.get("lambda_high", 0.3),
+        sample_rate=config.get("sampling_rate", 1000.0),
+        use_wavelet_loss=config.get("use_wavelet_loss", True),
         use_spectral_loss=config.get("use_spectral_loss", True),
-        spectral_weight=config.get("spectral_weight", 1.0),
     )
 
     # Optimizer
@@ -447,8 +450,10 @@ def train_dual_band(
 
     history = {
         "train_loss": [], "val_loss": [],
-        "train_loss_low": [], "val_loss_low": [],
-        "train_loss_high": [], "val_loss_high": [],
+        "train_l1_low": [], "val_l1_low": [],
+        "train_l1_high": [], "val_l1_high": [],
+        "train_wav_full": [], "val_wav_full": [],
+        "train_spec_full": [], "val_spec_full": [],
         "val_corr_full": [], "val_corr_low": [], "val_corr_high": [],
     }
 
@@ -456,7 +461,8 @@ def train_dual_band(
         print(f"\nStarting training for {num_epochs} epochs...")
         print(f"  Batch size: {config.get('batch_size', 8)}")
         print(f"  Learning rate: {config.get('learning_rate', 2e-4)}")
-        print(f"  Lambda low/high: {config.get('lambda_low', 0.5)}/{config.get('lambda_high', 0.5)}")
+        print(f"  Lambda low/high: {config.get('lambda_low', 0.3)}/{config.get('lambda_high', 0.3)}")
+        print(f"  Loss weights: L1={config.get('weight_l1', 1.0)}, Wav={config.get('weight_wavelet', 3.0)}, Spec={config.get('weight_spectral', 5.0)}")
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -499,8 +505,8 @@ def train_dual_band(
 
             pbar.set_postfix({
                 "loss": f"{loss_dict['loss_total']:.4f}",
-                "low": f"{loss_dict['loss_low']:.4f}",
-                "high": f"{loss_dict['loss_high']:.4f}",
+                "l1_low": f"{loss_dict['l1_low']:.4f}",
+                "l1_high": f"{loss_dict['l1_high']:.4f}",
             })
 
         scheduler.step()
@@ -515,18 +521,26 @@ def train_dual_band(
         # Log
         history["train_loss"].append(train_losses["loss_total"])
         history["val_loss"].append(val_metrics["loss_total"])
-        history["train_loss_low"].append(train_losses["loss_low"])
-        history["val_loss_low"].append(val_metrics["loss_low"])
-        history["train_loss_high"].append(train_losses["loss_high"])
-        history["val_loss_high"].append(val_metrics["loss_high"])
+        history["train_l1_low"].append(train_losses["l1_low"])
+        history["val_l1_low"].append(val_metrics["l1_low"])
+        history["train_l1_high"].append(train_losses["l1_high"])
+        history["val_l1_high"].append(val_metrics["l1_high"])
+        history["train_wav_full"].append(train_losses.get("wav_full", 0))
+        history["val_wav_full"].append(val_metrics.get("wav_full", 0))
+        history["train_spec_full"].append(train_losses.get("spec_full", 0))
+        history["val_spec_full"].append(val_metrics.get("spec_full", 0))
         history["val_corr_full"].append(val_metrics["corr_full"])
         history["val_corr_low"].append(val_metrics["corr_low"])
         history["val_corr_high"].append(val_metrics["corr_high"])
 
         if is_primary():
             print(f"\nEpoch {epoch+1}/{num_epochs}:")
-            print(f"  Train: loss={train_losses['loss_total']:.4f} (low={train_losses['loss_low']:.4f}, high={train_losses['loss_high']:.4f})")
-            print(f"  Val:   loss={val_metrics['loss_total']:.4f} (low={val_metrics['loss_low']:.4f}, high={val_metrics['loss_high']:.4f})")
+            print(f"  Train: loss={train_losses['loss_total']:.4f}")
+            print(f"    L1: full={train_losses['l1_full']:.4f}, low={train_losses['l1_low']:.4f}, high={train_losses['l1_high']:.4f}")
+            print(f"    Wav: full={train_losses['wav_full']:.4f}, Spec: {train_losses['spec_full']:.4f}")
+            print(f"  Val:   loss={val_metrics['loss_total']:.4f}")
+            print(f"    L1: full={val_metrics['l1_full']:.4f}, low={val_metrics['l1_low']:.4f}, high={val_metrics['l1_high']:.4f}")
+            print(f"    Wav: full={val_metrics['wav_full']:.4f}, Spec: {val_metrics['spec_full']:.4f}")
             print(f"  Corr:  full={val_metrics['corr_full']:.4f}, low={val_metrics['corr_low']:.4f}, high={val_metrics['corr_high']:.4f}")
 
         # Sync val_loss across ranks to ensure all take same branch
@@ -580,8 +594,8 @@ def train_dual_band(
 
     if is_primary():
         print(f"Test Loss: {test_metrics['loss_total']:.4f}")
-        print(f"  Low band: {test_metrics['loss_low']:.4f}")
-        print(f"  High band: {test_metrics['loss_high']:.4f}")
+        print(f"  L1: full={test_metrics['l1_full']:.4f}, low={test_metrics['l1_low']:.4f}, high={test_metrics['l1_high']:.4f}")
+        print(f"  Wavelet: {test_metrics['wav_full']:.4f}, Spectral: {test_metrics['spec_full']:.4f}")
         print(f"Test Correlation:")
         print(f"  Full: {test_metrics['corr_full']:.4f}")
         print(f"  Low:  {test_metrics['corr_low']:.4f}")
@@ -617,8 +631,11 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--base_channels", type=int, default=64, help="Base channels")
     parser.add_argument("--cutoff", type=float, default=30.0, help="Frequency cutoff (Hz)")
-    parser.add_argument("--lambda_low", type=float, default=0.5, help="Low band loss weight")
-    parser.add_argument("--lambda_high", type=float, default=0.5, help="High band loss weight")
+    parser.add_argument("--lambda_low", type=float, default=0.3, help="Low band loss weight")
+    parser.add_argument("--lambda_high", type=float, default=0.3, help="High band loss weight")
+    parser.add_argument("--weight_l1", type=float, default=1.0, help="L1 loss weight")
+    parser.add_argument("--weight_wavelet", type=float, default=3.0, help="Wavelet loss weight")
+    parser.add_argument("--weight_spectral", type=float, default=5.0, help="Spectral loss weight")
     parser.add_argument("--n_downsample_low", type=int, default=4, help="Downsample levels for low branch")
     parser.add_argument("--n_downsample_high", type=int, default=2, help="Downsample levels for high branch")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP")
@@ -639,6 +656,9 @@ def main():
         "cutoff_freq": args.cutoff,
         "lambda_low": args.lambda_low,
         "lambda_high": args.lambda_high,
+        "weight_l1": args.weight_l1,
+        "weight_wavelet": args.weight_wavelet,
+        "weight_spectral": args.weight_spectral,
         "n_downsample_low": args.n_downsample_low,
         "n_downsample_high": args.n_downsample_high,
         "low_band": [1.0, args.cutoff],
@@ -648,8 +668,8 @@ def main():
         "out_channels": 32,
         "sampling_rate": 1000.0,
         "per_channel_norm": True,
+        "use_wavelet_loss": True,
         "use_spectral_loss": True,
-        "spectral_weight": 1.0,
         "emb_dim": 128,
         "use_attention": True,
         "attention_type": "cross_freq_v2",

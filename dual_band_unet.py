@@ -38,6 +38,9 @@ from models import (
     FiLM,
     BASE_CHANNELS,
     NUM_ODORS,
+    # Loss functions
+    HighFrequencySpectralLoss,
+    build_wavelet_loss,
 )
 
 
@@ -673,44 +676,63 @@ class DualBandUNet(nn.Module):
 class DualBandLoss(nn.Module):
     """Combined loss function for dual-band U-Net training.
 
-    Computes:
-        total_loss = loss(pred, target)
-                   + lambda_low * loss(pred_low, target_low)
-                   + lambda_high * loss(pred_high, target_high)
+    Uses the same loss structure as train.py:
+        - L1 loss for temporal reconstruction
+        - WaveletLoss for time-frequency matching
+        - HighFrequencySpectralLoss for PSD matching
+
+    Computes losses on full signal AND band-specific losses:
+        total_loss = (l1 + wavelet + spectral) on full signal
+                   + lambda_low * (l1 + wavelet) on low band
+                   + lambda_high * (l1 + wavelet) on high band
 
     Args:
-        base_loss: Base loss function (e.g., nn.MSELoss, nn.L1Loss)
-        lambda_low: Weight for low-band loss (default: 0.5)
-        lambda_high: Weight for high-band loss (default: 0.5)
-        use_spectral_loss: Include spectral loss component (default: True)
-        spectral_weight: Weight for spectral loss (default: 1.0)
+        weight_l1: Weight for L1 loss (default: 1.0)
+        weight_wavelet: Weight for wavelet loss (default: 3.0)
+        weight_spectral: Weight for spectral loss (default: 5.0)
+        lambda_low: Weight for low-band loss (default: 0.3)
+        lambda_high: Weight for high-band loss (default: 0.3)
+        sample_rate: Sampling rate in Hz (default: 1000)
+        use_wavelet_loss: Whether to use wavelet loss (default: True)
+        use_spectral_loss: Whether to use spectral loss (default: True)
     """
 
     def __init__(
         self,
-        base_loss: nn.Module = None,
-        lambda_low: float = 0.5,
-        lambda_high: float = 0.5,
+        weight_l1: float = 1.0,
+        weight_wavelet: float = 3.0,
+        weight_spectral: float = 5.0,
+        lambda_low: float = 0.3,
+        lambda_high: float = 0.3,
+        sample_rate: float = 1000.0,
+        use_wavelet_loss: bool = True,
         use_spectral_loss: bool = True,
-        spectral_weight: float = 1.0,
     ):
         super().__init__()
-        self.base_loss = base_loss if base_loss is not None else nn.L1Loss()
+        self.weight_l1 = weight_l1
+        self.weight_wavelet = weight_wavelet
+        self.weight_spectral = weight_spectral
         self.lambda_low = lambda_low
         self.lambda_high = lambda_high
+        self.use_wavelet_loss = use_wavelet_loss
         self.use_spectral_loss = use_spectral_loss
-        self.spectral_weight = spectral_weight
 
-    def _spectral_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute spectral loss (log-magnitude MSE in frequency domain)."""
-        pred_fft = torch.fft.rfft(pred.float(), dim=-1)
-        target_fft = torch.fft.rfft(target.float(), dim=-1)
+        # Build proper loss functions from models.py
+        if use_wavelet_loss:
+            self.wavelet_loss = build_wavelet_loss()
+        else:
+            self.wavelet_loss = None
 
-        # Log magnitude (add epsilon for stability)
-        pred_mag = torch.log(torch.abs(pred_fft) + 1e-8)
-        target_mag = torch.log(torch.abs(target_fft) + 1e-8)
-
-        return F.mse_loss(pred_mag, target_mag)
+        if use_spectral_loss:
+            self.spectral_loss = HighFrequencySpectralLoss(
+                sample_rate=sample_rate,
+                low_freq_cutoff=0.0,  # Full range
+                high_freq_boost=1.0,  # Uniform weighting
+                max_freq=100.0,
+                use_log_psd=True,
+            )
+        else:
+            self.spectral_loss = None
 
     def forward(
         self,
@@ -734,41 +756,65 @@ class DualBandLoss(nn.Module):
         Returns:
             Tuple of (total_loss, loss_dict) where loss_dict contains individual components
         """
-        # Base temporal losses
-        loss_full = self.base_loss(pred, target)
-        loss_low = self.base_loss(pred_low, target_low)
-        loss_high = self.base_loss(pred_high, target_high)
+        # ==== Full signal losses ====
+        # L1 loss
+        l1_full = F.l1_loss(pred, target)
+        loss = self.weight_l1 * l1_full
 
-        # Combined temporal loss
-        total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
-
-        # Spectral losses (optional)
-        if self.use_spectral_loss:
-            spec_loss_full = self._spectral_loss(pred, target)
-            spec_loss_low = self._spectral_loss(pred_low, target_low)
-            spec_loss_high = self._spectral_loss(pred_high, target_high)
-
-            spec_total = spec_loss_full + self.lambda_low * spec_loss_low + self.lambda_high * spec_loss_high
-            total_loss = total_loss + self.spectral_weight * spec_total
+        # Wavelet loss (on full signal)
+        if self.wavelet_loss is not None:
+            wav_full = self.wavelet_loss(pred, target)
+            loss = loss + self.weight_wavelet * wav_full
         else:
-            spec_loss_full = torch.tensor(0.0)
-            spec_loss_low = torch.tensor(0.0)
-            spec_loss_high = torch.tensor(0.0)
+            wav_full = torch.tensor(0.0, device=pred.device)
+
+        # Spectral loss (on full signal)
+        if self.spectral_loss is not None:
+            spec_full = self.spectral_loss(pred, target)
+            loss = loss + self.weight_spectral * spec_full
+        else:
+            spec_full = torch.tensor(0.0, device=pred.device)
+
+        # ==== Low-band losses ====
+        l1_low = F.l1_loss(pred_low, target_low)
+        loss_low = self.weight_l1 * l1_low
+        if self.wavelet_loss is not None:
+            wav_low = self.wavelet_loss(pred_low, target_low)
+            loss_low = loss_low + self.weight_wavelet * wav_low
+        else:
+            wav_low = torch.tensor(0.0, device=pred.device)
+
+        # ==== High-band losses ====
+        l1_high = F.l1_loss(pred_high, target_high)
+        loss_high = self.weight_l1 * l1_high
+        if self.wavelet_loss is not None:
+            wav_high = self.wavelet_loss(pred_high, target_high)
+            loss_high = loss_high + self.weight_wavelet * wav_high
+        else:
+            wav_high = torch.tensor(0.0, device=pred.device)
+
+        # ==== Combined total loss ====
+        total_loss = loss + self.lambda_low * loss_low + self.lambda_high * loss_high
 
         loss_dict = {
             'loss_total': total_loss.item(),
-            'loss_full': loss_full.item(),
-            'loss_low': loss_low.item(),
-            'loss_high': loss_high.item(),
-            'spec_loss_full': spec_loss_full.item() if self.use_spectral_loss else 0.0,
-            'spec_loss_low': spec_loss_low.item() if self.use_spectral_loss else 0.0,
-            'spec_loss_high': spec_loss_high.item() if self.use_spectral_loss else 0.0,
+            'l1_full': l1_full.item(),
+            'l1_low': l1_low.item(),
+            'l1_high': l1_high.item(),
+            'wav_full': wav_full.item() if self.wavelet_loss is not None else 0.0,
+            'wav_low': wav_low.item() if self.wavelet_loss is not None else 0.0,
+            'wav_high': wav_high.item() if self.wavelet_loss is not None else 0.0,
+            'spec_full': spec_full.item() if self.spectral_loss is not None else 0.0,
         }
 
         return total_loss, loss_dict
 
     def extra_repr(self) -> str:
-        return f"lambda_low={self.lambda_low}, lambda_high={self.lambda_high}, spectral={self.use_spectral_loss}"
+        return (
+            f"weight_l1={self.weight_l1}, weight_wavelet={self.weight_wavelet}, "
+            f"weight_spectral={self.weight_spectral}, lambda_low={self.lambda_low}, "
+            f"lambda_high={self.lambda_high}"
+        )
 
 
 # =============================================================================
@@ -826,10 +872,17 @@ def test_dual_band_unet():
     print(f"Target high shape: {target_high.shape}")
 
     # Test loss
-    loss_fn = DualBandLoss(lambda_low=0.5, lambda_high=0.5, use_spectral_loss=True)
+    loss_fn = DualBandLoss(
+        weight_l1=1.0,
+        weight_wavelet=3.0,
+        weight_spectral=5.0,
+        lambda_low=0.3,
+        lambda_high=0.3,
+    )
     total_loss, loss_dict = loss_fn(pcx_pred, target, pcx_low, target_low, pcx_high, target_high)
     print(f"Total loss: {total_loss.item():.4f}")
-    print(f"Loss components: {loss_dict}")
+    for k, v in loss_dict.items():
+        print(f"  {k}: {v:.4f}")
 
     print("\nDualBandUNet test passed!")
 
