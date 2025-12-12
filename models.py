@@ -1695,10 +1695,11 @@ class AdaptiveSpectralShift(nn.Module):
         unet_log = torch.log(unet_band_power + 1e-10)
         target_log = torch.log(target_band_power + 1e-10)
 
-        # We want to correct POWER, but we multiply AMPLITUDE
-        # Power scales by amplitude², so: amplitude_scale = sqrt(power_ratio)
-        # In log: log(amplitude_scale) = log(power_ratio) / 2
-        diff_log = (target_log - unet_log) / 2  # log amplitude scale for power correction
+        # Difference: how much to shift UNet output to match target
+        # IMPORTANT: We compute log of POWER ratio, but apply to AMPLITUDE (FFT)
+        # Power = |FFT|², so to scale power by P, we scale amplitude by sqrt(P)
+        # Therefore: log_amplitude_ratio = log_power_ratio / 2
+        diff_log = (target_log - unet_log) / 2  # [N, C, n_bands] - log AMPLITUDE ratio
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
@@ -1933,25 +1934,26 @@ class OptimalSpectralBias(nn.Module):
         # Build frequency masks
         masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
 
-        # Compute POWER for both (PSD = |FFT|²)
+        # Compute PSD for both (in log scale)
         unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
         target_fft = torch.fft.rfft(targets.float(), dim=-1)
 
-        unet_power = unet_fft.abs().square()  # [N, C, n_freq] - POWER
+        unet_power = unet_fft.abs().square()  # [N, C, n_freq]
         target_power = target_fft.abs().square()
 
-        # Per-band power (weighted sum within band)
+        # Per-band power
         unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
         target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
 
-        # Log power
+        # Log scale (dB-like)
         unet_log = torch.log(unet_band_power + 1e-10)
         target_log = torch.log(target_band_power + 1e-10)
 
-        # We want to correct POWER, but we multiply AMPLITUDE
-        # Power scales by amplitude², so: amplitude_scale = sqrt(power_ratio)
-        # In log: log(amplitude_scale) = log(power_ratio) / 2
-        diff_log = (target_log - unet_log) / 2  # log amplitude scale for power correction
+        # Difference: how much to shift UNet output to match target
+        # IMPORTANT: We compute log of POWER ratio, but apply to AMPLITUDE (FFT)
+        # Power = |FFT|², so to scale power by P, we scale amplitude by sqrt(P)
+        # Therefore: log_amplitude_ratio = log_power_ratio / 2
+        diff_log = (target_log - unet_log) / 2  # [N, C, n_bands] - log AMPLITUDE ratio
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
@@ -1999,249 +2001,6 @@ class OptimalSpectralBias(nn.Module):
             f"n_channels={self.n_channels}, n_odors={self.n_odors}, "
             f"n_bands={self.n_bands}"
         )
-
-
-# =============================================================================
-# Envelope Histogram Matching (Closed-form amplitude dynamics correction)
-# =============================================================================
-
-class EnvelopeHistogramMatching(nn.Module):
-    """Closed-form envelope distribution correction via histogram matching.
-
-    PSD tells you average power at each frequency (spectral shape).
-    Envelope tells you distribution of instantaneous amplitudes (dynamics).
-
-    Two signals can have identical PSD but completely different envelopes:
-    - Constant amplitude oscillation → flat envelope
-    - Bursting oscillation → envelope with peaks and valleys
-
-    Neural signals have characteristic bursty dynamics. If UNet output is
-    too smooth or too peaky, it will look wrong even with perfect PSD.
-
-    This module corrects the envelope distribution by:
-    1. Computing analytic signal via Hilbert transform
-    2. Extracting envelope (magnitude) and phase (angle)
-    3. Histogram matching: map pred envelope quantiles to target quantiles
-    4. Reconstructing signal with corrected envelope, original phase
-
-    This is CLOSED-FORM - computed directly from data, no training needed!
-
-    Usage:
-        matcher = EnvelopeHistogramMatching()
-        # Compute target statistics from training data
-        matcher.fit(target_signals, odor_ids)
-        # Apply correction during inference
-        corrected = matcher(pred, odor_ids)
-    """
-
-    def __init__(
-        self,
-        n_odors: int = NUM_ODORS,
-        n_quantiles: int = 256,
-    ):
-        super().__init__()
-        self.n_odors = n_odors
-        self.n_quantiles = n_quantiles
-
-        # Store target quantiles per odor [n_odors, n_quantiles]
-        # These are computed from target data via fit()
-        self.register_buffer(
-            'target_quantiles',
-            torch.zeros(n_odors, n_quantiles)
-        )
-        self.register_buffer('fitted', torch.tensor(False))
-
-    @torch.no_grad()
-    def fit(
-        self,
-        targets: torch.Tensor,
-        odor_ids: torch.Tensor,
-    ) -> None:
-        """Compute target envelope quantiles from data.
-
-        Args:
-            targets: Target signals [N, C, T]
-            odor_ids: Odor indices [N]
-        """
-        device = targets.device
-        N, C, T = targets.shape
-
-        # Compute envelope for all targets
-        targets_flat = targets.view(N * C, T).float()
-        analytic = hilbert_torch(targets_flat)
-        envelope = analytic.abs()  # [N*C, T]
-
-        # Compute quantiles per odor
-        quantile_probs = torch.linspace(0, 1, self.n_quantiles, device=device)
-
-        for odor in range(self.n_odors):
-            # Get all samples for this odor
-            mask = (odor_ids == odor)
-            if not mask.any():
-                continue
-
-            # Expand mask to match flattened shape
-            mask_expanded = mask.unsqueeze(1).expand(-1, C).reshape(-1)
-            odor_envelope = envelope[mask_expanded]  # [n_samples * C, T]
-
-            # Flatten all envelope values for this odor
-            all_values = odor_envelope.flatten()
-
-            # Compute quantiles
-            self.target_quantiles[odor] = torch.quantile(all_values, quantile_probs)
-
-        self.fitted.fill_(True)
-        print(f"EnvelopeHistogramMatching fitted: {self.n_quantiles} quantiles per odor")
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        odor_ids: torch.Tensor,
-        target: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Apply envelope histogram matching.
-
-        Args:
-            x: Input signal [B, C, T]
-            odor_ids: Odor indices [B]
-            target: If provided, use target's envelope directly instead of stored quantiles
-
-        Returns:
-            Signal with corrected envelope distribution [B, C, T]
-        """
-        if not self.fitted and target is None:
-            # Not fitted and no target provided - return input unchanged
-            return x
-
-        B, C, T = x.shape
-        device = x.device
-        original_dtype = x.dtype
-
-        # Work in float32
-        x_float = x.float()
-
-        # Compute analytic signal
-        x_flat = x_float.view(B * C, T)
-        analytic = hilbert_torch(x_flat)
-        envelope = analytic.abs()  # [B*C, T]
-        phase = analytic.angle()  # [B*C, T]
-
-        # Correct envelope for each sample
-        corrected_envelope = torch.zeros_like(envelope)
-
-        for b in range(B):
-            odor = odor_ids[b].item()
-            start_idx = b * C
-            end_idx = (b + 1) * C
-
-            pred_env = envelope[start_idx:end_idx]  # [C, T]
-
-            if target is not None:
-                # Use target's envelope directly for histogram matching
-                target_flat = target[b].float()  # [C, T]
-                target_analytic = hilbert_torch(target_flat)
-                target_env = target_analytic.abs()
-
-                # Per-channel histogram matching
-                for c in range(C):
-                    corrected_envelope[start_idx + c] = self._histogram_match(
-                        pred_env[c], target_env[c]
-                    )
-            else:
-                # Use stored quantiles
-                target_q = self.target_quantiles[odor]  # [n_quantiles]
-
-                # Match each channel
-                for c in range(C):
-                    corrected_envelope[start_idx + c] = self._quantile_match(
-                        pred_env[c], target_q
-                    )
-
-        # Reconstruct signal with corrected envelope and original phase
-        # x_corrected = envelope_corrected * cos(phase)
-        # But we need the full analytic signal reconstruction
-        corrected_signal = corrected_envelope * torch.cos(phase)
-
-        # Reshape back
-        corrected_signal = corrected_signal.view(B, C, T)
-
-        return corrected_signal.to(original_dtype)
-
-    def _histogram_match(
-        self,
-        source: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match source histogram to target histogram.
-
-        Args:
-            source: Source values [T]
-            target: Target values [T] (same length)
-
-        Returns:
-            Source values remapped to match target distribution [T]
-        """
-        # Sort both
-        source_sorted, source_indices = source.sort()
-        target_sorted, _ = target.sort()
-
-        # If different lengths, interpolate
-        if len(source_sorted) != len(target_sorted):
-            # Interpolate target to match source length
-            target_sorted = F.interpolate(
-                target_sorted.unsqueeze(0).unsqueeze(0),
-                size=len(source_sorted),
-                mode='linear',
-                align_corners=True,
-            ).squeeze()
-
-        # Create output with same shape as source
-        matched = torch.zeros_like(source)
-        matched[source_indices] = target_sorted
-
-        return matched
-
-    def _quantile_match(
-        self,
-        source: torch.Tensor,
-        target_quantiles: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match source to target using stored quantiles.
-
-        Args:
-            source: Source values [T]
-            target_quantiles: Target quantile values [n_quantiles]
-
-        Returns:
-            Source values remapped to match target distribution [T]
-        """
-        T = source.shape[0]
-        n_q = target_quantiles.shape[0]
-
-        # Compute source ranks (0 to 1)
-        source_sorted, source_indices = source.sort()
-        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / (T - 1)
-
-        # Interpolate target quantiles at source ranks
-        # target_quantiles are at positions 0, 1/(n_q-1), 2/(n_q-1), ..., 1
-        quantile_positions = torch.linspace(0, 1, n_q, device=source.device)
-
-        # Linear interpolation
-        matched_sorted = torch.zeros_like(source_sorted)
-        for i, r in enumerate(ranks):
-            # Find bracketing quantiles
-            idx = (r * (n_q - 1)).long().clamp(0, n_q - 2)
-            alpha = r * (n_q - 1) - idx.float()
-            matched_sorted[i] = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
-
-        # Unsort
-        matched = torch.zeros_like(source)
-        matched[source_indices] = matched_sorted
-
-        return matched
-
-    def extra_repr(self) -> str:
-        return f"n_odors={self.n_odors}, n_quantiles={self.n_quantiles}, fitted={self.fitted.item()}"
 
 
 # =============================================================================

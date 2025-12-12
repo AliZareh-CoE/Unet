@@ -1724,7 +1724,7 @@ def train(
 
     # Create SpectralShift modules OUTSIDE of FSDP (too small for sharding overhead)
     # but DO wrap with DDP for gradient synchronization in distributed training
-    from models import SpectralShiftBlock, FrequencyBandSpectralShift, OptimalSpectralBias, EnvelopeHistogramMatching
+    from models import SpectralShiftBlock, FrequencyBandSpectralShift, OptimalSpectralBias
 
     spectral_shift_fwd = None
     spectral_shift_rev = None
@@ -2478,64 +2478,6 @@ def train(
             barrier()
 
         # =====================================================================
-        # COMPUTE ENVELOPE MATCHING FROM TARGET DATA
-        # =====================================================================
-        # EnvelopeHistogramMatching corrects amplitude dynamics (bursty vs smooth)
-        # This is the third closed-form correction after output scaling and spectral bias
-        use_envelope_matching = config.get("use_envelope_matching", True)
-        envelope_matcher_fwd = None
-        envelope_matcher_rev = None
-
-        if use_envelope_matching and spectral_shift_fwd is not None:
-            if is_primary():
-                print(f"\n{'='*70}")
-                print("COMPUTING ENVELOPE MATCHING FROM TARGET DATA")
-                print(f"{'='*70}")
-
-            n_odors = config.get("n_odors", 7)
-
-            # Create envelope matchers
-            envelope_matcher_fwd = EnvelopeHistogramMatching(n_odors=n_odors).to(device)
-            envelope_matcher_rev = EnvelopeHistogramMatching(n_odors=n_odors).to(device) if reverse_model is not None else None
-
-            # Collect target data for fitting (reuse from spectral bias if available)
-            all_targets_fwd = []
-            all_targets_rev = []
-            all_odor_ids_env = []
-
-            with torch.no_grad():
-                # Use ONLY TRAIN data for envelope statistics (never val or test!)
-                # This ensures proper train/test separation
-                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Collecting train targets", disable=not is_primary()):
-                    pcx_batch = pcx_batch.to(device)
-                    ob_batch = ob_batch.to(device)
-                    odor_batch = odor_batch.to(device)
-
-                    # Apply per-channel normalization if enabled
-                    if config.get("per_channel_norm", True):
-                        ob_batch = per_channel_normalize(ob_batch)
-                        pcx_batch = per_channel_normalize(pcx_batch)
-
-                    all_targets_fwd.append(pcx_batch.cpu())
-                    all_targets_rev.append(ob_batch.cpu())
-                    all_odor_ids_env.append(odor_batch.cpu())
-
-            all_targets_fwd = torch.cat(all_targets_fwd, dim=0)
-            all_targets_rev = torch.cat(all_targets_rev, dim=0)
-            all_odor_ids_env = torch.cat(all_odor_ids_env, dim=0)
-
-            # Fit envelope matchers
-            envelope_matcher_fwd.fit(all_targets_fwd.to(device), all_odor_ids_env.to(device))
-            if envelope_matcher_rev is not None:
-                envelope_matcher_rev.fit(all_targets_rev.to(device), all_odor_ids_env.to(device))
-
-            # Clean up
-            del all_targets_fwd, all_targets_rev, all_odor_ids_env
-            torch.cuda.empty_cache()
-
-            barrier()
-
-        # =====================================================================
         # STAGE 2: Optimal Bias Applied (No Training Needed!)
         # =====================================================================
         # With OptimalSpectralBias, we just compute the bias from data and apply it.
@@ -2556,7 +2498,7 @@ def train(
             for param in spectral_shift_rev.parameters():
                 param.requires_grad = False
 
-        # Evaluate with optimal bias applied + envelope matching
+        # Evaluate with optimal bias applied
         val_metrics = evaluate(
             model, loaders["val"], device, wavelet_loss, spectral_loss,
             compute_phase=False, reverse_model=reverse_model, config=config,
@@ -2565,8 +2507,6 @@ def train(
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             cond_encoder=cond_encoder,
             residual_corrector=residual_corrector,
-            envelope_matcher_fwd=envelope_matcher_fwd,
-            envelope_matcher_rev=envelope_matcher_rev,
         )
 
         psd_err_fwd = val_metrics.get("psd_err_db", float("inf"))
