@@ -988,18 +988,19 @@ class DualBandLoss(nn.Module):
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
-        # Build loss dict - use .item() only for logging (causes GPU sync)
+        # CRITICAL: Return tensors, NOT .item() - .item() causes GPU sync and kills performance!
+        # Call .item() only at epoch end for logging, not every batch
         loss_dict = {
-            'loss_total': total_loss.item(),
-            'l1_full': l1_full.item(),
-            'l1_low': l1_low.item(),
-            'l1_high': l1_high.item(),
-            'wav_full': wav_full.item() if self.wavelet_loss is not None else 0.0,
-            'wav_low': wav_low.item() if self.wavelet_loss is not None else 0.0,
-            'wav_high': wav_high.item() if self.wavelet_loss is not None else 0.0,
-            'spec_full': spec_full.item() if self.spectral_loss is not None else 0.0,
-            'spec_high': spec_high.item() if self.high_spectral_loss is not None else 0.0,
-            'corr_high': corr_high.item(),
+            'loss_total': total_loss.detach(),
+            'l1_full': l1_full.detach(),
+            'l1_low': l1_low.detach(),
+            'l1_high': l1_high.detach(),
+            'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_low': wav_low.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_high': wav_high.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'spec_full': spec_full.detach() if self.spectral_loss is not None else pred.new_tensor(0.0),
+            'spec_high': spec_high.detach() if self.high_spectral_loss is not None else pred.new_tensor(0.0),
+            'corr_high': corr_high.detach(),
         }
 
         return total_loss, loss_dict
