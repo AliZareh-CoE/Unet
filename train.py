@@ -1724,7 +1724,7 @@ def train(
 
     # Create SpectralShift modules OUTSIDE of FSDP (too small for sharding overhead)
     # but DO wrap with DDP for gradient synchronization in distributed training
-    from models import SpectralShiftBlock, FrequencyBandSpectralShift, OptimalSpectralBias
+    from models import SpectralShiftBlock, FrequencyBandSpectralShift, OptimalSpectralBias, EnvelopeHistogramMatching
 
     spectral_shift_fwd = None
     spectral_shift_rev = None
