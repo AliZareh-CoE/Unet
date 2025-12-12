@@ -676,6 +676,8 @@ class DualBandUNet(nn.Module):
 class DualBandLoss(nn.Module):
     """Combined loss function for dual-band U-Net training.
 
+    OPTIMIZED: Uses batched computation for all wavelet losses simultaneously.
+
     Uses the same loss structure as train.py:
         - L1 loss for temporal reconstruction
         - WaveletLoss for time-frequency matching
@@ -734,6 +736,114 @@ class DualBandLoss(nn.Module):
         else:
             self.spectral_loss = None
 
+    def _batched_l1_loss(
+        self,
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute L1 losses for batched pred/target pairs.
+
+        Args:
+            preds: Stacked predictions [3, B, C, T] (full, low, high)
+            targets: Stacked targets [3, B, C, T]
+
+        Returns:
+            L1 losses [3] for each pair
+        """
+        # Vectorized L1: mean over (B, C, T) for each of the 3 pairs
+        return torch.abs(preds - targets).mean(dim=(1, 2, 3))
+
+    def _batched_wavelet_loss(
+        self,
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute wavelet losses for all band pairs in one batched forward pass.
+
+        Instead of calling wavelet_loss 3 times (full, low, high), we concatenate
+        all pairs along batch dimension and compute once, then split results.
+
+        Args:
+            preds: Stacked predictions [3, B, C, T]
+            targets: Stacked targets [3, B, C, T]
+
+        Returns:
+            Wavelet losses [3] for each pair
+        """
+        if self.wavelet_loss is None:
+            return preds.new_zeros(3)
+
+        # Reshape: [3, B, C, T] -> [3*B, C, T]
+        n_pairs, B, C, T = preds.shape
+        preds_batched = preds.reshape(n_pairs * B, C, T)
+        targets_batched = targets.reshape(n_pairs * B, C, T)
+
+        # Single wavelet loss forward pass for all 3*B samples
+        # Use the internal _cwt_loss_batched to get per-sample losses
+        # We need to compute mean per original batch group
+
+        # Get wavelet loss internals
+        wl = self.wavelet_loss
+        device = preds_batched.device
+        original_dtype = preds_batched.dtype
+
+        # Handle dtype conversion
+        if preds_batched.dtype in (torch.bfloat16, torch.float16):
+            preds_batched = preds_batched.float()
+            targets_batched = targets_batched.float()
+
+        # Build/cache filters
+        cache_valid = (
+            wl._cached_filters is not None
+            and wl._cached_num_channels == C
+            and wl._cached_filters.device == device
+        )
+        if not cache_valid:
+            wl._cached_filters = wl._build_batched_filters(C, device)
+            wl._cached_num_channels = C
+            wl._cached_weights = wl.level_weights.to(device)
+
+        filters = wl._cached_filters
+        weights = wl._cached_weights
+
+        # Determine padding
+        pad = min(wl.max_filter_len // 2, T - 1)
+
+        # Convert to complex if needed
+        pred_c = preds_batched.to(torch.complex64) if wl.use_complex_morlet else preds_batched
+        target_c = targets_batched.to(torch.complex64) if wl.use_complex_morlet else targets_batched
+
+        # Pad inputs
+        pred_padded = F.pad(pred_c, (pad, pad), mode="constant", value=0)
+        target_padded = F.pad(target_c, (pad, pad), mode="constant", value=0)
+
+        # Expand for batched conv
+        pred_expanded = pred_padded.repeat(1, wl.levels, 1)
+        target_expanded = target_padded.repeat(1, wl.levels, 1)
+
+        # Single batched convolution
+        pred_coeffs = F.conv1d(pred_expanded, filters, groups=wl.levels * C)
+        target_coeffs = F.conv1d(target_expanded, filters, groups=wl.levels * C)
+
+        # Reshape: [3*B, levels*C, T_out] -> [3, B, levels, C, T_out]
+        T_out = pred_coeffs.shape[-1]
+        pred_coeffs = pred_coeffs.view(n_pairs, B, wl.levels, C, T_out)
+        target_coeffs = target_coeffs.view(n_pairs, B, wl.levels, C, T_out)
+
+        # Compute per-pair losses
+        diff = torch.abs(pred_coeffs - target_coeffs)
+        # Mean over (B, C, T_out), keeping (n_pairs, levels)
+        per_level_losses = diff.mean(dim=(1, 3, 4))  # [n_pairs, levels]
+
+        # Apply level weights and sum
+        weighted = per_level_losses * weights[:wl.levels].unsqueeze(0)  # [n_pairs, levels]
+        total_losses = weighted.sum(dim=1)  # [n_pairs]
+
+        # Handle complex
+        total_losses = total_losses.real if torch.is_complex(total_losses) else total_losses
+
+        return total_losses.to(original_dtype)
+
     def forward(
         self,
         pred: torch.Tensor,
@@ -743,7 +853,7 @@ class DualBandLoss(nn.Module):
         pred_high: torch.Tensor,
         target_high: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        """Compute combined dual-band loss.
+        """Compute combined dual-band loss with optimized batched computation.
 
         Args:
             pred: Full reconstructed prediction [B, C, T]
@@ -756,46 +866,35 @@ class DualBandLoss(nn.Module):
         Returns:
             Tuple of (total_loss, loss_dict) where loss_dict contains individual components
         """
-        # ==== Full signal losses ====
-        # L1 loss
-        l1_full = F.l1_loss(pred, target)
-        loss = self.weight_l1 * l1_full
+        # Stack all pairs for batched computation: [3, B, C, T]
+        preds_stacked = torch.stack([pred, pred_low, pred_high], dim=0)
+        targets_stacked = torch.stack([target, target_low, target_high], dim=0)
 
-        # Wavelet loss (on full signal)
+        # ==== Batched L1 losses ====
+        l1_losses = self._batched_l1_loss(preds_stacked, targets_stacked)
+        l1_full, l1_low, l1_high = l1_losses[0], l1_losses[1], l1_losses[2]
+
+        # ==== Batched Wavelet losses ====
         if self.wavelet_loss is not None:
-            wav_full = self.wavelet_loss(pred, target)
-            loss = loss + self.weight_wavelet * wav_full
+            wav_losses = self._batched_wavelet_loss(preds_stacked, targets_stacked)
+            wav_full, wav_low, wav_high = wav_losses[0], wav_losses[1], wav_losses[2]
         else:
-            wav_full = torch.tensor(0.0, device=pred.device)
+            wav_full = wav_low = wav_high = pred.new_tensor(0.0)
 
-        # Spectral loss (on full signal)
+        # ==== Spectral loss (only on full signal) ====
         if self.spectral_loss is not None:
             spec_full = self.spectral_loss(pred, target)
-            loss = loss + self.weight_spectral * spec_full
         else:
-            spec_full = torch.tensor(0.0, device=pred.device)
+            spec_full = pred.new_tensor(0.0)
 
-        # ==== Low-band losses ====
-        l1_low = F.l1_loss(pred_low, target_low)
-        loss_low = self.weight_l1 * l1_low
-        if self.wavelet_loss is not None:
-            wav_low = self.wavelet_loss(pred_low, target_low)
-            loss_low = loss_low + self.weight_wavelet * wav_low
-        else:
-            wav_low = torch.tensor(0.0, device=pred.device)
+        # ==== Combine losses ====
+        loss_full = self.weight_l1 * l1_full + self.weight_wavelet * wav_full + self.weight_spectral * spec_full
+        loss_low = self.weight_l1 * l1_low + self.weight_wavelet * wav_low
+        loss_high = self.weight_l1 * l1_high + self.weight_wavelet * wav_high
 
-        # ==== High-band losses ====
-        l1_high = F.l1_loss(pred_high, target_high)
-        loss_high = self.weight_l1 * l1_high
-        if self.wavelet_loss is not None:
-            wav_high = self.wavelet_loss(pred_high, target_high)
-            loss_high = loss_high + self.weight_wavelet * wav_high
-        else:
-            wav_high = torch.tensor(0.0, device=pred.device)
+        total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
-        # ==== Combined total loss ====
-        total_loss = loss + self.lambda_low * loss_low + self.lambda_high * loss_high
-
+        # Build loss dict - use .item() only for logging (causes GPU sync)
         loss_dict = {
             'loss_total': total_loss.item(),
             'l1_full': l1_full.item(),

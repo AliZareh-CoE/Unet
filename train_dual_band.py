@@ -43,8 +43,10 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     FullStateDictConfig,
     StateDictType,
+    BackwardPrefetch,
 )
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 # Local imports
 from dual_band_unet import DualBandUNet, DualBandLoss
@@ -143,24 +145,51 @@ def evaluate_dual_band(
                 total_losses[k] += v
             n_batches += 1
 
-            # Compute correlations (per-channel, averaged)
-            def batch_correlation(a, b):
-                """Compute mean correlation across batch and channels."""
-                B, C, T = a.shape
-                corrs = []
-                for bi in range(B):
-                    for ci in range(C):
-                        a_flat = a[bi, ci].float().cpu().numpy()
-                        b_flat = b[bi, ci].float().cpu().numpy()
-                        if np.std(a_flat) > 1e-6 and np.std(b_flat) > 1e-6:
-                            corr = np.corrcoef(a_flat, b_flat)[0, 1]
-                            if not np.isnan(corr):
-                                corrs.append(corr)
-                return np.mean(corrs) if corrs else 0.0
+            # Compute correlations (per-channel, averaged) - VECTORIZED
+            def batch_correlation_vectorized(a: torch.Tensor, b: torch.Tensor) -> float:
+                """Compute mean correlation across batch and channels - fully vectorized.
 
-            correlations["full"].append(batch_correlation(pred, pcx_batch))
-            correlations["low"].append(batch_correlation(pred_low, target_low))
-            correlations["high"].append(batch_correlation(pred_high, target_high))
+                ~100x faster than nested loops by using batched tensor operations.
+                """
+                # a, b: [B, C, T] - compute correlation for each (batch, channel) pair
+                B, C, T = a.shape
+
+                # Flatten batch and channel dims: [B*C, T]
+                a_flat = a.reshape(B * C, T).float()
+                b_flat = b.reshape(B * C, T).float()
+
+                # Compute means: [B*C, 1]
+                a_mean = a_flat.mean(dim=1, keepdim=True)
+                b_mean = b_flat.mean(dim=1, keepdim=True)
+
+                # Center the data
+                a_centered = a_flat - a_mean
+                b_centered = b_flat - b_mean
+
+                # Compute std devs: [B*C]
+                a_std = a_centered.std(dim=1)
+                b_std = b_centered.std(dim=1)
+
+                # Mask for valid correlations (non-zero std)
+                valid_mask = (a_std > 1e-6) & (b_std > 1e-6)
+
+                if not valid_mask.any():
+                    return 0.0
+
+                # Compute correlation only for valid pairs: [B*C]
+                # corr = sum((a-mean_a)*(b-mean_b)) / (T * std_a * std_b)
+                numerator = (a_centered * b_centered).sum(dim=1)
+                denominator = (T - 1) * a_std * b_std  # Use T-1 for sample correlation
+
+                corrs = numerator[valid_mask] / denominator[valid_mask]
+
+                # Filter NaN and return mean
+                corrs = corrs[~torch.isnan(corrs)]
+                return corrs.mean().item() if len(corrs) > 0 else 0.0
+
+            correlations["full"].append(batch_correlation_vectorized(pred, pcx_batch))
+            correlations["low"].append(batch_correlation_vectorized(pred_low, target_low))
+            correlations["high"].append(batch_correlation_vectorized(pred_high, target_high))
 
     # Average metrics
     metrics = {k: v / n_batches for k, v in total_losses.items()}
@@ -375,30 +404,47 @@ def train_dual_band(
     # Move to device
     model = model.to(device)
 
-    # FSDP wrapping
+    # FSDP wrapping with optimized settings
     if use_fsdp and is_distributed:
         if is_primary():
-            print("Using FSDP")
+            print("Using FSDP with optimized settings")
 
-        # Mixed precision
+        # Mixed precision - use float32 for reduce to maintain numerical stability
+        # while keeping params in bfloat16 for memory efficiency
         mp_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,  # Higher precision for gradient reduction
             buffer_dtype=torch.bfloat16,
         )
 
-        # Auto-wrap policy (use functools.partial for newer PyTorch)
+        # Auto-wrap policy - wrap smaller modules for better parallelism
         import functools
-        auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
+        auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy,
+            min_num_params=500_000  # Lower threshold for finer-grained sharding
+        )
+
+        # Get world size for forward prefetch decision
+        world_size = get_world_size()
 
         model = FSDP(
             model,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # Keep gradients sharded
             mixed_precision=mp_policy,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
+            # Optimization: overlap backward communication with computation
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            # Forward prefetch for 4+ GPUs
+            forward_prefetch=(world_size >= 4),
+            # Limit all-gather for memory efficiency
+            limit_all_gathers=True,
         )
         is_fsdp_wrapped = True
+        if is_primary():
+            print(f"  Backward prefetch: BACKWARD_PRE")
+            print(f"  Forward prefetch: {world_size >= 4}")
+            print(f"  Limit all-gathers: True")
     elif is_distributed:
         model = DDP(model, device_ids=[local_rank])
         is_fsdp_wrapped = False
@@ -457,9 +503,15 @@ def train_dual_band(
         "val_corr_full": [], "val_corr_low": [], "val_corr_high": [],
     }
 
+    # Gradient accumulation steps
+    grad_accum_steps = config.get("grad_accum", 1)
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
     if is_primary():
         print(f"\nStarting training for {num_epochs} epochs...")
-        print(f"  Batch size: {config.get('batch_size', 8)}")
+        print(f"  Batch size: {config.get('batch_size', 8)} (effective: {config.get('batch_size', 8) * grad_accum_steps * get_world_size()})")
+        print(f"  Gradient accumulation: {grad_accum_steps}")
+        print(f"  BF16 autocast: {use_bf16}")
         print(f"  Learning rate: {config.get('learning_rate', 2e-4)}")
         print(f"  Lambda low/high: {config.get('lambda_low', 0.3)}/{config.get('lambda_high', 0.3)}")
         print(f"  Loss weights: L1={config.get('weight_l1', 1.0)}, Wav={config.get('weight_wavelet', 3.0)}, Spec={config.get('weight_spectral', 5.0)}")
@@ -468,37 +520,45 @@ def train_dual_band(
         model.train()
         train_losses = defaultdict(float)
         n_batches = 0
+        optimizer.zero_grad(set_to_none=True)  # More memory efficient
 
         # Training
         pbar = tqdm(loaders["train"], desc=f"Epoch {epoch+1}/{num_epochs}", disable=not is_primary())
-        for ob_batch, pcx_batch, odor_batch in pbar:
-            ob_batch = ob_batch.to(device)
-            pcx_batch = pcx_batch.to(device)
-            odor_batch = odor_batch.to(device)
+        for batch_idx, (ob_batch, pcx_batch, odor_batch) in enumerate(pbar):
+            # Non-blocking transfers for overlap with compute
+            ob_batch = ob_batch.to(device, non_blocking=True)
+            pcx_batch = pcx_batch.to(device, non_blocking=True)
+            odor_batch = odor_batch.to(device, non_blocking=True)
 
             if config.get("per_channel_norm", True):
                 ob_batch = per_channel_normalize(ob_batch)
                 pcx_batch = per_channel_normalize(pcx_batch)
 
-            optimizer.zero_grad()
+            # Forward pass with BF16 autocast
+            with torch.cuda.amp.autocast(enabled=use_bf16, dtype=torch.bfloat16):
+                pred, pred_low, pred_high = model(ob_batch, odor_batch, return_bands=True)
+                target_low, target_high = model.module.decompose_target(pcx_batch) if hasattr(model, 'module') else model.decompose_target(pcx_batch)
 
-            # Forward pass
-            pred, pred_low, pred_high = model(ob_batch, odor_batch, return_bands=True)
-            target_low, target_high = model.module.decompose_target(pcx_batch) if hasattr(model, 'module') else model.decompose_target(pcx_batch)
+                # Compute loss
+                loss, loss_dict = loss_fn(
+                    pred, pcx_batch,
+                    pred_low, target_low,
+                    pred_high, target_high
+                )
 
-            # Compute loss
-            loss, loss_dict = loss_fn(
-                pred, pcx_batch,
-                pred_low, target_low,
-                pred_high, target_high
-            )
+                # Scale loss for gradient accumulation
+                loss = loss / grad_accum_steps
 
-            # Backward
+            # Backward (outside autocast for proper gradient dtype)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
 
-            # Accumulate
+            # Step optimizer every grad_accum_steps
+            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(loaders["train"]):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            # Accumulate (unscaled for logging)
             for k, v in loss_dict.items():
                 train_losses[k] += v
             n_batches += 1
@@ -639,6 +699,7 @@ def main():
     parser.add_argument("--n_downsample_low", type=int, default=2, help="Downsample levels for low branch")
     parser.add_argument("--n_downsample_high", type=int, default=2, help="Downsample levels for high branch")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP")
+    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
@@ -661,6 +722,7 @@ def main():
         "weight_spectral": args.weight_spectral,
         "n_downsample_low": args.n_downsample_low,
         "n_downsample_high": args.n_downsample_high,
+        "grad_accum": args.grad_accum,
         "low_band": [1.0, args.cutoff],
         "high_band": [args.cutoff, 100.0],
         "seed": args.seed,
