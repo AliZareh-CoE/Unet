@@ -116,10 +116,13 @@ def evaluate_dual_band(
     model.eval()
     # GPU OPTIMIZED: Initialize accumulators as None, will be tensors on device
     total_losses_accum = None
-    # GPU OPTIMIZED: Accumulate correlations as tensors on GPU
+    # GPU OPTIMIZED: Accumulate correlations and R² as tensors on GPU
     corr_full_sum = torch.tensor(0.0, device=device)
     corr_low_sum = torch.tensor(0.0, device=device)
     corr_high_sum = torch.tensor(0.0, device=device)
+    r2_full_sum = torch.tensor(0.0, device=device)
+    r2_low_sum = torch.tensor(0.0, device=device)
+    r2_high_sum = torch.tensor(0.0, device=device)
     n_batches = 0
 
     with torch.no_grad():
@@ -199,11 +202,46 @@ def evaluate_dual_band(
             corr_low_sum += batch_correlation_vectorized_tensor(pred_low, target_low)
             corr_high_sum += batch_correlation_vectorized_tensor(pred_high, target_high)
 
+            # GPU OPTIMIZED: Compute R² (explained variance) returning tensors
+            def batch_r2_tensor(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                """Compute R² (explained variance) across batch and channels - returns tensor.
+
+                R² = 1 - SS_res / SS_tot = 1 - Var(target - pred) / Var(target)
+                GPU OPTIMIZED: Returns tensor instead of calling .item() per batch.
+                """
+                B, C, T = pred.shape
+                pred_flat = pred.reshape(B * C, T).float()
+                target_flat = target.reshape(B * C, T).float()
+
+                # Compute residuals and variance
+                residuals = target_flat - pred_flat
+                ss_res = (residuals ** 2).sum(dim=1)  # [B*C]
+                target_mean = target_flat.mean(dim=1, keepdim=True)
+                ss_tot = ((target_flat - target_mean) ** 2).sum(dim=1)  # [B*C]
+
+                # Avoid division by zero
+                valid_mask = ss_tot > 1e-8
+                if not valid_mask.any():
+                    return torch.tensor(0.0, device=pred.device)
+
+                r2_vals = 1.0 - ss_res[valid_mask] / ss_tot[valid_mask]
+                # Clip to [-1, 1] range (R² can be negative for bad predictions)
+                r2_vals = r2_vals.clamp(-1.0, 1.0)
+                r2_vals = r2_vals[~torch.isnan(r2_vals)]
+                return r2_vals.mean() if len(r2_vals) > 0 else torch.tensor(0.0, device=pred.device)
+
+            r2_full_sum += batch_r2_tensor(pred, pcx_batch)
+            r2_low_sum += batch_r2_tensor(pred_low, target_low)
+            r2_high_sum += batch_r2_tensor(pred_high, target_high)
+
     # GPU OPTIMIZED: Convert to floats only once at the end (single sync point)
     metrics = {k: v.item() / n_batches for k, v in total_losses_accum.items()}
     metrics["corr_full"] = corr_full_sum.item() / n_batches
     metrics["corr_low"] = corr_low_sum.item() / n_batches
     metrics["corr_high"] = corr_high_sum.item() / n_batches
+    metrics["r2_full"] = r2_full_sum.item() / n_batches
+    metrics["r2_low"] = r2_low_sum.item() / n_batches
+    metrics["r2_high"] = r2_high_sum.item() / n_batches
 
     return metrics
 
@@ -509,6 +547,7 @@ def train_dual_band(
         "train_wav_full": [], "val_wav_full": [],
         "train_spec_full": [], "val_spec_full": [],
         "val_corr_full": [], "val_corr_low": [], "val_corr_high": [],
+        "val_r2_full": [], "val_r2_low": [], "val_r2_high": [],
     }
 
     # Gradient accumulation steps
@@ -545,7 +584,7 @@ def train_dual_band(
                 pcx_batch = per_channel_normalize(pcx_batch)
 
             # Forward pass with BF16 autocast
-            with torch.cuda.amp.autocast(enabled=use_bf16, dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', enabled=use_bf16, dtype=torch.bfloat16):
                 pred, pred_low, pred_high = model(ob_batch, odor_batch, return_bands=True)
                 target_low, target_high = model.module.decompose_target(pcx_batch) if hasattr(model, 'module') else model.decompose_target(pcx_batch)
 
@@ -607,6 +646,9 @@ def train_dual_band(
         history["val_corr_full"].append(val_metrics["corr_full"])
         history["val_corr_low"].append(val_metrics["corr_low"])
         history["val_corr_high"].append(val_metrics["corr_high"])
+        history["val_r2_full"].append(val_metrics["r2_full"])
+        history["val_r2_low"].append(val_metrics["r2_low"])
+        history["val_r2_high"].append(val_metrics["r2_high"])
 
         if is_primary():
             print(f"\nEpoch {epoch+1}/{num_epochs}:")
@@ -617,6 +659,7 @@ def train_dual_band(
             print(f"    L1: full={val_metrics['l1_full']:.4f}, low={val_metrics['l1_low']:.4f}, high={val_metrics['l1_high']:.4f}")
             print(f"    Wav: full={val_metrics['wav_full']:.4f}, Spec: {val_metrics['spec_full']:.4f}")
             print(f"  Corr:  full={val_metrics['corr_full']:.4f}, low={val_metrics['corr_low']:.4f}, high={val_metrics['corr_high']:.4f}")
+            print(f"  R²:    full={val_metrics['r2_full']:.4f}, low={val_metrics['r2_low']:.4f}, high={val_metrics['r2_high']:.4f}")
 
         # Sync val_loss across ranks to ensure all take same branch
         val_loss = val_metrics["loss_total"]
@@ -675,6 +718,10 @@ def train_dual_band(
         print(f"  Full: {test_metrics['corr_full']:.4f}")
         print(f"  Low:  {test_metrics['corr_low']:.4f}")
         print(f"  High: {test_metrics['corr_high']:.4f}")
+        print(f"Test R²:")
+        print(f"  Full: {test_metrics['r2_full']:.4f}")
+        print(f"  Low:  {test_metrics['r2_low']:.4f}")
+        print(f"  High: {test_metrics['r2_high']:.4f}")
 
         # Generate band comparison plots
         print("\nGenerating band comparison plots...")
