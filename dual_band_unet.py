@@ -894,16 +894,17 @@ class DualBandLoss(nn.Module):
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
-        # Build loss dict - use .item() only for logging (causes GPU sync)
+        # GPU OPTIMIZED: Return tensors instead of calling .item() per batch
+        # Callers should accumulate tensors and call .item() only at epoch end
         loss_dict = {
-            'loss_total': total_loss.item(),
-            'l1_full': l1_full.item(),
-            'l1_low': l1_low.item(),
-            'l1_high': l1_high.item(),
-            'wav_full': wav_full.item() if self.wavelet_loss is not None else 0.0,
-            'wav_low': wav_low.item() if self.wavelet_loss is not None else 0.0,
-            'wav_high': wav_high.item() if self.wavelet_loss is not None else 0.0,
-            'spec_full': spec_full.item() if self.spectral_loss is not None else 0.0,
+            'loss_total': total_loss.detach(),
+            'l1_full': l1_full.detach(),
+            'l1_low': l1_low.detach(),
+            'l1_high': l1_high.detach(),
+            'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_low': wav_low.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_high': wav_high.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'spec_full': spec_full.detach() if self.spectral_loss is not None else pred.new_tensor(0.0),
         }
 
         return total_loss, loss_dict
@@ -980,8 +981,9 @@ def test_dual_band_unet():
     )
     total_loss, loss_dict = loss_fn(pcx_pred, target, pcx_low, target_low, pcx_high, target_high)
     print(f"Total loss: {total_loss.item():.4f}")
+    # loss_dict now contains tensors (GPU optimized), call .item() for display
     for k, v in loss_dict.items():
-        print(f"  {k}: {v:.4f}")
+        print(f"  {k}: {v.item():.4f}")
 
     print("\nDualBandUNet test passed!")
 
