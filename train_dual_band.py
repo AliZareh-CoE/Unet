@@ -451,17 +451,27 @@ def train_dual_band(
     else:
         is_fsdp_wrapped = False
 
-    # Loss function - use same weights as train.py
+    # Loss function - CRITICAL: Enable high-band specific losses for proper 30-100Hz learning
     loss_fn = DualBandLoss(
         weight_l1=config.get("weight_l1", 1.0),
         weight_wavelet=config.get("weight_wavelet", 3.0),
         weight_spectral=config.get("weight_spectral", 5.0),
+        weight_high_spectral=config.get("weight_high_spectral", 10.0),  # Extra spectral for high
+        weight_high_corr=config.get("weight_high_corr", 5.0),  # Correlation loss for high
         lambda_low=config.get("lambda_low", 0.3),
-        lambda_high=config.get("lambda_high", 0.3),
+        lambda_high=config.get("lambda_high", 1.0),  # INCREASED from 0.3
         sample_rate=config.get("sampling_rate", 1000.0),
         use_wavelet_loss=config.get("use_wavelet_loss", True),
         use_spectral_loss=config.get("use_spectral_loss", True),
+        use_high_band_spectral=config.get("use_high_band_spectral", True),  # Enable!
     )
+
+    if is_primary():
+        print(f"\nLoss Configuration (HIGH-BAND OPTIMIZED):")
+        print(f"  lambda_high: {config.get('lambda_high', 1.0)} (was 0.3)")
+        print(f"  weight_high_spectral: {config.get('weight_high_spectral', 10.0)}")
+        print(f"  weight_high_corr: {config.get('weight_high_corr', 5.0)}")
+        print(f"  use_high_band_spectral: {config.get('use_high_band_spectral', True)}")
 
     # Optimizer
     optimizer = AdamW(
@@ -565,8 +575,8 @@ def train_dual_band(
 
             pbar.set_postfix({
                 "loss": f"{loss_dict['loss_total']:.4f}",
-                "l1_low": f"{loss_dict['l1_low']:.4f}",
-                "l1_high": f"{loss_dict['l1_high']:.4f}",
+                "corr_h": f"{1-loss_dict.get('corr_high', 1):.3f}",  # Show actual correlation
+                "spec_h": f"{loss_dict.get('spec_high', 0):.3f}",
             })
 
         scheduler.step()
@@ -692,10 +702,12 @@ def main():
     parser.add_argument("--base_channels", type=int, default=32, help="Base channels")
     parser.add_argument("--cutoff", type=float, default=30.0, help="Frequency cutoff (Hz)")
     parser.add_argument("--lambda_low", type=float, default=0.3, help="Low band loss weight")
-    parser.add_argument("--lambda_high", type=float, default=0.3, help="High band loss weight")
+    parser.add_argument("--lambda_high", type=float, default=1.0, help="High band loss weight (INCREASED for proper learning)")
     parser.add_argument("--weight_l1", type=float, default=1.0, help="L1 loss weight")
     parser.add_argument("--weight_wavelet", type=float, default=3.0, help="Wavelet loss weight")
     parser.add_argument("--weight_spectral", type=float, default=5.0, help="Spectral loss weight")
+    parser.add_argument("--weight_high_spectral", type=float, default=10.0, help="High-band spectral loss weight")
+    parser.add_argument("--weight_high_corr", type=float, default=5.0, help="High-band correlation loss weight")
     parser.add_argument("--n_downsample_low", type=int, default=2, help="Downsample levels for low branch")
     parser.add_argument("--n_downsample_high", type=int, default=2, help="Downsample levels for high branch")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP")
@@ -720,6 +732,8 @@ def main():
         "weight_l1": args.weight_l1,
         "weight_wavelet": args.weight_wavelet,
         "weight_spectral": args.weight_spectral,
+        "weight_high_spectral": args.weight_high_spectral,  # NEW: High-band spectral
+        "weight_high_corr": args.weight_high_corr,          # NEW: High-band correlation
         "n_downsample_low": args.n_downsample_low,
         "n_downsample_high": args.n_downsample_high,
         "grad_accum": args.grad_accum,
@@ -731,7 +745,8 @@ def main():
         "sampling_rate": 1000.0,
         "per_channel_norm": True,
         "use_wavelet_loss": True,
-        "use_spectral_loss": False,
+        "use_spectral_loss": True,          # ENABLED - was False (critical bug!)
+        "use_high_band_spectral": True,     # NEW: Dedicated 30-100Hz loss
         "emb_dim": 128,
         "use_attention": True,
         "attention_type": "cross_freq_v2",
