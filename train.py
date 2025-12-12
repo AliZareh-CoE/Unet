@@ -2539,6 +2539,93 @@ def train(
             barrier()
 
         # =====================================================================
+        # DEBUG: Save envelope distributions before/after correction
+        # =====================================================================
+        if is_primary() and envelope_matcher_fwd is not None:
+            print(f"\n{'='*70}")
+            print("DEBUG: Computing envelope distributions (before/after correction)")
+            print(f"{'='*70}")
+
+            import json
+            from models import hilbert_torch
+
+            debug_stats = {
+                "target": {"mean": [], "std": [], "cv": [], "quantiles": {}},
+                "pred_raw": {"mean": [], "std": [], "cv": [], "quantiles": {}},
+                "pred_corrected": {"mean": [], "std": [], "cv": [], "quantiles": {}},
+            }
+
+            # Sample a few batches from validation set
+            n_debug_batches = min(5, len(loaders["val"]))
+            debug_iter = iter(loaders["val"])
+
+            with torch.no_grad():
+                for batch_idx in range(n_debug_batches):
+                    ob_batch, pcx_batch, odor_batch = next(debug_iter)
+                    ob_batch = ob_batch.to(device)
+                    pcx_batch = pcx_batch.to(device)
+                    odor_batch = odor_batch.to(device)
+
+                    if config.get("per_channel_norm", True):
+                        ob_batch = per_channel_normalize(ob_batch)
+                        pcx_batch = per_channel_normalize(pcx_batch)
+
+                    # Get UNet prediction
+                    if cond_encoder is not None:
+                        cond_source = config.get("conditioning_source", "odor_onehot")
+                        if cond_source == "spectro_temporal":
+                            cond_emb = cond_encoder(ob_batch)
+                        else:
+                            cond_emb = None
+                        pred_raw = model(ob_batch, cond_emb=cond_emb) if cond_emb is not None else model(ob_batch, odor_batch)
+                    else:
+                        pred_raw = model(ob_batch, odor_batch)
+
+                    # Apply spectral shift
+                    pred_shifted = spectral_shift_fwd(pred_raw, odor_ids=odor_batch)
+
+                    # Apply envelope correction
+                    pred_corrected = envelope_matcher_fwd(pred_shifted, odor_ids=odor_batch)
+
+                    # Compute envelopes
+                    B, C, T = pcx_batch.shape
+                    target_env = hilbert_torch(pcx_batch.view(B*C, T).float()).abs()
+                    pred_raw_env = hilbert_torch(pred_shifted.view(B*C, T).float()).abs()
+                    pred_corr_env = hilbert_torch(pred_corrected.view(B*C, T).float()).abs()
+
+                    # Stats
+                    debug_stats["target"]["mean"].append(target_env.mean().item())
+                    debug_stats["target"]["std"].append(target_env.std().item())
+                    debug_stats["target"]["cv"].append((target_env.std() / target_env.mean().clamp(min=1e-8)).item())
+
+                    debug_stats["pred_raw"]["mean"].append(pred_raw_env.mean().item())
+                    debug_stats["pred_raw"]["std"].append(pred_raw_env.std().item())
+                    debug_stats["pred_raw"]["cv"].append((pred_raw_env.std() / pred_raw_env.mean().clamp(min=1e-8)).item())
+
+                    debug_stats["pred_corrected"]["mean"].append(pred_corr_env.mean().item())
+                    debug_stats["pred_corrected"]["std"].append(pred_corr_env.std().item())
+                    debug_stats["pred_corrected"]["cv"].append((pred_corr_env.std() / pred_corr_env.mean().clamp(min=1e-8)).item())
+
+            # Aggregate stats
+            for key in ["target", "pred_raw", "pred_corrected"]:
+                debug_stats[key]["mean_avg"] = sum(debug_stats[key]["mean"]) / len(debug_stats[key]["mean"])
+                debug_stats[key]["std_avg"] = sum(debug_stats[key]["std"]) / len(debug_stats[key]["std"])
+                debug_stats[key]["cv_avg"] = sum(debug_stats[key]["cv"]) / len(debug_stats[key]["cv"])
+
+            # Print summary
+            print(f"\nEnvelope Statistics (averaged over {n_debug_batches} batches):")
+            print(f"  TARGET:     mean={debug_stats['target']['mean_avg']:.4f}, std={debug_stats['target']['std_avg']:.4f}, CV={debug_stats['target']['cv_avg']:.4f}")
+            print(f"  PRED (raw): mean={debug_stats['pred_raw']['mean_avg']:.4f}, std={debug_stats['pred_raw']['std_avg']:.4f}, CV={debug_stats['pred_raw']['cv_avg']:.4f}")
+            print(f"  PRED (fix): mean={debug_stats['pred_corrected']['mean_avg']:.4f}, std={debug_stats['pred_corrected']['std_avg']:.4f}, CV={debug_stats['pred_corrected']['cv_avg']:.4f}")
+
+            # Save to file
+            debug_path = CHECKPOINT_DIR / "envelope_debug_stats.json"
+            with open(debug_path, "w") as f:
+                json.dump(debug_stats, f, indent=2)
+            print(f"\nSaved envelope debug stats to: {debug_path}")
+            print(f"{'='*70}\n")
+
+        # =====================================================================
         # STAGE 2: Optimal Bias Applied (No Training Needed!)
         # =====================================================================
         # With OptimalSpectralBias, we just compute the bias from data and apply it.
