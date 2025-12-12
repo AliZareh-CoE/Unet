@@ -679,42 +679,61 @@ class DualBandLoss(nn.Module):
     SPEED OPTIMIZED: Wavelet computed only on full signal (5 freqs instead of 11).
 
     Loss structure:
-        total_loss = (l1 + wavelet) on full signal
+        total_loss = (l1 + wavelet + spectral) on full signal
                    + lambda_low * l1 on low band
                    + lambda_high * l1 on high band
 
     Args:
         weight_l1: Weight for L1 loss (default: 1.0)
         weight_wavelet: Weight for wavelet loss (default: 3.0)
+        weight_spectral: Weight for spectral loss (default: 5.0)
         lambda_low: Weight for low-band loss (default: 0.3)
         lambda_high: Weight for high-band loss (default: 0.3)
         sample_rate: Sampling rate in Hz (default: 1000)
         use_wavelet_loss: Whether to use wavelet loss (default: True)
+        use_spectral_loss: Whether to use spectral loss (default: True)
     """
 
     def __init__(
         self,
         weight_l1: float = 1.0,
         weight_wavelet: float = 3.0,
+        weight_spectral: float = 5.0,
         lambda_low: float = 0.3,
-        lambda_high: float = 0.3,
+        lambda_high: float = 0.3,  # REVERTED to original 0.3
         sample_rate: float = 1000.0,
         use_wavelet_loss: bool = True,
+        use_spectral_loss: bool = True,
     ):
         super().__init__()
         self.weight_l1 = weight_l1
         self.weight_wavelet = weight_wavelet
+        self.weight_spectral = weight_spectral
         self.lambda_low = lambda_low
         self.lambda_high = lambda_high
         self.use_wavelet_loss = use_wavelet_loss
+        self.use_spectral_loss = use_spectral_loss
         self.sample_rate = sample_rate
 
-        # Build wavelet loss with 5 key frequencies for speed
+        # Build proper loss functions from models.py
+        # Use FAST wavelet with fewer frequency bands (5 instead of 11) for speed
         if use_wavelet_loss:
             fast_freqs = [80, 40, 20, 8, 2]  # Key neural frequencies
             self.wavelet_loss = build_wavelet_loss(frequencies=fast_freqs)
         else:
             self.wavelet_loss = None
+
+        # Spectral loss (full range)
+        if use_spectral_loss:
+            self.spectral_loss = HighFrequencySpectralLoss(
+                sample_rate=sample_rate,
+                low_freq_cutoff=0.0,  # Full range
+                high_freq_boost=1.0,  # Uniform weighting
+                max_freq=100.0,
+                use_log_psd=True,
+            )
+        else:
+            self.spectral_loss = None
 
     def _batched_l1_loss(
         self,
@@ -860,11 +879,19 @@ class DualBandLoss(nn.Module):
         else:
             wav_full = pred.new_tensor(0.0)
 
-        # ==== Combine losses ====
-        # Full signal: L1 + wavelet
-        loss_full = self.weight_l1 * l1_full + self.weight_wavelet * wav_full
+        # ==== Spectral loss on full signal ====
+        if self.spectral_loss is not None:
+            spec_full = self.spectral_loss(pred, target)
+        else:
+            spec_full = pred.new_tensor(0.0)
 
-        # Band losses: just L1
+        # ==== Combine losses ====
+        # Full signal: L1 + wavelet + spectral
+        loss_full = (self.weight_l1 * l1_full +
+                     self.weight_wavelet * wav_full +
+                     self.weight_spectral * spec_full)
+
+        # Band losses: just L1 (simple, no extra high-freq losses)
         loss_low = self.weight_l1 * l1_low
         loss_high = self.weight_l1 * l1_high
 
@@ -877,6 +904,7 @@ class DualBandLoss(nn.Module):
             'l1_low': l1_low.detach(),
             'l1_high': l1_high.detach(),
             'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'spec_full': spec_full.detach() if self.spectral_loss is not None else pred.new_tensor(0.0),
         }
 
         return total_loss, loss_dict
@@ -884,7 +912,8 @@ class DualBandLoss(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"weight_l1={self.weight_l1}, weight_wavelet={self.weight_wavelet}, "
-            f"lambda_low={self.lambda_low}, lambda_high={self.lambda_high}"
+            f"weight_spectral={self.weight_spectral}, lambda_low={self.lambda_low}, "
+            f"lambda_high={self.lambda_high}"
         )
 
 

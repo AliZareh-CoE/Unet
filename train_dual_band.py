@@ -588,20 +588,22 @@ def train_dual_band(
     else:
         is_fsdp_wrapped = False
 
-    # Loss function - L1 + wavelet only (no spectral)
+    # Loss function - simple L1 + wavelet + spectral (no extra high-band losses)
     loss_fn = DualBandLoss(
         weight_l1=config.get("weight_l1", 1.0),
         weight_wavelet=config.get("weight_wavelet", 3.0),
+        weight_spectral=config.get("weight_spectral", 5.0),
         lambda_low=config.get("lambda_low", 0.3),
-        lambda_high=config.get("lambda_high", 0.3),
+        lambda_high=config.get("lambda_high", 0.3),  # Original value
         sample_rate=config.get("sampling_rate", 1000.0),
         use_wavelet_loss=config.get("use_wavelet_loss", True),
+        use_spectral_loss=config.get("use_spectral_loss", True),
     )
 
     if is_primary():
         print(f"\nLoss Configuration (SPEED OPTIMIZED):")
-        print(f"  L1 + Wavelet (no spectral)")
         print(f"  lambda_low/high: {config.get('lambda_low', 0.3)}/{config.get('lambda_high', 0.3)}")
+        print(f"  Wavelet: 5 freq bands (fast)")
 
     # Optimizer
     optimizer = AdamW(
@@ -639,6 +641,7 @@ def train_dual_band(
         "train_l1_low": [], "val_l1_low": [],
         "train_l1_high": [], "val_l1_high": [],
         "train_wav_full": [], "val_wav_full": [],
+        "train_spec_full": [], "val_spec_full": [],
         "val_corr_full": [], "val_corr_low": [], "val_corr_high": [],
         # R² metrics
         "train_r2_high": [],
@@ -656,7 +659,7 @@ def train_dual_band(
         print(f"  BF16 autocast: {use_bf16}")
         print(f"  Learning rate: {config.get('learning_rate', 2e-4)}")
         print(f"  Lambda low/high: {config.get('lambda_low', 0.3)}/{config.get('lambda_high', 0.3)}")
-        print(f"  Loss weights: L1={config.get('weight_l1', 1.0)}, Wav={config.get('weight_wavelet', 3.0)}")
+        print(f"  Loss weights: L1={config.get('weight_l1', 1.0)}, Wav={config.get('weight_wavelet', 3.0)}, Spec={config.get('weight_spectral', 5.0)}")
 
     # Determine compute dtype - use direct casting, NOT autocast (faster)
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -742,6 +745,8 @@ def train_dual_band(
         history["val_l1_high"].append(val_metrics["l1_high"])
         history["train_wav_full"].append(train_losses_float.get("wav_full", 0))
         history["val_wav_full"].append(val_metrics.get("wav_full", 0))
+        history["train_spec_full"].append(train_losses_float.get("spec_full", 0))
+        history["val_spec_full"].append(val_metrics.get("spec_full", 0))
         history["val_corr_full"].append(val_metrics["corr_full"])
         history["val_corr_low"].append(val_metrics["corr_low"])
         history["val_corr_high"].append(val_metrics["corr_high"])
@@ -816,7 +821,7 @@ def train_dual_band(
     if is_primary():
         print(f"Test Loss: {test_metrics['loss_total']:.4f}")
         print(f"  L1: full={test_metrics['l1_full']:.4f}, low={test_metrics['l1_low']:.4f}, high={test_metrics['l1_high']:.4f}")
-        print(f"  Wavelet: {test_metrics.get('wav_full', 0):.4f}")
+        print(f"  Wavelet: {test_metrics['wav_full']:.4f}, Spectral: {test_metrics['spec_full']:.4f}")
         print(f"Test R²:")
         print(f"  Full: {test_metrics['r2_full']:.4f}")
         print(f"  Low:  {test_metrics['r2_low']:.4f}")
@@ -864,6 +869,7 @@ def main():
     parser.add_argument("--lambda_high", type=float, default=0.3, help="High band loss weight")
     parser.add_argument("--weight_l1", type=float, default=1.0, help="L1 loss weight")
     parser.add_argument("--weight_wavelet", type=float, default=3.0, help="Wavelet loss weight")
+    parser.add_argument("--weight_spectral", type=float, default=5.0, help="Spectral loss weight")
     parser.add_argument("--n_downsample_low", type=int, default=2, help="Downsample levels for low branch")
     parser.add_argument("--n_downsample_high", type=int, default=2, help="Downsample levels for high branch")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP")
@@ -887,6 +893,7 @@ def main():
         "lambda_high": args.lambda_high,
         "weight_l1": args.weight_l1,
         "weight_wavelet": args.weight_wavelet,
+        "weight_spectral": args.weight_spectral,
         "n_downsample_low": args.n_downsample_low,
         "n_downsample_high": args.n_downsample_high,
         "grad_accum": args.grad_accum,
@@ -898,6 +905,7 @@ def main():
         "sampling_rate": 1000.0,
         "per_channel_norm": True,
         "use_wavelet_loss": True,
+        "use_spectral_loss": True,
         "emb_dim": 128,
         "use_attention": True,
         "attention_type": "cross_freq_v2",
