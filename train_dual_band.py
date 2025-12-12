@@ -664,9 +664,9 @@ def main():
     data = prepare_data(seed=config["seed"])
 
     if is_primary():
-        print(f"  Train: {len(data['train']['ob'])} samples")
-        print(f"  Val: {len(data['val']['ob'])} samples")
-        print(f"  Test: {len(data['test']['ob'])} samples")
+        print(f"  Train: {len(data['train_idx'])} samples")
+        print(f"  Val: {len(data['val_idx'])} samples")
+        print(f"  Test: {len(data['test_idx'])} samples")
         print(f"  Odors: {data['n_odors']}")
 
     # Train
