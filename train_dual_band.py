@@ -529,27 +529,39 @@ def train_dual_band(
             print(f"  Val:   loss={val_metrics['loss_total']:.4f} (low={val_metrics['loss_low']:.4f}, high={val_metrics['loss_high']:.4f})")
             print(f"  Corr:  full={val_metrics['corr_full']:.4f}, low={val_metrics['corr_low']:.4f}, high={val_metrics['corr_high']:.4f}")
 
-        # Save best model
+        # Sync val_loss across ranks to ensure all take same branch
         val_loss = val_metrics["loss_total"]
-        if val_loss < best_val_loss and is_primary():
+        if is_distributed:
+            val_loss_tensor = torch.tensor([val_loss], device=device)
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+            val_loss = val_loss_tensor.item()
+
+        # Save checkpoint every epoch (FSDP requires all ranks to call state_dict)
+        # Get state dict on all ranks
+        model_state = model.state_dict()
+        opt_state = optimizer.state_dict()
+
+        # Check if best and save (only primary writes to disk)
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict() if not is_fsdp_wrapped else model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "best_val_loss": best_val_loss,
-                "config": config,
-                "history": history,
-            }
-            torch.save(checkpoint, DUAL_BAND_CHECKPOINT_DIR / "best_model.pt")
-            print(f"  Saved best model (val_loss={best_val_loss:.4f})")
+            if is_primary():
+                checkpoint = {
+                    "epoch": epoch,
+                    "model_state_dict": model_state,
+                    "optimizer_state_dict": opt_state,
+                    "best_val_loss": best_val_loss,
+                    "config": config,
+                    "history": history,
+                }
+                torch.save(checkpoint, DUAL_BAND_CHECKPOINT_DIR / "best_model.pt")
+                print(f"  Saved best model (val_loss={best_val_loss:.4f})")
 
         # Periodic checkpoint
         if (epoch + 1) % 10 == 0 and is_primary():
             checkpoint = {
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+                "model_state_dict": model_state,
+                "optimizer_state_dict": opt_state,
                 "best_val_loss": best_val_loss,
                 "config": config,
                 "history": history,
