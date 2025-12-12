@@ -2008,25 +2008,21 @@ class OptimalSpectralBias(nn.Module):
 # =============================================================================
 
 class EnvelopeHistogramMatching(nn.Module):
-    """Closed-form envelope distribution correction via histogram matching.
+    """Closed-form envelope scaling correction (mean/std matching).
 
-    PSD tells you average power at each frequency (spectral shape).
-    Envelope tells you distribution of instantaneous amplitudes (dynamics).
+    NOTE: Full histogram matching DESTROYS temporal structure because it's a
+    global statistical operation - it matches amplitude distributions without
+    considering WHEN amplitudes occur. This breaks the signal!
 
-    Two signals can have identical PSD but completely different envelopes:
-    - Constant amplitude oscillation → flat envelope
-    - Bursting oscillation → envelope with peaks and valleys
+    Instead, we use simple MEAN/STD SCALING which:
+    1. Preserves temporal structure (peaks stay at same times)
+    2. Adjusts overall amplitude scale to match target statistics
 
-    Neural signals have characteristic bursty dynamics. If UNet output is
-    too smooth or too peaky, it will look wrong even with perfect PSD.
+    The correction is:
+        corrected = (pred_envelope - pred_mean) * (target_std / pred_std) + target_mean
 
-    This module corrects the envelope distribution by:
-    1. Computing analytic signal via Hilbert transform
-    2. Extracting envelope (magnitude) and phase (angle)
-    3. Histogram matching: map pred envelope quantiles to target quantiles
-    4. Reconstructing signal with corrected envelope, original phase
-
-    This is CLOSED-FORM - computed directly from data, no training needed!
+    This is a linear transformation that preserves the SHAPE of the envelope
+    while matching its mean and variability to the target.
 
     Usage:
         matcher = EnvelopeHistogramMatching()
@@ -2039,18 +2035,14 @@ class EnvelopeHistogramMatching(nn.Module):
     def __init__(
         self,
         n_odors: int = NUM_ODORS,
-        n_quantiles: int = 256,
     ):
         super().__init__()
         self.n_odors = n_odors
-        self.n_quantiles = n_quantiles
 
-        # Store target quantiles per odor [n_odors, n_quantiles]
+        # Store target envelope mean/std per odor [n_odors]
         # These are computed from target data via fit()
-        self.register_buffer(
-            'target_quantiles',
-            torch.zeros(n_odors, n_quantiles)
-        )
+        self.register_buffer('target_mean', torch.zeros(n_odors))
+        self.register_buffer('target_std', torch.ones(n_odors))
         self.register_buffer('fitted', torch.tensor(False))
 
     @torch.no_grad()
@@ -2059,7 +2051,7 @@ class EnvelopeHistogramMatching(nn.Module):
         targets: torch.Tensor,
         odor_ids: torch.Tensor,
     ) -> None:
-        """Compute target envelope quantiles from data.
+        """Compute target envelope mean/std from data.
 
         Args:
             targets: Target signals [N, C, T]
@@ -2073,9 +2065,7 @@ class EnvelopeHistogramMatching(nn.Module):
         analytic = hilbert_torch(targets_flat)
         envelope = analytic.abs()  # [N*C, T]
 
-        # Compute quantiles per odor
-        quantile_probs = torch.linspace(0, 1, self.n_quantiles, device=device)
-
+        # Compute mean/std per odor
         for odor in range(self.n_odors):
             # Get all samples for this odor
             mask = (odor_ids == odor)
@@ -2086,14 +2076,13 @@ class EnvelopeHistogramMatching(nn.Module):
             mask_expanded = mask.unsqueeze(1).expand(-1, C).reshape(-1)
             odor_envelope = envelope[mask_expanded]  # [n_samples * C, T]
 
-            # Flatten all envelope values for this odor
-            all_values = odor_envelope.flatten()
-
-            # Compute quantiles
-            self.target_quantiles[odor] = torch.quantile(all_values, quantile_probs)
+            # Compute mean and std of all envelope values for this odor
+            self.target_mean[odor] = odor_envelope.mean()
+            self.target_std[odor] = odor_envelope.std().clamp(min=1e-6)
 
         self.fitted.fill_(True)
-        print(f"EnvelopeHistogramMatching fitted: {self.n_quantiles} quantiles per odor")
+        print(f"EnvelopeScaling fitted: mean=[{self.target_mean.min():.3f}, {self.target_mean.max():.3f}], "
+              f"std=[{self.target_std.min():.3f}, {self.target_std.max():.3f}]")
 
     def forward(
         self,
@@ -2101,15 +2090,15 @@ class EnvelopeHistogramMatching(nn.Module):
         odor_ids: torch.Tensor,
         target: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Apply envelope histogram matching.
+        """Apply envelope mean/std scaling (preserves temporal structure).
 
         Args:
             x: Input signal [B, C, T]
             odor_ids: Odor indices [B]
-            target: If provided, use target's envelope directly instead of stored quantiles
+            target: If provided, use target's envelope stats directly
 
         Returns:
-            Signal with corrected envelope distribution [B, C, T]
+            Signal with scaled envelope [B, C, T]
         """
         if not self.fitted and target is None:
             # Not fitted and no target provided - return input unchanged
@@ -2128,7 +2117,7 @@ class EnvelopeHistogramMatching(nn.Module):
         envelope = analytic.abs()  # [B*C, T]
         phase = analytic.angle()  # [B*C, T]
 
-        # Correct envelope for each sample - VECTORIZED over channels
+        # Scale envelope for each sample
         corrected_envelope = torch.zeros_like(envelope)
 
         for b in range(B):
@@ -2138,26 +2127,29 @@ class EnvelopeHistogramMatching(nn.Module):
 
             pred_env = envelope[start_idx:end_idx]  # [C, T]
 
+            # Compute prediction envelope stats
+            pred_mean = pred_env.mean()
+            pred_std = pred_env.std().clamp(min=1e-6)
+
             if target is not None:
-                # Use target's envelope directly for histogram matching
+                # Use target's envelope stats directly
                 target_flat = target[b].float()  # [C, T]
                 target_analytic = hilbert_torch(target_flat)
                 target_env = target_analytic.abs()
-
-                # Vectorized per-channel histogram matching
-                corrected_envelope[start_idx:end_idx] = self._histogram_match_batch(
-                    pred_env, target_env
-                )
+                tgt_mean = target_env.mean()
+                tgt_std = target_env.std().clamp(min=1e-6)
             else:
-                # Use stored quantiles - VECTORIZED over all channels
-                target_q = self.target_quantiles[odor]  # [n_quantiles]
-                corrected_envelope[start_idx:end_idx] = self._quantile_match_batch(
-                    pred_env, target_q
-                )
+                # Use stored stats for this odor
+                tgt_mean = self.target_mean[odor]
+                tgt_std = self.target_std[odor]
+
+            # Linear scaling: (x - mean_x) * (std_tgt / std_x) + mean_tgt
+            # This preserves temporal structure while matching mean/std
+            scale = tgt_std / pred_std
+            corrected_envelope[start_idx:end_idx] = (pred_env - pred_mean) * scale + tgt_mean
 
         # Reconstruct signal with corrected envelope and original phase
-        # x_corrected = envelope_corrected * cos(phase)
-        # But we need the full analytic signal reconstruction
+        # The original signal is x = Re(analytic) = envelope * cos(phase)
         corrected_signal = corrected_envelope * torch.cos(phase)
 
         # Reshape back
@@ -2165,107 +2157,14 @@ class EnvelopeHistogramMatching(nn.Module):
 
         return corrected_signal.to(original_dtype)
 
-    def _histogram_match_batch(
-        self,
-        source: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match source histogram to target histogram - BATCHED over channels.
-
-        Args:
-            source: Source values [C, T]
-            target: Target values [C, T]
-
-        Returns:
-            Source values remapped to match target distribution [C, T]
-        """
-        C, T = source.shape
-
-        # Sort both along time dimension
-        source_sorted, source_indices = source.sort(dim=-1)
-        target_sorted, _ = target.sort(dim=-1)
-
-        # Create output - scatter target values to source positions
-        matched = torch.zeros_like(source)
-        # Use scatter to unsort
-        matched.scatter_(dim=-1, index=source_indices, src=target_sorted)
-
-        return matched
-
-    def _quantile_match_batch(
-        self,
-        source: torch.Tensor,
-        target_quantiles: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match source to target using stored quantiles - BATCHED over channels.
-
-        Args:
-            source: Source values [C, T]
-            target_quantiles: Target quantile values [n_quantiles]
-
-        Returns:
-            Source values remapped to match target distribution [C, T]
-        """
-        C, T = source.shape
-        n_q = target_quantiles.shape[0]
-
-        # Sort source along time dimension
-        source_sorted, source_indices = source.sort(dim=-1)
-
-        # Ranks for interpolation [T]
-        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / max(T - 1, 1)
-
-        # Vectorized interpolation indices
-        idx = (ranks * (n_q - 1)).long().clamp(0, n_q - 2)
-        alpha = ranks * (n_q - 1) - idx.float()
-
-        # Interpolate: broadcasts over C channels
-        matched_sorted = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
-        matched_sorted = matched_sorted.unsqueeze(0).expand(C, -1)  # [C, T]
-
-        # Unsort using scatter
-        matched = torch.zeros_like(source)
-        matched.scatter_(dim=-1, index=source_indices, src=matched_sorted)
-
-        return matched
-
-    def _quantile_match(
-        self,
-        source: torch.Tensor,
-        target_quantiles: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match source to target using stored quantiles (VECTORIZED).
-
-        Args:
-            source: Source values [T]
-            target_quantiles: Target quantile values [n_quantiles]
-
-        Returns:
-            Source values remapped to match target distribution [T]
-        """
-        T = source.shape[0]
-        n_q = target_quantiles.shape[0]
-
-        # Compute source ranks (0 to 1)
-        source_sorted, source_indices = source.sort()
-        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / max(T - 1, 1)
-
-        # Vectorized linear interpolation
-        # Find bracketing quantile indices for all ranks at once
-        idx = (ranks * (n_q - 1)).long().clamp(0, n_q - 2)
-        alpha = ranks * (n_q - 1) - idx.float()
-
-        # Interpolate: (1 - alpha) * q[idx] + alpha * q[idx+1]
-        matched_sorted = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
-
-        # Unsort
-        matched = torch.zeros_like(source)
-        matched[source_indices] = matched_sorted
-
-        return matched
-
     def extra_repr(self) -> str:
-        return f"n_odors={self.n_odors}, n_quantiles={self.n_quantiles}, fitted={self.fitted.item()}"
+        if self.fitted:
+            return (
+                f"n_odors={self.n_odors}, fitted=True, "
+                f"mean_range=[{self.target_mean.min():.3f}, {self.target_mean.max():.3f}], "
+                f"std_range=[{self.target_std.min():.3f}, {self.target_std.max():.3f}]"
+            )
+        return f"n_odors={self.n_odors}, fitted=False"
 
 
 # =============================================================================
