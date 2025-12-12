@@ -2394,8 +2394,9 @@ def train(
             all_targets = []
             all_odor_ids = []
 
-            # Use BOTH train and val data for bias computation (never test!)
-            bias_loaders = [("train", loaders["train"]), ("val", loaders["val"])]
+            # Use ONLY TRAIN data for computing bias (never val or test!)
+            # This ensures proper train/test separation
+            bias_loaders = [("train", loaders["train"])]
 
             with torch.no_grad():
                 for loader_name, loader in bias_loaders:
@@ -2503,20 +2504,21 @@ def train(
             all_odor_ids_env = []
 
             with torch.no_grad():
-                for loader_name, loader in [("train", loaders["train"]), ("val", loaders["val"])]:
-                    for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Collecting targets ({loader_name})", disable=not is_primary()):
-                        pcx_batch = pcx_batch.to(device)
-                        ob_batch = ob_batch.to(device)
-                        odor_batch = odor_batch.to(device)
+                # Use ONLY TRAIN data for envelope statistics (never val or test!)
+                # This ensures proper train/test separation
+                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Collecting train targets", disable=not is_primary()):
+                    pcx_batch = pcx_batch.to(device)
+                    ob_batch = ob_batch.to(device)
+                    odor_batch = odor_batch.to(device)
 
-                        # Apply per-channel normalization if enabled
-                        if config.get("per_channel_norm", True):
-                            ob_batch = per_channel_normalize(ob_batch)
-                            pcx_batch = per_channel_normalize(pcx_batch)
+                    # Apply per-channel normalization if enabled
+                    if config.get("per_channel_norm", True):
+                        ob_batch = per_channel_normalize(ob_batch)
+                        pcx_batch = per_channel_normalize(pcx_batch)
 
-                        all_targets_fwd.append(pcx_batch.cpu())
-                        all_targets_rev.append(ob_batch.cpu())
-                        all_odor_ids_env.append(odor_batch.cpu())
+                    all_targets_fwd.append(pcx_batch.cpu())
+                    all_targets_rev.append(ob_batch.cpu())
+                    all_odor_ids_env.append(odor_batch.cpu())
 
             all_targets_fwd = torch.cat(all_targets_fwd, dim=0)
             all_targets_rev = torch.cat(all_targets_rev, dim=0)
