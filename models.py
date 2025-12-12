@@ -1680,18 +1680,18 @@ class AdaptiveSpectralShift(nn.Module):
         # Build frequency masks
         masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
 
-        # Compute PSD for both (in log scale)
+        # Compute POWER for both (PSD = |FFT|²)
         unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
         target_fft = torch.fft.rfft(targets.float(), dim=-1)
 
-        unet_power = unet_fft.abs().square()  # [N, C, n_freq]
+        unet_power = unet_fft.abs().square()  # [N, C, n_freq] - POWER
         target_power = target_fft.abs().square()
 
-        # Per-band power
+        # Per-band power (weighted sum within band)
         unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
         target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
 
-        # Log scale (dB-like)
+        # Log power
         unet_log = torch.log(unet_band_power + 1e-10)
         target_log = torch.log(target_band_power + 1e-10)
 

@@ -4,7 +4,7 @@ Usage:
     # Train model (single GPU)
     python train.py --epochs 80
 
-    # Distributed training with FSDP1
+    # Distributed training with FSDP
     torchrun --nproc_per_node=4 train.py --epochs 80 --fsdp
 """
 from __future__ import annotations
@@ -746,6 +746,8 @@ def evaluate(
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
     residual_corrector: Optional[nn.Module] = None,
+    envelope_matcher_fwd: Optional[nn.Module] = None,
+    envelope_matcher_rev: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -845,6 +847,11 @@ def evaluate(
             if spectral_shift_fwd is not None and not disable_spectral:
                 pred = spectral_shift_fwd(pred, odor_ids=odor)
 
+            # Apply envelope histogram matching (closed-form correction for amplitude dynamics)
+            # This corrects bursty vs smooth characteristics - applied after spectral shift
+            if envelope_matcher_fwd is not None and not disable_spectral:
+                pred = envelope_matcher_fwd(pred, odor_ids=odor)
+
             # Apply residual distribution correction (learns to match target envelope)
             # This is the FINAL output that should be used for metrics
             if residual_corrector is not None and cond_emb is not None:
@@ -943,6 +950,10 @@ def evaluate(
                 # NOTE: Skip in Stage 1 (disable_spectral=True)
                 if spectral_shift_rev is not None and not disable_spectral:
                     pred_rev = spectral_shift_rev(pred_rev, odor_ids=odor)
+
+                # Apply envelope histogram matching (reverse direction)
+                if envelope_matcher_rev is not None and not disable_spectral:
+                    pred_rev = envelope_matcher_rev(pred_rev, odor_ids=odor)
 
                 pred_rev_c = crop_to_target_torch(pred_rev)
 
@@ -2383,8 +2394,9 @@ def train(
             all_targets = []
             all_odor_ids = []
 
-            # Use BOTH train and val data for bias computation (never test!)
-            bias_loaders = [("train", loaders["train"]), ("val", loaders["val"])]
+            # Use ONLY TRAIN data for computing bias (never val or test!)
+            # This ensures proper train/test separation
+            bias_loaders = [("train", loaders["train"])]
 
             with torch.no_grad():
                 for loader_name, loader in bias_loaders:
@@ -2457,8 +2469,8 @@ def train(
                     all_rev_odor_ids.to(device),
                 )
 
-            # Clean up
-            del all_unet_outputs, all_targets, all_odor_ids
+            # Clean up spectral bias data
+            del all_unet_outputs, all_odor_ids
             if spectral_shift_rev is not None:
                 del all_rev_outputs, all_rev_targets, all_rev_odor_ids
             torch.cuda.empty_cache()
@@ -2538,6 +2550,8 @@ def train(
         fast_mode=False,  # Full metrics for final evaluation
         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
         cond_encoder=cond_encoder,
+        envelope_matcher_fwd=envelope_matcher_fwd,
+        envelope_matcher_rev=envelope_matcher_rev,
     )
 
     if is_primary():
