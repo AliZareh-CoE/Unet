@@ -957,7 +957,7 @@ class DualBandLoss(nn.Module):
         else:
             spec_full = pred.new_tensor(0.0)
 
-    # ==== High-band specific losses (critical for 30-100 Hz quality) ====
+        # ==== High-band specific losses (critical for 30-100 Hz quality) ====
         # High-band spectral loss (focused on 30-100 Hz)
         if self.high_spectral_loss is not None:
             spec_high = self.high_spectral_loss(pred_high, target_high)
@@ -972,13 +972,13 @@ class DualBandLoss(nn.Module):
                      self.weight_wavelet * wav_full +
                      self.weight_spectral * spec_full)
 
-    # Low band: just L1 (cheap, wavelet on full already covers low freqs)
-    loss_low = self.weight_l1 * l1_low
+        # Low band: just L1 (cheap, wavelet on full already covers low freqs)
+        loss_low = self.weight_l1 * l1_low
 
-    # High band: L1 + dedicated spectral + correlation (for quality)
-    loss_high = (self.weight_l1 * l1_high +
-             self.weight_high_spectral * spec_high +
-             self.weight_high_corr * corr_high)
+        # High band: L1 + dedicated spectral + correlation (for quality)
+        loss_high = (self.weight_l1 * l1_high +
+                     self.weight_high_spectral * spec_high +
+                     self.weight_high_corr * corr_high)
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
