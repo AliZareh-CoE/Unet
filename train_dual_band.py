@@ -72,14 +72,14 @@ def create_dual_band_model(
     model = DualBandUNet(
         in_channels=config.get("in_channels", 32),
         out_channels=config.get("out_channels", 32),
-        base_channels=config.get("base_channels", 64),
+        base_channels=config.get("base_channels", 32),
         n_odors=n_odors,
         emb_dim=config.get("emb_dim", 128),
         cutoff_freq=config.get("cutoff_freq", 30.0),
         sampling_rate=config.get("sampling_rate", 1000.0),
         low_band=tuple(config.get("low_band", [1.0, 30.0])),
         high_band=tuple(config.get("high_band", [30.0, 100.0])),
-        n_downsample_low=config.get("n_downsample_low", 4),
+        n_downsample_low=config.get("n_downsample_low", 2),
         n_downsample_high=config.get("n_downsample_high", 2),
         use_differentiable_decomp=config.get("use_differentiable_decomp", True),
         dropout=config.get("dropout", 0.0),
@@ -369,7 +369,7 @@ def train_dual_band(
         print(f"  Total parameters: {n_params:,}")
         print(f"  Low branch: {n_params_low:,}")
         print(f"  High branch: {n_params_high:,}")
-        print(f"  Low band: {config.get('low_band', [1, 30])} Hz ({config.get('n_downsample_low', 4)} downsample)")
+        print(f"  Low band: {config.get('low_band', [1, 30])} Hz ({config.get('n_downsample_low', 2)} downsample)")
         print(f"  High band: {config.get('high_band', [30, 100])} Hz ({config.get('n_downsample_high', 2)} downsample)")
 
     # Move to device
@@ -629,14 +629,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=80, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--base_channels", type=int, default=64, help="Base channels")
+    parser.add_argument("--base_channels", type=int, default=32, help="Base channels")
     parser.add_argument("--cutoff", type=float, default=30.0, help="Frequency cutoff (Hz)")
     parser.add_argument("--lambda_low", type=float, default=0.3, help="Low band loss weight")
     parser.add_argument("--lambda_high", type=float, default=0.3, help="High band loss weight")
     parser.add_argument("--weight_l1", type=float, default=1.0, help="L1 loss weight")
     parser.add_argument("--weight_wavelet", type=float, default=3.0, help="Wavelet loss weight")
     parser.add_argument("--weight_spectral", type=float, default=5.0, help="Spectral loss weight")
-    parser.add_argument("--n_downsample_low", type=int, default=4, help="Downsample levels for low branch")
+    parser.add_argument("--n_downsample_low", type=int, default=2, help="Downsample levels for low branch")
     parser.add_argument("--n_downsample_high", type=int, default=2, help="Downsample levels for high branch")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
@@ -669,7 +669,7 @@ def main():
         "sampling_rate": 1000.0,
         "per_channel_norm": True,
         "use_wavelet_loss": True,
-        "use_spectral_loss": True,
+        "use_spectral_loss": False,
         "emb_dim": 128,
         "use_attention": True,
         "attention_type": "cross_freq_v2",
