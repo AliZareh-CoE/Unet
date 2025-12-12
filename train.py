@@ -26,6 +26,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2539,7 +2542,7 @@ def train(
             barrier()
 
         # =====================================================================
-        # DEBUG: Save envelope distributions before/after correction
+        # DEBUG: Save envelope distributions before/after correction (WITH PLOTS)
         # =====================================================================
         if is_primary() and envelope_matcher_fwd is not None:
             print(f"\n{'='*70}")
@@ -2550,13 +2553,18 @@ def train(
             from models import hilbert_torch
 
             debug_stats = {
-                "target": {"mean": [], "std": [], "cv": [], "quantiles": {}},
-                "pred_raw": {"mean": [], "std": [], "cv": [], "quantiles": {}},
-                "pred_corrected": {"mean": [], "std": [], "cv": [], "quantiles": {}},
+                "target": {"mean": [], "std": [], "cv": []},
+                "pred_raw": {"mean": [], "std": [], "cv": []},
+                "pred_corrected": {"mean": [], "std": [], "cv": []},
             }
 
+            # Collect ALL envelope values for plotting
+            all_target_env = []
+            all_pred_raw_env = []
+            all_pred_corr_env = []
+
             # Sample a few batches from validation set
-            n_debug_batches = min(5, len(loaders["val"]))
+            n_debug_batches = min(10, len(loaders["val"]))  # More batches for better distribution
             debug_iter = iter(loaders["val"])
 
             with torch.no_grad():
@@ -2593,6 +2601,11 @@ def train(
                     pred_raw_env = hilbert_torch(pred_shifted.view(B*C, T).float()).abs()
                     pred_corr_env = hilbert_torch(pred_corrected.view(B*C, T).float()).abs()
 
+                    # Collect values for plotting (flatten and move to CPU)
+                    all_target_env.append(target_env.flatten().cpu().numpy())
+                    all_pred_raw_env.append(pred_raw_env.flatten().cpu().numpy())
+                    all_pred_corr_env.append(pred_corr_env.flatten().cpu().numpy())
+
                     # Stats
                     debug_stats["target"]["mean"].append(target_env.mean().item())
                     debug_stats["target"]["std"].append(target_env.std().item())
@@ -2606,6 +2619,11 @@ def train(
                     debug_stats["pred_corrected"]["std"].append(pred_corr_env.std().item())
                     debug_stats["pred_corrected"]["cv"].append((pred_corr_env.std() / pred_corr_env.mean().clamp(min=1e-8)).item())
 
+            # Concatenate all envelope values
+            all_target_env = np.concatenate(all_target_env)
+            all_pred_raw_env = np.concatenate(all_pred_raw_env)
+            all_pred_corr_env = np.concatenate(all_pred_corr_env)
+
             # Aggregate stats
             for key in ["target", "pred_raw", "pred_corrected"]:
                 debug_stats[key]["mean_avg"] = sum(debug_stats[key]["mean"]) / len(debug_stats[key]["mean"])
@@ -2618,11 +2636,132 @@ def train(
             print(f"  PRED (raw): mean={debug_stats['pred_raw']['mean_avg']:.4f}, std={debug_stats['pred_raw']['std_avg']:.4f}, CV={debug_stats['pred_raw']['cv_avg']:.4f}")
             print(f"  PRED (fix): mean={debug_stats['pred_corrected']['mean_avg']:.4f}, std={debug_stats['pred_corrected']['std_avg']:.4f}, CV={debug_stats['pred_corrected']['cv_avg']:.4f}")
 
-            # Save to file
+            # =====================================================================
+            # CREATE ENVELOPE DISTRIBUTION PLOTS
+            # =====================================================================
+            print("\nGenerating envelope distribution plots...")
+
+            # Plot 1: Histogram comparison (all three distributions)
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+            # Determine common bin edges based on all data
+            all_vals = np.concatenate([all_target_env, all_pred_raw_env, all_pred_corr_env])
+            bins = np.linspace(np.percentile(all_vals, 1), np.percentile(all_vals, 99), 100)
+
+            # Plot histograms
+            axes[0].hist(all_target_env, bins=bins, alpha=0.7, color='green', label='Target', density=True)
+            axes[0].set_title('Target Envelope Distribution')
+            axes[0].set_xlabel('Envelope Amplitude')
+            axes[0].set_ylabel('Density')
+            axes[0].axvline(np.mean(all_target_env), color='darkgreen', linestyle='--', label=f'Mean: {np.mean(all_target_env):.3f}')
+            axes[0].legend()
+
+            axes[1].hist(all_pred_raw_env, bins=bins, alpha=0.7, color='red', label='Pred (raw)', density=True)
+            axes[1].set_title('Predicted Envelope (Before Correction)')
+            axes[1].set_xlabel('Envelope Amplitude')
+            axes[1].set_ylabel('Density')
+            axes[1].axvline(np.mean(all_pred_raw_env), color='darkred', linestyle='--', label=f'Mean: {np.mean(all_pred_raw_env):.3f}')
+            axes[1].legend()
+
+            axes[2].hist(all_pred_corr_env, bins=bins, alpha=0.7, color='blue', label='Pred (corrected)', density=True)
+            axes[2].set_title('Predicted Envelope (After Correction)')
+            axes[2].set_xlabel('Envelope Amplitude')
+            axes[2].set_ylabel('Density')
+            axes[2].axvline(np.mean(all_pred_corr_env), color='darkblue', linestyle='--', label=f'Mean: {np.mean(all_pred_corr_env):.3f}')
+            axes[2].legend()
+
+            plt.tight_layout()
+            plot_path_1 = CHECKPOINT_DIR / "envelope_distributions_separate.png"
+            plt.savefig(plot_path_1, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {plot_path_1}")
+
+            # Plot 2: Overlaid histogram comparison
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            ax.hist(all_target_env, bins=bins, alpha=0.5, color='green', label=f'Target (μ={np.mean(all_target_env):.3f}, σ={np.std(all_target_env):.3f})', density=True)
+            ax.hist(all_pred_raw_env, bins=bins, alpha=0.5, color='red', label=f'Pred Raw (μ={np.mean(all_pred_raw_env):.3f}, σ={np.std(all_pred_raw_env):.3f})', density=True)
+            ax.hist(all_pred_corr_env, bins=bins, alpha=0.5, color='blue', label=f'Pred Corrected (μ={np.mean(all_pred_corr_env):.3f}, σ={np.std(all_pred_corr_env):.3f})', density=True)
+
+            ax.set_title('Envelope Distribution Comparison\n(Target vs Predicted Before/After Correction)')
+            ax.set_xlabel('Envelope Amplitude')
+            ax.set_ylabel('Density')
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path_2 = CHECKPOINT_DIR / "envelope_distributions_overlay.png"
+            plt.savefig(plot_path_2, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {plot_path_2}")
+
+            # Plot 3: Q-Q plot (quantile-quantile) to compare distributions
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # Subsample for Q-Q plot if too many points
+            n_qq = min(10000, len(all_target_env))
+            idx = np.random.choice(len(all_target_env), n_qq, replace=False)
+
+            target_sorted = np.sort(all_target_env[idx])
+            raw_sorted = np.sort(all_pred_raw_env[idx])
+            corr_sorted = np.sort(all_pred_corr_env[idx])
+
+            # Q-Q: Raw vs Target
+            axes[0].scatter(target_sorted, raw_sorted, alpha=0.3, s=1, color='red')
+            axes[0].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x (perfect match)')
+            axes[0].set_xlabel('Target Envelope Quantiles')
+            axes[0].set_ylabel('Predicted (Raw) Envelope Quantiles')
+            axes[0].set_title('Q-Q Plot: Raw Prediction vs Target')
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            # Q-Q: Corrected vs Target
+            axes[1].scatter(target_sorted, corr_sorted, alpha=0.3, s=1, color='blue')
+            axes[1].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x (perfect match)')
+            axes[1].set_xlabel('Target Envelope Quantiles')
+            axes[1].set_ylabel('Predicted (Corrected) Envelope Quantiles')
+            axes[1].set_title('Q-Q Plot: Corrected Prediction vs Target')
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path_3 = CHECKPOINT_DIR / "envelope_distributions_qq.png"
+            plt.savefig(plot_path_3, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {plot_path_3}")
+
+            # Plot 4: CDF comparison
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            # Compute CDFs
+            target_sorted_full = np.sort(all_target_env)
+            raw_sorted_full = np.sort(all_pred_raw_env)
+            corr_sorted_full = np.sort(all_pred_corr_env)
+            cdf = np.linspace(0, 1, len(target_sorted_full))
+
+            # Subsample for plotting
+            step = max(1, len(cdf) // 1000)
+            ax.plot(target_sorted_full[::step], cdf[::step], 'g-', linewidth=2, label='Target')
+            ax.plot(raw_sorted_full[::step], cdf[::step], 'r-', linewidth=2, label='Pred (raw)')
+            ax.plot(corr_sorted_full[::step], cdf[::step], 'b-', linewidth=2, label='Pred (corrected)')
+
+            ax.set_xlabel('Envelope Amplitude')
+            ax.set_ylabel('Cumulative Probability')
+            ax.set_title('Cumulative Distribution Function (CDF) Comparison')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plot_path_4 = CHECKPOINT_DIR / "envelope_distributions_cdf.png"
+            plt.savefig(plot_path_4, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {plot_path_4}")
+
+            # Save stats to file
             debug_path = CHECKPOINT_DIR / "envelope_debug_stats.json"
             with open(debug_path, "w") as f:
                 json.dump(debug_stats, f, indent=2)
-            print(f"\nSaved envelope debug stats to: {debug_path}")
+            print(f"  Saved: {debug_path}")
             print(f"{'='*70}\n")
 
         # =====================================================================
