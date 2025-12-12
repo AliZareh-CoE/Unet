@@ -924,10 +924,10 @@ class DualBandLoss(nn.Module):
         pred_high: torch.Tensor,
         target_high: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        """Compute combined dual-band loss with optimized batched computation.
+        """Compute combined dual-band loss - SPEED OPTIMIZED.
 
-        CRITICAL for high-band: Includes dedicated spectral + correlation losses
-        that are amplitude-invariant and frequency-aware.
+        Key optimization: Wavelet loss ONLY on full signal (not bands) - 3x faster!
+        Band losses use cheap L1 only. High-band gets spectral + correlation for quality.
 
         Args:
             pred: Full reconstructed prediction [B, C, T]
@@ -940,20 +940,16 @@ class DualBandLoss(nn.Module):
         Returns:
             Tuple of (total_loss, loss_dict) where loss_dict contains individual components
         """
-        # Stack all pairs for batched computation: [3, B, C, T]
-        preds_stacked = torch.stack([pred, pred_low, pred_high], dim=0)
-        targets_stacked = torch.stack([target, target_low, target_high], dim=0)
+        # ==== L1 losses (cheap - vectorized) ====
+        l1_full = F.l1_loss(pred, target)
+        l1_low = F.l1_loss(pred_low, target_low)
+        l1_high = F.l1_loss(pred_high, target_high)
 
-        # ==== Batched L1 losses ====
-        l1_losses = self._batched_l1_loss(preds_stacked, targets_stacked)
-        l1_full, l1_low, l1_high = l1_losses[0], l1_losses[1], l1_losses[2]
-
-        # ==== Batched Wavelet losses ====
+        # ==== Wavelet loss - ONLY on full signal (expensive, don't compute 3x!) ====
         if self.wavelet_loss is not None:
-            wav_losses = self._batched_wavelet_loss(preds_stacked, targets_stacked)
-            wav_full, wav_low, wav_high = wav_losses[0], wav_losses[1], wav_losses[2]
+            wav_full = self.wavelet_loss(pred, target)
         else:
-            wav_full = wav_low = wav_high = pred.new_tensor(0.0)
+            wav_full = pred.new_tensor(0.0)
 
         # ==== Spectral loss (on full signal) ====
         if self.spectral_loss is not None:
@@ -961,9 +957,7 @@ class DualBandLoss(nn.Module):
         else:
             spec_full = pred.new_tensor(0.0)
 
-        # ==== CRITICAL: High-band specific losses ====
-        # These are essential for learning 30-100 Hz content which has lower amplitude
-
+        # ==== High-band specific losses (critical for 30-100 Hz quality) ====
         # High-band spectral loss (focused on 30-100 Hz)
         if self.high_spectral_loss is not None:
             spec_high = self.high_spectral_loss(pred_high, target_high)
@@ -974,30 +968,28 @@ class DualBandLoss(nn.Module):
         corr_high = self._correlation_loss(pred_high, target_high)
 
         # ==== Combine losses ====
+        # Full signal: L1 + wavelet + spectral
         loss_full = (self.weight_l1 * l1_full +
                      self.weight_wavelet * wav_full +
                      self.weight_spectral * spec_full)
 
-        loss_low = self.weight_l1 * l1_low + self.weight_wavelet * wav_low
+        # Low band: just L1 (cheap, wavelet on full already covers low freqs)
+        loss_low = self.weight_l1 * l1_low
 
-        # High-band gets EXTRA losses for spectral matching and correlation
+        # High band: L1 + dedicated spectral + correlation (for quality)
         loss_high = (self.weight_l1 * l1_high +
-                     self.weight_wavelet * wav_high +
                      self.weight_high_spectral * spec_high +
                      self.weight_high_corr * corr_high)
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
         # CRITICAL: Return tensors, NOT .item() - .item() causes GPU sync and kills performance!
-        # Call .item() only at epoch end for logging, not every batch
         loss_dict = {
             'loss_total': total_loss.detach(),
             'l1_full': l1_full.detach(),
             'l1_low': l1_low.detach(),
             'l1_high': l1_high.detach(),
             'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
-            'wav_low': wav_low.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
-            'wav_high': wav_high.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
             'spec_full': spec_full.detach() if self.spectral_loss is not None else pred.new_tensor(0.0),
             'spec_high': spec_high.detach() if self.high_spectral_loss is not None else pred.new_tensor(0.0),
             'corr_high': corr_high.detach(),
