@@ -48,7 +48,7 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 # Local imports
 from dual_band_unet import DualBandUNet, DualBandLoss
-from data import load_olfactory_data, create_dataloaders
+from data import prepare_data, create_dataloaders
 from train import (
     set_seed,
     is_primary,
@@ -661,7 +661,7 @@ def main():
     if is_primary():
         print("\nLoading data...")
 
-    data = load_olfactory_data()
+    data = prepare_data(seed=config["seed"])
 
     if is_primary():
         print(f"  Train: {len(data['train']['ob'])} samples")
