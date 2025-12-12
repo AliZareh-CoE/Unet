@@ -108,19 +108,25 @@ def evaluate_dual_band(
 ) -> Dict[str, float]:
     """Evaluate model on a dataset.
 
+    GPU OPTIMIZED: Accumulates losses as tensors on GPU, only calls .item() at the end.
+
     Returns:
         Dictionary with metrics including band-wise losses and correlations.
     """
     model.eval()
-    total_losses = defaultdict(float)
-    correlations = {"full": [], "low": [], "high": []}
+    # GPU OPTIMIZED: Initialize accumulators as None, will be tensors on device
+    total_losses_accum = None
+    # GPU OPTIMIZED: Accumulate correlations as tensors on GPU
+    corr_full_sum = torch.tensor(0.0, device=device)
+    corr_low_sum = torch.tensor(0.0, device=device)
+    corr_high_sum = torch.tensor(0.0, device=device)
     n_batches = 0
 
     with torch.no_grad():
         for ob_batch, pcx_batch, odor_batch in loader:
-            ob_batch = ob_batch.to(device)
-            pcx_batch = pcx_batch.to(device)
-            odor_batch = odor_batch.to(device)
+            ob_batch = ob_batch.to(device, non_blocking=True)
+            pcx_batch = pcx_batch.to(device, non_blocking=True)
+            odor_batch = odor_batch.to(device, non_blocking=True)
 
             # Normalize if needed
             if config.get("per_channel_norm", True):
@@ -140,16 +146,19 @@ def evaluate_dual_band(
                 pred_high, target_high
             )
 
-            # Accumulate losses
-            for k, v in loss_dict.items():
-                total_losses[k] += v
+            # GPU OPTIMIZED: Accumulate tensors on GPU
+            if total_losses_accum is None:
+                total_losses_accum = {k: v.clone() for k, v in loss_dict.items()}
+            else:
+                for k, v in loss_dict.items():
+                    total_losses_accum[k] += v
             n_batches += 1
 
-            # Compute correlations (per-channel, averaged) - VECTORIZED
-            def batch_correlation_vectorized(a: torch.Tensor, b: torch.Tensor) -> float:
-                """Compute mean correlation across batch and channels - fully vectorized.
+            # GPU OPTIMIZED: Compute correlations returning tensors (no .item() per batch)
+            def batch_correlation_vectorized_tensor(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                """Compute mean correlation across batch and channels - returns tensor.
 
-                ~100x faster than nested loops by using batched tensor operations.
+                GPU OPTIMIZED: Returns tensor instead of calling .item() per batch.
                 """
                 # a, b: [B, C, T] - compute correlation for each (batch, channel) pair
                 B, C, T = a.shape
@@ -174,28 +183,27 @@ def evaluate_dual_band(
                 valid_mask = (a_std > 1e-6) & (b_std > 1e-6)
 
                 if not valid_mask.any():
-                    return 0.0
+                    return torch.tensor(0.0, device=a.device)
 
                 # Compute correlation only for valid pairs: [B*C]
-                # corr = sum((a-mean_a)*(b-mean_b)) / (T * std_a * std_b)
                 numerator = (a_centered * b_centered).sum(dim=1)
                 denominator = (T - 1) * a_std * b_std  # Use T-1 for sample correlation
 
                 corrs = numerator[valid_mask] / denominator[valid_mask]
 
-                # Filter NaN and return mean
+                # Filter NaN and return mean as tensor
                 corrs = corrs[~torch.isnan(corrs)]
-                return corrs.mean().item() if len(corrs) > 0 else 0.0
+                return corrs.mean() if len(corrs) > 0 else torch.tensor(0.0, device=a.device)
 
-            correlations["full"].append(batch_correlation_vectorized(pred, pcx_batch))
-            correlations["low"].append(batch_correlation_vectorized(pred_low, target_low))
-            correlations["high"].append(batch_correlation_vectorized(pred_high, target_high))
+            corr_full_sum += batch_correlation_vectorized_tensor(pred, pcx_batch)
+            corr_low_sum += batch_correlation_vectorized_tensor(pred_low, target_low)
+            corr_high_sum += batch_correlation_vectorized_tensor(pred_high, target_high)
 
-    # Average metrics
-    metrics = {k: v / n_batches for k, v in total_losses.items()}
-    metrics["corr_full"] = np.mean(correlations["full"])
-    metrics["corr_low"] = np.mean(correlations["low"])
-    metrics["corr_high"] = np.mean(correlations["high"])
+    # GPU OPTIMIZED: Convert to floats only once at the end (single sync point)
+    metrics = {k: v.item() / n_batches for k, v in total_losses_accum.items()}
+    metrics["corr_full"] = corr_full_sum.item() / n_batches
+    metrics["corr_low"] = corr_low_sum.item() / n_batches
+    metrics["corr_high"] = corr_high_sum.item() / n_batches
 
     return metrics
 
@@ -518,7 +526,9 @@ def train_dual_band(
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
-        train_losses = defaultdict(float)
+        # GPU OPTIMIZED: Accumulate as tensors on GPU, not floats
+        # Initialize accumulators on device
+        train_losses_accum = None  # Will be initialized on first batch
         n_batches = 0
         optimizer.zero_grad(set_to_none=True)  # More memory efficient
 
@@ -558,22 +568,27 @@ def train_dual_band(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            # Accumulate (unscaled for logging)
-            for k, v in loss_dict.items():
-                train_losses[k] += v
+            # GPU OPTIMIZED: Accumulate tensors on GPU - no .item() calls per batch
+            if train_losses_accum is None:
+                train_losses_accum = {k: v.clone() for k, v in loss_dict.items()}
+            else:
+                for k, v in loss_dict.items():
+                    train_losses_accum[k] += v
             n_batches += 1
 
-            pbar.set_postfix({
-                "loss": f"{loss_dict['loss_total']:.4f}",
-                "l1_low": f"{loss_dict['l1_low']:.4f}",
-                "l1_high": f"{loss_dict['l1_high']:.4f}",
-            })
+            # Update progress bar less frequently to reduce overhead (every 10 batches)
+            if batch_idx % 10 == 0:
+                # Only call .item() occasionally for display
+                pbar.set_postfix({
+                    "loss": f"{loss_dict['loss_total'].item():.4f}",
+                    "l1_low": f"{loss_dict['l1_low'].item():.4f}",
+                    "l1_high": f"{loss_dict['l1_high'].item():.4f}",
+                })
 
         scheduler.step()
 
-        # Average training losses
-        for k in train_losses:
-            train_losses[k] /= n_batches
+        # GPU OPTIMIZED: Convert to floats only once at epoch end (single sync point)
+        train_losses = {k: v.item() / n_batches for k, v in train_losses_accum.items()}
 
         # Validation
         val_metrics = evaluate_dual_band(model, loaders["val"], loss_fn, device, config)
