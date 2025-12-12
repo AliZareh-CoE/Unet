@@ -676,65 +676,45 @@ class DualBandUNet(nn.Module):
 class DualBandLoss(nn.Module):
     """Combined loss function for dual-band U-Net training.
 
-    OPTIMIZED: Uses batched computation for all wavelet losses simultaneously.
+    SPEED OPTIMIZED: Wavelet computed only on full signal (5 freqs instead of 11).
 
-    Uses the same loss structure as train.py:
-        - L1 loss for temporal reconstruction
-        - WaveletLoss for time-frequency matching
-        - HighFrequencySpectralLoss for PSD matching
-
-    Computes losses on full signal AND band-specific losses:
-        total_loss = (l1 + wavelet + spectral) on full signal
-                   + lambda_low * (l1 + wavelet) on low band
-                   + lambda_high * (l1 + wavelet) on high band
+    Loss structure:
+        total_loss = (l1 + wavelet) on full signal
+                   + lambda_low * l1 on low band
+                   + lambda_high * l1 on high band
 
     Args:
         weight_l1: Weight for L1 loss (default: 1.0)
         weight_wavelet: Weight for wavelet loss (default: 3.0)
-        weight_spectral: Weight for spectral loss (default: 5.0)
         lambda_low: Weight for low-band loss (default: 0.3)
         lambda_high: Weight for high-band loss (default: 0.3)
         sample_rate: Sampling rate in Hz (default: 1000)
         use_wavelet_loss: Whether to use wavelet loss (default: True)
-        use_spectral_loss: Whether to use spectral loss (default: True)
     """
 
     def __init__(
         self,
         weight_l1: float = 1.0,
         weight_wavelet: float = 3.0,
-        weight_spectral: float = 5.0,
         lambda_low: float = 0.3,
         lambda_high: float = 0.3,
         sample_rate: float = 1000.0,
         use_wavelet_loss: bool = True,
-        use_spectral_loss: bool = True,
     ):
         super().__init__()
         self.weight_l1 = weight_l1
         self.weight_wavelet = weight_wavelet
-        self.weight_spectral = weight_spectral
         self.lambda_low = lambda_low
         self.lambda_high = lambda_high
         self.use_wavelet_loss = use_wavelet_loss
-        self.use_spectral_loss = use_spectral_loss
+        self.sample_rate = sample_rate
 
-        # Build proper loss functions from models.py
+        # Build wavelet loss with 5 key frequencies for speed
         if use_wavelet_loss:
-            self.wavelet_loss = build_wavelet_loss()
+            fast_freqs = [80, 40, 20, 8, 2]  # Key neural frequencies
+            self.wavelet_loss = build_wavelet_loss(frequencies=fast_freqs)
         else:
             self.wavelet_loss = None
-
-        if use_spectral_loss:
-            self.spectral_loss = HighFrequencySpectralLoss(
-                sample_rate=sample_rate,
-                low_freq_cutoff=0.0,  # Full range
-                high_freq_boost=1.0,  # Uniform weighting
-                max_freq=100.0,
-                use_log_psd=True,
-            )
-        else:
-            self.spectral_loss = None
 
     def _batched_l1_loss(
         self,
@@ -853,7 +833,10 @@ class DualBandLoss(nn.Module):
         pred_high: torch.Tensor,
         target_high: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        """Compute combined dual-band loss with optimized batched computation.
+        """Compute combined dual-band loss - SPEED OPTIMIZED.
+
+        Simple structure: L1 + wavelet + spectral on full signal.
+        Band losses are L1 only (weighted by lambda_low/high).
 
         Args:
             pred: Full reconstructed prediction [B, C, T]
@@ -866,44 +849,34 @@ class DualBandLoss(nn.Module):
         Returns:
             Tuple of (total_loss, loss_dict) where loss_dict contains individual components
         """
-        # Stack all pairs for batched computation: [3, B, C, T]
-        preds_stacked = torch.stack([pred, pred_low, pred_high], dim=0)
-        targets_stacked = torch.stack([target, target_low, target_high], dim=0)
+        # ==== L1 losses (cheap) ====
+        l1_full = F.l1_loss(pred, target)
+        l1_low = F.l1_loss(pred_low, target_low)
+        l1_high = F.l1_loss(pred_high, target_high)
 
-        # ==== Batched L1 losses ====
-        l1_losses = self._batched_l1_loss(preds_stacked, targets_stacked)
-        l1_full, l1_low, l1_high = l1_losses[0], l1_losses[1], l1_losses[2]
-
-        # ==== Batched Wavelet losses ====
+        # ==== Wavelet loss - ONLY on full signal (5 freqs for speed) ====
         if self.wavelet_loss is not None:
-            wav_losses = self._batched_wavelet_loss(preds_stacked, targets_stacked)
-            wav_full, wav_low, wav_high = wav_losses[0], wav_losses[1], wav_losses[2]
+            wav_full = self.wavelet_loss(pred, target)
         else:
-            wav_full = wav_low = wav_high = pred.new_tensor(0.0)
-
-        # ==== Spectral loss (only on full signal) ====
-        if self.spectral_loss is not None:
-            spec_full = self.spectral_loss(pred, target)
-        else:
-            spec_full = pred.new_tensor(0.0)
+            wav_full = pred.new_tensor(0.0)
 
         # ==== Combine losses ====
-        loss_full = self.weight_l1 * l1_full + self.weight_wavelet * wav_full + self.weight_spectral * spec_full
-        loss_low = self.weight_l1 * l1_low + self.weight_wavelet * wav_low
-        loss_high = self.weight_l1 * l1_high + self.weight_wavelet * wav_high
+        # Full signal: L1 + wavelet
+        loss_full = self.weight_l1 * l1_full + self.weight_wavelet * wav_full
+
+        # Band losses: just L1
+        loss_low = self.weight_l1 * l1_low
+        loss_high = self.weight_l1 * l1_high
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
-        # Build loss dict - use .item() only for logging (causes GPU sync)
+        # CRITICAL: Return tensors, NOT .item() - .item() causes GPU sync and kills performance!
         loss_dict = {
-            'loss_total': total_loss.item(),
-            'l1_full': l1_full.item(),
-            'l1_low': l1_low.item(),
-            'l1_high': l1_high.item(),
-            'wav_full': wav_full.item() if self.wavelet_loss is not None else 0.0,
-            'wav_low': wav_low.item() if self.wavelet_loss is not None else 0.0,
-            'wav_high': wav_high.item() if self.wavelet_loss is not None else 0.0,
-            'spec_full': spec_full.item() if self.spectral_loss is not None else 0.0,
+            'loss_total': total_loss.detach(),
+            'l1_full': l1_full.detach(),
+            'l1_low': l1_low.detach(),
+            'l1_high': l1_high.detach(),
+            'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
         }
 
         return total_loss, loss_dict
@@ -911,8 +884,7 @@ class DualBandLoss(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"weight_l1={self.weight_l1}, weight_wavelet={self.weight_wavelet}, "
-            f"weight_spectral={self.weight_spectral}, lambda_low={self.lambda_low}, "
-            f"lambda_high={self.lambda_high}"
+            f"lambda_low={self.lambda_low}, lambda_high={self.lambda_high}"
         )
 
 
