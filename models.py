@@ -2128,7 +2128,7 @@ class EnvelopeHistogramMatching(nn.Module):
         envelope = analytic.abs()  # [B*C, T]
         phase = analytic.angle()  # [B*C, T]
 
-        # Correct envelope for each sample
+        # Correct envelope for each sample - VECTORIZED over channels
         corrected_envelope = torch.zeros_like(envelope)
 
         for b in range(B):
@@ -2144,20 +2144,16 @@ class EnvelopeHistogramMatching(nn.Module):
                 target_analytic = hilbert_torch(target_flat)
                 target_env = target_analytic.abs()
 
-                # Per-channel histogram matching
-                for c in range(C):
-                    corrected_envelope[start_idx + c] = self._histogram_match(
-                        pred_env[c], target_env[c]
-                    )
+                # Vectorized per-channel histogram matching
+                corrected_envelope[start_idx:end_idx] = self._histogram_match_batch(
+                    pred_env, target_env
+                )
             else:
-                # Use stored quantiles
+                # Use stored quantiles - VECTORIZED over all channels
                 target_q = self.target_quantiles[odor]  # [n_quantiles]
-
-                # Match each channel
-                for c in range(C):
-                    corrected_envelope[start_idx + c] = self._quantile_match(
-                        pred_env[c], target_q
-                    )
+                corrected_envelope[start_idx:end_idx] = self._quantile_match_batch(
+                    pred_env, target_q
+                )
 
         # Reconstruct signal with corrected envelope and original phase
         # x_corrected = envelope_corrected * cos(phase)
@@ -2169,37 +2165,67 @@ class EnvelopeHistogramMatching(nn.Module):
 
         return corrected_signal.to(original_dtype)
 
-    def _histogram_match(
+    def _histogram_match_batch(
         self,
         source: torch.Tensor,
         target: torch.Tensor,
     ) -> torch.Tensor:
-        """Match source histogram to target histogram.
+        """Match source histogram to target histogram - BATCHED over channels.
 
         Args:
-            source: Source values [T]
-            target: Target values [T] (same length)
+            source: Source values [C, T]
+            target: Target values [C, T]
 
         Returns:
-            Source values remapped to match target distribution [T]
+            Source values remapped to match target distribution [C, T]
         """
-        # Sort both
-        source_sorted, source_indices = source.sort()
-        target_sorted, _ = target.sort()
+        C, T = source.shape
 
-        # If different lengths, interpolate
-        if len(source_sorted) != len(target_sorted):
-            # Interpolate target to match source length
-            target_sorted = F.interpolate(
-                target_sorted.unsqueeze(0).unsqueeze(0),
-                size=len(source_sorted),
-                mode='linear',
-                align_corners=True,
-            ).squeeze()
+        # Sort both along time dimension
+        source_sorted, source_indices = source.sort(dim=-1)
+        target_sorted, _ = target.sort(dim=-1)
 
-        # Create output with same shape as source
+        # Create output - scatter target values to source positions
         matched = torch.zeros_like(source)
-        matched[source_indices] = target_sorted
+        # Use scatter to unsort
+        matched.scatter_(dim=-1, index=source_indices, src=target_sorted)
+
+        return matched
+
+    def _quantile_match_batch(
+        self,
+        source: torch.Tensor,
+        target_quantiles: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match source to target using stored quantiles - BATCHED over channels.
+
+        Args:
+            source: Source values [C, T]
+            target_quantiles: Target quantile values [n_quantiles]
+
+        Returns:
+            Source values remapped to match target distribution [C, T]
+        """
+        C, T = source.shape
+        n_q = target_quantiles.shape[0]
+
+        # Sort source along time dimension
+        source_sorted, source_indices = source.sort(dim=-1)
+
+        # Ranks for interpolation [T]
+        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / max(T - 1, 1)
+
+        # Vectorized interpolation indices
+        idx = (ranks * (n_q - 1)).long().clamp(0, n_q - 2)
+        alpha = ranks * (n_q - 1) - idx.float()
+
+        # Interpolate: broadcasts over C channels
+        matched_sorted = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
+        matched_sorted = matched_sorted.unsqueeze(0).expand(C, -1)  # [C, T]
+
+        # Unsort using scatter
+        matched = torch.zeros_like(source)
+        matched.scatter_(dim=-1, index=source_indices, src=matched_sorted)
 
         return matched
 
@@ -2208,7 +2234,7 @@ class EnvelopeHistogramMatching(nn.Module):
         source: torch.Tensor,
         target_quantiles: torch.Tensor,
     ) -> torch.Tensor:
-        """Match source to target using stored quantiles.
+        """Match source to target using stored quantiles (VECTORIZED).
 
         Args:
             source: Source values [T]
@@ -2222,19 +2248,15 @@ class EnvelopeHistogramMatching(nn.Module):
 
         # Compute source ranks (0 to 1)
         source_sorted, source_indices = source.sort()
-        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / (T - 1)
+        ranks = torch.arange(T, device=source.device, dtype=source.dtype) / max(T - 1, 1)
 
-        # Interpolate target quantiles at source ranks
-        # target_quantiles are at positions 0, 1/(n_q-1), 2/(n_q-1), ..., 1
-        quantile_positions = torch.linspace(0, 1, n_q, device=source.device)
+        # Vectorized linear interpolation
+        # Find bracketing quantile indices for all ranks at once
+        idx = (ranks * (n_q - 1)).long().clamp(0, n_q - 2)
+        alpha = ranks * (n_q - 1) - idx.float()
 
-        # Linear interpolation
-        matched_sorted = torch.zeros_like(source_sorted)
-        for i, r in enumerate(ranks):
-            # Find bracketing quantiles
-            idx = (r * (n_q - 1)).long().clamp(0, n_q - 2)
-            alpha = r * (n_q - 1) - idx.float()
-            matched_sorted[i] = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
+        # Interpolate: (1 - alpha) * q[idx] + alpha * q[idx+1]
+        matched_sorted = (1 - alpha) * target_quantiles[idx] + alpha * target_quantiles[idx + 1]
 
         # Unsort
         matched = torch.zeros_like(source)
