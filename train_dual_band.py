@@ -387,8 +387,9 @@ def train_dual_band(
             buffer_dtype=torch.bfloat16,
         )
 
-        # Auto-wrap policy
-        auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=1e6)
+        # Auto-wrap policy (use functools.partial for newer PyTorch)
+        import functools
+        auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
 
         model = FSDP(
             model,
