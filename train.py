@@ -2652,9 +2652,10 @@ def train(
                     all_pred_corr_env.append(pred_corr_env.flatten().cpu().numpy())
 
                     # Collect signals for PSD (flatten channels, keep time)
-                    all_target_signals.append(pcx_batch.view(B*C, T).cpu().numpy())
-                    all_pred_raw_signals.append(pred_shifted.view(B*C, T).cpu().numpy())
-                    all_pred_corr_signals.append(pred_corrected.view(B*C, T).cpu().numpy())
+                    # Convert to float32 first (bfloat16 not supported by numpy)
+                    all_target_signals.append(pcx_batch.view(B*C, T).float().cpu().numpy())
+                    all_pred_raw_signals.append(pred_shifted.view(B*C, T).float().cpu().numpy())
+                    all_pred_corr_signals.append(pred_corrected.view(B*C, T).float().cpu().numpy())
 
                     # Collect instantaneous frequencies
                     all_target_inst_freq.append(target_inst_freq)
