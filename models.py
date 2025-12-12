@@ -1696,10 +1696,7 @@ class AdaptiveSpectralShift(nn.Module):
         target_log = torch.log(target_band_power + 1e-10)
 
         # Difference: how much to shift UNet output to match target
-        # IMPORTANT: We compute log of POWER ratio, but apply to AMPLITUDE (FFT)
-        # Power = |FFT|², so to scale power by P, we scale amplitude by sqrt(P)
-        # Therefore: log_amplitude_ratio = log_power_ratio / 2
-        diff_log = (target_log - unet_log) / 2  # [N, C, n_bands] - log AMPLITUDE ratio
+        diff_log = target_log - unet_log  # [N, C, n_bands]
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
@@ -1736,8 +1733,7 @@ class AdaptiveSpectralShift(nn.Module):
         optimal_bias = self.compute_optimal_bias(unet_outputs, targets, odor_ids)
         self.odor_bias.data.copy_(optimal_bias)
 
-        # Convert to dB for logging (amplitude dB = 20*log10, we have ln)
-        # bias is in ln(amplitude_ratio), convert to dB: 20 * log10(exp(bias)) = 20 * bias / ln(10)
+        # Convert to dB for logging
         bias_db = optimal_bias * 20.0 / math.log(10)
         print(f"Set odor_bias from data: mean={bias_db.mean():.2f}dB, "
               f"range=[{bias_db.min():.2f}, {bias_db.max():.2f}]dB")
@@ -1950,10 +1946,7 @@ class OptimalSpectralBias(nn.Module):
         target_log = torch.log(target_band_power + 1e-10)
 
         # Difference: how much to shift UNet output to match target
-        # IMPORTANT: We compute log of POWER ratio, but apply to AMPLITUDE (FFT)
-        # Power = |FFT|², so to scale power by P, we scale amplitude by sqrt(P)
-        # Therefore: log_amplitude_ratio = log_power_ratio / 2
-        diff_log = (target_log - unet_log) / 2  # [N, C, n_bands] - log AMPLITUDE ratio
+        diff_log = target_log - unet_log  # [N, C, n_bands]
 
         # Average across channels
         diff_log = diff_log.mean(dim=1)  # [N, n_bands]
@@ -1990,8 +1983,7 @@ class OptimalSpectralBias(nn.Module):
         optimal_bias = self.compute_optimal_bias(unet_outputs, targets, odor_ids)
         self.odor_bias.data.copy_(optimal_bias)
 
-        # Convert to dB for logging (amplitude dB = 20*log10, we have ln)
-        # bias is in ln(amplitude_ratio), convert to dB: 20 * log10(exp(bias)) = 20 * bias / ln(10)
+        # Convert to dB for logging
         bias_db = optimal_bias * 20.0 / math.log(10)
         print(f"Set optimal bias from data: mean={bias_db.mean():.2f}dB, "
               f"range=[{bias_db.min():.2f}, {bias_db.max():.2f}]dB")
