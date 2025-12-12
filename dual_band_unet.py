@@ -677,26 +677,31 @@ class DualBandLoss(nn.Module):
     """Combined loss function for dual-band U-Net training.
 
     OPTIMIZED: Uses batched computation for all wavelet losses simultaneously.
+    CRITICAL: Includes dedicated high-frequency spectral loss for proper 30-100Hz learning.
 
-    Uses the same loss structure as train.py:
-        - L1 loss for temporal reconstruction
-        - WaveletLoss for time-frequency matching
-        - HighFrequencySpectralLoss for PSD matching
+    The key insight is that high-frequency (30-100 Hz) signals:
+    - Have much lower amplitude than low-frequency
+    - Are easily drowned out by L1/L2 losses
+    - Need explicit frequency-domain supervision
+    - Benefit from correlation-based losses (amplitude-invariant)
 
-    Computes losses on full signal AND band-specific losses:
+    Loss structure:
         total_loss = (l1 + wavelet + spectral) on full signal
                    + lambda_low * (l1 + wavelet) on low band
-                   + lambda_high * (l1 + wavelet) on high band
+                   + lambda_high * (l1 + wavelet + HIGH_FREQ_SPECTRAL + CORRELATION) on high band
 
     Args:
         weight_l1: Weight for L1 loss (default: 1.0)
         weight_wavelet: Weight for wavelet loss (default: 3.0)
         weight_spectral: Weight for spectral loss (default: 5.0)
+        weight_high_spectral: Weight for high-band spectral loss (default: 10.0)
+        weight_high_corr: Weight for high-band correlation loss (default: 5.0)
         lambda_low: Weight for low-band loss (default: 0.3)
-        lambda_high: Weight for high-band loss (default: 0.3)
+        lambda_high: Weight for high-band loss (default: 1.0) - INCREASED from 0.3
         sample_rate: Sampling rate in Hz (default: 1000)
         use_wavelet_loss: Whether to use wavelet loss (default: True)
         use_spectral_loss: Whether to use spectral loss (default: True)
+        use_high_band_spectral: Whether to use dedicated high-band spectral (default: True)
     """
 
     def __init__(
@@ -704,20 +709,27 @@ class DualBandLoss(nn.Module):
         weight_l1: float = 1.0,
         weight_wavelet: float = 3.0,
         weight_spectral: float = 5.0,
+        weight_high_spectral: float = 10.0,  # Extra spectral weight for high band
+        weight_high_corr: float = 5.0,  # Correlation loss for high band
         lambda_low: float = 0.3,
-        lambda_high: float = 0.3,
+        lambda_high: float = 1.0,  # INCREASED - high band needs more attention
         sample_rate: float = 1000.0,
         use_wavelet_loss: bool = True,
         use_spectral_loss: bool = True,
+        use_high_band_spectral: bool = True,  # Dedicated high-band loss
     ):
         super().__init__()
         self.weight_l1 = weight_l1
         self.weight_wavelet = weight_wavelet
         self.weight_spectral = weight_spectral
+        self.weight_high_spectral = weight_high_spectral
+        self.weight_high_corr = weight_high_corr
         self.lambda_low = lambda_low
         self.lambda_high = lambda_high
         self.use_wavelet_loss = use_wavelet_loss
         self.use_spectral_loss = use_spectral_loss
+        self.use_high_band_spectral = use_high_band_spectral
+        self.sample_rate = sample_rate
 
         # Build proper loss functions from models.py
         if use_wavelet_loss:
@@ -725,6 +737,7 @@ class DualBandLoss(nn.Module):
         else:
             self.wavelet_loss = None
 
+        # Full-band spectral loss
         if use_spectral_loss:
             self.spectral_loss = HighFrequencySpectralLoss(
                 sample_rate=sample_rate,
@@ -735,6 +748,64 @@ class DualBandLoss(nn.Module):
             )
         else:
             self.spectral_loss = None
+
+        # Dedicated HIGH-FREQUENCY spectral loss (30-100 Hz focus)
+        if use_high_band_spectral:
+            self.high_spectral_loss = HighFrequencySpectralLoss(
+                sample_rate=sample_rate,
+                low_freq_cutoff=30.0,  # Focus on 30+ Hz
+                high_freq_boost=3.0,   # Boost high frequencies
+                max_freq=100.0,
+                use_log_psd=True,
+            )
+        else:
+            self.high_spectral_loss = None
+
+    def _correlation_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute negative correlation loss (amplitude-invariant).
+
+        This is CRITICAL for high-frequency signals where amplitude varies
+        but we want to match the waveform shape.
+
+        Returns: 1 - mean_correlation (so lower is better, 0 = perfect correlation)
+        """
+        # pred, target: [B, C, T]
+        B, C, T = pred.shape
+
+        # Flatten B, C -> [B*C, T]
+        pred_flat = pred.reshape(B * C, T).float()
+        target_flat = target.reshape(B * C, T).float()
+
+        # Center (remove mean)
+        pred_centered = pred_flat - pred_flat.mean(dim=1, keepdim=True)
+        target_centered = target_flat - target_flat.mean(dim=1, keepdim=True)
+
+        # Compute correlation coefficient
+        pred_std = pred_centered.std(dim=1, keepdim=True).clamp(min=1e-6)
+        target_std = target_centered.std(dim=1, keepdim=True).clamp(min=1e-6)
+
+        pred_norm = pred_centered / pred_std
+        target_norm = target_centered / target_std
+
+        # Correlation = mean of element-wise product of normalized signals
+        corr = (pred_norm * target_norm).mean(dim=1)  # [B*C]
+
+        # Clamp to valid range and handle NaN
+        corr = torch.clamp(corr, -1.0, 1.0)
+        corr = torch.where(torch.isnan(corr), torch.zeros_like(corr), corr)
+
+        # Return 1 - corr so that minimizing loss maximizes correlation
+        return (1.0 - corr.mean()).to(pred.dtype)
+
+    def _relative_l1_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute scale-invariant L1 loss.
+
+        For high-frequency signals, we normalize by target magnitude to prevent
+        low-amplitude signals from being ignored.
+        """
+        # Normalize by target RMS to make loss scale-invariant
+        target_rms = target.pow(2).mean().sqrt().clamp(min=1e-6)
+        return F.l1_loss(pred / target_rms, target / target_rms)
 
     def _batched_l1_loss(
         self,
@@ -855,6 +926,9 @@ class DualBandLoss(nn.Module):
     ) -> Tuple[torch.Tensor, dict]:
         """Compute combined dual-band loss with optimized batched computation.
 
+        CRITICAL for high-band: Includes dedicated spectral + correlation losses
+        that are amplitude-invariant and frequency-aware.
+
         Args:
             pred: Full reconstructed prediction [B, C, T]
             target: Full target [B, C, T]
@@ -881,29 +955,52 @@ class DualBandLoss(nn.Module):
         else:
             wav_full = wav_low = wav_high = pred.new_tensor(0.0)
 
-        # ==== Spectral loss (only on full signal) ====
+        # ==== Spectral loss (on full signal) ====
         if self.spectral_loss is not None:
             spec_full = self.spectral_loss(pred, target)
         else:
             spec_full = pred.new_tensor(0.0)
 
+        # ==== CRITICAL: High-band specific losses ====
+        # These are essential for learning 30-100 Hz content which has lower amplitude
+
+        # High-band spectral loss (focused on 30-100 Hz)
+        if self.high_spectral_loss is not None:
+            spec_high = self.high_spectral_loss(pred_high, target_high)
+        else:
+            spec_high = pred.new_tensor(0.0)
+
+        # High-band correlation loss (amplitude-invariant - crucial!)
+        corr_high = self._correlation_loss(pred_high, target_high)
+
         # ==== Combine losses ====
-        loss_full = self.weight_l1 * l1_full + self.weight_wavelet * wav_full + self.weight_spectral * spec_full
+        loss_full = (self.weight_l1 * l1_full +
+                     self.weight_wavelet * wav_full +
+                     self.weight_spectral * spec_full)
+
         loss_low = self.weight_l1 * l1_low + self.weight_wavelet * wav_low
-        loss_high = self.weight_l1 * l1_high + self.weight_wavelet * wav_high
+
+        # High-band gets EXTRA losses for spectral matching and correlation
+        loss_high = (self.weight_l1 * l1_high +
+                     self.weight_wavelet * wav_high +
+                     self.weight_high_spectral * spec_high +
+                     self.weight_high_corr * corr_high)
 
         total_loss = loss_full + self.lambda_low * loss_low + self.lambda_high * loss_high
 
-        # Build loss dict - use .item() only for logging (causes GPU sync)
+        # CRITICAL: Return tensors, NOT .item() - .item() causes GPU sync and kills performance!
+        # Call .item() only at epoch end for logging, not every batch
         loss_dict = {
-            'loss_total': total_loss.item(),
-            'l1_full': l1_full.item(),
-            'l1_low': l1_low.item(),
-            'l1_high': l1_high.item(),
-            'wav_full': wav_full.item() if self.wavelet_loss is not None else 0.0,
-            'wav_low': wav_low.item() if self.wavelet_loss is not None else 0.0,
-            'wav_high': wav_high.item() if self.wavelet_loss is not None else 0.0,
-            'spec_full': spec_full.item() if self.spectral_loss is not None else 0.0,
+            'loss_total': total_loss.detach(),
+            'l1_full': l1_full.detach(),
+            'l1_low': l1_low.detach(),
+            'l1_high': l1_high.detach(),
+            'wav_full': wav_full.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_low': wav_low.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'wav_high': wav_high.detach() if self.wavelet_loss is not None else pred.new_tensor(0.0),
+            'spec_full': spec_full.detach() if self.spectral_loss is not None else pred.new_tensor(0.0),
+            'spec_high': spec_high.detach() if self.high_spectral_loss is not None else pred.new_tensor(0.0),
+            'corr_high': corr_high.detach(),
         }
 
         return total_loss, loss_dict
