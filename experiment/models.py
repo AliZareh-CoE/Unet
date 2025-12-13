@@ -1359,6 +1359,169 @@ class OptimalSpectralBias(nn.Module):
         )
 
 
+# =============================================================================
+# Envelope Histogram Matching (Closed-form amplitude dynamics correction)
+# =============================================================================
+
+class EnvelopeHistogramMatching(nn.Module):
+    """Closed-form envelope scaling correction (mean/std matching).
+
+    NOTE: Full histogram matching DESTROYS temporal structure because it's a
+    global statistical operation - it matches amplitude distributions without
+    considering WHEN amplitudes occur. This breaks the signal!
+
+    Instead, we use simple MEAN/STD SCALING which:
+    1. Preserves temporal structure (peaks stay at same times)
+    2. Adjusts overall amplitude scale to match target statistics
+
+    The correction is:
+        corrected = (pred_envelope - pred_mean) * (target_std / pred_std) + target_mean
+
+    This is a linear transformation that preserves the SHAPE of the envelope
+    while matching its mean and variability to the target.
+
+    Usage:
+        matcher = EnvelopeHistogramMatching()
+        # Compute target statistics from training data
+        matcher.fit(target_signals, odor_ids)
+        # Apply correction during inference
+        corrected = matcher(pred, odor_ids)
+    """
+
+    def __init__(
+        self,
+        n_odors: int = NUM_ODORS,
+    ):
+        super().__init__()
+        self.n_odors = n_odors
+
+        # Store target envelope mean/std per odor [n_odors]
+        # These are computed from target data via fit()
+        self.register_buffer('target_mean', torch.zeros(n_odors))
+        self.register_buffer('target_std', torch.ones(n_odors))
+        self.register_buffer('fitted', torch.tensor(False))
+
+    @torch.no_grad()
+    def fit(
+        self,
+        targets: torch.Tensor,
+        odor_ids: torch.Tensor,
+    ) -> None:
+        """Compute target envelope mean/std from data.
+
+        Args:
+            targets: Target signals [N, C, T]
+            odor_ids: Odor indices [N]
+        """
+        device = targets.device
+        N, C, T = targets.shape
+
+        # Compute envelope for all targets
+        targets_flat = targets.view(N * C, T).float()
+        analytic = hilbert_torch(targets_flat)
+        envelope = analytic.abs()  # [N*C, T]
+
+        # Compute mean/std per odor
+        for odor in range(self.n_odors):
+            # Get all samples for this odor
+            mask = (odor_ids == odor)
+            if not mask.any():
+                continue
+
+            # Expand mask to match flattened shape
+            mask_expanded = mask.unsqueeze(1).expand(-1, C).reshape(-1)
+            odor_envelope = envelope[mask_expanded]  # [n_samples * C, T]
+
+            # Compute mean and std of all envelope values for this odor
+            self.target_mean[odor] = odor_envelope.mean()
+            self.target_std[odor] = odor_envelope.std().clamp(min=1e-6)
+
+        self.fitted.fill_(True)
+        print(f"EnvelopeScaling fitted: mean=[{self.target_mean.min():.3f}, {self.target_mean.max():.3f}], "
+              f"std=[{self.target_std.min():.3f}, {self.target_std.max():.3f}]")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        odor_ids: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply envelope mean/std scaling (preserves temporal structure).
+
+        Args:
+            x: Input signal [B, C, T]
+            odor_ids: Odor indices [B]
+            target: If provided, use target's envelope stats directly
+
+        Returns:
+            Signal with scaled envelope [B, C, T]
+        """
+        if not self.fitted and target is None:
+            # Not fitted and no target provided - return input unchanged
+            return x
+
+        B, C, T = x.shape
+        device = x.device
+        original_dtype = x.dtype
+
+        # Work in float32
+        x_float = x.float()
+
+        # Compute analytic signal
+        x_flat = x_float.view(B * C, T)
+        analytic = hilbert_torch(x_flat)
+        envelope = analytic.abs()  # [B*C, T]
+        phase = analytic.angle()  # [B*C, T]
+
+        # Scale envelope for each sample
+        corrected_envelope = torch.zeros_like(envelope)
+
+        for b in range(B):
+            odor = odor_ids[b].item()
+            start_idx = b * C
+            end_idx = (b + 1) * C
+
+            pred_env = envelope[start_idx:end_idx]  # [C, T]
+
+            # Compute prediction envelope stats
+            pred_mean = pred_env.mean()
+            pred_std = pred_env.std().clamp(min=1e-6)
+
+            if target is not None:
+                # Use target's envelope stats directly
+                target_flat = target[b].float()  # [C, T]
+                target_analytic = hilbert_torch(target_flat)
+                target_env = target_analytic.abs()
+                tgt_mean = target_env.mean()
+                tgt_std = target_env.std().clamp(min=1e-6)
+            else:
+                # Use stored stats for this odor
+                tgt_mean = self.target_mean[odor]
+                tgt_std = self.target_std[odor]
+
+            # Linear scaling: (x - mean_x) * (std_tgt / std_x) + mean_tgt
+            # This preserves temporal structure while matching mean/std
+            scale = tgt_std / pred_std
+            corrected_envelope[start_idx:end_idx] = (pred_env - pred_mean) * scale + tgt_mean
+
+        # Reconstruct signal with corrected envelope and original phase
+        # The original signal is x = Re(analytic) = envelope * cos(phase)
+        corrected_signal = corrected_envelope * torch.cos(phase)
+
+        # Reshape back
+        corrected_signal = corrected_signal.view(B, C, T)
+
+        return corrected_signal.to(original_dtype)
+
+    def extra_repr(self) -> str:
+        if self.fitted:
+            return (
+                f"n_odors={self.n_odors}, fitted=True, "
+                f"mean_range=[{self.target_mean.min():.3f}, {self.target_mean.max():.3f}], "
+                f"std_range=[{self.target_std.min():.3f}, {self.target_std.max():.3f}]"
+            )
+        return f"n_odors={self.n_odors}, fitted=False"
+
 
 # =============================================================================
 # Spectro-Temporal Auto-Conditioning Encoder
