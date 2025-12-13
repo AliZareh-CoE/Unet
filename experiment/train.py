@@ -2611,6 +2611,40 @@ def parse_args():
     parser.add_argument("--prob-loss-weight", type=float, default=1.0,
                         help="Weight for probabilistic loss (default: 1.0)")
 
+    # Loss toggles (for ablation experiments)
+    parser.add_argument("--use-l1-loss", action="store_true", default=None,
+                        help="Enable time-domain L1/Huber loss")
+    parser.add_argument("--no-l1-loss", action="store_true",
+                        help="Disable time-domain L1/Huber loss")
+    parser.add_argument("--use-wavelet-loss", action="store_true", default=None,
+                        help="Enable wavelet loss")
+    parser.add_argument("--no-wavelet-loss", action="store_true",
+                        help="Disable wavelet loss")
+    parser.add_argument("--use-spectral-loss", action="store_true", default=None,
+                        help="Enable spectral (PSD) loss")
+    parser.add_argument("--no-spectral-loss", action="store_true",
+                        help="Disable spectral loss")
+    parser.add_argument("--use-freq-l1-loss", action="store_true", default=None,
+                        help="Enable frequency-weighted L1 loss")
+    parser.add_argument("--no-freq-l1-loss", action="store_true",
+                        help="Disable frequency-weighted L1 loss")
+
+    # Frequency scaling options
+    parser.add_argument("--spectral-freq-scaling", type=str, default=None,
+                        choices=["none", "linear", "log", "power", "focal"],
+                        help="Frequency scaling mode for spectral loss")
+    parser.add_argument("--freq-l1-scaling", type=str, default=None,
+                        choices=["none", "linear", "log", "power"],
+                        help="Frequency scaling mode for freq-weighted L1 loss")
+    parser.add_argument("--power-exponent", type=float, default=None,
+                        help="Power exponent for frequency scaling (both spectral and freq-l1)")
+    parser.add_argument("--freq-l1-use-phase", action="store_true",
+                        help="Enable phase penalty in frequency-weighted L1 loss")
+
+    # Model architecture
+    parser.add_argument("--n-downsample", type=int, default=None,
+                        help="Number of downsample levels in UNet (default: 4)")
+
     return parser.parse_args()
 
 
@@ -2772,6 +2806,51 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
+
+    # Loss toggles (for ablation experiments)
+    if args.no_l1_loss:
+        config["use_l1_loss"] = False
+    elif args.use_l1_loss:
+        config["use_l1_loss"] = True
+
+    if args.no_wavelet_loss:
+        config["use_wavelet_loss"] = False
+    elif args.use_wavelet_loss:
+        config["use_wavelet_loss"] = True
+
+    if args.no_spectral_loss:
+        config["use_spectral_loss"] = False
+    elif args.use_spectral_loss:
+        config["use_spectral_loss"] = True
+
+    if args.no_freq_l1_loss:
+        config["use_freq_l1_loss"] = False
+    elif args.use_freq_l1_loss:
+        config["use_freq_l1_loss"] = True
+
+    # Frequency scaling options
+    if args.spectral_freq_scaling is not None:
+        config["spectral_freq_scaling"] = args.spectral_freq_scaling
+    if args.freq_l1_scaling is not None:
+        config["freq_l1_scaling"] = args.freq_l1_scaling
+    if args.power_exponent is not None:
+        config["spectral_power_exponent"] = args.power_exponent
+        config["freq_l1_power_exponent"] = args.power_exponent
+    if args.freq_l1_use_phase:
+        config["freq_l1_use_phase"] = True
+
+    # Model architecture
+    if args.n_downsample is not None:
+        config["n_downsample"] = args.n_downsample
+
+    # Print loss configuration
+    if is_primary():
+        print(f"Loss config: L1={config.get('use_l1_loss', True)}, Wavelet={config.get('use_wavelet_loss', True)}, "
+              f"Spectral={config.get('use_spectral_loss', True)}, FreqL1={config.get('use_freq_l1_loss', True)}")
+        if config.get('use_spectral_loss', True):
+            print(f"  Spectral scaling: {config.get('spectral_freq_scaling', 'power')}")
+        if config.get('use_freq_l1_loss', True):
+            print(f"  FreqL1 scaling: {config.get('freq_l1_scaling', 'power')}, phase={config.get('freq_l1_use_phase', False)}")
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
