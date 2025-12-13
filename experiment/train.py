@@ -61,6 +61,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.distribute
 from models import (
     CondUNet1D,
     HighFrequencySpectralLoss,
+    FrequencyWeightedL1Loss,
     build_wavelet_loss,
     pearson_batch,
     explained_variance_torch,
@@ -173,9 +174,15 @@ DEFAULT_CONFIG = {
     "wavelet_omega0": 3.0,
     "use_complex_morlet": False,
 
-    # Loss toggles (set False to disable)
-    "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
-    "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
+    # ===========================================
+    # LOSS TOGGLES (set False to disable any loss)
+    # ===========================================
+    "use_l1_loss": True,         # Time-domain L1/Huber loss (waveform matching)
+    "use_wavelet_loss": True,    # Time-frequency matching (Morlet wavelet decomposition)
+    "use_spectral_loss": True,   # PSD matching (log-domain spectral loss)
+    "use_freq_l1_loss": True,    # Frequency-weighted L1 (Gemini 2.5 suggestion)
+
+    # Spectral loss affects UNet gradients
     "spectral_affects_unet": True,  # If True, spectral loss gradients flow to UNet (no detach)
 
     # Spectral loss frequency scaling (addresses spectral bias in neural networks)
@@ -184,6 +191,14 @@ DEFAULT_CONFIG = {
     "spectral_scaling_factor": 2.0,    # For linear/log modes: how much to boost high freq
     "spectral_power_exponent": 1.0,    # For power mode: compensates 1/f spectrum (1.0 = full compensation)
     "spectral_focal_gamma": 2.0,       # For focal mode: higher = more focus on errors
+
+    # Frequency-weighted L1 loss settings (same scaling options as spectral loss)
+    "freq_l1_scaling": "power",        # "none", "linear", "log", "power"
+    "freq_l1_scaling_factor": 2.0,     # For linear/log modes
+    "freq_l1_power_exponent": 1.0,     # For power mode
+    "freq_l1_use_phase": False,        # Also penalize phase differences
+    "freq_l1_phase_weight": 0.1,       # Weight for phase loss if enabled
+    "weight_freq_l1": 1.0,             # Weight for frequency L1 in total loss
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -1043,6 +1058,7 @@ def train_epoch(
     config: Dict[str, Any],
     wavelet_loss: Optional[nn.Module] = None,
     spectral_loss: Optional[nn.Module] = None,
+    freq_l1_loss: Optional[nn.Module] = None,
     reverse_model: Optional[nn.Module] = None,
     epoch: int = 0,
     num_epochs: int = 0,
@@ -1176,18 +1192,28 @@ def train_epoch(
             # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
             # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
             loss_type = config.get("loss_type", "huber_wavelet")
-            if loss_type in ("huber", "huber_wavelet"):
-                recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
+            # Time-domain L1/Huber loss (forward) - can be toggled off
+            if config.get("use_l1_loss", True):
+                if loss_type in ("huber", "huber_wavelet"):
+                    recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
+                else:
+                    recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
+                loss = recon_loss
+                loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
             else:
-                recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
-            loss = recon_loss
-            loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             # Wavelet loss (forward) - uses pred_raw (no SpectralShift gradient)
             if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
                 w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
                 loss = loss + w_loss
                 loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
+
+            # Frequency-weighted L1 loss (forward) - helps with high-frequency learning
+            if config.get("use_freq_l1_loss", True) and freq_l1_loss is not None:
+                freq_l1 = config.get("weight_freq_l1", 1.0) * freq_l1_loss(pred_raw_c, pcx_c)
+                loss = loss + freq_l1
+                loss_components["freq_l1_fwd"] = loss_components["freq_l1_fwd"] + freq_l1.detach()
 
             # Spectral loss (forward) - DISABLED in Stage 1, enabled in joint training
             # uses pred_shifted (SpectralShift DOES get gradients here)
@@ -1241,19 +1267,27 @@ def train_epoch(
             else:
                 # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
                 # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
+                # Time-domain L1/Huber loss (reverse) - can be toggled off
                 loss_type = config.get("loss_type", "huber_wavelet")
-                if loss_type in ("huber", "huber_wavelet"):
-                    rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
-                else:
-                    rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
-                loss = loss + rev_loss
-                loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
+                if config.get("use_l1_loss", True):
+                    if loss_type in ("huber", "huber_wavelet"):
+                        rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
+                    else:
+                        rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
+                    loss = loss + rev_loss
+                    loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
 
                 # Wavelet loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
                 if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
                     w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
                     loss = loss + w_loss_rev
                     loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
+
+                # Frequency-weighted L1 loss (reverse) - helps with high-frequency learning
+                if config.get("use_freq_l1_loss", True) and freq_l1_loss is not None:
+                    freq_l1_rev = config.get("weight_freq_l1", 1.0) * freq_l1_loss(pred_rev_raw_c, ob_c)
+                    loss = loss + freq_l1_rev
+                    loss_components["freq_l1_rev"] = loss_components["freq_l1_rev"] + freq_l1_rev.detach()
 
                 # Spectral loss (reverse) - DISABLED in Stage 1, enabled in joint training
                 # uses pred_rev_shifted (SpectralShift DOES get gradients)
@@ -1634,6 +1668,22 @@ def train(
         if is_primary():
             print(f"Spectral loss frequency scaling: {freq_scaling}")
 
+    # Frequency-weighted L1 loss (Gemini 2.5 suggestion)
+    freq_l1_loss = None
+    if config.get("use_freq_l1_loss", True):
+        freq_l1_scaling = config.get("freq_l1_scaling", "power")
+        freq_l1_loss = FrequencyWeightedL1Loss(
+            sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+            max_freq=MAX_FREQ_HZ,
+            freq_scaling=freq_l1_scaling,
+            scaling_factor=config.get("freq_l1_scaling_factor", 2.0),
+            power_exponent=config.get("freq_l1_power_exponent", 1.0),
+            use_phase=config.get("freq_l1_use_phase", False),
+            phase_weight=config.get("freq_l1_phase_weight", 0.1),
+        ).to(device)
+        if is_primary():
+            phase_str = " + phase" if config.get("freq_l1_use_phase", False) else ""
+            print(f"Frequency-weighted L1 loss: scaling={freq_l1_scaling}{phase_str}")
 
     # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
     prob_loss = None
@@ -1788,7 +1838,7 @@ def train(
 
             train_metrics = train_epoch(
                 model, loaders["train"], optimizer, device, config,
-                wavelet_loss, spectral_loss,
+                wavelet_loss, spectral_loss, freq_l1_loss,
                 reverse_model, epoch, num_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
