@@ -695,6 +695,282 @@ class MultiScaleDilatedConv1d(nn.Module):
         return torch.einsum('n,nbct->bct', weights, branch_outputs)
 
 
+# =============================================================================
+# Inception-Style Multi-Kernel Convolutions
+# =============================================================================
+
+class InceptionConv1d(nn.Module):
+    """Inception-style multi-kernel convolution for neural signals.
+
+    Uses parallel convolution branches with DIFFERENT kernel sizes to capture
+    features at multiple temporal scales simultaneously. Each kernel size
+    can optionally have its own dilation rate.
+
+    This is inspired by GoogLeNet/Inception but adapted for 1D neural signals:
+    - k=3: Captures sharp transients, fast gamma bursts (30-100 Hz)
+    - k=5: Captures medium-scale patterns, beta rhythms (12-30 Hz)
+    - k=7: Captures broader patterns, alpha/theta waves (4-12 Hz)
+
+    Args:
+        in_channels: Input channels
+        out_channels: Output channels
+        kernel_sizes: Tuple of kernel sizes for each branch (default: (3, 5, 7))
+        dilations: Tuple of dilation rates per kernel (default: (1, 1, 1))
+                   Can also be a single int applied to all kernels
+        stride: Stride for downsampling (applied to all branches)
+        reduction_ratio: Channel reduction in branches (default: 4)
+                        Set to 1 for no reduction (more params but more expressive)
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_sizes: Tuple[int, ...] = (3, 5, 7),
+        dilations: Union[Tuple[int, ...], int] = (1, 1, 1),
+        stride: int = 1,
+        reduction_ratio: int = 1,
+    ):
+        super().__init__()
+        self.n_branches = len(kernel_sizes)
+
+        # Handle single dilation value
+        if isinstance(dilations, int):
+            dilations = tuple([dilations] * self.n_branches)
+        assert len(dilations) == self.n_branches, "dilations must match kernel_sizes length"
+
+        # Compute channels per branch
+        # Each branch outputs out_channels, then we combine via learned weights
+        branch_channels = max(out_channels // reduction_ratio, 16)
+
+        # Build parallel branches with different kernel sizes
+        self.branches = nn.ModuleList()
+        for k, d in zip(kernel_sizes, dilations):
+            padding = (k - 1) * d // 2
+            self.branches.append(
+                nn.Conv1d(
+                    in_channels, out_channels,
+                    kernel_size=k,
+                    stride=stride,
+                    padding=padding,
+                    dilation=d,
+                    bias=True,
+                )
+            )
+
+        # Learnable branch weights (softmax-normalized)
+        self.branch_weights = nn.Parameter(torch.ones(self.n_branches) / self.n_branches)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute softmax weights
+        weights = F.softmax(self.branch_weights, dim=0)
+
+        # Stack branch outputs and weighted sum
+        branch_outputs = torch.stack([b(x) for b in self.branches], dim=0)  # [n_branches, B, C, T]
+        return torch.einsum('n,nbct->bct', weights, branch_outputs)
+
+
+class InceptionDilatedConv1d(nn.Module):
+    """Inception + Dilation: Multi-kernel with multi-dilation for maximum coverage.
+
+    Combines the Inception approach (multiple kernel sizes) with multi-scale
+    dilations for comprehensive temporal pattern capture.
+
+    Creates a grid of (kernel_size, dilation) combinations:
+    - (k=3, d=1), (k=3, d=4), (k=3, d=8)   -> fine-grained multi-scale
+    - (k=5, d=1), (k=5, d=4), (k=5, d=8)   -> medium multi-scale
+    - (k=7, d=1), (k=7, d=4), (k=7, d=8)   -> broad multi-scale
+
+    Args:
+        in_channels: Input channels
+        out_channels: Output channels
+        kernel_sizes: Tuple of kernel sizes (default: (3, 5, 7))
+        dilations: Tuple of dilation rates applied to EACH kernel (default: (1, 4))
+        stride: Stride for downsampling
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_sizes: Tuple[int, ...] = (3, 5, 7),
+        dilations: Tuple[int, ...] = (1, 4),
+        stride: int = 1,
+    ):
+        super().__init__()
+        self.kernel_sizes = kernel_sizes
+        self.dilations = dilations
+        self.n_branches = len(kernel_sizes) * len(dilations)
+
+        # Build grid of (kernel, dilation) branches
+        self.branches = nn.ModuleList()
+        for k in kernel_sizes:
+            for d in dilations:
+                padding = (k - 1) * d // 2
+                self.branches.append(
+                    nn.Conv1d(
+                        in_channels, out_channels,
+                        kernel_size=k,
+                        stride=stride,
+                        padding=padding,
+                        dilation=d,
+                        bias=True,
+                    )
+                )
+
+        # Learnable branch weights
+        self.branch_weights = nn.Parameter(torch.ones(self.n_branches) / self.n_branches)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weights = F.softmax(self.branch_weights, dim=0)
+        branch_outputs = torch.stack([b(x) for b in self.branches], dim=0)
+        return torch.einsum('n,nbct->bct', weights, branch_outputs)
+
+
+class InceptionBlock(nn.Module):
+    """Inception-style convolution block with SE attention and FiLM conditioning.
+
+    Drop-in replacement for ModernConvBlock using Inception multi-kernel approach.
+
+    Architecture:
+        Input -> InceptionConv -> Norm -> GELU -> [SE] -> [Dropout] -> FiLM -> Output
+
+    Args:
+        in_c: Input channels
+        out_c: Output channels
+        emb_dim: Embedding dimension for FiLM
+        downsample: If True, use stride=2 for downsampling
+        dropout: Dropout probability
+        norm_type: Normalization type ("instance", "batch", "group")
+        cond_mode: FiLM conditioning mode
+        use_se: Whether to use SE attention (default: True)
+        kernel_sizes: Tuple of kernel sizes for Inception branches (default: (3, 5, 7))
+        dilations: Dilation rates per kernel or for grid (default: (1, 1, 1))
+        use_dilation_grid: If True, use InceptionDilatedConv1d (kernel x dilation grid)
+    """
+    def __init__(
+        self,
+        in_c: int,
+        out_c: int,
+        emb_dim: int,
+        downsample: bool = False,
+        dropout: float = 0.0,
+        norm_type: str = "instance",
+        cond_mode: str = "cross_attn_gated",
+        use_se: bool = True,
+        kernel_sizes: Tuple[int, ...] = (3, 5, 7),
+        dilations: Tuple[int, ...] = (1, 1, 1),
+        use_dilation_grid: bool = False,
+    ):
+        super().__init__()
+        stride = 2 if downsample else 1
+        self.use_se = use_se
+
+        # Build normalization
+        if norm_type == "instance":
+            norm = nn.InstanceNorm1d(out_c, affine=True)
+        elif norm_type == "batch":
+            norm = nn.BatchNorm1d(out_c)
+        elif norm_type == "group":
+            num_groups = min(8, out_c)
+            while out_c % num_groups != 0:
+                num_groups -= 1
+            norm = nn.GroupNorm(num_groups, out_c)
+        else:
+            raise ValueError(f"Unknown norm_type: {norm_type}")
+
+        # Inception convolution (multi-kernel)
+        if use_dilation_grid:
+            conv = InceptionDilatedConv1d(
+                in_c, out_c,
+                kernel_sizes=kernel_sizes,
+                dilations=dilations,
+                stride=stride,
+            )
+        else:
+            conv = InceptionConv1d(
+                in_c, out_c,
+                kernel_sizes=kernel_sizes,
+                dilations=dilations,
+                stride=stride,
+            )
+
+        layers = [conv, norm, nn.GELU()]
+
+        # Add SE attention for electrode correlation modeling
+        if self.use_se:
+            layers.append(SqueezeExcitation1D(out_c))
+
+        if dropout > 0:
+            layers.append(nn.Dropout1d(p=dropout))
+
+        self.conv = nn.Sequential(*layers)
+        self.film = FiLM(out_c, emb_dim, cond_mode=cond_mode)
+
+    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.film(self.conv(x), emb)
+
+
+class InceptionUpBlock(nn.Module):
+    """Upsampling block with Inception convolutions.
+
+    Uses ConvTranspose1d for upsampling, then InceptionBlock for refinement.
+
+    Args:
+        in_c: Input channels
+        skip_c: Skip connection channels
+        out_c: Output channels
+        emb_dim: Embedding dimension for FiLM
+        dropout: Dropout probability
+        norm_type: Normalization type
+        cond_mode: FiLM conditioning mode
+        use_se: Whether to use SE attention
+        kernel_sizes: Kernel sizes for Inception branches
+        dilations: Dilation rates
+        use_dilation_grid: If True, use kernel x dilation grid
+    """
+    def __init__(
+        self,
+        in_c: int,
+        skip_c: int,
+        out_c: int,
+        emb_dim: int,
+        dropout: float = 0.0,
+        norm_type: str = "instance",
+        cond_mode: str = "cross_attn_gated",
+        use_se: bool = True,
+        kernel_sizes: Tuple[int, ...] = (3, 5, 7),
+        dilations: Tuple[int, ...] = (1, 1, 1),
+        use_dilation_grid: bool = False,
+    ):
+        super().__init__()
+        self.up = nn.ConvTranspose1d(in_c, out_c, kernel_size=4, stride=2, padding=1)
+        self.block = InceptionBlock(
+            out_c + skip_c, out_c, emb_dim,
+            downsample=False,
+            dropout=dropout,
+            norm_type=norm_type,
+            cond_mode=cond_mode,
+            use_se=use_se,
+            kernel_sizes=kernel_sizes,
+            dilations=dilations,
+            use_dilation_grid=use_dilation_grid,
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.up(x)
+        # Handle size mismatches from convolutions
+        if x.shape[-1] != skip.shape[-1]:
+            if x.shape[-1] < skip.shape[-1]:
+                diff = skip.shape[-1] - x.shape[-1]
+                start = diff // 2
+                skip = skip[..., start : start + x.shape[-1]]
+            else:
+                diff = x.shape[-1] - skip.shape[-1]
+                start = diff // 2
+                x = x[..., start : start + skip.shape[-1]]
+        x = torch.cat([x, skip], dim=1)
+        return self.block(x, emb)
+
+
 class ModernConvBlock(nn.Module):
     """Modern convolution block with multi-scale dilated convolutions and SE attention.
 
@@ -3354,6 +3630,7 @@ class CondUNet1D(nn.Module):
     - Multi-scale skip connections for detail preservation
     - SpectralShiftBlock for learnable per-channel PSD correction
     - Modern convolutions (multi-scale dilated depthwise separable + SE attention)
+    - Inception convolutions (multi-kernel parallel branches)
     - Configurable depth (n_downsample) to control frequency resolution
 
     Frequency Resolution:
@@ -3369,7 +3646,8 @@ class CondUNet1D(nn.Module):
 
     Convolution types:
     - "standard": Original Conv1d(kernel_size=3) - backward compatible
-    - "modern": Multi-scale dilated depthwise separable + SE attention
+    - "modern": Multi-scale dilated convolutions with single kernel size + SE attention
+    - "inception": Multi-kernel parallel branches (k=3,5,7) + SE attention
     """
     def __init__(
         self,
@@ -3387,10 +3665,13 @@ class CondUNet1D(nn.Module):
         # Depth control for frequency resolution
         n_downsample: int = 2,  # 2 = 4x downsample (125 Hz Nyquist), 4 = 16x (31 Hz)
         # Modern convolution options
-        conv_type: str = "standard",  # "standard" or "modern"
-        use_se: bool = True,  # SE attention in conv blocks (only for modern)
-        conv_kernel_size: int = 7,  # Kernel size for modern convs
-        dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
+        conv_type: str = "standard",  # "standard", "modern", or "inception"
+        use_se: bool = True,  # SE attention in conv blocks (only for modern/inception)
+        conv_kernel_size: int = 7,  # Kernel size for modern convs (ignored for inception)
+        dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates (for modern)
+        # Inception-specific options
+        kernel_sizes: Tuple[int, ...] = (3, 5, 7),  # Kernel sizes for Inception branches
+        use_dilation_grid: bool = False,  # If True, use kernel x dilation grid (Inception+Dilation)
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
     ):
@@ -3414,20 +3695,45 @@ class CondUNet1D(nn.Module):
             channels.append(min(base * (2 ** (i + 1)), base * 8))
         
         # Build encoder and decoder as ModuleList for variable depth
-        if conv_type == "modern":
+        if conv_type == "inception":
+            # Inception: multi-kernel parallel branches (k=3,5,7)
+            conv_kwargs = dict(
+                use_se=use_se,
+                kernel_sizes=kernel_sizes,
+                dilations=dilations if use_dilation_grid else tuple([1] * len(kernel_sizes)),
+                use_dilation_grid=use_dilation_grid,
+            )
+            self.inc = InceptionBlock(in_channels, channels[0], emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
+
+            self.encoders = nn.ModuleList()
+            for i in range(n_downsample):
+                self.encoders.append(
+                    InceptionBlock(channels[i], channels[i+1], emb_dim, downsample=True, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
+                )
+
+            self.decoders = nn.ModuleList()
+            for i in range(n_downsample):
+                dec_in = channels[n_downsample - i]
+                skip_in = channels[n_downsample - i - 1]
+                dec_out = channels[n_downsample - i - 1]
+                self.decoders.append(
+                    InceptionUpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
+                )
+        elif conv_type == "modern":
+            # Modern: multi-scale dilated convolutions with single kernel size
             conv_kwargs = dict(
                 use_se=use_se,
                 kernel_size=conv_kernel_size,
                 dilations=dilations,
             )
             self.inc = ModernConvBlock(in_channels, channels[0], emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
-            
+
             self.encoders = nn.ModuleList()
             for i in range(n_downsample):
                 self.encoders.append(
                     ModernConvBlock(channels[i], channels[i+1], emb_dim, downsample=True, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
                 )
-            
+
             self.decoders = nn.ModuleList()
             for i in range(n_downsample):
                 # Decoder goes in reverse: channels[n] -> channels[n-1]

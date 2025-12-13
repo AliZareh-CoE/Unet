@@ -159,11 +159,17 @@ DEFAULT_CONFIG = {
     # n_downsample=4: 16x downsample → 31 Hz Nyquist (default)
     "n_downsample": 4,
 
-    # Modern convolutions (for improved correlation in Stage 1)
-    "conv_type": "modern",  # "standard" (Conv1d k=3) or "modern" (multi-scale dilated depthwise sep + SE)
-    "use_se": True,  # SE channel attention in modern conv blocks
-    "conv_kernel_size": 7,  # Kernel size for modern convs (ConvNeXt-style)
-    "conv_dilations": (1, 4, 16, 32),  # Multi-scale dilation rates tuned for LFP bands
+    # Convolution type options:
+    # - "standard": Original Conv1d(kernel_size=3) - backward compatible
+    # - "modern": Multi-scale dilated convolutions with single kernel size + SE attention
+    # - "inception": Multi-kernel parallel branches (k=3,5,7) + SE attention
+    "conv_type": "inception",  # Use Inception for best multi-scale capture
+    "use_se": True,  # SE channel attention in modern/inception conv blocks
+    "conv_kernel_size": 7,  # Kernel size for modern convs (ignored for inception)
+    "conv_dilations": (1, 4, 16, 32),  # Multi-scale dilation rates (for modern or inception+dilation_grid)
+    # Inception-specific options
+    "kernel_sizes": (3, 5, 7),  # Kernel sizes for Inception branches
+    "use_dilation_grid": False,  # If True, use kernel x dilation grid (more params, more expressive)
 
     # Wavelet loss configuration
     "wavelet_family": "morlet",
@@ -1567,11 +1573,14 @@ def train(
         use_spectral_shift=config.get("use_spectral_shift", True),
         # U-Net depth for frequency resolution
         n_downsample=config.get("n_downsample", 2),
-        # Modern convolution options
+        # Convolution options (modern or inception)
         conv_type=conv_type,
         use_se=config.get("use_se", True),
         conv_kernel_size=config.get("conv_kernel_size", 7),
         dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+        # Inception-specific options
+        kernel_sizes=tuple(config.get("kernel_sizes", (3, 5, 7))),
+        use_dilation_grid=config.get("use_dilation_grid", False),
         # Output scaling correction
         use_output_scaling=config.get("use_output_scaling", True),
     )
@@ -1592,11 +1601,14 @@ def train(
             use_spectral_shift=config.get("use_spectral_shift", True),
             # U-Net depth (same as forward)
             n_downsample=config.get("n_downsample", 2),
-            # Modern convolution options (same as forward)
+            # Convolution options (same as forward)
             conv_type=conv_type,
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+            # Inception-specific options
+            kernel_sizes=tuple(config.get("kernel_sizes", (3, 5, 7))),
+            use_dilation_grid=config.get("use_dilation_grid", False),
             # Output scaling correction
             use_output_scaling=config.get("use_output_scaling", True),
         )
@@ -1604,6 +1616,8 @@ def train(
             print("Bidirectional training ENABLED")
             if conv_type == "modern":
                 print(f"Using MODERN convolutions: dilations={config.get('conv_dilations', (1, 4, 16, 32))}, kernel_size={config.get('conv_kernel_size', 7)}, SE={config.get('use_se', True)}")
+            elif conv_type == "inception":
+                print(f"Using INCEPTION convolutions: kernel_sizes={config.get('kernel_sizes', (3, 5, 7))}, dilation_grid={config.get('use_dilation_grid', False)}, SE={config.get('use_se', True)}")
 
     # Create conditioning encoder for auto-conditioning modes
     cond_source = config.get("conditioning_source", "odor_onehot")
@@ -3432,8 +3446,13 @@ def main():
         print(f"Attention type: {config['attention_type']}")
         print(f"Convolution type: {config['conv_type']}")
         if config['conv_type'] == 'modern':
-            print(f"  -> Multi-scale dilated depthwise separable + SE attention")
+            print(f"  -> Multi-scale dilated convolutions + SE attention")
             print(f"  -> Dilations: {config['conv_dilations']}, Kernel: {config['conv_kernel_size']}")
+        elif config['conv_type'] == 'inception':
+            print(f"  -> Inception multi-kernel branches + SE attention")
+            print(f"  -> Kernel sizes: {config.get('kernel_sizes', (3, 5, 7))}")
+            if config.get('use_dilation_grid', False):
+                print(f"  -> Dilation grid enabled: {config['conv_dilations']}")
         print(f"Config: {config}")
         print()
 
