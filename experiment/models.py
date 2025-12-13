@@ -2889,38 +2889,60 @@ class TemporalSmoothness(nn.Module):
         return torch.mean(d2**2)
 
 
-class HighFrequencySpectralLoss(nn.Module):
-    """Spectral loss that computes FFT-based PSD matching.
+class FrequencyWeightedL1Loss(nn.Module):
+    """Frequency-domain L1 loss with frequency-dependent weighting.
 
-    This loss computes the Power Spectral Density and applies frequency-dependent
-    weights. With low_freq_cutoff=0, it provides uniform weighting across the
-    full 0-100 Hz LFP range.
+    Unlike HighFrequencySpectralLoss which compares PSDs (power), this loss
+    compares FFT magnitudes directly with L1 loss. The frequency weighting
+    helps the model learn high-frequency content which neural networks
+    typically struggle with (spectral bias problem).
+
+    This is complementary to:
+    - Time-domain L1: Matches waveform shape
+    - Wavelet loss: Multi-scale time-frequency matching
+    - Spectral loss (PSD): Power spectrum matching
+
+    Frequency-weighted L1 directly penalizes magnitude errors at each frequency,
+    with configurable weighting to emphasize high frequencies.
 
     Args:
         sample_rate: Sampling rate in Hz (default: 1000)
-        low_freq_cutoff: Frequencies below this get weight=1, above get high_freq_boost
-                         Set to 0 for uniform weighting (default: 0)
-        high_freq_boost: Multiplicative boost for frequencies above low_freq_cutoff (default: 1.0)
         max_freq: Maximum frequency to consider (default: 100 Hz, LFP range)
-        use_log_psd: Whether to compare log-magnitude PSDs (default: True)
+        freq_scaling: Frequency scaling mode (default: "power")
+            - "none": Uniform weighting
+            - "linear": weight = 1 + (f/f_max) * scaling_factor
+            - "log": weight = 1 + log(1 + f/f_ref) * scaling_factor
+            - "power": weight = (f/f_min)^power_exponent (compensates 1/f)
+        scaling_factor: Multiplier for linear/log scaling (default: 2.0)
+        power_exponent: Exponent for power scaling (default: 1.0)
+        use_phase: Whether to also penalize phase differences (default: False)
+        phase_weight: Weight for phase loss if use_phase=True (default: 0.1)
     """
 
     def __init__(
         self,
         sample_rate: float = SAMPLING_RATE_HZ,
-        low_freq_cutoff: float = 0.0,  # No cutoff - full range
-        high_freq_boost: float = 1.0,  # Uniform weighting by default
         max_freq: float = MAX_FREQ_HZ,
-        use_log_psd: bool = True,
+        freq_scaling: str = "power",
+        scaling_factor: float = 2.0,
+        power_exponent: float = 1.0,
+        use_phase: bool = False,
+        phase_weight: float = 0.1,
     ):
         super().__init__()
         self.sample_rate = sample_rate
-        self.low_freq_cutoff = low_freq_cutoff
-        self.high_freq_boost = high_freq_boost
         self.max_freq = max_freq
-        self.use_log_psd = use_log_psd
+        self.freq_scaling = freq_scaling
+        self.scaling_factor = scaling_factor
+        self.power_exponent = power_exponent
+        self.use_phase = use_phase
+        self.phase_weight = phase_weight
         self._freq_weights = None
         self._cached_length = None
+
+        valid_modes = ("none", "linear", "log", "power")
+        if freq_scaling not in valid_modes:
+            raise ValueError(f"freq_scaling must be one of {valid_modes}, got {freq_scaling}")
 
     def _get_freq_weights(self, n_fft: int, device: torch.device) -> torch.Tensor:
         """Build frequency-dependent weights (cached for efficiency)."""
@@ -2930,20 +2952,185 @@ class HighFrequencySpectralLoss(nn.Module):
         # Frequency bins for rfft output
         freqs = torch.fft.rfftfreq(n_fft, d=1.0 / self.sample_rate)
 
-        # Weight: 1.0 for low frequencies, high_freq_boost for high frequencies
+        # Start with base weights
         weights = torch.ones_like(freqs)
-        if self.low_freq_cutoff > 0:
-            weights[freqs >= self.low_freq_cutoff] = self.high_freq_boost
 
-            # Smooth transition around cutoff (helps with gradient stability)
-            transition_width = 10.0  # Hz
-            transition_mask = (freqs >= self.low_freq_cutoff - transition_width) & (freqs < self.low_freq_cutoff)
-            if transition_mask.any():
-                t = (freqs[transition_mask] - (self.low_freq_cutoff - transition_width)) / transition_width
-                weights[transition_mask] = 1.0 + (self.high_freq_boost - 1.0) * t
+        if self.freq_scaling == "none":
+            pass  # Uniform weighting
+
+        elif self.freq_scaling == "linear":
+            weights = 1.0 + (freqs / self.max_freq) * self.scaling_factor
+
+        elif self.freq_scaling == "log":
+            f_ref = 10.0
+            weights = 1.0 + torch.log1p(freqs / f_ref) * self.scaling_factor
+
+        elif self.freq_scaling == "power":
+            f_min = 1.0
+            freqs_clamped = torch.clamp(freqs, min=f_min)
+            weights = (freqs_clamped / f_min) ** self.power_exponent
+            # Normalize to have mean ~1 for stable gradients
+            weights = weights / weights[freqs <= self.max_freq].mean().clamp(min=1e-6)
+
+        # Zero out frequencies above max_freq
+        weights[freqs > self.max_freq] = 0.0
+        # Zero out DC component
+        weights[0] = 0.0
+
+        self._freq_weights = weights
+        self._cached_length = n_fft
+        return weights.to(device)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute frequency-weighted L1 loss.
+
+        Args:
+            pred: Predicted signal [B, C, T]
+            target: Target signal [B, C, T]
+
+        Returns:
+            Scalar loss value
+        """
+        B, C, T = pred.shape
+
+        # Convert to float32 if needed (BFloat16 not supported by FFT)
+        original_dtype = pred.dtype
+        if pred.dtype in (torch.bfloat16, torch.float16):
+            pred = pred.float()
+            target = target.float()
+
+        # Compute FFT
+        pred_fft = torch.fft.rfft(pred, dim=-1)
+        target_fft = torch.fft.rfft(target, dim=-1)
+
+        # Get frequency weights
+        weights = self._get_freq_weights(T, pred.device)  # [F]
+        weights = weights.unsqueeze(0).unsqueeze(0)  # [1, 1, F]
+
+        # Compute magnitude L1 loss
+        pred_mag = torch.abs(pred_fft)
+        target_mag = torch.abs(target_fft)
+        mag_loss = (weights * torch.abs(pred_mag - target_mag)).mean()
+
+        # Optionally add phase loss
+        if self.use_phase:
+            # Phase difference with wrapping
+            pred_phase = torch.angle(pred_fft)
+            target_phase = torch.angle(target_fft)
+            # Circular phase difference
+            phase_diff = torch.abs(torch.angle(torch.exp(1j * (pred_phase - target_phase))))
+            phase_loss = (weights * phase_diff).mean()
+            total_loss = mag_loss + self.phase_weight * phase_loss
+        else:
+            total_loss = mag_loss
+
+        return total_loss.to(original_dtype)
+
+
+class HighFrequencySpectralLoss(nn.Module):
+    """Spectral loss that computes FFT-based PSD matching with frequency scaling.
+
+    This loss computes the Power Spectral Density and applies frequency-dependent
+    weights. Supports multiple scaling modes to address the spectral bias problem
+    where neural networks tend to learn low frequencies better than high frequencies.
+
+    Args:
+        sample_rate: Sampling rate in Hz (default: 1000)
+        low_freq_cutoff: Frequencies below this get weight=1, above get high_freq_boost
+                         Set to 0 for uniform weighting (default: 0)
+        high_freq_boost: Multiplicative boost for frequencies above low_freq_cutoff (default: 1.0)
+        max_freq: Maximum frequency to consider (default: 100 Hz, LFP range)
+        use_log_psd: Whether to compare log-magnitude PSDs (default: True)
+        freq_scaling: Frequency scaling mode (default: "none")
+            - "none": No frequency-dependent scaling (original behavior)
+            - "linear": weight = 1 + (f/f_max) * scaling_factor
+            - "log": weight = 1 + log(1 + f/f_ref) * scaling_factor
+            - "power": weight = (f/f_min)^power_exponent (compensates 1/f spectrum)
+            - "focal": weight = error^focal_gamma (focuses on hard frequencies)
+        scaling_factor: Multiplier for linear/log scaling (default: 2.0)
+        power_exponent: Exponent for power scaling to compensate 1/f (default: 1.0)
+        focal_gamma: Gamma for focal loss - higher = more focus on errors (default: 2.0)
+    """
+
+    def __init__(
+        self,
+        sample_rate: float = SAMPLING_RATE_HZ,
+        low_freq_cutoff: float = 0.0,  # No cutoff - full range
+        high_freq_boost: float = 1.0,  # Uniform weighting by default
+        max_freq: float = MAX_FREQ_HZ,
+        use_log_psd: bool = True,
+        freq_scaling: str = "none",  # "none", "linear", "log", "power", "focal"
+        scaling_factor: float = 2.0,  # For linear/log modes
+        power_exponent: float = 1.0,  # For power mode (compensate 1/f)
+        focal_gamma: float = 2.0,  # For focal mode
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.low_freq_cutoff = low_freq_cutoff
+        self.high_freq_boost = high_freq_boost
+        self.max_freq = max_freq
+        self.use_log_psd = use_log_psd
+        self.freq_scaling = freq_scaling
+        self.scaling_factor = scaling_factor
+        self.power_exponent = power_exponent
+        self.focal_gamma = focal_gamma
+        self._freq_weights = None
+        self._cached_length = None
+
+        valid_modes = ("none", "linear", "log", "power", "focal")
+        if freq_scaling not in valid_modes:
+            raise ValueError(f"freq_scaling must be one of {valid_modes}, got {freq_scaling}")
+
+    def _get_freq_weights(self, n_fft: int, device: torch.device) -> torch.Tensor:
+        """Build frequency-dependent weights (cached for efficiency)."""
+        if self._freq_weights is not None and self._cached_length == n_fft:
+            return self._freq_weights.to(device)
+
+        # Frequency bins for rfft output
+        freqs = torch.fft.rfftfreq(n_fft, d=1.0 / self.sample_rate)
+
+        # Start with base weights
+        weights = torch.ones_like(freqs)
+
+        # Apply frequency scaling mode
+        if self.freq_scaling == "none":
+            # Original behavior: step function at low_freq_cutoff
+            if self.low_freq_cutoff > 0:
+                weights[freqs >= self.low_freq_cutoff] = self.high_freq_boost
+                # Smooth transition around cutoff
+                transition_width = 10.0  # Hz
+                transition_mask = (freqs >= self.low_freq_cutoff - transition_width) & (freqs < self.low_freq_cutoff)
+                if transition_mask.any():
+                    t = (freqs[transition_mask] - (self.low_freq_cutoff - transition_width)) / transition_width
+                    weights[transition_mask] = 1.0 + (self.high_freq_boost - 1.0) * t
+
+        elif self.freq_scaling == "linear":
+            # Linear increase with frequency: weight = 1 + (f/f_max) * scale
+            # Higher frequencies get progressively more weight
+            weights = 1.0 + (freqs / self.max_freq) * self.scaling_factor
+
+        elif self.freq_scaling == "log":
+            # Logarithmic increase: weight = 1 + log(1 + f/f_ref) * scale
+            # Gentler increase than linear, good for wide frequency ranges
+            f_ref = 10.0  # Reference frequency (10 Hz)
+            weights = 1.0 + torch.log1p(freqs / f_ref) * self.scaling_factor
+
+        elif self.freq_scaling == "power":
+            # Power law: weight = (f/f_min)^alpha
+            # Compensates for 1/f power spectrum in neural signals
+            # With alpha=1, this equalizes contribution across frequencies
+            f_min = 1.0  # Minimum frequency to avoid division by zero
+            # Clamp frequencies to avoid extreme weights at DC
+            freqs_clamped = torch.clamp(freqs, min=f_min)
+            weights = (freqs_clamped / f_min) ** self.power_exponent
+            # Normalize to have mean ~1 for stable gradients
+            weights = weights / weights[freqs <= self.max_freq].mean().clamp(min=1e-6)
 
         # Zero out frequencies above max_freq (100 Hz for LFP)
         weights[freqs > self.max_freq] = 0.0
+
+        # Also zero out DC component (0 Hz) - not meaningful for neural signals
+        weights[0] = 0.0
 
         self._freq_weights = weights
         self._cached_length = n_fft
@@ -2981,12 +3168,30 @@ class HighFrequencySpectralLoss(nn.Module):
             pred_psd = torch.log(pred_psd + eps)
             target_psd = torch.log(target_psd + eps)
 
-        # Get frequency weights
-        weights = self._get_freq_weights(T, pred.device)  # [F]
-
-        # Compute weighted MSE
+        # Compute error
         diff = (pred_psd - target_psd) ** 2  # [B, C, F]
-        weighted_diff = diff * weights.unsqueeze(0).unsqueeze(0)  # Broadcast weights
+
+        # Apply weighting based on mode
+        if self.freq_scaling == "focal":
+            # Focal loss: weight by error magnitude
+            # Higher errors get exponentially more weight
+            # This focuses learning on poorly-predicted frequencies
+            error_magnitude = torch.sqrt(diff + 1e-10)  # [B, C, F]
+            focal_weights = error_magnitude ** self.focal_gamma
+            # Normalize focal weights to prevent gradient explosion
+            focal_weights = focal_weights / (focal_weights.mean() + 1e-10)
+
+            # Get base frequency weights (mask out > max_freq)
+            base_weights = self._get_freq_weights(T, pred.device)  # [F]
+            base_weights = base_weights.unsqueeze(0).unsqueeze(0)  # [1, 1, F]
+
+            # Combine: focal weighting * frequency mask
+            weighted_diff = diff * focal_weights * (base_weights > 0).float()
+        else:
+            # Standard frequency weighting
+            weights = self._get_freq_weights(T, pred.device)  # [F]
+            weighted_diff = diff * weights.unsqueeze(0).unsqueeze(0)  # Broadcast weights
+
         loss = weighted_diff.mean()
 
         return loss.to(original_dtype)
