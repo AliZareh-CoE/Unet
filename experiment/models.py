@@ -1110,6 +1110,28 @@ class ModernUpBlock(nn.Module):
 # Optimal Spectral Bias (Fixed per-odor correction, no signal-adaptive network)
 # =============================================================================
 
+def make_uniform_bands(band_width_hz: float, min_freq_hz: float = 1.0, max_freq_hz: float = 100.0) -> Dict[str, Tuple[float, float]]:
+    """Generate uniformly-spaced frequency bands.
+
+    Args:
+        band_width_hz: Width of each band in Hz (e.g., 2.0 for 2Hz bands)
+        min_freq_hz: Minimum frequency (default 1.0 Hz)
+        max_freq_hz: Maximum frequency (default 100.0 Hz)
+
+    Returns:
+        Dict mapping band names to (low_freq, high_freq) tuples
+    """
+    bands = {}
+    f = min_freq_hz
+    i = 0
+    while f < max_freq_hz:
+        f_high = min(f + band_width_hz, max_freq_hz)
+        bands[f"{int(f)}-{int(f_high)}Hz"] = (f, f_high)
+        f = f_high
+        i += 1
+    return bands
+
+
 class OptimalSpectralBias(nn.Module):
     """Fixed per-odor spectral bias correction.
 
