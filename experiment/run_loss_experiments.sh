@@ -56,24 +56,35 @@ run_experiment() {
     echo "Extra args: $extra_args"
     echo ""
 
-    # Create experiment-specific output dir
+    # Create experiment-specific output directories
     local exp_dir="${BASE_DIR}/${exp_name}"
     mkdir -p "$exp_dir"
 
-    # Set checkpoint directory via environment variable
+    # Set ALL output directories via environment variables
+    # This ensures checkpoints, logs, and plots all go to experiment folder
+    export OUTPUT_DIR="$exp_dir"
     export CHECKPOINT_DIR="$exp_dir/checkpoints"
-    mkdir -p "$CHECKPOINT_DIR"
+    export LOGS_DIR="$exp_dir/logs"
+    mkdir -p "$CHECKPOINT_DIR" "$LOGS_DIR"
 
     # Run training
     local log_file="${exp_dir}/train.log"
-    echo "Logging to: $log_file"
+    echo "Output directory: $OUTPUT_DIR"
+    echo "Checkpoints: $CHECKPOINT_DIR"
+    echo "Logs: $LOGS_DIR"
+    echo "Training log: $log_file"
+    echo ""
 
     $BASE_CMD $extra_args 2>&1 | tee "$log_file"
 
     # Extract final metrics
     echo ""
-    echo "Final metrics for $exp_name:"
-    grep -E "Best:|val_corr|val_r2|psd_err" "$log_file" | tail -10 || true
+    echo "=============================================="
+    echo "Results for $exp_name:"
+    echo "=============================================="
+    grep -E "Best:|val.*corr|val.*r2|psd_err|STAGE" "$log_file" | tail -15 || true
+    echo ""
+    echo "Output saved to: $exp_dir"
     echo ""
 }
 

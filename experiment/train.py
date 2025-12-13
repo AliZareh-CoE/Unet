@@ -107,9 +107,10 @@ except ImportError:
 # =============================================================================
 # Configuration
 # =============================================================================
-OUTPUT_DIR = Path("artifacts")
-CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-LOGS_DIR = OUTPUT_DIR / "logs"
+# Support environment variable overrides for experiment management
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "artifacts"))
+CHECKPOINT_DIR = Path(os.environ.get("CHECKPOINT_DIR", str(OUTPUT_DIR / "checkpoints")))
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", str(OUTPUT_DIR / "logs")))
 
 # Default hyperparameters
 DEFAULT_CONFIG = {
