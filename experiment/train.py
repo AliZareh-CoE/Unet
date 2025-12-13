@@ -176,6 +176,7 @@ DEFAULT_CONFIG = {
     # Loss toggles (set False to disable)
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
     "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
+    "spectral_affects_unet": True,  # If True, spectral loss gradients flow to UNet (no detach)
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -1143,14 +1144,13 @@ def train_epoch(
         ob_c = crop_to_target_torch(ob)
 
         # Apply spectral shift OUTSIDE the model (FSDP-safe)
-        # CRITICAL: Detach pred_raw so UNet does NOT get gradients from spectral loss!
-        # This ensures clean separation of responsibilities:
-        # - UNet handles waveform matching (L1 + wavelet loss)
-        # - SpectralShift ALONE handles PSD correction (spectral loss)
-        # Without detach, UNet and SpectralShift fight each other trying to fix PSD.
+        # If spectral_affects_unet=True: UNet gets gradients from spectral loss (no detach)
+        # If spectral_affects_unet=False: Clean separation - UNet only gets L1/wavelet gradients
         # NOTE: In Stage 1 (disable_spectral=True), skip SpectralShift entirely
         if spectral_shift_fwd is not None and not disable_spectral:
-            pred_shifted = spectral_shift_fwd(pred_raw.detach(), odor_ids=odor)
+            spectral_affects_unet = config.get("spectral_affects_unet", True)
+            pred_for_shift = pred_raw if spectral_affects_unet else pred_raw.detach()
+            pred_shifted = spectral_shift_fwd(pred_for_shift, odor_ids=odor)
             pred_shifted_c = crop_to_target_torch(pred_shifted)
         else:
             pred_shifted = pred_raw
@@ -1211,11 +1211,13 @@ def train_epoch(
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
             # Apply spectral shift with SEPARATE reverse module
-            # CRITICAL: Detach so reverse UNet doesn't get spectral loss gradients
-            # SpectralShift alone handles PSD correction for reverse direction
+            # If spectral_affects_unet=True: Reverse UNet gets gradients from spectral loss
+            # If spectral_affects_unet=False: Clean separation for reverse direction too
             # NOTE: In Stage 1 (disable_spectral=True), skip SpectralShift entirely
             if spectral_shift_rev is not None and not disable_spectral:
-                pred_rev_shifted = spectral_shift_rev(pred_rev_raw.detach(), odor_ids=odor)
+                spectral_affects_unet = config.get("spectral_affects_unet", True)
+                pred_rev_for_shift = pred_rev_raw if spectral_affects_unet else pred_rev_raw.detach()
+                pred_rev_shifted = spectral_shift_rev(pred_rev_for_shift, odor_ids=odor)
                 pred_rev_shifted_c = crop_to_target_torch(pred_rev_shifted)
             else:
                 pred_rev_shifted = pred_rev_raw
