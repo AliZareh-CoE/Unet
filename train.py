@@ -2866,6 +2866,75 @@ def train(
             plt.close()
             print(f"  Saved: {debug_dir / 'envelope_qq.png'}")
 
+            # =====================================================================
+            # PLOT 5: SIGNAL COMPARISON (Real vs Generated vs Corrected + Overlap)
+            # =====================================================================
+            # 4 columns: Real | Generated | Corrected | Overlap (all three)
+            n_signals_to_plot = 4  # Number of example signals to show
+            fig, axes = plt.subplots(n_signals_to_plot, 4, figsize=(20, 3 * n_signals_to_plot))
+
+            # Pick random signals to display
+            n_available = all_target_signals.shape[0]
+            signal_indices = np.random.choice(n_available, min(n_signals_to_plot, n_available), replace=False)
+
+            # Time axis (use first 1000 samples for clarity)
+            T_display = min(1000, all_target_signals.shape[1])
+            t = np.arange(T_display) / sampling_rate * 1000  # Convert to ms
+
+            for row, sig_idx in enumerate(signal_indices):
+                real_sig = all_target_signals[sig_idx, :T_display]
+                gen_sig = all_pred_raw_signals[sig_idx, :T_display]
+                corr_sig = all_pred_corr_signals[sig_idx, :T_display]
+
+                # Compute correlations for titles
+                corr_gen = np.corrcoef(real_sig, gen_sig)[0, 1]
+                corr_corr = np.corrcoef(real_sig, corr_sig)[0, 1]
+
+                # Column 1: Real signal
+                axes[row, 0].plot(t, real_sig, 'g-', linewidth=0.8, label='Real')
+                axes[row, 0].set_ylabel(f'Sig {sig_idx}', fontsize=10)
+                if row == 0:
+                    axes[row, 0].set_title('Real (Target)', fontsize=12, fontweight='bold')
+                axes[row, 0].grid(True, alpha=0.3)
+                axes[row, 0].set_xlim([t[0], t[-1]])
+
+                # Column 2: Generated (raw + spectral shift)
+                axes[row, 1].plot(t, gen_sig, 'r-', linewidth=0.8, label='Generated')
+                if row == 0:
+                    axes[row, 1].set_title('Generated (UNet+SpectralShift)', fontsize=12, fontweight='bold')
+                axes[row, 1].set_ylabel(f'r={corr_gen:.3f}', fontsize=9, color='red')
+                axes[row, 1].grid(True, alpha=0.3)
+                axes[row, 1].set_xlim([t[0], t[-1]])
+
+                # Column 3: Corrected (with envelope matching)
+                axes[row, 2].plot(t, corr_sig, 'b-', linewidth=0.8, label='Corrected')
+                if row == 0:
+                    axes[row, 2].set_title('Corrected (+EnvelopeMatch)', fontsize=12, fontweight='bold')
+                axes[row, 2].set_ylabel(f'r={corr_corr:.3f}', fontsize=9, color='blue')
+                axes[row, 2].grid(True, alpha=0.3)
+                axes[row, 2].set_xlim([t[0], t[-1]])
+
+                # Column 4: Overlap of all three
+                axes[row, 3].plot(t, real_sig, 'g-', linewidth=1.0, alpha=0.8, label='Real')
+                axes[row, 3].plot(t, gen_sig, 'r-', linewidth=0.8, alpha=0.6, label='Generated')
+                axes[row, 3].plot(t, corr_sig, 'b--', linewidth=0.8, alpha=0.6, label='Corrected')
+                if row == 0:
+                    axes[row, 3].set_title('Overlap Comparison', fontsize=12, fontweight='bold')
+                    axes[row, 3].legend(loc='upper right', fontsize=8)
+                axes[row, 3].grid(True, alpha=0.3)
+                axes[row, 3].set_xlim([t[0], t[-1]])
+
+                # Add x-label to bottom row
+                if row == n_signals_to_plot - 1:
+                    for col in range(4):
+                        axes[row, col].set_xlabel('Time (ms)')
+
+            plt.suptitle('Signal Comparison: Real vs Generated vs Corrected', fontsize=14, fontweight='bold', y=1.02)
+            plt.tight_layout()
+            plt.savefig(debug_dir / "signal_comparison.png", dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {debug_dir / 'signal_comparison.png'}")
+
             # Save stats to JSON
             with open(debug_dir / "debug_stats.json", "w") as f:
                 json.dump(debug_stats, f, indent=2)
