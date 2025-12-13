@@ -178,6 +178,13 @@ DEFAULT_CONFIG = {
     "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
     "spectral_affects_unet": True,  # If True, spectral loss gradients flow to UNet (no detach)
 
+    # Spectral loss frequency scaling (addresses spectral bias in neural networks)
+    # Neural networks learn low frequencies better; scaling boosts high-freq importance
+    "spectral_freq_scaling": "power",  # "none", "linear", "log", "power", "focal"
+    "spectral_scaling_factor": 2.0,    # For linear/log modes: how much to boost high freq
+    "spectral_power_exponent": 1.0,    # For power mode: compensates 1/f spectrum (1.0 = full compensation)
+    "spectral_focal_gamma": 2.0,       # For focal mode: higher = more focus on errors
+
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
 
@@ -1612,13 +1619,20 @@ def train(
 
     spectral_loss = None
     if config.get("use_spectral_loss", True):
+        freq_scaling = config.get("spectral_freq_scaling", "power")
         spectral_loss = HighFrequencySpectralLoss(
             sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             low_freq_cutoff=0.0,
             high_freq_boost=1.0,
             max_freq=MAX_FREQ_HZ,
             use_log_psd=True,
+            freq_scaling=freq_scaling,
+            scaling_factor=config.get("spectral_scaling_factor", 2.0),
+            power_exponent=config.get("spectral_power_exponent", 1.0),
+            focal_gamma=config.get("spectral_focal_gamma", 2.0),
         ).to(device)
+        if is_primary():
+            print(f"Spectral loss frequency scaling: {freq_scaling}")
 
 
     # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
