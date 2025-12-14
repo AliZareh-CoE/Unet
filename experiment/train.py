@@ -2744,6 +2744,42 @@ def train(
             plt.close()
             print(f"  Saved: {debug_dir / 'envelope_qq.png'}")
 
+            # =====================================================================
+            # PLOT 5: EXAMPLE TRIALS (time-domain waveforms)
+            # =====================================================================
+            fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
+
+            # Get 5 example trials from the collected signals
+            n_examples = min(5, all_target_signals.shape[0])
+            example_indices = np.linspace(0, all_target_signals.shape[0] - 1, n_examples, dtype=int)
+
+            # Time axis (in seconds)
+            T_samples = all_target_signals.shape[1]
+            time_axis = np.arange(T_samples) / sampling_rate
+
+            for i, idx in enumerate(example_indices):
+                ax = axes[i]
+
+                # Plot all 4 traces
+                ax.plot(time_axis, all_target_signals[idx], 'g-', linewidth=1, alpha=0.8, label='Target')
+                ax.plot(time_axis, all_pred_raw_signals[idx], 'r-', linewidth=1, alpha=0.6, label='Pred Raw')
+                ax.plot(time_axis, all_pred_shifted_signals[idx], color='orange', linewidth=1, alpha=0.6, label='Pred Shifted')
+                ax.plot(time_axis, all_pred_corr_signals[idx], 'b-', linewidth=1, alpha=0.6, label='Pred Corrected')
+
+                ax.set_ylabel(f'Trial {i+1}')
+                ax.grid(True, alpha=0.3)
+
+                if i == 0:
+                    ax.legend(loc='upper right', fontsize=8, ncol=4)
+
+            axes[-1].set_xlabel('Time (s)')
+            fig.suptitle('Example Trials: Target vs Predictions at Each Stage', fontsize=12)
+
+            plt.tight_layout()
+            plt.savefig(debug_dir / "example_trials.png", dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {debug_dir / 'example_trials.png'}")
+
             # Save stats to JSON
             with open(debug_dir / "debug_stats.json", "w") as f:
                 json.dump(debug_stats, f, indent=2)
