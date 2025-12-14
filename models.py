@@ -1886,6 +1886,14 @@ class OptimalSpectralBias(nn.Module):
         # Build per-frequency scale factors
         # scales: [B, n_bands], masks: [n_bands, n_freq]
         freq_scales = torch.einsum('bk,kf->bf', scales, masks)  # [B, n_freq]
+
+        # BUG FIX: Frequencies outside defined bands (e.g., >100Hz) have zero mask coverage,
+        # resulting in freq_scales=0, which zeroes out high-frequency content!
+        # These frequencies should be UNCHANGED (scale=1.0), not zeroed.
+        mask_coverage = masks.sum(dim=0)  # [n_freq] - how much each freq is covered by bands
+        uncovered_mask = (mask_coverage < 0.01)  # frequencies with no band coverage
+        freq_scales[:, uncovered_mask] = 1.0  # leave uncovered frequencies unchanged
+
         freq_scales = freq_scales.unsqueeze(1)  # [B, 1, n_freq]
 
         # Apply scaling in frequency domain
