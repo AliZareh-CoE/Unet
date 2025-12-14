@@ -2347,6 +2347,181 @@ class CondUNet1D(nn.Module):
 
 
 # =============================================================================
+# Adversarial Discriminator
+# =============================================================================
+
+class PatchDiscriminator1D(nn.Module):
+    """1D PatchGAN Discriminator for neural signal adversarial training.
+
+    Uses spectral normalization for stable GAN training.
+    Multi-scale design captures both local patterns and global structure.
+
+    Args:
+        in_channels: Number of input channels (e.g., 32 for LFP)
+        base_channels: Base number of feature channels (default: 64)
+        n_layers: Number of discriminator layers (default: 4)
+        use_spectral_norm: Apply spectral normalization (default: True)
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 32,
+        base_channels: int = 64,
+        n_layers: int = 4,
+        use_spectral_norm: bool = True,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+
+        # Spectral norm wrapper
+        norm_layer = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
+
+        # Build discriminator layers
+        layers = []
+
+        # First layer: no normalization
+        layers.append(norm_layer(nn.Conv1d(in_channels, base_channels, kernel_size=15, stride=2, padding=7)))
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        # Middle layers with increasing channels
+        ch_mult = 1
+        for i in range(1, n_layers):
+            ch_mult_prev = ch_mult
+            ch_mult = min(2 ** i, 8)
+            layers.append(norm_layer(nn.Conv1d(
+                base_channels * ch_mult_prev,
+                base_channels * ch_mult,
+                kernel_size=15,
+                stride=2,
+                padding=7,
+            )))
+            layers.append(nn.BatchNorm1d(base_channels * ch_mult))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+
+        # Final layer: produce patch-wise predictions
+        layers.append(norm_layer(nn.Conv1d(base_channels * ch_mult, 1, kernel_size=15, stride=1, padding=7)))
+
+        self.model = nn.Sequential(*layers)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            Patch-wise predictions [B, 1, T']
+        """
+        return self.model(x)
+
+
+class MultiScaleDiscriminator(nn.Module):
+    """Multi-scale discriminator for robust adversarial training.
+
+    Uses multiple discriminators at different temporal scales to capture
+    both fine details and coarse patterns in neural signals.
+
+    Args:
+        in_channels: Number of input channels
+        n_discriminators: Number of discriminators at different scales (default: 3)
+        base_channels: Base channels for each discriminator
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 32,
+        n_discriminators: int = 3,
+        base_channels: int = 64,
+    ):
+        super().__init__()
+        self.n_discriminators = n_discriminators
+
+        self.discriminators = nn.ModuleList([
+            PatchDiscriminator1D(in_channels, base_channels, n_layers=4 - i)
+            for i in range(n_discriminators)
+        ])
+
+        # Downsampling for multi-scale
+        self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Forward pass at multiple scales.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            List of predictions at each scale
+        """
+        outputs = []
+        for i, disc in enumerate(self.discriminators):
+            outputs.append(disc(x))
+            if i < self.n_discriminators - 1:
+                x = self.downsample(x)
+        return outputs
+
+
+def adversarial_loss(pred: torch.Tensor, target_is_real: bool, loss_type: str = "lsgan") -> torch.Tensor:
+    """Compute adversarial loss.
+
+    Args:
+        pred: Discriminator prediction
+        target_is_real: Whether target should be real (True) or fake (False)
+        loss_type: Loss type - 'lsgan' (MSE), 'vanilla' (BCE), or 'hinge'
+
+    Returns:
+        Scalar loss value
+    """
+    if loss_type == "lsgan":
+        # Least-squares GAN (more stable)
+        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
+        return F.mse_loss(pred, target)
+    elif loss_type == "vanilla":
+        # Standard GAN with BCE
+        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
+        return F.binary_cross_entropy_with_logits(pred, target)
+    elif loss_type == "hinge":
+        # Hinge loss (used in SAGAN, BigGAN)
+        if target_is_real:
+            return torch.mean(F.relu(1.0 - pred))
+        else:
+            return torch.mean(F.relu(1.0 + pred))
+    else:
+        raise ValueError(f"Unknown loss type: {loss_type}")
+
+
+def feature_matching_loss(
+    real_features: List[torch.Tensor],
+    fake_features: List[torch.Tensor],
+) -> torch.Tensor:
+    """Feature matching loss for stable GAN training.
+
+    Matches intermediate features between real and fake samples.
+
+    Args:
+        real_features: List of intermediate features from real samples
+        fake_features: List of intermediate features from fake samples
+
+    Returns:
+        Feature matching loss
+    """
+    loss = 0.0
+    for real_feat, fake_feat in zip(real_features, fake_features):
+        loss += F.l1_loss(fake_feat, real_feat.detach())
+    return loss / len(real_features)
+
+
+# =============================================================================
 # Loss Functions
 # =============================================================================
 

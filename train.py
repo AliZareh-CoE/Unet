@@ -136,11 +136,23 @@ DEFAULT_CONFIG = {
     #   - "huber_wavelet": Huber + Wavelet combined
     "loss_type": "l1_wavelet",
 
-    # Two-stage training: UNet convergence → SpectralShift fine-tuning
-    "use_two_stage": True,        # Enable two-stage training (UNet converge → freeze → SpectralShift fine-tune)
-    "spectral_finetune_epochs": 20,  # Extra epochs to fine-tune ONLY SpectralShift after UNet converges
-    "stage2_only": False,         # Skip Stage 1, load checkpoint and run ONLY Stage 2 (SpectralShift fine-tuning)
-    "stage1_checkpoint": "best_model.pt",    # Path to Stage 1 checkpoint (required if stage2_only=True)
+    # Multi-stage training:
+    # Stage 1: Train UNet (L1 + wavelet)
+    # Stage 2: Adversarial fine-tuning (optional) - improves correlation
+    # Stage 3: Post-hoc calibration (OptimalSpectralBias + EnvelopeHistogramMatching)
+    "use_two_stage": True,        # Enable multi-stage training
+    "spectral_finetune_epochs": 20,  # Epochs for Stage 3 (post-hoc calibration)
+    "stage2_only": False,         # Skip Stage 1, load checkpoint and run Stage 2+
+    "adversarial_only": False,    # Skip Stage 1, load checkpoint and run ONLY Stage 2 (adversarial)
+    "stage1_checkpoint": "best_model.pt",    # Path to Stage 1 checkpoint
+
+    # Adversarial fine-tuning (Stage 2) - improves r² and correlation
+    "use_adversarial": False,     # Enable adversarial fine-tuning stage
+    "adversarial_epochs": 10,     # Number of adversarial training epochs
+    "adversarial_lambda": 0.1,    # Weight for adversarial loss (vs reconstruction)
+    "adversarial_lr_g": 1e-5,     # Generator learning rate (lower than Stage 1)
+    "adversarial_lr_d": 4e-5,     # Discriminator learning rate (typically higher than G)
+    "adversarial_loss_type": "lsgan",  # lsgan (stable), vanilla (BCE), or hinge
 
     # Model
     "base_channels": 64,
@@ -1257,6 +1269,226 @@ def train_epoch(
     }
 
 
+# =============================================================================
+# Adversarial Training (Stage 2)
+# =============================================================================
+
+def adversarial_train_epoch(
+    generator: nn.Module,
+    discriminator: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    g_optimizer: torch.optim.Optimizer,
+    d_optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    config: Dict[str, Any],
+    wavelet_loss: Optional[nn.Module] = None,
+    reverse_generator: Optional[nn.Module] = None,
+    reverse_discriminator: Optional[nn.Module] = None,
+    epoch: int = 0,
+    num_epochs: int = 0,
+    cond_encoder: Optional[nn.Module] = None,
+) -> Dict[str, float]:
+    """Train one epoch with adversarial loss for improved correlation.
+
+    Uses LSGAN loss for stability + L1 reconstruction loss for content preservation.
+
+    Args:
+        generator: Forward UNet model (OB → PCx)
+        discriminator: Forward discriminator
+        reverse_generator: Reverse UNet model (PCx → OB)
+        reverse_discriminator: Reverse discriminator
+        wavelet_loss: Optional wavelet loss for frequency content
+    """
+    from models import adversarial_loss
+
+    generator.train()
+    discriminator.train()
+    if reverse_generator is not None:
+        reverse_generator.train()
+    if reverse_discriminator is not None:
+        reverse_discriminator.train()
+    if cond_encoder is not None:
+        cond_encoder.train()
+
+    # Loss weights
+    lambda_adv = config.get("adversarial_lambda", 0.1)  # GAN loss weight
+    lambda_l1 = config.get("weight_l1", 1.0)
+    lambda_wav = config.get("weight_wavelet", 3.0)
+    gan_loss_type = config.get("adversarial_loss_type", "lsgan")
+
+    # Accumulators
+    total_g_loss = torch.tensor(0.0, device=device)
+    total_d_loss = torch.tensor(0.0, device=device)
+    total_d_real = torch.tensor(0.0, device=device)
+    total_d_fake = torch.tensor(0.0, device=device)
+    total_recon_loss = torch.tensor(0.0, device=device)
+    total_adv_loss = torch.tensor(0.0, device=device)
+
+    # Determine compute dtype
+    use_bf16 = config.get("fsdp_bf16", False)
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    pbar = tqdm(
+        loader,
+        desc=f"Adversarial {epoch}/{num_epochs}",
+        leave=True,
+        position=0,
+        ncols=100,
+    )
+
+    for ob, pcx, odor in pbar:
+        ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
+        pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
+        odor = odor.to(device, non_blocking=True)
+
+        # Per-channel normalization
+        if config.get("per_channel_norm", True):
+            ob = per_channel_normalize(ob)
+            pcx = per_channel_normalize(pcx)
+
+        # Get conditioning embedding
+        cond_emb = None
+        if cond_encoder is not None:
+            cond_source = config.get("conditioning_source", "odor_onehot")
+            if cond_source == "spectro_temporal":
+                cond_emb = cond_encoder(ob)
+
+        # =====================================================================
+        # DISCRIMINATOR UPDATE
+        # =====================================================================
+        d_optimizer.zero_grad(set_to_none=True)
+
+        # Generate fake samples (detached from generator graph)
+        with torch.no_grad():
+            if cond_emb is not None:
+                fake_pcx = generator(ob, cond_emb=cond_emb)
+            else:
+                fake_pcx = generator(ob, odor)
+            fake_pcx = crop_to_target_torch(fake_pcx)
+
+        real_pcx = crop_to_target_torch(pcx)
+
+        # Discriminator loss on real samples
+        d_real_pred = discriminator(real_pcx)
+        d_loss_real = adversarial_loss(d_real_pred, target_is_real=True, loss_type=gan_loss_type)
+
+        # Discriminator loss on fake samples
+        d_fake_pred = discriminator(fake_pcx)
+        d_loss_fake = adversarial_loss(d_fake_pred, target_is_real=False, loss_type=gan_loss_type)
+
+        d_loss = (d_loss_real + d_loss_fake) * 0.5
+
+        # Reverse direction discriminator
+        if reverse_generator is not None and reverse_discriminator is not None:
+            with torch.no_grad():
+                if cond_emb is not None:
+                    fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
+                else:
+                    fake_ob = reverse_generator(pcx, odor)
+                fake_ob = crop_to_target_torch(fake_ob)
+
+            real_ob = crop_to_target_torch(ob)
+
+            d_real_pred_rev = reverse_discriminator(real_ob)
+            d_loss_real_rev = adversarial_loss(d_real_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+
+            d_fake_pred_rev = reverse_discriminator(fake_ob)
+            d_loss_fake_rev = adversarial_loss(d_fake_pred_rev, target_is_real=False, loss_type=gan_loss_type)
+
+            d_loss_rev = (d_loss_real_rev + d_loss_fake_rev) * 0.5
+            d_loss = d_loss + d_loss_rev
+
+        d_loss.backward()
+        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
+        if reverse_discriminator is not None:
+            torch.nn.utils.clip_grad_norm_(reverse_discriminator.parameters(), GRAD_CLIP)
+        d_optimizer.step()
+
+        # =====================================================================
+        # GENERATOR UPDATE
+        # =====================================================================
+        g_optimizer.zero_grad(set_to_none=True)
+
+        # Generate fake samples (now need gradients)
+        if cond_emb is not None:
+            fake_pcx = generator(ob, cond_emb=cond_emb)
+        else:
+            fake_pcx = generator(ob, odor)
+        fake_pcx_c = crop_to_target_torch(fake_pcx)
+        real_pcx_c = crop_to_target_torch(pcx)
+
+        # Adversarial loss - fool discriminator
+        g_fake_pred = discriminator(fake_pcx_c)
+        g_adv_loss = adversarial_loss(g_fake_pred, target_is_real=True, loss_type=gan_loss_type)
+
+        # Reconstruction loss (L1)
+        g_l1_loss = F.l1_loss(fake_pcx_c, real_pcx_c)
+
+        # Wavelet loss (optional)
+        g_wav_loss = torch.tensor(0.0, device=device)
+        if wavelet_loss is not None:
+            g_wav_loss = wavelet_loss(fake_pcx_c.float(), real_pcx_c.float())
+
+        # Total generator loss
+        g_loss = lambda_adv * g_adv_loss + lambda_l1 * g_l1_loss + lambda_wav * g_wav_loss
+
+        # Reverse direction
+        if reverse_generator is not None and reverse_discriminator is not None:
+            if cond_emb is not None:
+                fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
+            else:
+                fake_ob = reverse_generator(pcx, odor)
+            fake_ob_c = crop_to_target_torch(fake_ob)
+            real_ob_c = crop_to_target_torch(ob)
+
+            g_fake_pred_rev = reverse_discriminator(fake_ob_c)
+            g_adv_loss_rev = adversarial_loss(g_fake_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+            g_l1_loss_rev = F.l1_loss(fake_ob_c, real_ob_c)
+
+            g_wav_loss_rev = torch.tensor(0.0, device=device)
+            if wavelet_loss is not None:
+                g_wav_loss_rev = wavelet_loss(fake_ob_c.float(), real_ob_c.float())
+
+            g_loss_rev = lambda_adv * g_adv_loss_rev + lambda_l1 * g_l1_loss_rev + lambda_wav * g_wav_loss_rev
+            g_loss = g_loss + g_loss_rev
+
+        g_loss.backward()
+        torch.nn.utils.clip_grad_norm_(generator.parameters(), GRAD_CLIP)
+        if reverse_generator is not None:
+            torch.nn.utils.clip_grad_norm_(reverse_generator.parameters(), GRAD_CLIP)
+        if cond_encoder is not None:
+            torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
+            sync_gradients_manual(cond_encoder)
+        g_optimizer.step()
+
+        # Accumulate losses
+        total_g_loss = total_g_loss + g_loss.detach()
+        total_d_loss = total_d_loss + d_loss.detach()
+        total_d_real = total_d_real + d_loss_real.detach()
+        total_d_fake = total_d_fake + d_loss_fake.detach()
+        total_recon_loss = total_recon_loss + g_l1_loss.detach()
+        total_adv_loss = total_adv_loss + g_adv_loss.detach()
+
+        # Update progress bar
+        pbar.set_postfix({
+            "G": f"{g_loss.item():.3f}",
+            "D": f"{d_loss.item():.3f}",
+        })
+
+    pbar.close()
+    sys.stdout.flush()
+
+    n_batches = len(loader)
+    return {
+        "g_loss": total_g_loss.item() / n_batches,
+        "d_loss": total_d_loss.item() / n_batches,
+        "d_real": total_d_real.item() / n_batches,
+        "d_fake": total_d_fake.item() / n_batches,
+        "recon_loss": total_recon_loss.item() / n_batches,
+        "adv_loss": total_adv_loss.item() / n_batches,
+    }
+
+
 def train(
     config: Dict[str, Any],
     data: Dict[str, Any],
@@ -1663,10 +1895,12 @@ def train(
 
     elif is_primary() and use_two_stage:
         print(f"\n{'='*70}")
-        print("TWO-STAGE TRAINING ENABLED")
+        print("MULTI-STAGE TRAINING ENABLED")
         print(f"{'='*70}")
         print(f"  Stage 1: Train UNet + SpectralShift until early stopping")
-        print(f"  Stage 2: FREEZE best UNet, fine-tune ONLY SpectralShift for {spectral_finetune_epochs} epochs")
+        if config.get("use_adversarial", False):
+            print(f"  Stage 2: Adversarial fine-tuning (GAN-based) for {config.get('adversarial_epochs', 10)} epochs")
+        print(f"  Stage 3: Post-hoc calibration (OptimalSpectralBias + EnvelopeHistogramMatching)")
         print(f"{'='*70}\n")
 
     early_stop_patience = config.get("early_stop_patience", 8)
@@ -1954,9 +2188,211 @@ def train(
                     print(f"STAGE1_RESULT_PSD_ERR_DB={test_metrics_stage1['psd_err_db']:.4f}")
 
     # =============================================================================
-    # STAGE 2: FREEZE best UNet, fine-tune ONLY SpectralShift (if enabled)
+    # STAGE 2: ADVERSARIAL FINE-TUNING (optional) - improves r² and correlation
     # =============================================================================
-    # Only run Stage 2 if:
+    # This stage uses a discriminator to improve the quality of generated signals.
+    # The generator (UNet) is fine-tuned with both reconstruction loss and adversarial loss.
+
+    use_adversarial = config.get("use_adversarial", False)
+    adversarial_only = config.get("adversarial_only", False)
+    adversarial_epochs = config.get("adversarial_epochs", 10)
+
+    should_run_adversarial = use_adversarial and adversarial_epochs > 0
+
+    if should_run_adversarial:
+        if is_primary():
+            print(f"\n{'='*70}")
+            print("STAGE 2: ADVERSARIAL FINE-TUNING")
+            print(f"{'='*70}")
+            print(f"  Epochs: {adversarial_epochs}")
+            print(f"  Lambda (adv weight): {config.get('adversarial_lambda', 0.1)}")
+            print(f"  Generator LR: {config.get('adversarial_lr_g', 1e-5)}")
+            print(f"  Discriminator LR: {config.get('adversarial_lr_d', 4e-5)}")
+            print(f"  Loss type: {config.get('adversarial_loss_type', 'lsgan')}")
+
+        # If adversarial_only mode, load Stage 1 checkpoint
+        if adversarial_only:
+            stage1_checkpoint = config.get("stage1_checkpoint", str(CHECKPOINT_DIR / "best_model.pt"))
+            if is_primary():
+                print(f"\nADVERSARIAL-ONLY MODE: Loading Stage 1 checkpoint")
+                print(f"  Checkpoint: {stage1_checkpoint}")
+
+            barrier()
+            expected_cond = config.get("cond_mode") if adversarial_only else None
+            load_checkpoint(
+                stage1_checkpoint,
+                model, reverse_model,
+                spectral_shift_fwd, spectral_shift_rev,
+                load_spectral_only=False,
+                skip_spectral=True,  # Don't load spectral shift (fresh for Stage 3)
+                expected_cond_mode=expected_cond,
+            )
+            barrier()
+
+        # Create discriminators for forward and reverse directions
+        from models import MultiScaleDiscriminator, adversarial_loss, feature_matching_loss
+
+        out_channels = config.get("out_channels", 32)
+        disc_fwd = MultiScaleDiscriminator(
+            in_channels=out_channels,
+            n_discriminators=3,
+            base_channels=64,
+        ).to(device)
+
+        disc_rev = None
+        if reverse_model is not None:
+            in_channels = config.get("in_channels", 32)
+            disc_rev = MultiScaleDiscriminator(
+                in_channels=in_channels,
+                n_discriminators=3,
+                base_channels=64,
+            ).to(device)
+
+        # Create optimizers for adversarial training
+        # Generator (UNet) uses lower LR to preserve Stage 1 features
+        g_lr = config.get("adversarial_lr_g", 1e-5)
+        d_lr = config.get("adversarial_lr_d", 4e-5)
+
+        g_optimizer = torch.optim.AdamW(
+            list(model.parameters()) + (list(reverse_model.parameters()) if reverse_model else []),
+            lr=g_lr,
+            betas=(0.5, 0.999),  # Standard GAN betas
+            weight_decay=1e-4,
+        )
+
+        d_params = list(disc_fwd.parameters())
+        if disc_rev is not None:
+            d_params += list(disc_rev.parameters())
+        d_optimizer = torch.optim.AdamW(
+            d_params,
+            lr=d_lr,
+            betas=(0.5, 0.999),
+            weight_decay=1e-4,
+        )
+
+        # Unfreeze UNet for fine-tuning (in case it was frozen)
+        for param in model.parameters():
+            param.requires_grad = True
+        if reverse_model is not None:
+            for param in reverse_model.parameters():
+                param.requires_grad = True
+
+        # Training loop
+        best_adv_val_corr = -float('inf')
+        best_adv_epoch = 0
+
+        for epoch in range(adversarial_epochs):
+            # Train epoch
+            model.train()
+            disc_fwd.train()
+            if reverse_model is not None:
+                reverse_model.train()
+            if disc_rev is not None:
+                disc_rev.train()
+
+            epoch_metrics = adversarial_train_epoch(
+                generator=model,
+                discriminator=disc_fwd,
+                loader=loaders["train"],
+                g_optimizer=g_optimizer,
+                d_optimizer=d_optimizer,
+                device=device,
+                config=config,
+                wavelet_loss=wavelet_loss,
+                reverse_generator=reverse_model,
+                reverse_discriminator=disc_rev,
+                epoch=epoch,
+                num_epochs=adversarial_epochs,
+                cond_encoder=cond_encoder,
+            )
+
+            # Validation
+            model.eval()
+            if reverse_model is not None:
+                reverse_model.eval()
+
+            val_metrics = evaluate(
+                model, loaders["val"], device, wavelet_loss,
+                compute_phase=False, reverse_model=reverse_model, config=config,
+                spectral_shift_fwd=None, spectral_shift_rev=None,  # No spectral shift yet
+                fast_mode=True,
+                sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                cond_encoder=cond_encoder,
+            )
+
+            if is_primary():
+                print(f"\n[Stage 2 Epoch {epoch+1}/{adversarial_epochs}]")
+                print(f"  G_loss={epoch_metrics['g_loss']:.4f}, D_loss={epoch_metrics['d_loss']:.4f}")
+                print(f"  recon={epoch_metrics['recon_loss']:.4f}, adv={epoch_metrics['adv_loss']:.4f}")
+                print(f"  Val: corr={val_metrics['corr']:.4f}, r2={val_metrics['r2']:.4f}")
+
+            # Save best model based on validation correlation
+            if val_metrics['corr'] > best_adv_val_corr:
+                best_adv_val_corr = val_metrics['corr']
+                best_adv_epoch = epoch + 1
+
+                # Save checkpoint
+                save_checkpoint(
+                    model, g_optimizer, epoch + 1,
+                    CHECKPOINT_DIR / "best_model_stage2_adv.pt",
+                    is_fsdp=is_fsdp_wrapped,
+                    reverse_model=reverse_model,
+                    spectral_shift_fwd=spectral_shift_fwd,
+                    spectral_shift_rev=spectral_shift_rev,
+                    config=config,
+                )
+
+                if is_primary():
+                    print(f"  ✓ New best! Saved checkpoint (corr={best_adv_val_corr:.4f})")
+
+        # Load best adversarial model for Stage 3
+        barrier()
+        load_checkpoint(
+            CHECKPOINT_DIR / "best_model_stage2_adv.pt",
+            model, reverse_model,
+            spectral_shift_fwd, spectral_shift_rev,
+            load_spectral_only=False,
+            skip_spectral=True,
+        )
+        barrier()
+
+        # Evaluate Stage 2 results
+        test_metrics_stage2 = evaluate(
+            model, loaders["test"], device, wavelet_loss,
+            compute_phase=True, reverse_model=reverse_model, config=config,
+            spectral_shift_fwd=None, spectral_shift_rev=None,
+            fast_mode=False,
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+            cond_encoder=cond_encoder,
+        )
+
+        if is_primary():
+            print(f"\n{'='*70}")
+            print("STAGE 2 COMPLETE: Adversarial Fine-tuning Results")
+            print(f"{'='*70}")
+            print(f"  Best epoch: {best_adv_epoch}/{adversarial_epochs}")
+            print(f"  Test Correlation: {test_metrics_stage2['corr']:.4f}")
+            print(f"  Test R²: {test_metrics_stage2['r2']:.4f}")
+            print(f"  Test NRMSE: {test_metrics_stage2['nrmse']:.4f}")
+            # Machine-parseable results
+            print(f"STAGE2_ADV_RESULT_CORR={test_metrics_stage2['corr']:.4f}")
+            print(f"STAGE2_ADV_RESULT_R2={test_metrics_stage2['r2']:.4f}")
+            print(f"STAGE2_ADV_BEST_EPOCH={best_adv_epoch}")
+
+        # Update best_epoch for Stage 3 reference
+        best_epoch = best_adv_epoch
+
+        # Clean up discriminators (no longer needed)
+        del disc_fwd, disc_rev, g_optimizer, d_optimizer
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        if is_primary():
+            print(f"\n{'='*70}\n")
+
+    # =============================================================================
+    # STAGE 3: POST-HOC CALIBRATION (OptimalSpectralBias + EnvelopeHistogramMatching)
+    # =============================================================================
+    # Only run Stage 3 if:
     # 1. Two-stage training is enabled OR stage2_only mode
     # 2. SpectralShift is available
     # 3. spectral_finetune_epochs > 0 (skip if --skip-spectral-finetune was used)
@@ -1965,27 +2401,31 @@ def train(
     envelope_matcher_fwd = None
     envelope_matcher_rev = None
 
-    should_run_stage2 = (
-        (use_two_stage or stage2_only) and 
-        spectral_shift_fwd is not None and 
+    should_run_stage3 = (
+        (use_two_stage or stage2_only) and
+        spectral_shift_fwd is not None and
         spectral_finetune_epochs > 0
     )
-    
-    if should_run_stage2:
-        # Determine checkpoint path: user-provided (stage2_only) or best from stage1
-        if stage2_only:
+
+    if should_run_stage3:
+        # Determine checkpoint path: user-provided (stage2_only) or best from stage1/2
+        if stage2_only and not should_run_adversarial:
+            # Loading from user-provided checkpoint (no adversarial stage)
             checkpoint_path = stage1_checkpoint
             checkpoint_source = f"user-provided: {stage1_checkpoint}"
+        elif should_run_adversarial:
+            # Adversarial training was run, use Stage 2 checkpoint
+            checkpoint_path = CHECKPOINT_DIR / "best_model_stage2_adv.pt"
+            checkpoint_source = f"best from Stage 2 adversarial (epoch {best_epoch})"
         else:
+            # No adversarial, use Stage 1 checkpoint
             checkpoint_path = CHECKPOINT_DIR / "best_model.pt"
             checkpoint_source = f"best from Stage 1 (epoch {best_epoch})"
 
         if is_primary():
             print(f"\n{'='*70}")
-            print(f"STAGE 2: Fine-tuning SpectralShift for PSD correction (TWO-PHASE)")
+            print(f"STAGE 3: POST-HOC CALIBRATION (OptimalSpectralBias + EnvelopeHistogramMatching)")
             print(f"{'='*70}")
-            print(f"  Phase 2a: Train FORWARD SpectralShift (reverse frozen)")
-            print(f"  Phase 2b: Train REVERSE SpectralShift (forward frozen)")
             print(f"Loading UNet from checkpoint: {checkpoint_source}")
 
         # Load UNet checkpoint
@@ -2004,7 +2444,7 @@ def train(
         if stage2_only and is_primary():
             print(f"SpectralShift: using FRESH initialization (not loaded from checkpoint)")
 
-        # FREEZE UNet parameters (forward and reverse) - stays frozen for all of Stage 2
+        # FREEZE UNet parameters (forward and reverse) - stays frozen for all of Stage 3
         freeze_model_params(model)
         if reverse_model is not None:
             freeze_model_params(reverse_model)
@@ -2578,14 +3018,14 @@ def train(
             print(f"{'='*70}\n")
 
         # =====================================================================
-        # STAGE 2: Optimal Bias Applied (No Training Needed!)
+        # STAGE 3: Optimal Bias Applied (No Training Needed!)
         # =====================================================================
         # With OptimalSpectralBias, we just compute the bias from data and apply it.
         # No gradient-based training is required - the bias is fixed per-odor.
 
         if is_primary():
             print(f"\n{'='*70}")
-            print("STAGE 2: Optimal Spectral Bias Applied")
+            print("STAGE 3: Optimal Spectral Bias Applied")
             print(f"{'='*70}")
             print("  Bias computed directly from UNet output vs target PSD difference")
             print("  No training required - bias is fixed per-odor per-band")
@@ -2622,8 +3062,8 @@ def train(
         # Save checkpoint with computed bias
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         save_checkpoint(
-            model, optimizer, num_epochs,  # Use Stage 1 optimizer/epoch since no Stage 2 training
-            CHECKPOINT_DIR / "best_model_stage2.pt",
+            model, optimizer, num_epochs,  # Use Stage 1 optimizer/epoch since no Stage 3 training
+            CHECKPOINT_DIR / "best_model_stage3.pt",
             is_fsdp=is_fsdp_wrapped,
             reverse_model=reverse_model,
             spectral_shift_fwd=spectral_shift_fwd,
@@ -2633,7 +3073,7 @@ def train(
 
         if is_primary():
             print(f"\n{'='*70}")
-            print("STAGE 2 COMPLETE")
+            print("STAGE 3 COMPLETE: Post-hoc Calibration Applied")
             print(f"{'='*70}")
             print(f"  Optimal bias computed and saved (no training)")
             print(f"  FWD PSD_err = {psd_err_fwd:.2f} dB")
@@ -2884,11 +3324,28 @@ def parse_args():
 
     # Stage control
     parser.add_argument("--skip-spectral-finetune", action="store_true",
-                        help="Skip Stage 2 (spectral fine-tuning) - only run Stage 1")
+                        help="Skip Stage 3 (post-hoc calibration)")
     parser.add_argument("--stage2-only", action="store_true",
-                        help="Skip Stage 1, load checkpoint and run ONLY Stage 2 (SpectralShift fine-tuning)")
+                        help="Skip Stage 1, load checkpoint and run Stage 2 (adversarial) + 3 (calibration)")
+    parser.add_argument("--adversarial-only", action="store_true",
+                        help="Skip Stage 1, load checkpoint and run ONLY Stage 2 (adversarial fine-tuning)")
     parser.add_argument("--load-checkpoint", type=str, default=None,
-                        help="Path to checkpoint to load for stage2-only mode")
+                        help="Path to checkpoint to load for stage2-only or adversarial-only mode")
+
+    # Adversarial fine-tuning (Stage 2) - improves r² and correlation
+    parser.add_argument("--adversarial", action="store_true",
+                        help="Enable adversarial fine-tuning (Stage 2) for improved correlation")
+    parser.add_argument("--adversarial-epochs", type=int, default=10,
+                        help="Number of adversarial fine-tuning epochs (default: 10)")
+    parser.add_argument("--adversarial-lambda", type=float, default=0.1,
+                        help="Weight for adversarial loss vs reconstruction (default: 0.1)")
+    parser.add_argument("--adversarial-lr-g", type=float, default=1e-5,
+                        help="Generator learning rate for adversarial stage (default: 1e-5)")
+    parser.add_argument("--adversarial-lr-d", type=float, default=4e-5,
+                        help="Discriminator learning rate (default: 4e-5)")
+    parser.add_argument("--adversarial-loss-type", type=str, default="lsgan",
+                        choices=["lsgan", "vanilla", "hinge"],
+                        help="Adversarial loss type (default: lsgan)")
 
     # Training mode control
     parser.add_argument("--no-bidirectional", action="store_true",
@@ -3018,7 +3475,7 @@ def main():
 
     # Stage control from CLI
     if args.skip_spectral_finetune:
-        config["spectral_finetune_epochs"] = 0  # Disables Stage 2
+        config["spectral_finetune_epochs"] = 0  # Disables Stage 3 (post-hoc calibration)
     if args.stage2_only:
         config["stage2_only"] = True
         if args.load_checkpoint:
@@ -3029,6 +3486,28 @@ def main():
 
     # Stage 1 evaluation flag
     config["eval_stage1"] = args.eval_stage1
+
+    # Adversarial fine-tuning (Stage 2) config from CLI
+    if args.adversarial:
+        config["use_adversarial"] = True
+    if args.adversarial_only:
+        config["adversarial_only"] = True
+        config["use_adversarial"] = True  # Also enable adversarial training
+        if args.load_checkpoint:
+            config["stage1_checkpoint"] = args.load_checkpoint
+        else:
+            # Default to best_model.pt in artifacts/checkpoints
+            config["stage1_checkpoint"] = str(CHECKPOINT_DIR / "best_model.pt")
+    if args.adversarial_epochs is not None:
+        config["adversarial_epochs"] = args.adversarial_epochs
+    if args.adversarial_lambda is not None:
+        config["adversarial_lambda"] = args.adversarial_lambda
+    if args.adversarial_lr_g is not None:
+        config["adversarial_lr_g"] = args.adversarial_lr_g
+    if args.adversarial_lr_d is not None:
+        config["adversarial_lr_d"] = args.adversarial_lr_d
+    if args.adversarial_loss_type is not None:
+        config["adversarial_loss_type"] = args.adversarial_loss_type
 
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
