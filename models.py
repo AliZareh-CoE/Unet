@@ -2357,109 +2357,6 @@ class TemporalSmoothness(nn.Module):
         return torch.mean(d2**2)
 
 
-class HighFrequencySpectralLoss(nn.Module):
-    """Spectral loss that computes FFT-based PSD matching.
-
-    This loss computes the Power Spectral Density and applies frequency-dependent
-    weights. With low_freq_cutoff=0, it provides uniform weighting across the
-    full 0-100 Hz LFP range.
-
-    Args:
-        sample_rate: Sampling rate in Hz (default: 1000)
-        low_freq_cutoff: Frequencies below this get weight=1, above get high_freq_boost
-                         Set to 0 for uniform weighting (default: 0)
-        high_freq_boost: Multiplicative boost for frequencies above low_freq_cutoff (default: 1.0)
-        max_freq: Maximum frequency to consider (default: 100 Hz, LFP range)
-        use_log_psd: Whether to compare log-magnitude PSDs (default: True)
-    """
-
-    def __init__(
-        self,
-        sample_rate: float = SAMPLING_RATE_HZ,
-        low_freq_cutoff: float = 0.0,  # No cutoff - full range
-        high_freq_boost: float = 1.0,  # Uniform weighting by default
-        max_freq: float = MAX_FREQ_HZ,
-        use_log_psd: bool = True,
-    ):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.low_freq_cutoff = low_freq_cutoff
-        self.high_freq_boost = high_freq_boost
-        self.max_freq = max_freq
-        self.use_log_psd = use_log_psd
-        self._freq_weights = None
-        self._cached_length = None
-
-    def _get_freq_weights(self, n_fft: int, device: torch.device) -> torch.Tensor:
-        """Build frequency-dependent weights (cached for efficiency)."""
-        if self._freq_weights is not None and self._cached_length == n_fft:
-            return self._freq_weights.to(device)
-
-        # Frequency bins for rfft output
-        freqs = torch.fft.rfftfreq(n_fft, d=1.0 / self.sample_rate)
-
-        # Weight: 1.0 for low frequencies, high_freq_boost for high frequencies
-        weights = torch.ones_like(freqs)
-        if self.low_freq_cutoff > 0:
-            weights[freqs >= self.low_freq_cutoff] = self.high_freq_boost
-
-            # Smooth transition around cutoff (helps with gradient stability)
-            transition_width = 10.0  # Hz
-            transition_mask = (freqs >= self.low_freq_cutoff - transition_width) & (freqs < self.low_freq_cutoff)
-            if transition_mask.any():
-                t = (freqs[transition_mask] - (self.low_freq_cutoff - transition_width)) / transition_width
-                weights[transition_mask] = 1.0 + (self.high_freq_boost - 1.0) * t
-
-        # Zero out frequencies above max_freq (100 Hz for LFP)
-        weights[freqs > self.max_freq] = 0.0
-
-        self._freq_weights = weights
-        self._cached_length = n_fft
-        return weights.to(device)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute frequency-weighted spectral loss.
-
-        Args:
-            pred: Predicted signal [B, C, T]
-            target: Target signal [B, C, T]
-
-        Returns:
-            Scalar loss value
-        """
-        B, C, T = pred.shape
-
-        # Convert to float32 if needed (BFloat16 not supported by FFT)
-        original_dtype = pred.dtype
-        if pred.dtype in (torch.bfloat16, torch.float16):
-            pred = pred.float()
-            target = target.float()
-
-        # Compute FFT
-        pred_fft = torch.fft.rfft(pred, dim=-1)
-        target_fft = torch.fft.rfft(target, dim=-1)
-
-        # Compute magnitude (PSD)
-        pred_psd = torch.abs(pred_fft) ** 2
-        target_psd = torch.abs(target_fft) ** 2
-
-        if self.use_log_psd:
-            # Log-magnitude for better dynamic range
-            eps = 1e-10
-            pred_psd = torch.log(pred_psd + eps)
-            target_psd = torch.log(target_psd + eps)
-
-        # Get frequency weights
-        weights = self._get_freq_weights(T, pred.device)  # [F]
-
-        # Compute weighted MSE
-        diff = (pred_psd - target_psd) ** 2  # [B, C, F]
-        weighted_diff = diff * weights.unsqueeze(0).unsqueeze(0)  # Broadcast weights
-        loss = weighted_diff.mean()
-
-        return loss.to(original_dtype)
-
-
 class WaveletLoss(nn.Module):
     """Continuous Wavelet Transform loss for multi-scale frequency alignment.
 
@@ -2806,10 +2703,6 @@ def build_wavelet_loss(
     wavelet: str = WAVELET_FAMILY,
     use_complex_morlet: bool = USE_COMPLEX_MORLET,
     omega0: float = 5.0,
-    # Legacy parameters (ignored, kept for backward compatibility)
-    levels: int = None,
-    multiscale: bool = None,
-    base_freq: float = None,
 ) -> nn.Module:
     """Factory function for wavelet loss.
 
@@ -2821,9 +2714,6 @@ def build_wavelet_loss(
         wavelet: Wavelet family to use
         use_complex_morlet: Whether to use complex Morlet wavelets
         omega0: Morlet wavelet parameter (5.0 = good temporal resolution)
-        levels: DEPRECATED - ignored, kept for backward compatibility
-        multiscale: DEPRECATED - ignored, kept for backward compatibility
-        base_freq: DEPRECATED - ignored, kept for backward compatibility
 
     Returns:
         WaveletLoss module with full neural frequency coverage

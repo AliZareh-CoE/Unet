@@ -60,7 +60,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.distribute
 # Local imports
 from models import (
     CondUNet1D,
-    HighFrequencySpectralLoss,
     build_wavelet_loss,
     pearson_batch,
     explained_variance_torch,
@@ -170,7 +169,6 @@ DEFAULT_CONFIG = {
 
     # Loss toggles (set False to disable)
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
-    "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -717,7 +715,6 @@ def evaluate(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     wavelet_loss: Optional[nn.Module] = None,
-    spectral_loss: Optional[nn.Module] = None,
     compute_phase: bool = False,
     reverse_model: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -736,8 +733,8 @@ def evaluate(
     Returns composite validation loss that mirrors training loss.
 
     Args:
-        spectral_only: If True, composite loss uses ONLY spectral loss (Stage 2 mode)
-        disable_spectral: If True, disable SpectralShift and exclude spectral from composite loss (Stage 1 mode)
+        spectral_only: If True, Stage 2 mode (UNet frozen, only SpectralShift active)
+        disable_spectral: If True, disable SpectralShift (Stage 1 mode)
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
@@ -760,7 +757,7 @@ def evaluate(
 
     # Reverse direction (PCx→OB)
     mse_list_rev, mae_list_rev, corr_list_rev = [], [], []
-    wavelet_list_rev, spectral_list_rev = [], []
+    wavelet_list_rev = []
     plv_list_rev, pli_list_rev = [], []
     r2_list_rev, nrmse_list_rev = [], []
     psd_err_list_rev, psd_diff_list_rev = [], []
@@ -770,9 +767,6 @@ def evaluate(
     baseline_corr_list, baseline_r2_list, baseline_nrmse_list = [], [], []
     baseline_psd_err_list, baseline_psd_diff_list = [], []
     baseline_plv_list, baseline_pli_list = [], []
-
-    # For composite loss (forward)
-    spectral_list = []
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
@@ -846,15 +840,12 @@ def evaluate(
             if wavelet_loss is not None:
                 wavelet_list.append(wavelet_loss(pred_f32, pcx_f32).item())
 
-            if spectral_loss is not None:
-                spectral_list.append(spectral_loss(pred_f32, pcx_f32).item())
-
             # Skip expensive phase metrics in fast_mode
             if compute_phase and not fast_mode:
                 plv_list.append(plv_torch(pred_f32, pcx_f32).item())
                 pli_list.append(pli_torch(pred_f32, pcx_f32).item())
 
-            # Skip expensive PSD metrics in fast_mode (spectral_loss already covers frequency info)
+            # Skip expensive PSD metrics in fast_mode
             if not fast_mode:
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
                 psd_diff_list.append(psd_diff_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
@@ -913,9 +904,6 @@ def evaluate(
                 if wavelet_loss is not None:
                     wavelet_list_rev.append(wavelet_loss(pred_rev_f32, ob_f32).item())
 
-                if spectral_loss is not None:
-                    spectral_list_rev.append(spectral_loss(pred_rev_f32, ob_f32).item())
-
                 # Skip expensive phase metrics in fast_mode
                 if compute_phase and not fast_mode:
                     plv_list_rev.append(plv_torch(pred_rev_f32, ob_f32).item())
@@ -942,8 +930,6 @@ def evaluate(
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
     if wavelet_list:
         results["wavelet"] = float(np.mean(wavelet_list))
-    if spectral_list:
-        results["spectral"] = float(np.mean(spectral_list))
     if plv_list:
         results["plv"] = float(np.mean(plv_list))
     if pli_list:
@@ -963,8 +949,6 @@ def evaluate(
         results["psd_diff_db_rev"] = float(np.mean(psd_diff_list_rev))
     if wavelet_list_rev:
         results["wavelet_rev"] = float(np.mean(wavelet_list_rev))
-    if spectral_list_rev:
-        results["spectral_rev"] = float(np.mean(spectral_list_rev))
     if plv_list_rev:
         results["plv_rev"] = float(np.mean(plv_list_rev))
     if pli_list_rev:
@@ -986,34 +970,25 @@ def evaluate(
     # This allows early stopping based on overall objective, not just correlation
     if config is not None:
         if spectral_only:
-            # Stage 2: ONLY spectral loss (UNet frozen, pure PSD optimization)
-            w_spec = config.get("weight_spectral", 1.0) if config.get("use_spectral_loss", True) else 0.0
-            val_loss = 0.0
-            if "spectral" in results:
-                val_loss += w_spec * results["spectral"]
-            if "spectral_rev" in results:
-                val_loss += w_spec * results["spectral_rev"]
+            # Stage 2: Use PSD error for validation (SpectralShift optimization)
+            val_loss = results.get("psd_err_db", results["mae"])
+            if "psd_err_db_rev" in results:
+                val_loss += results["psd_err_db_rev"]
         else:
-            # Stage 1: L1 + wavelet (spectral excluded if disable_spectral=True)
+            # Stage 1: L1 + wavelet
             w_l1 = config.get("weight_l1", 1.0)
             w_wav = config.get("weight_wavelet", 1.0) if config.get("use_wavelet_loss", True) else 0.0
-            # Spectral weight is 0 if disabled (Stage 1 mode)
-            w_spec = 0.0 if disable_spectral else (config.get("weight_spectral", 1.0) if config.get("use_spectral_loss", True) else 0.0)
 
             # Forward loss
             val_loss = w_l1 * results["mae"]
             if "wavelet" in results:
                 val_loss += w_wav * results["wavelet"]
-            if "spectral" in results and not disable_spectral:
-                val_loss += w_spec * results["spectral"]
 
             # Reverse loss (if bidirectional)
             if "mae_rev" in results:
                 val_loss += w_l1 * results["mae_rev"]
                 if "wavelet_rev" in results:
                     val_loss += w_wav * results["wavelet_rev"]
-                if "spectral_rev" in results and not disable_spectral:
-                    val_loss += w_spec * results["spectral_rev"]
 
         results["loss"] = val_loss
 
@@ -1058,7 +1033,6 @@ def train_epoch(
     device: torch.device,
     config: Dict[str, Any],
     wavelet_loss: Optional[nn.Module] = None,
-    spectral_loss: Optional[nn.Module] = None,
     reverse_model: Optional[nn.Module] = None,
     epoch: int = 0,
     num_epochs: int = 0,
@@ -1067,13 +1041,12 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
-    prob_loss: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
-        stage2_spectral_only: If True, ONLY use spectral loss (Stage 2 mode where UNet is frozen)
-        disable_spectral: If True, disable SpectralShift application and spectral loss (Stage 1 mode)
+        stage2_spectral_only: If True, Stage 2 mode (UNet frozen, SpectralShift active)
+        disable_spectral: If True, disable SpectralShift application (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
     model.train()
@@ -1180,18 +1153,19 @@ def train_epoch(
             pred_shifted = pred_raw
             pred_shifted_c = pred_raw_c
 
-        # Stage 2 (UNet frozen): ONLY spectral loss for PSD correction
-        # Stage 1 (UNet trainable): L1 + wavelet (NO spectral)
+        # Stage 2 (UNet frozen): OptimalSpectralBias computes bias from statistics (no training needed)
+        # Stage 1 (UNet trainable): L1 + wavelet
         if stage2_spectral_only:
-            # ONLY spectral loss - UNet is frozen, we're fine-tuning SpectralShift for PSD
-            if config.get("use_spectral_loss", True) and spectral_loss is not None:
-                loss = config.get("weight_spectral", 1.0) * spectral_loss(pred_shifted_c, pcx_c)
-                loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + loss.detach()
+            # Stage 2: No loss needed - OptimalSpectralBias uses closed-form solution
+            # Just use wavelet loss if available for validation consistency
+            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+                loss = config["weight_wavelet"] * wavelet_loss(pred_shifted_c, pcx_c)
+                loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + loss.detach()
             else:
                 loss = torch.tensor(0.0, device=device)
 
         else:
-            # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+            # Stage 1: L1/Huber + wavelet
             # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
             loss_type = config.get("loss_type", "huber_wavelet")
             if loss_type in ("huber", "huber_wavelet"):
@@ -1206,19 +1180,6 @@ def train_epoch(
                 w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
                 loss = loss + w_loss
                 loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
-
-            # Spectral loss (forward) - DISABLED in Stage 1, enabled in joint training
-            # uses pred_shifted (SpectralShift DOES get gradients here)
-            if not disable_spectral and config.get("use_spectral_loss", True) and spectral_loss is not None:
-                spec_loss = config.get("weight_spectral", 1.0) * spectral_loss(pred_shifted_c, pcx_c)
-                loss = loss + spec_loss
-                loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + spec_loss.detach()
-
-            # Probabilistic loss (forward) - for tier 2.5, added ON TOP of base loss
-            if prob_loss is not None:
-                p_loss = prob_loss(pred_raw_c, pcx_c)
-                loss = loss + p_loss
-                loss_components["prob_fwd"] = loss_components["prob_fwd"] + p_loss.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -1246,15 +1207,15 @@ def train_epoch(
                 pred_rev_shifted = pred_rev_raw
                 pred_rev_shifted_c = pred_rev_raw_c
 
-            # Stage 2: ONLY spectral loss for reverse direction too
+            # Stage 2: No training needed for reverse (OptimalSpectralBias uses closed-form)
             if stage2_spectral_only:
-                # ONLY spectral loss - UNet frozen, fine-tuning SpectralShift
-                if config.get("use_spectral_loss", True) and spectral_loss is not None:
-                    spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + spec_loss_rev
-                    loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
+                # Just use wavelet loss if available for validation consistency
+                if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+                    w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_shifted_c, ob_c)
+                    loss = loss + w_loss_rev
+                    loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
             else:
-                # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+                # Stage 1: L1/Huber + wavelet
                 # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
                 loss_type = config.get("loss_type", "huber_wavelet")
                 if loss_type in ("huber", "huber_wavelet"):
@@ -1269,19 +1230,6 @@ def train_epoch(
                     w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
                     loss = loss + w_loss_rev
                     loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
-
-                # Spectral loss (reverse) - DISABLED in Stage 1, enabled in joint training
-                # uses pred_rev_shifted (SpectralShift DOES get gradients)
-                if not disable_spectral and config.get("use_spectral_loss", True) and spectral_loss is not None:
-                    spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + spec_loss_rev
-                    loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
-
-                # Probabilistic loss (reverse) - for tier 2.5
-                if prob_loss is not None:
-                    p_loss_rev = prob_loss(pred_rev_raw_c, ob_c)
-                    loss = loss + p_loss_rev
-                    loss_components["prob_rev"] = loss_components["prob_rev"] + p_loss_rev.detach()
 
                 # Cycle consistency: OB → PCx → OB (use raw, no spectral shift in cycle)
                 # Skip in Stage 2 since UNet is frozen
@@ -1689,33 +1637,6 @@ def train(
             omega0=config.get("wavelet_omega0", 5.0),
         ).to(device)
 
-    spectral_loss = None
-    if config.get("use_spectral_loss", True):
-        spectral_loss = HighFrequencySpectralLoss(
-            sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-            low_freq_cutoff=0.0,
-            high_freq_boost=1.0,
-            max_freq=MAX_FREQ_HZ,
-            use_log_psd=True,
-        ).to(device)
-
-    # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
-    prob_loss = None
-    prob_loss_type = config.get("prob_loss_type", "none")
-    prob_loss_weight = config.get("prob_loss_weight", 1.0)
-    if prob_loss_type != "none":
-        try:
-            from experiments.study3_loss.losses.neural_probabilistic_losses import (
-                create_neural_prob_loss
-            )
-            prob_loss = create_neural_prob_loss(prob_loss_type, weight=prob_loss_weight).to(device)
-            if is_primary():
-                print(f"Probabilistic loss: {prob_loss_type} (weight={prob_loss_weight})")
-        except Exception as e:
-            if is_primary():
-                print(f"Warning: Could not create probabilistic loss '{prob_loss_type}': {e}")
-            prob_loss = None
-
     # Create optimizer with parameter groups
     # SpectralShift needs MUCH higher lr because it's just 32 scalars trying to make dB-scale changes
     lr = config.get("learning_rate", 1e-4)
@@ -1734,11 +1655,6 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
-    # Add probabilistic loss parameters (if any) with model learning rate
-    if prob_loss is not None:
-        prob_params = list(prob_loss.parameters())
-        if prob_params:
-            param_groups.append({"params": prob_params, "lr": lr, "name": "prob_loss"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
     if is_primary():
@@ -1850,18 +1766,17 @@ def train(
 
             train_metrics = train_epoch(
                 model, loaders["train"], optimizer, device, config,
-                wavelet_loss, spectral_loss,
+                wavelet_loss,
                 reverse_model, epoch, num_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
-                prob_loss=prob_loss,
             )
 
             barrier()
 
             val_metrics = evaluate(
-                model, loaders["val"], device, wavelet_loss, spectral_loss,
+                model, loaders["val"], device, wavelet_loss,
                 compute_phase=False, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
@@ -2057,7 +1972,7 @@ def train(
 
             # Evaluate on VALIDATION set - ALL ranks must call this (FSDP requirement)
             val_metrics_stage1 = evaluate(
-                model, loaders["val"], device, wavelet_loss, spectral_loss,
+                model, loaders["val"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,
@@ -2069,7 +1984,7 @@ def train(
 
             # Evaluate on TEST set - ALL ranks must call this (FSDP requirement)
             test_metrics_stage1 = evaluate(
-                model, loaders["test"], device, wavelet_loss, spectral_loss,
+                model, loaders["test"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,
@@ -2759,7 +2674,7 @@ def train(
 
         # Evaluate with optimal bias applied
         val_metrics = evaluate(
-            model, loaders["val"], device, wavelet_loss, spectral_loss,
+            model, loaders["val"], device, wavelet_loss,
             compute_phase=False, reverse_model=reverse_model, config=config,
             spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
             spectral_only=True, fast_mode=False,
@@ -2802,7 +2717,7 @@ def train(
 
     # Final test evaluation (full metrics, fast_mode=False)
     test_metrics = evaluate(
-        model, loaders["test"], device, wavelet_loss, spectral_loss,
+        model, loaders["test"], device, wavelet_loss,
         compute_phase=True, reverse_model=reverse_model, config=config,
         spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
         fast_mode=False,  # Full metrics for final evaluation
@@ -3074,28 +2989,6 @@ def parse_args():
                              "'huber_wavelet' (Huber + Wavelet combined). "
                              "If not specified, uses config default (huber_wavelet)")
 
-    # Probabilistic loss (for tier 2.5 - added ON TOP of base loss)
-    PROB_LOSS_CHOICES = [
-        "none",               # No probabilistic loss (baseline)
-        "gaussian_nll",       # Gaussian negative log-likelihood
-        "laplacian_nll",      # Laplacian NLL (robust to outliers)
-        "rayleigh",           # Signal envelope distribution
-        "von_mises",          # Phase distribution (circular statistics)
-        "kl_divergence",      # Distribution matching
-        "cauchy_nll",         # Heavy-tailed (very robust)
-        "student_t_nll",      # Controllable heavy tails
-        "gumbel",             # Peak/extreme value distribution
-        "gamma",              # Positive-valued signals
-        "log_normal",         # Multiplicative processes
-        "mixture",            # Gaussian mixture (multi-modal)
-    ]
-    parser.add_argument("--prob-loss", type=str, default="none",
-                        choices=PROB_LOSS_CHOICES,
-                        help="Probabilistic loss to ADD on top of base loss (for tier 2.5). "
-                             "Default: 'none' (no probabilistic loss)")
-    parser.add_argument("--prob-loss-weight", type=float, default=1.0,
-                        help="Weight for probabilistic loss (default: 1.0)")
-
     return parser.parse_args()
 
 
@@ -3252,12 +3145,6 @@ def main():
         loss_type = config.get("loss_type", "huber_wavelet")
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
-
-    # Probabilistic loss (tier 2.5) - added ON TOP of base loss
-    config["prob_loss_type"] = args.prob_loss if hasattr(args, 'prob_loss') else "none"
-    config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 1.0
-    if config["prob_loss_type"] != "none" and is_primary():
-        print(f"Probabilistic loss: {config['prob_loss_type']} (weight={config['prob_loss_weight']})")
 
     # Per-channel normalization (default: enabled)
     config["per_channel_norm"] = args.per_channel_norm if hasattr(args, 'per_channel_norm') else True
