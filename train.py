@@ -1907,14 +1907,15 @@ def train(
 
     # =============================================================================
     # STAGE 1: Train UNet + SpectralShift together until early stopping
-    # (SKIPPED if stage2_only=True)
+    # (SKIPPED if stage2_only=True or adversarial_only=True)
     # =============================================================================
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
     history = []
 
-    if not stage2_only:
+    skip_stage1 = stage2_only or adversarial_only
+    if not skip_stage1:
         if is_primary() and use_two_stage:
             print(f"\n{'='*70}")
             print("STAGE 1: Training UNet + SpectralShift together")
