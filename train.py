@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import functools
+import math
 import os
 import sys
 import traceback
@@ -118,6 +119,10 @@ DEFAULT_CONFIG = {
     "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
     "beta2": 0.920298282605139,
+    "weight_decay": 0.0,            # L2 regularization (0.01-0.1 typical)
+    "lr_scheduler": "none",         # "none", "cosine", "cosine_warmup"
+    "lr_warmup_epochs": 5,          # Warmup epochs for cosine_warmup
+    "lr_min_ratio": 0.01,           # Min lr as ratio of initial (for cosine)
     "early_stop_patience": 15,  # Increased for better PSD convergence
     "seed": 42,
 
@@ -1886,37 +1891,59 @@ def train(
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
+
+    # Weight decay (L2 regularization)
+    weight_decay = config.get("weight_decay", 0.0)
+
     if is_primary():
-        print(f"Optimizer: {total_params} total params | model lr={lr}, spectral_shift lr={spectral_shift_lr}")
+        print(f"Optimizer: {total_params} total params | model lr={lr}, spectral_shift lr={spectral_shift_lr}, weight_decay={weight_decay}")
 
-    optimizer = AdamW(param_groups, lr=lr, betas=betas)
+    optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
 
-    # Learning rate scheduler for SpectralShift
-    # Decay SpectralShift lr by gamma each epoch (start high, converge smoothly)
-    # Model lr stays constant, only SpectralShift decays
-    spectral_shift_lr_decay = config.get("spectral_shift_lr_decay", 0.95)  # decay per epoch
+    # Learning rate scheduler configuration
+    spectral_shift_lr_decay = config.get("spectral_shift_lr_decay", 0.95)
     num_epochs = config.get("num_epochs", 80)
+    lr_scheduler_type = config.get("lr_scheduler", "none")
+    lr_warmup_epochs = config.get("lr_warmup_epochs", 5)
+    lr_min_ratio = config.get("lr_min_ratio", 0.01)
 
-    def lr_lambda(_epoch):
-        """Return lr multiplier. Model lr stays constant."""
-        return 1.0  # Model lr unchanged
+    def make_lr_lambda(is_spectral_shift: bool):
+        """Create lr lambda for a param group."""
+        def lr_lambda(epoch):
+            # Base multiplier from scheduler type
+            if lr_scheduler_type == "none":
+                base_mult = 1.0
+            elif lr_scheduler_type == "cosine":
+                # Cosine annealing from 1.0 to lr_min_ratio
+                progress = epoch / max(num_epochs - 1, 1)
+                base_mult = lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+            elif lr_scheduler_type == "cosine_warmup":
+                # Linear warmup then cosine decay
+                if epoch < lr_warmup_epochs:
+                    base_mult = (epoch + 1) / lr_warmup_epochs
+                else:
+                    progress = (epoch - lr_warmup_epochs) / max(num_epochs - lr_warmup_epochs - 1, 1)
+                    base_mult = lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+            else:
+                base_mult = 1.0
 
-    def spectral_shift_lr_lambda(epoch):
-        """Exponential decay for SpectralShift lr."""
-        return spectral_shift_lr_decay ** epoch
+            # SpectralShift always gets exponential decay on top
+            if is_spectral_shift:
+                return base_mult * (spectral_shift_lr_decay ** epoch)
+            return base_mult
+        return lr_lambda
 
     # Build per-group lr lambdas
     lr_lambdas = []
     for pg in param_groups:
-        if pg.get("name", "").startswith("spectral_shift"):
-            lr_lambdas.append(spectral_shift_lr_lambda)
-        else:
-            lr_lambdas.append(lr_lambda)
+        is_spectral = pg.get("name", "").startswith("spectral_shift")
+        lr_lambdas.append(make_lr_lambda(is_spectral))
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
 
     if is_primary():
-        print(f"SpectralShift lr scheduler: decay={spectral_shift_lr_decay} per epoch")
+        print(f"LR scheduler: {lr_scheduler_type}" + (f" (warmup={lr_warmup_epochs}, min_ratio={lr_min_ratio})" if lr_scheduler_type != "none" else ""))
+        print(f"SpectralShift lr decay: {spectral_shift_lr_decay} per epoch")
 
     # =========================================================================
     # Initialize Recording System (for Nature Methods publication)
@@ -3123,6 +3150,15 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: from config)")
+    parser.add_argument("--weight-decay", type=float, default=None,
+                        help="Weight decay / L2 regularization (default: 0.0, try 0.01-0.1)")
+    parser.add_argument("--lr-scheduler", type=str, default=None,
+                        choices=["none", "cosine", "cosine_warmup"],
+                        help="LR scheduler: 'none' (constant), 'cosine' (annealing), 'cosine_warmup' (warmup + cosine)")
+    parser.add_argument("--lr-warmup-epochs", type=int, default=None,
+                        help="Warmup epochs for cosine_warmup scheduler (default: 5)")
+    parser.add_argument("--lr-min-ratio", type=float, default=None,
+                        help="Min LR as ratio of initial for cosine scheduler (default: 0.01)")
     parser.add_argument("--base-channels", type=int, default=None, help="Base channels for model (default: from config)")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP for distributed training")
     parser.add_argument("--fsdp-strategy", type=str, default="full",
@@ -3309,6 +3345,14 @@ def main():
         config["batch_size"] = args.batch_size
     if args.lr is not None:
         config["learning_rate"] = args.lr
+    if args.weight_decay is not None:
+        config["weight_decay"] = args.weight_decay
+    if args.lr_scheduler is not None:
+        config["lr_scheduler"] = args.lr_scheduler
+    if args.lr_warmup_epochs is not None:
+        config["lr_warmup_epochs"] = args.lr_warmup_epochs
+    if args.lr_min_ratio is not None:
+        config["lr_min_ratio"] = args.lr_min_ratio
     if args.base_channels is not None:
         config["base_channels"] = args.base_channels
     if args.seed is not None:

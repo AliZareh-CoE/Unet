@@ -900,7 +900,8 @@ class OptimalSpectralBias(nn.Module):
         band_width_hz: If set, use uniform bands with this spacing
                        If None, use predefined neuroscience bands
         min_freq_hz: Minimum frequency for uniform bands (default: 1.0)
-        max_freq_hz: Maximum frequency for uniform bands (default: 100.0)
+        max_freq_hz: Maximum frequency for uniform bands (default: None = Nyquist)
+                     IMPORTANT: Set to sample_rate/2 to cover ALL frequencies!
     """
 
     def __init__(
@@ -910,7 +911,7 @@ class OptimalSpectralBias(nn.Module):
         sample_rate: float = SAMPLING_RATE_HZ,
         band_width_hz: Optional[float] = None,
         min_freq_hz: float = 1.0,
-        max_freq_hz: float = 100.0,
+        max_freq_hz: Optional[float] = None,  # None = Nyquist (sample_rate / 2)
     ):
         super().__init__()
         self.n_channels = n_channels
@@ -918,13 +919,19 @@ class OptimalSpectralBias(nn.Module):
         self.sample_rate = sample_rate
         self.band_width_hz = band_width_hz
         self.min_freq_hz = min_freq_hz
-        self.max_freq_hz = max_freq_hz
+        # Default to Nyquist frequency to cover ALL frequencies
+        self.max_freq_hz = max_freq_hz if max_freq_hz is not None else (sample_rate / 2.0)
 
         # Build frequency bands
         if band_width_hz is not None:
-            self.freq_bands = make_uniform_bands(band_width_hz, min_freq_hz, max_freq_hz)
+            # Use self.max_freq_hz (which defaults to Nyquist if not specified)
+            self.freq_bands = make_uniform_bands(band_width_hz, self.min_freq_hz, self.max_freq_hz)
         else:
-            self.freq_bands = FREQ_BANDS_NEURO
+            # When using predefined neuro bands, also add a high-frequency band
+            # to cover everything above 100 Hz up to Nyquist
+            self.freq_bands = FREQ_BANDS_NEURO.copy()
+            if self.max_freq_hz > 100.0:
+                self.freq_bands["High (100-500 Hz)"] = (100.0, self.max_freq_hz)
 
         self.band_names = list(self.freq_bands.keys())
         self.n_bands = len(self.freq_bands)
