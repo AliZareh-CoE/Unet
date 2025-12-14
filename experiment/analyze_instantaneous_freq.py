@@ -125,11 +125,18 @@ def generate_predictions(
     model: CondUNet1D,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
-    n_samples: int = 100,
+    n_samples: Optional[int] = None,
     config: Optional[Dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Generate predictions and collect real targets.
+
+    Args:
+        model: Trained model
+        dataloader: Test dataloader
+        device: Device to run on
+        n_samples: If None, use all samples in dataloader
+        config: Model config (unused, for compatibility)
 
     Returns:
         pred_signals: [N, C, T] array of predictions
@@ -140,10 +147,7 @@ def generate_predictions(
 
     model.eval()
     with torch.no_grad():
-        for ob, pcx, odor in tqdm(dataloader, desc="Generating predictions", total=min(n_samples, len(dataloader))):
-            if len(pred_list) >= n_samples:
-                break
-
+        for ob, pcx, odor in tqdm(dataloader, desc="Generating predictions"):
             ob = ob.to(device)
             odor = odor.to(device)
 
@@ -159,8 +163,8 @@ def generate_predictions(
             pred_list.append(pred.cpu().numpy())
             real_list.append(pcx.numpy())
 
-    pred_signals = np.concatenate(pred_list, axis=0)[:n_samples]
-    real_signals = np.concatenate(real_list, axis=0)[:n_samples]
+    pred_signals = np.concatenate(pred_list, axis=0)
+    real_signals = np.concatenate(real_list, axis=0)
 
     return pred_signals, real_signals
 
@@ -314,8 +318,6 @@ def main():
     parser = argparse.ArgumentParser(description='Analyze instantaneous frequency distributions')
     parser.add_argument('--exp-dir', type=str, default='artifacts/loss_ablation',
                         help='Directory containing experiment folders')
-    parser.add_argument('--n-samples', type=int, default=100,
-                        help='Number of samples to analyze per experiment')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
     parser.add_argument('--batch-size', type=int, default=8,
@@ -327,7 +329,6 @@ def main():
 
     print(f"Experiment directory: {exp_dir}")
     print(f"Device: {device}")
-    print(f"Samples per experiment: {args.n_samples}")
     print()
 
     # Find all experiment folders with checkpoints
@@ -355,16 +356,12 @@ def main():
         print(f"  - {name}")
     print()
 
-    # Load validation data once
-    print("Loading validation data...")
+    # Load test data once
+    print("Loading test data...")
     data = prepare_data(seed=42)
-    _, val_loader, _ = create_dataloaders(
-        data['ob_train'], data['pcx_train'], data['odor_train'],
-        data['ob_val'], data['pcx_val'], data['odor_val'],
-        data['ob_test'], data['pcx_test'], data['odor_test'],
-        batch_size=args.batch_size,
-    )
-    print(f"Validation samples: {len(val_loader.dataset)}")
+    loaders = create_dataloaders(data, batch_size=args.batch_size)
+    test_loader = loaders['test']
+    print(f"Test samples: {len(test_loader.dataset)}")
     print()
 
     # Analyze each experiment
@@ -380,11 +377,9 @@ def main():
             print(f"Loading checkpoint: {checkpoint_path}")
             model, config = load_checkpoint(checkpoint_path, device)
 
-            # Generate predictions
+            # Generate predictions on ALL test samples
             pred_signals, real_signals = generate_predictions(
-                model, val_loader, device,
-                n_samples=args.n_samples,
-                config=config,
+                model, test_loader, device,
             )
 
             # Plot and save
