@@ -2339,11 +2339,16 @@ def train(
                 print(f"  Val: corr={val_metrics['corr']:.4f}, r2={val_metrics['r2']:.4f}")
 
             # Save best model based on validation correlation
-            if val_metrics['corr'] > best_adv_val_corr:
+            # All ranks must participate in checkpoint save with FSDP
+            # Broadcast decision from rank 0 to ensure all ranks agree
+            is_best_tensor = torch.tensor([1 if val_metrics['corr'] > best_adv_val_corr else 0], device=device)
+            if dist.is_initialized():
+                dist.broadcast(is_best_tensor, src=0)
+            is_best = is_best_tensor.item() == 1
+
+            if is_best:
                 best_adv_val_corr = val_metrics['corr']
                 best_adv_epoch = epoch + 1
-
-                # Save checkpoint
                 save_checkpoint(
                     model, g_optimizer, epoch + 1,
                     CHECKPOINT_DIR / "best_model_stage2_adv.pt",
@@ -2353,7 +2358,6 @@ def train(
                     spectral_shift_rev=spectral_shift_rev,
                     config=config,
                 )
-
                 if is_primary():
                     print(f"  ✓ New best! Saved checkpoint (corr={best_adv_val_corr:.4f})")
 
