@@ -172,6 +172,18 @@ DEFAULT_CONFIG = {
     # Loss toggles (set False to disable)
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
 
+    # Data augmentation (applied during training only)
+    "aug_time_shift": False,        # Random circular time shift
+    "aug_time_shift_max": 0.1,      # Max shift as fraction of signal length (0.1 = 10%)
+    "aug_noise": False,             # Add Gaussian noise
+    "aug_noise_std": 0.05,          # Noise std relative to signal std
+    "aug_channel_dropout": False,   # Randomly zero out channels
+    "aug_channel_dropout_p": 0.1,   # Probability of dropping each channel
+    "aug_amplitude_scale": False,   # Random amplitude scaling
+    "aug_amplitude_scale_range": (0.8, 1.2),  # Scale factor range (min, max)
+    "aug_time_mask": False,         # Randomly mask time segments
+    "aug_time_mask_ratio": 0.1,     # Fraction of time to mask
+
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
 
@@ -415,6 +427,182 @@ def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     std = x.std(dim=-1, keepdim=True).clamp(min=eps)
 
     return (x - mean) / std
+
+
+# =============================================================================
+# Data Augmentation Functions
+# =============================================================================
+
+def aug_time_shift(x: torch.Tensor, max_shift: float = 0.1) -> torch.Tensor:
+    """Apply random circular time shift to each sample in batch.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        max_shift: Maximum shift as fraction of signal length
+
+    Returns:
+        Shifted tensor (same shape)
+    """
+    batch_size, _, time_len = x.shape
+    max_shift_samples = int(time_len * max_shift)
+
+    if max_shift_samples == 0:
+        return x
+
+    # Random shift per sample in batch
+    shifts = torch.randint(-max_shift_samples, max_shift_samples + 1, (batch_size,), device=x.device)
+
+    # Apply circular shift to each sample
+    shifted = torch.zeros_like(x)
+    for i in range(batch_size):
+        shifted[i] = torch.roll(x[i], shifts=shifts[i].item(), dims=-1)
+
+    return shifted
+
+
+def aug_gaussian_noise(x: torch.Tensor, noise_std: float = 0.05) -> torch.Tensor:
+    """Add Gaussian noise scaled relative to signal std.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        noise_std: Noise std as fraction of signal std per channel
+
+    Returns:
+        Noisy tensor (same shape)
+    """
+    # Compute per-channel std
+    signal_std = x.std(dim=-1, keepdim=True).clamp(min=1e-6)
+    noise = torch.randn_like(x) * signal_std * noise_std
+    return x + noise
+
+
+def aug_channel_dropout(x: torch.Tensor, dropout_p: float = 0.1) -> torch.Tensor:
+    """Randomly zero out entire channels.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        dropout_p: Probability of dropping each channel
+
+    Returns:
+        Tensor with some channels zeroed (same shape)
+    """
+    batch_size, n_channels, _ = x.shape
+    # Create dropout mask (batch, channels, 1)
+    mask = torch.bernoulli(torch.full((batch_size, n_channels, 1), 1 - dropout_p, device=x.device))
+    return x * mask
+
+
+def aug_amplitude_scale(x: torch.Tensor, scale_range: tuple = (0.8, 1.2)) -> torch.Tensor:
+    """Apply random amplitude scaling per sample.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        scale_range: (min_scale, max_scale) tuple
+
+    Returns:
+        Scaled tensor (same shape)
+    """
+    batch_size = x.shape[0]
+    min_scale, max_scale = scale_range
+    # Random scale per sample (batch, 1, 1)
+    scales = torch.empty(batch_size, 1, 1, device=x.device).uniform_(min_scale, max_scale)
+    return x * scales
+
+
+def aug_time_mask(x: torch.Tensor, mask_ratio: float = 0.1) -> torch.Tensor:
+    """Randomly mask contiguous time segments with zeros.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        mask_ratio: Fraction of time to mask
+
+    Returns:
+        Masked tensor (same shape)
+    """
+    batch_size, _, time_len = x.shape
+    mask_len = int(time_len * mask_ratio)
+
+    if mask_len == 0:
+        return x
+
+    result = x.clone()
+    for i in range(batch_size):
+        # Random start position for mask
+        start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
+        result[i, :, start:start + mask_len] = 0
+
+    return result
+
+
+def apply_augmentations(
+    ob: torch.Tensor,
+    pcx: torch.Tensor,
+    config: Dict[str, Any]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply configured augmentations to input/target pairs.
+
+    IMPORTANT: Augmentations that change timing (time_shift) are applied
+    identically to both input and target to maintain correspondence.
+    Other augmentations are applied independently or only to input.
+
+    Args:
+        ob: Input (OB) tensor (batch, channels, time)
+        pcx: Target (PCx) tensor (batch, channels, time)
+        config: Config dict with aug_* keys
+
+    Returns:
+        Tuple of (augmented_ob, augmented_pcx)
+    """
+    # Time shift: apply same shift to both (maintains correspondence)
+    if config.get("aug_time_shift", False):
+        max_shift = config.get("aug_time_shift_max", 0.1)
+        # Generate shifts once, apply to both
+        batch_size, _, time_len = ob.shape
+        max_shift_samples = int(time_len * max_shift)
+        if max_shift_samples > 0:
+            shifts = torch.randint(-max_shift_samples, max_shift_samples + 1, (batch_size,), device=ob.device)
+            ob_shifted = torch.zeros_like(ob)
+            pcx_shifted = torch.zeros_like(pcx)
+            for i in range(batch_size):
+                ob_shifted[i] = torch.roll(ob[i], shifts=shifts[i].item(), dims=-1)
+                pcx_shifted[i] = torch.roll(pcx[i], shifts=shifts[i].item(), dims=-1)
+            ob, pcx = ob_shifted, pcx_shifted
+
+    # Noise: add independently to both (realistic noise augmentation)
+    if config.get("aug_noise", False):
+        noise_std = config.get("aug_noise_std", 0.05)
+        ob = aug_gaussian_noise(ob, noise_std)
+        pcx = aug_gaussian_noise(pcx, noise_std)
+
+    # Channel dropout: apply same mask to both (maintains channel correspondence)
+    if config.get("aug_channel_dropout", False):
+        dropout_p = config.get("aug_channel_dropout_p", 0.1)
+        batch_size, n_channels, _ = ob.shape
+        mask = torch.bernoulli(torch.full((batch_size, n_channels, 1), 1 - dropout_p, device=ob.device))
+        ob = ob * mask
+        pcx = pcx * mask
+
+    # Amplitude scale: apply same scale to both (maintains relative amplitude)
+    if config.get("aug_amplitude_scale", False):
+        scale_range = config.get("aug_amplitude_scale_range", (0.8, 1.2))
+        batch_size = ob.shape[0]
+        min_scale, max_scale = scale_range
+        scales = torch.empty(batch_size, 1, 1, device=ob.device).uniform_(min_scale, max_scale)
+        ob = ob * scales
+        pcx = pcx * scales
+
+    # Time mask: apply same mask to both (maintains correspondence)
+    if config.get("aug_time_mask", False):
+        mask_ratio = config.get("aug_time_mask_ratio", 0.1)
+        batch_size, _, time_len = ob.shape
+        mask_len = int(time_len * mask_ratio)
+        if mask_len > 0:
+            for i in range(batch_size):
+                start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
+                ob[i, :, start:start + mask_len] = 0
+                pcx[i, :, start:start + mask_len] = 0
+
+    return ob, pcx
 
 
 def load_checkpoint(
@@ -1066,6 +1254,9 @@ def train_epoch(
         if config.get("per_channel_norm", True):
             ob = per_channel_normalize(ob)
             pcx = per_channel_normalize(pcx)
+
+        # Apply data augmentation (training only)
+        ob, pcx = apply_augmentations(ob, pcx, config)
 
         # Compute conditioning embedding
         cond_emb = None
@@ -2903,6 +3094,40 @@ def parse_args():
     parser.add_argument("--no-per-channel-norm", action="store_false", dest="per_channel_norm",
                         help="Disable per-channel normalization")
 
+    # Data augmentation (default=None means use config value, not override)
+    parser.add_argument("--aug-time-shift", action="store_true", default=None,
+                        help="Enable random circular time shift augmentation")
+    parser.add_argument("--no-aug-time-shift", action="store_false", dest="aug_time_shift",
+                        help="Disable time shift augmentation")
+    parser.add_argument("--aug-time-shift-max", type=float, default=None,
+                        help="Max time shift as fraction of signal length (default: 0.1)")
+    parser.add_argument("--aug-noise", action="store_true", default=None,
+                        help="Enable Gaussian noise augmentation")
+    parser.add_argument("--no-aug-noise", action="store_false", dest="aug_noise",
+                        help="Disable noise augmentation")
+    parser.add_argument("--aug-noise-std", type=float, default=None,
+                        help="Noise std relative to signal std (default: 0.05)")
+    parser.add_argument("--aug-channel-dropout", action="store_true", default=None,
+                        help="Enable random channel dropout augmentation")
+    parser.add_argument("--no-aug-channel-dropout", action="store_false", dest="aug_channel_dropout",
+                        help="Disable channel dropout augmentation")
+    parser.add_argument("--aug-channel-dropout-p", type=float, default=None,
+                        help="Probability of dropping each channel (default: 0.1)")
+    parser.add_argument("--aug-amplitude-scale", action="store_true", default=None,
+                        help="Enable random amplitude scaling augmentation")
+    parser.add_argument("--no-aug-amplitude-scale", action="store_false", dest="aug_amplitude_scale",
+                        help="Disable amplitude scale augmentation")
+    parser.add_argument("--aug-amplitude-scale-min", type=float, default=None,
+                        help="Min amplitude scale factor (default: 0.8)")
+    parser.add_argument("--aug-amplitude-scale-max", type=float, default=None,
+                        help="Max amplitude scale factor (default: 1.2)")
+    parser.add_argument("--aug-time-mask", action="store_true", default=None,
+                        help="Enable random time masking augmentation")
+    parser.add_argument("--no-aug-time-mask", action="store_false", dest="aug_time_mask",
+                        help="Disable time mask augmentation")
+    parser.add_argument("--aug-time-mask-ratio", type=float, default=None,
+                        help="Fraction of time to mask (default: 0.1)")
+
     # Output scaling correction (learnable per-channel scale and bias in model)
     parser.add_argument("--output-scaling", action="store_true", default=True,
                         help="Enable learnable per-channel output scaling in model (default: True)")
@@ -3038,6 +3263,40 @@ def main():
         config["use_bidirectional"] = False
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
+
+    # Data augmentation config from CLI (only override if explicitly set, not None)
+    if args.aug_time_shift is not None:
+        config["aug_time_shift"] = args.aug_time_shift
+    if args.aug_time_shift_max is not None:
+        config["aug_time_shift_max"] = args.aug_time_shift_max
+    if args.aug_noise is not None:
+        config["aug_noise"] = args.aug_noise
+    if args.aug_noise_std is not None:
+        config["aug_noise_std"] = args.aug_noise_std
+    if args.aug_channel_dropout is not None:
+        config["aug_channel_dropout"] = args.aug_channel_dropout
+    if args.aug_channel_dropout_p is not None:
+        config["aug_channel_dropout_p"] = args.aug_channel_dropout_p
+    if args.aug_amplitude_scale is not None:
+        config["aug_amplitude_scale"] = args.aug_amplitude_scale
+    if args.aug_amplitude_scale_min is not None or args.aug_amplitude_scale_max is not None:
+        # Get current range or default
+        current_range = config.get("aug_amplitude_scale_range", (0.8, 1.2))
+        min_val = args.aug_amplitude_scale_min if args.aug_amplitude_scale_min is not None else current_range[0]
+        max_val = args.aug_amplitude_scale_max if args.aug_amplitude_scale_max is not None else current_range[1]
+        config["aug_amplitude_scale_range"] = (min_val, max_val)
+    if args.aug_time_mask is not None:
+        config["aug_time_mask"] = args.aug_time_mask
+    if args.aug_time_mask_ratio is not None:
+        config["aug_time_mask_ratio"] = args.aug_time_mask_ratio
+
+    # Print augmentation config if any are enabled
+    aug_enabled = [
+        k for k in ["aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale", "aug_time_mask"]
+        if config.get(k, False)
+    ]
+    if aug_enabled and is_primary():
+        print(f"Data augmentation ENABLED: {', '.join(aug_enabled)}")
 
     # Loss function selection (for tier1 fair comparison)
     # Only override config if --loss is explicitly provided
