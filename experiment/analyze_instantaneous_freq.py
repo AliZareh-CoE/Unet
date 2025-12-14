@@ -79,72 +79,45 @@ def compute_instantaneous_frequency(
 
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> Tuple[CondUNet1D, Dict]:
-    """Load model from checkpoint, inferring architecture from state dict."""
+    """Load model from checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Get state dict and clean keys (remove FSDP/DDP prefixes)
-    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', {}))
-    clean_state_dict = {}
-    for k, v in state_dict.items():
-        new_key = k.replace('module.', '').replace('_fsdp_wrapped_module.', '')
-        clean_state_dict[new_key] = v
+    # Get config from checkpoint
+    config = checkpoint.get('config', {})
 
-    # Infer n_downsample from number of encoders
-    n_downsample = 0
-    for key in clean_state_dict:
-        if key.startswith('encoders.'):
-            idx = int(key.split('.')[1])
-            n_downsample = max(n_downsample, idx + 1)
-
-    # Infer base channels from inc block output
-    base_channels = 64  # default
-    for key in clean_state_dict:
-        if 'inc.conv.0.branches.0.bias' in key:  # inception conv
-            base_channels = clean_state_dict[key].shape[0]
-            break
-        elif 'inc.conv.2.bias' in key:  # standard conv
-            base_channels = clean_state_dict[key].shape[0]
-            break
-
-    # Infer conv_type from state dict keys
-    conv_type = 'inception' if any('branches' in k for k in clean_state_dict) else 'standard'
-
-    # Get cond_mode from checkpoint (this IS saved)
-    cond_mode = checkpoint.get('cond_mode', 'cross_attn_gated')
-
-    # Build model with inferred parameters
+    # Build model with correct parameter names matching CondUNet1D.__init__
     model = CondUNet1D(
-        in_channels=32,
-        out_channels=32,
-        base=base_channels,
-        n_odors=7,
-        emb_dim=128,
-        dropout=0.0,
-        use_attention=True,
-        attention_type='cross_freq_v2',
-        norm_type='batch',
-        cond_mode=cond_mode,
-        use_spectral_shift=True,
-        n_downsample=n_downsample,
-        conv_type=conv_type,
-        use_se=True,
-        conv_kernel_size=7,
-        dilations=(1, 4, 16, 32),
-        kernel_sizes=(3, 5, 7),
-        use_dilation_grid=False,
-        use_output_scaling=True,
+        in_channels=config.get('in_channels', 32),
+        out_channels=config.get('out_channels', 32),
+        base=config.get('base_channels', 64),  # config uses 'base_channels', model uses 'base'
+        n_odors=config.get('n_odors', 7),  # NOT n_conditions
+        emb_dim=config.get('emb_dim', 128),
+        dropout=config.get('dropout', 0.0),
+        use_attention=config.get('use_attention', True),
+        attention_type=config.get('attention_type', 'cross_freq_v2'),
+        norm_type=config.get('norm_type', 'batch'),
+        cond_mode=config.get('cond_mode', 'cross_attn_gated'),
+        use_spectral_shift=config.get('use_spectral_shift', True),
+        n_downsample=config.get('n_downsample', 4),
+        conv_type=config.get('conv_type', 'inception'),
+        use_se=config.get('use_se', True),
+        conv_kernel_size=config.get('conv_kernel_size', 7),
+        dilations=tuple(config.get('conv_dilations', (1, 4, 16, 32))),  # config uses 'conv_dilations'
+        kernel_sizes=tuple(config.get('kernel_sizes', (3, 5, 7))),
+        use_dilation_grid=config.get('use_dilation_grid', False),
+        use_output_scaling=config.get('use_output_scaling', True),
     ).to(device)
 
-    # Create inferred config dict for return
-    config = {
-        'n_downsample': n_downsample,
-        'base_channels': base_channels,
-        'conv_type': conv_type,
-        'cond_mode': cond_mode,
-    }
-
     # Load weights
-    model.load_state_dict(clean_state_dict, strict=False)
+    state_dict = checkpoint.get('model_state_dict', checkpoint.get('model', {}))
+    # Handle FSDP/DDP wrapped state dict
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # Remove 'module.' prefix if present
+        new_key = k.replace('module.', '').replace('_fsdp_wrapped_module.', '')
+        new_state_dict[new_key] = v
+
+    model.load_state_dict(new_state_dict, strict=False)
     model.eval()
 
     return model, config
