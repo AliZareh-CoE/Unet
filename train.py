@@ -1354,9 +1354,13 @@ def adversarial_train_epoch(
                 cond_emb = cond_encoder(ob)
 
         # =====================================================================
-        # DISCRIMINATOR UPDATE
+        # DISCRIMINATOR UPDATE (Conditional - judges source->output pairs)
         # =====================================================================
         d_optimizer.zero_grad(set_to_none=True)
+
+        # Crop source for conditional discriminator
+        real_ob_c = crop_to_target_torch(ob)
+        real_pcx_c = crop_to_target_torch(pcx)
 
         # Generate fake samples (detached from generator graph)
         with torch.no_grad():
@@ -1364,16 +1368,14 @@ def adversarial_train_epoch(
                 fake_pcx = generator(ob, cond_emb=cond_emb)
             else:
                 fake_pcx = generator(ob, odor)
-            fake_pcx = crop_to_target_torch(fake_pcx)
+            fake_pcx_c = crop_to_target_torch(fake_pcx)
 
-        real_pcx = crop_to_target_torch(pcx)
-
-        # Discriminator loss on real samples
-        d_real_pred = discriminator(real_pcx)
+        # Discriminator loss on REAL pairs: (source, real_target) -> should be real
+        d_real_pred = discriminator(real_pcx_c, condition=real_ob_c)
         d_loss_real = adversarial_loss(d_real_pred, target_is_real=True, loss_type=gan_loss_type)
 
-        # Discriminator loss on fake samples
-        d_fake_pred = discriminator(fake_pcx)
+        # Discriminator loss on FAKE pairs: (source, fake_target) -> should be fake
+        d_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
         d_loss_fake = adversarial_loss(d_fake_pred, target_is_real=False, loss_type=gan_loss_type)
 
         d_loss = (d_loss_real + d_loss_fake) * 0.5
@@ -1385,14 +1387,14 @@ def adversarial_train_epoch(
                     fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
                 else:
                     fake_ob = reverse_generator(pcx, odor)
-                fake_ob = crop_to_target_torch(fake_ob)
+                fake_ob_c = crop_to_target_torch(fake_ob)
 
-            real_ob = crop_to_target_torch(ob)
-
-            d_real_pred_rev = reverse_discriminator(real_ob)
+            # REAL pairs: (target, real_source) -> should be real
+            d_real_pred_rev = reverse_discriminator(real_ob_c, condition=real_pcx_c)
             d_loss_real_rev = adversarial_loss(d_real_pred_rev, target_is_real=True, loss_type=gan_loss_type)
 
-            d_fake_pred_rev = reverse_discriminator(fake_ob)
+            # FAKE pairs: (target, fake_source) -> should be fake
+            d_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
             d_loss_fake_rev = adversarial_loss(d_fake_pred_rev, target_is_real=False, loss_type=gan_loss_type)
 
             d_loss_rev = (d_loss_real_rev + d_loss_fake_rev) * 0.5
@@ -1415,10 +1417,9 @@ def adversarial_train_epoch(
         else:
             fake_pcx = generator(ob, odor)
         fake_pcx_c = crop_to_target_torch(fake_pcx)
-        real_pcx_c = crop_to_target_torch(pcx)
 
-        # Adversarial loss - fool discriminator
-        g_fake_pred = discriminator(fake_pcx_c)
+        # Adversarial loss - fool discriminator with (source, fake_target) pair
+        g_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
         g_adv_loss = adversarial_loss(g_fake_pred, target_is_real=True, loss_type=gan_loss_type)
 
         # Reconstruction loss (L1)
@@ -1439,9 +1440,9 @@ def adversarial_train_epoch(
             else:
                 fake_ob = reverse_generator(pcx, odor)
             fake_ob_c = crop_to_target_torch(fake_ob)
-            real_ob_c = crop_to_target_torch(ob)
 
-            g_fake_pred_rev = reverse_discriminator(fake_ob_c)
+            # Fool reverse discriminator with (target, fake_source) pair
+            g_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
             g_adv_loss_rev = adversarial_loss(g_fake_pred_rev, target_is_real=True, loss_type=gan_loss_type)
             g_l1_loss_rev = F.l1_loss(fake_ob_c, real_ob_c)
 
