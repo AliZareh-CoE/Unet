@@ -221,7 +221,7 @@ DEFAULT_CONFIG = {
     "record_neuroscience": False,  # Compute PAC, coherence, ERP, burst analysis
     "saliency_epoch_interval": 5,  # Compute saliency every N epochs
     "neuroscience_epoch_interval": 10,  # Compute neuroscience metrics every N epochs
-    "recording_output_dir": "artifacts/recordings",  # Output directory for recordings
+    "recording_output_dir": None,  # Output directory for recordings (None = use OUTPUT_DIR/recordings)
 }
 
 
@@ -1767,6 +1767,10 @@ def train(
     # =========================================================================
     recording_session = None
     if config.get("enable_recording", False) and RECORDING_AVAILABLE and is_primary():
+        # Use config recording_output_dir if set, otherwise use OUTPUT_DIR/recordings
+        recording_out = config.get("recording_output_dir")
+        if recording_out is None:
+            recording_out = OUTPUT_DIR / "recordings"
         recording_config = RecordingConfig(
             record_losses=True,
             record_gradients=True,
@@ -1774,7 +1778,7 @@ def train(
             record_neuroscience=config.get("record_neuroscience", True),
             saliency_epoch_interval=config.get("saliency_epoch_interval", 5),
             neuroscience_epoch_interval=config.get("neuroscience_epoch_interval", 10),
-            output_dir=Path(config.get("recording_output_dir", "artifacts/recordings")),
+            output_dir=Path(recording_out),
             use_tensorboard=True,
             use_hdf5=True,
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
