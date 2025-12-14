@@ -1592,6 +1592,16 @@ def train(
         stage1_checkpoint = config.get("stage1_checkpoint", None)
         if stage1_checkpoint:
             ckpt_path = Path(stage1_checkpoint)
+            # Smart path resolution - check common locations
+            if not ckpt_path.exists():
+                for candidate in [
+                    CHECKPOINT_DIR / ckpt_path.name,
+                    CHECKPOINT_DIR / ckpt_path,
+                    Path("artifacts/checkpoints") / ckpt_path.name,
+                ]:
+                    if candidate.exists():
+                        ckpt_path = candidate
+                        break
             if ckpt_path.exists():
                 checkpoint_cond_mode = get_checkpoint_cond_mode(ckpt_path)
                 config_cond_mode = config.get("cond_mode", "film")
@@ -1979,9 +1989,29 @@ def train(
     if stage2_only:
         if stage1_checkpoint is None:
             raise ValueError("stage2_only requires stage1_checkpoint path to be set!")
+
+        # Smart checkpoint path resolution - check multiple locations
         stage1_checkpoint = Path(stage1_checkpoint)
         if not stage1_checkpoint.exists():
-            raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_checkpoint}")
+            # Try common locations
+            candidates = [
+                CHECKPOINT_DIR / stage1_checkpoint.name,  # artifacts/checkpoints/<filename>
+                CHECKPOINT_DIR / stage1_checkpoint,        # artifacts/checkpoints/<full_path>
+                Path("artifacts/checkpoints") / stage1_checkpoint.name,
+            ]
+            found = False
+            for candidate in candidates:
+                if candidate.exists():
+                    stage1_checkpoint = candidate
+                    found = True
+                    if is_primary():
+                        print(f"[INFO] Resolved checkpoint path: {stage1_checkpoint}")
+                    break
+            if not found:
+                raise FileNotFoundError(
+                    f"Stage 1 checkpoint not found: {stage1_checkpoint}\n"
+                    f"  Also checked: {[str(c) for c in candidates]}"
+                )
         if is_primary():
             print(f"\n{'='*70}")
             print("STAGE 2 ONLY MODE")
