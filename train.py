@@ -2220,7 +2220,7 @@ def train(
 
         # If adversarial_only mode, load Stage 1 checkpoint
         if adversarial_only:
-            stage1_checkpoint = config.get("stage1_checkpoint", str(CHECKPOINT_DIR / "best_model.pt"))
+            # stage1_checkpoint is already set and converted to Path at top of train()
             if is_primary():
                 print(f"\nADVERSARIAL-ONLY MODE: Loading Stage 1 checkpoint")
                 print(f"  Checkpoint: {stage1_checkpoint}")
