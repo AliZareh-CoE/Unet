@@ -148,12 +148,12 @@ DEFAULT_CONFIG = {
 
     # Adversarial fine-tuning (Stage 2) - improves r² and correlation
     "use_adversarial": False,     # Enable adversarial fine-tuning stage
-    "adversarial_epochs": 10,     # Number of adversarial training epochs
+    "adversarial_epochs": 20,     # Number of adversarial training epochs (more epochs with lower LR)
     "adversarial_lambda": 1.0,    # Weight for adversarial loss (must be high to affect converged model!)
-    "adversarial_lr_g": 5e-4,     # Generator learning rate (higher than Stage 1 to actually move)
-    "adversarial_lr_d": 2e-3,     # Discriminator learning rate (4x generator)
+    "adversarial_lr_g": 1e-4,     # Generator learning rate (conservative to prevent catastrophic forgetting)
+    "adversarial_lr_d": 4e-4,     # Discriminator learning rate (4x generator)
     "adversarial_loss_type": "lsgan",  # lsgan (stable), vanilla (BCE), or hinge
-    "adversarial_recon_scale": 0.1,    # Scale factor for L1 loss during adversarial (keeps content without fighting)
+    "adversarial_recon_scale": 0.5,    # Scale factor for L1 loss (0.5 = balance preservation vs adversarial)
     "adversarial_use_wavelet": False,  # Disable wavelet loss during adversarial (already converged, would fight)
 
     # Model
@@ -1314,9 +1314,9 @@ def adversarial_train_epoch(
 
     # Loss weights for adversarial fine-tuning
     # Key insight: Model already converged on L1/wavelet in Stage 1
-    # Must reduce reconstruction losses to let adversarial loss actually drive change
+    # Balance: enough recon to prevent forgetting, enough adv to improve
     lambda_adv = config.get("adversarial_lambda", 1.0)  # GAN loss weight (high!)
-    recon_scale = config.get("adversarial_recon_scale", 0.1)  # Scale down reconstruction
+    recon_scale = config.get("adversarial_recon_scale", 0.5)  # Balance preservation vs change
     lambda_l1 = config.get("weight_l1", 1.0) * recon_scale
     use_wavelet = config.get("adversarial_use_wavelet", False)  # Disable by default
     lambda_wav = config.get("weight_wavelet", 3.0) if use_wavelet else 0.0
@@ -2217,14 +2217,14 @@ def train(
     if should_run_adversarial:
         if is_primary():
             adv_lambda = config.get('adversarial_lambda', 1.0)
-            recon_scale = config.get('adversarial_recon_scale', 0.1)
+            recon_scale = config.get('adversarial_recon_scale', 0.5)
             use_wav = config.get('adversarial_use_wavelet', False)
             print(f"\n{'='*70}")
             print("STAGE 2: ADVERSARIAL FINE-TUNING")
             print(f"{'='*70}")
             print(f"  Epochs: {adversarial_epochs}")
-            print(f"  Generator LR: {config.get('adversarial_lr_g', 5e-4)}")
-            print(f"  Discriminator LR: {config.get('adversarial_lr_d', 2e-3)}")
+            print(f"  Generator LR: {config.get('adversarial_lr_g', 1e-4)}")
+            print(f"  Discriminator LR: {config.get('adversarial_lr_d', 4e-4)}")
             print(f"  Loss type: {config.get('adversarial_loss_type', 'lsgan')}")
             print(f"  Loss weights:")
             print(f"    - Adversarial (λ_adv): {adv_lambda}")
@@ -3365,13 +3365,13 @@ def parse_args():
     parser.add_argument("--adversarial", action="store_true",
                         help="Enable adversarial fine-tuning (Stage 2) for improved correlation")
     parser.add_argument("--adversarial-epochs", type=int, default=None,
-                        help="Number of adversarial fine-tuning epochs (default: 10)")
+                        help="Number of adversarial fine-tuning epochs (default: 20)")
     parser.add_argument("--adversarial-lambda", type=float, default=None,
                         help="Weight for adversarial loss vs reconstruction (default: 1.0)")
     parser.add_argument("--adversarial-lr-g", type=float, default=None,
-                        help="Generator learning rate for adversarial stage (default: 5e-4)")
+                        help="Generator learning rate for adversarial stage (default: 1e-4)")
     parser.add_argument("--adversarial-lr-d", type=float, default=None,
-                        help="Discriminator learning rate (default: 2e-3)")
+                        help="Discriminator learning rate (default: 4e-4)")
     parser.add_argument("--adversarial-loss-type", type=str, default=None,
                         choices=["lsgan", "vanilla", "hinge"],
                         help="Adversarial loss type (default: lsgan)")
