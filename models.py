@@ -2356,11 +2356,16 @@ class PatchDiscriminator1D(nn.Module):
     Uses spectral normalization for stable GAN training.
     Multi-scale design captures both local patterns and global structure.
 
+    Conditional mode (default): Takes concatenated [source, output] to judge
+    whether the output matches the expected transformation of the source.
+    This is essential for improving correlation (not just realism).
+
     Args:
         in_channels: Number of input channels (e.g., 32 for LFP)
         base_channels: Base number of feature channels (default: 64)
         n_layers: Number of discriminator layers (default: 4)
         use_spectral_norm: Apply spectral normalization (default: True)
+        conditional: If True, expects concatenated [source, output] input (default: True)
     """
 
     def __init__(
@@ -2369,9 +2374,14 @@ class PatchDiscriminator1D(nn.Module):
         base_channels: int = 64,
         n_layers: int = 4,
         use_spectral_norm: bool = True,
+        conditional: bool = True,
     ):
         super().__init__()
         self.in_channels = in_channels
+        self.conditional = conditional
+
+        # For conditional discriminator, input is concatenated [source, output]
+        actual_in_channels = in_channels * 2 if conditional else in_channels
 
         # Spectral norm wrapper
         norm_layer = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
@@ -2380,7 +2390,7 @@ class PatchDiscriminator1D(nn.Module):
         layers = []
 
         # First layer: no normalization
-        layers.append(norm_layer(nn.Conv1d(in_channels, base_channels, kernel_size=15, stride=2, padding=7)))
+        layers.append(norm_layer(nn.Conv1d(actual_in_channels, base_channels, kernel_size=15, stride=2, padding=7)))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
 
         # Middle layers with increasing channels
@@ -2413,28 +2423,38 @@ class PatchDiscriminator1D(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x: Input signal [B, C, T]
+            x: Output signal [B, C, T] (generated or real target)
+            condition: Source signal [B, C, T] for conditional mode
 
         Returns:
             Patch-wise predictions [B, 1, T']
         """
+        if self.conditional:
+            if condition is None:
+                raise ValueError("Conditional discriminator requires 'condition' argument")
+            # Concatenate source and output along channel dimension
+            x = torch.cat([condition, x], dim=1)
         return self.model(x)
 
 
 class MultiScaleDiscriminator(nn.Module):
-    """Multi-scale discriminator for robust adversarial training.
+    """Multi-scale conditional discriminator for robust adversarial training.
 
     Uses multiple discriminators at different temporal scales to capture
     both fine details and coarse patterns in neural signals.
+
+    Conditional mode: Judges whether output matches the expected transformation
+    of the source, essential for improving correlation (not just realism).
 
     Args:
         in_channels: Number of input channels
         n_discriminators: Number of discriminators at different scales (default: 3)
         base_channels: Base channels for each discriminator
+        conditional: If True, expects source condition for judgment (default: True)
     """
 
     def __init__(
@@ -2442,32 +2462,37 @@ class MultiScaleDiscriminator(nn.Module):
         in_channels: int = 32,
         n_discriminators: int = 3,
         base_channels: int = 64,
+        conditional: bool = True,
     ):
         super().__init__()
         self.n_discriminators = n_discriminators
+        self.conditional = conditional
 
         self.discriminators = nn.ModuleList([
-            PatchDiscriminator1D(in_channels, base_channels, n_layers=4 - i)
+            PatchDiscriminator1D(in_channels, base_channels, n_layers=4 - i, conditional=conditional)
             for i in range(n_discriminators)
         ])
 
         # Downsampling for multi-scale
         self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1)
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+    def forward(self, x: torch.Tensor, condition: torch.Tensor = None) -> List[torch.Tensor]:
         """Forward pass at multiple scales.
 
         Args:
-            x: Input signal [B, C, T]
+            x: Output signal [B, C, T] (generated or real target)
+            condition: Source signal [B, C, T] for conditional mode
 
         Returns:
             List of predictions at each scale
         """
         outputs = []
         for i, disc in enumerate(self.discriminators):
-            outputs.append(disc(x))
+            outputs.append(disc(x, condition))
             if i < self.n_discriminators - 1:
                 x = self.downsample(x)
+                if condition is not None:
+                    condition = self.downsample(condition)
         return outputs
 
 
