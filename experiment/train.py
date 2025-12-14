@@ -2412,22 +2412,26 @@ def train(
             debug_stats = {
                 "target": {"mean": [], "std": [], "cv": []},
                 "pred_raw": {"mean": [], "std": [], "cv": []},
+                "pred_shifted": {"mean": [], "std": [], "cv": []},
                 "pred_corrected": {"mean": [], "std": [], "cv": []},
             }
 
             # Collect ALL values for plotting
             all_target_env = []
             all_pred_raw_env = []
+            all_pred_shifted_env = []
             all_pred_corr_env = []
 
             # Collect signals for PSD
             all_target_signals = []
             all_pred_raw_signals = []
+            all_pred_shifted_signals = []
             all_pred_corr_signals = []
 
             # Collect instantaneous frequencies
             all_target_inst_freq = []
             all_pred_raw_inst_freq = []
+            all_pred_shifted_inst_freq = []
             all_pred_corr_inst_freq = []
 
             # Sample batches from validation set
@@ -2467,15 +2471,18 @@ def train(
 
                     target_analytic = hilbert_torch(pcx_batch.view(B*C, T).float())
                     pred_raw_analytic = hilbert_torch(pred_raw.view(B*C, T).float())
+                    pred_shifted_analytic = hilbert_torch(pred_shifted.view(B*C, T).float())
                     pred_corr_analytic = hilbert_torch(pred_corrected.view(B*C, T).float())
 
                     target_env = target_analytic.abs()
                     pred_raw_env = pred_raw_analytic.abs()
+                    pred_shifted_env = pred_shifted_analytic.abs()
                     pred_corr_env = pred_corr_analytic.abs()
 
                     # Compute instantaneous frequency from phase derivative
                     target_phase = target_analytic.angle()
                     pred_raw_phase = pred_raw_analytic.angle()
+                    pred_shifted_phase = pred_shifted_analytic.angle()
                     pred_corr_phase = pred_corr_analytic.angle()
 
                     # Unwrap phase and compute derivative
@@ -2490,21 +2497,25 @@ def train(
 
                     target_inst_freq = compute_inst_freq(target_phase, sampling_rate)
                     pred_raw_inst_freq = compute_inst_freq(pred_raw_phase, sampling_rate)
+                    pred_shifted_inst_freq = compute_inst_freq(pred_shifted_phase, sampling_rate)
                     pred_corr_inst_freq = compute_inst_freq(pred_corr_phase, sampling_rate)
 
                     # Collect envelope values
                     all_target_env.append(target_env.flatten().cpu().numpy())
                     all_pred_raw_env.append(pred_raw_env.flatten().cpu().numpy())
+                    all_pred_shifted_env.append(pred_shifted_env.flatten().cpu().numpy())
                     all_pred_corr_env.append(pred_corr_env.flatten().cpu().numpy())
 
                     # Collect signals for PSD
                     all_target_signals.append(pcx_batch.view(B*C, T).float().cpu().numpy())
                     all_pred_raw_signals.append(pred_raw.view(B*C, T).float().cpu().numpy())
+                    all_pred_shifted_signals.append(pred_shifted.view(B*C, T).float().cpu().numpy())
                     all_pred_corr_signals.append(pred_corrected.view(B*C, T).float().cpu().numpy())
 
                     # Collect instantaneous frequencies
                     all_target_inst_freq.append(target_inst_freq)
                     all_pred_raw_inst_freq.append(pred_raw_inst_freq)
+                    all_pred_shifted_inst_freq.append(pred_shifted_inst_freq)
                     all_pred_corr_inst_freq.append(pred_corr_inst_freq)
 
                     # Envelope stats
@@ -2516,6 +2527,10 @@ def train(
                     debug_stats["pred_raw"]["std"].append(pred_raw_env.std().item())
                     debug_stats["pred_raw"]["cv"].append((pred_raw_env.std() / pred_raw_env.mean().clamp(min=1e-8)).item())
 
+                    debug_stats["pred_shifted"]["mean"].append(pred_shifted_env.mean().item())
+                    debug_stats["pred_shifted"]["std"].append(pred_shifted_env.std().item())
+                    debug_stats["pred_shifted"]["cv"].append((pred_shifted_env.std() / pred_shifted_env.mean().clamp(min=1e-8)).item())
+
                     debug_stats["pred_corrected"]["mean"].append(pred_corr_env.mean().item())
                     debug_stats["pred_corrected"]["std"].append(pred_corr_env.std().item())
                     debug_stats["pred_corrected"]["cv"].append((pred_corr_env.std() / pred_corr_env.mean().clamp(min=1e-8)).item())
@@ -2523,27 +2538,31 @@ def train(
             # Concatenate all values
             all_target_env = np.concatenate(all_target_env)
             all_pred_raw_env = np.concatenate(all_pred_raw_env)
+            all_pred_shifted_env = np.concatenate(all_pred_shifted_env)
             all_pred_corr_env = np.concatenate(all_pred_corr_env)
 
             all_target_signals = np.vstack(all_target_signals)
             all_pred_raw_signals = np.vstack(all_pred_raw_signals)
+            all_pred_shifted_signals = np.vstack(all_pred_shifted_signals)
             all_pred_corr_signals = np.vstack(all_pred_corr_signals)
 
             all_target_inst_freq = np.concatenate(all_target_inst_freq)
             all_pred_raw_inst_freq = np.concatenate(all_pred_raw_inst_freq)
+            all_pred_shifted_inst_freq = np.concatenate(all_pred_shifted_inst_freq)
             all_pred_corr_inst_freq = np.concatenate(all_pred_corr_inst_freq)
 
             # Aggregate stats
-            for key in ["target", "pred_raw", "pred_corrected"]:
+            for key in ["target", "pred_raw", "pred_shifted", "pred_corrected"]:
                 debug_stats[key]["mean_avg"] = sum(debug_stats[key]["mean"]) / len(debug_stats[key]["mean"])
                 debug_stats[key]["std_avg"] = sum(debug_stats[key]["std"]) / len(debug_stats[key]["std"])
                 debug_stats[key]["cv_avg"] = sum(debug_stats[key]["cv"]) / len(debug_stats[key]["cv"])
 
             # Print summary
             print(f"\nEnvelope Statistics (averaged over {n_debug_batches} batches):")
-            print(f"  TARGET:     mean={debug_stats['target']['mean_avg']:.4f}, std={debug_stats['target']['std_avg']:.4f}, CV={debug_stats['target']['cv_avg']:.4f}")
-            print(f"  PRED (raw): mean={debug_stats['pred_raw']['mean_avg']:.4f}, std={debug_stats['pred_raw']['std_avg']:.4f}, CV={debug_stats['pred_raw']['cv_avg']:.4f}")
-            print(f"  PRED (fix): mean={debug_stats['pred_corrected']['mean_avg']:.4f}, std={debug_stats['pred_corrected']['std_avg']:.4f}, CV={debug_stats['pred_corrected']['cv_avg']:.4f}")
+            print(f"  TARGET:       mean={debug_stats['target']['mean_avg']:.4f}, std={debug_stats['target']['std_avg']:.4f}, CV={debug_stats['target']['cv_avg']:.4f}")
+            print(f"  PRED (raw):   mean={debug_stats['pred_raw']['mean_avg']:.4f}, std={debug_stats['pred_raw']['std_avg']:.4f}, CV={debug_stats['pred_raw']['cv_avg']:.4f}")
+            print(f"  PRED (shift): mean={debug_stats['pred_shifted']['mean_avg']:.4f}, std={debug_stats['pred_shifted']['std_avg']:.4f}, CV={debug_stats['pred_shifted']['cv_avg']:.4f}")
+            print(f"  PRED (fix):   mean={debug_stats['pred_corrected']['mean_avg']:.4f}, std={debug_stats['pred_corrected']['std_avg']:.4f}, CV={debug_stats['pred_corrected']['cv_avg']:.4f}")
 
             print("\nGenerating debug plots...")
 
@@ -2552,11 +2571,12 @@ def train(
             # =====================================================================
             fig, ax = plt.subplots(figsize=(10, 6))
 
-            all_vals = np.concatenate([all_target_env, all_pred_raw_env, all_pred_corr_env])
+            all_vals = np.concatenate([all_target_env, all_pred_raw_env, all_pred_shifted_env, all_pred_corr_env])
             bins = np.linspace(np.percentile(all_vals, 1), np.percentile(all_vals, 99), 100)
 
             ax.hist(all_target_env, bins=bins, alpha=0.5, color='green', label=f'Target (μ={np.mean(all_target_env):.3f}, σ={np.std(all_target_env):.3f})', density=True)
             ax.hist(all_pred_raw_env, bins=bins, alpha=0.5, color='red', label=f'Pred Raw (μ={np.mean(all_pred_raw_env):.3f}, σ={np.std(all_pred_raw_env):.3f})', density=True)
+            ax.hist(all_pred_shifted_env, bins=bins, alpha=0.5, color='orange', label=f'Pred Shifted (μ={np.mean(all_pred_shifted_env):.3f}, σ={np.std(all_pred_shifted_env):.3f})', density=True)
             ax.hist(all_pred_corr_env, bins=bins, alpha=0.5, color='blue', label=f'Pred Corrected (μ={np.mean(all_pred_corr_env):.3f}, σ={np.std(all_pred_corr_env):.3f})', density=True)
 
             ax.set_title('Envelope Distribution Comparison')
@@ -2586,13 +2606,16 @@ def train(
 
             f_target, psd_target, psd_target_std = compute_avg_psd(all_target_signals, sampling_rate, nperseg)
             f_raw, psd_raw, psd_raw_std = compute_avg_psd(all_pred_raw_signals, sampling_rate, nperseg)
+            f_shifted, psd_shifted, psd_shifted_std = compute_avg_psd(all_pred_shifted_signals, sampling_rate, nperseg)
             f_corr, psd_corr, psd_corr_std = compute_avg_psd(all_pred_corr_signals, sampling_rate, nperseg)
 
             axes[0].semilogy(f_target, psd_target, 'g-', linewidth=2, label='Target')
             axes[0].semilogy(f_raw, psd_raw, 'r-', linewidth=2, label='Pred (raw)')
+            axes[0].semilogy(f_shifted, psd_shifted, color='orange', linewidth=2, label='Pred (shifted)')
             axes[0].semilogy(f_corr, psd_corr, 'b-', linewidth=2, label='Pred (corrected)')
             axes[0].fill_between(f_target, psd_target - psd_target_std, psd_target + psd_target_std, alpha=0.2, color='green')
             axes[0].fill_between(f_raw, psd_raw - psd_raw_std, psd_raw + psd_raw_std, alpha=0.2, color='red')
+            axes[0].fill_between(f_shifted, psd_shifted - psd_shifted_std, psd_shifted + psd_shifted_std, alpha=0.2, color='orange')
             axes[0].fill_between(f_corr, psd_corr - psd_corr_std, psd_corr + psd_corr_std, alpha=0.2, color='blue')
             axes[0].set_xlabel('Frequency (Hz)')
             axes[0].set_ylabel('PSD (log scale)')
@@ -2603,9 +2626,11 @@ def train(
 
             eps = 1e-10
             psd_diff_raw = 10 * np.log10((psd_raw + eps) / (psd_target + eps))
+            psd_diff_shifted = 10 * np.log10((psd_shifted + eps) / (psd_target + eps))
             psd_diff_corr = 10 * np.log10((psd_corr + eps) / (psd_target + eps))
 
             axes[1].plot(f_target, psd_diff_raw, 'r-', linewidth=2, label=f'Raw - Target (mean: {np.mean(psd_diff_raw):.2f} dB)')
+            axes[1].plot(f_target, psd_diff_shifted, color='orange', linewidth=2, label=f'Shifted - Target (mean: {np.mean(psd_diff_shifted):.2f} dB)')
             axes[1].plot(f_target, psd_diff_corr, 'b-', linewidth=2, label=f'Corrected - Target (mean: {np.mean(psd_diff_corr):.2f} dB)')
             axes[1].axhline(0, color='k', linestyle='--', alpha=0.5)
             axes[1].set_xlabel('Frequency (Hz)')
@@ -2629,16 +2654,19 @@ def train(
             max_freq = sampling_rate / 2
             valid_mask_target = (all_target_inst_freq > 0) & (all_target_inst_freq < max_freq)
             valid_mask_raw = (all_pred_raw_inst_freq > 0) & (all_pred_raw_inst_freq < max_freq)
+            valid_mask_shifted = (all_pred_shifted_inst_freq > 0) & (all_pred_shifted_inst_freq < max_freq)
             valid_mask_corr = (all_pred_corr_inst_freq > 0) & (all_pred_corr_inst_freq < max_freq)
 
             target_freq_valid = all_target_inst_freq[valid_mask_target]
             raw_freq_valid = all_pred_raw_inst_freq[valid_mask_raw]
+            shifted_freq_valid = all_pred_shifted_inst_freq[valid_mask_shifted]
             corr_freq_valid = all_pred_corr_inst_freq[valid_mask_corr]
 
             freq_bins = np.linspace(0, min(150, max_freq), 100)
 
             axes[0].hist(target_freq_valid, bins=freq_bins, alpha=0.5, color='green', label=f'Target (median: {np.median(target_freq_valid):.1f} Hz)', density=True)
             axes[0].hist(raw_freq_valid, bins=freq_bins, alpha=0.5, color='red', label=f'Pred Raw (median: {np.median(raw_freq_valid):.1f} Hz)', density=True)
+            axes[0].hist(shifted_freq_valid, bins=freq_bins, alpha=0.5, color='orange', label=f'Pred Shifted (median: {np.median(shifted_freq_valid):.1f} Hz)', density=True)
             axes[0].hist(corr_freq_valid, bins=freq_bins, alpha=0.5, color='blue', label=f'Pred Corrected (median: {np.median(corr_freq_valid):.1f} Hz)', density=True)
 
             axes[0].set_xlabel('Instantaneous Frequency (Hz)')
@@ -2649,14 +2677,17 @@ def train(
 
             target_sorted = np.sort(target_freq_valid)
             raw_sorted = np.sort(raw_freq_valid)
+            shifted_sorted = np.sort(shifted_freq_valid)
             corr_sorted = np.sort(corr_freq_valid)
 
             step_t = max(1, len(target_sorted) // 1000)
             step_r = max(1, len(raw_sorted) // 1000)
+            step_s = max(1, len(shifted_sorted) // 1000)
             step_c = max(1, len(corr_sorted) // 1000)
 
             axes[1].plot(target_sorted[::step_t], np.linspace(0, 1, len(target_sorted))[::step_t], 'g-', linewidth=2, label='Target')
             axes[1].plot(raw_sorted[::step_r], np.linspace(0, 1, len(raw_sorted))[::step_r], 'r-', linewidth=2, label='Pred (raw)')
+            axes[1].plot(shifted_sorted[::step_s], np.linspace(0, 1, len(shifted_sorted))[::step_s], color='orange', linewidth=2, label='Pred (shifted)')
             axes[1].plot(corr_sorted[::step_c], np.linspace(0, 1, len(corr_sorted))[::step_c], 'b-', linewidth=2, label='Pred (corrected)')
 
             axes[1].set_xlabel('Instantaneous Frequency (Hz)')
@@ -2674,13 +2705,14 @@ def train(
             # =====================================================================
             # PLOT 4: Q-Q PLOTS (envelope)
             # =====================================================================
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
             n_qq = min(10000, len(all_target_env))
             idx = np.random.choice(len(all_target_env), n_qq, replace=False)
 
             target_sorted = np.sort(all_target_env[idx])
             raw_sorted = np.sort(all_pred_raw_env[idx])
+            shifted_sorted = np.sort(all_pred_shifted_env[idx])
             corr_sorted = np.sort(all_pred_corr_env[idx])
 
             axes[0].scatter(target_sorted, raw_sorted, alpha=0.3, s=1, color='red')
@@ -2691,13 +2723,21 @@ def train(
             axes[0].legend()
             axes[0].grid(True, alpha=0.3)
 
-            axes[1].scatter(target_sorted, corr_sorted, alpha=0.3, s=1, color='blue')
+            axes[1].scatter(target_sorted, shifted_sorted, alpha=0.3, s=1, color='orange')
             axes[1].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x')
             axes[1].set_xlabel('Target Envelope Quantiles')
-            axes[1].set_ylabel('Pred (Corrected) Envelope Quantiles')
-            axes[1].set_title('Q-Q Plot: Corrected vs Target')
+            axes[1].set_ylabel('Pred (Shifted) Envelope Quantiles')
+            axes[1].set_title('Q-Q Plot: Shifted vs Target')
             axes[1].legend()
             axes[1].grid(True, alpha=0.3)
+
+            axes[2].scatter(target_sorted, corr_sorted, alpha=0.3, s=1, color='blue')
+            axes[2].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x')
+            axes[2].set_xlabel('Target Envelope Quantiles')
+            axes[2].set_ylabel('Pred (Corrected) Envelope Quantiles')
+            axes[2].set_title('Q-Q Plot: Corrected vs Target')
+            axes[2].legend()
+            axes[2].grid(True, alpha=0.3)
 
             plt.tight_layout()
             plt.savefig(debug_dir / "envelope_qq.png", dpi=150, bbox_inches='tight')
