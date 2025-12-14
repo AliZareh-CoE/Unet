@@ -584,10 +584,10 @@ def save_checkpoint(
 # =============================================================================
 
 def get_spectral_shift_db(spectral_shift_module, detailed: bool = False) -> float | dict | None:
-    """Get dB shift from SpectralShiftBlock or FrequencyBandSpectralShift (handles DDP wrapping).
+    """Get dB shift from OptimalSpectralBias (handles DDP wrapping).
 
     Args:
-        spectral_shift_module: SpectralShiftBlock or FrequencyBandSpectralShift (may be DDP-wrapped)
+        spectral_shift_module: OptimalSpectralBias (may be DDP-wrapped)
         detailed: If True, return dict with detailed info
 
     Returns:
@@ -596,45 +596,21 @@ def get_spectral_shift_db(spectral_shift_module, detailed: bool = False) -> floa
     if spectral_shift_module is None:
         return None
 
-    import math
     # Handle DDP wrapping - access the underlying module
     module = spectral_shift_module.module if hasattr(spectral_shift_module, 'module') else spectral_shift_module
 
-    # Check if it's FrequencyBandSpectralShift (has get_shift_db_dict method)
-    if hasattr(module, 'get_shift_db_dict'):
-        band_shifts = module.get_shift_db_dict()  # Total shifts (includes global gain)
-        mean_shift = sum(band_shifts.values()) / len(band_shifts)
-        # Get global gain separately if available
-        global_gain_db = module.get_global_gain_db() if hasattr(module, 'get_global_gain_db') else 0.0
+    # OptimalSpectralBias stores bias in bias_db parameter [n_odors, n_bands]
+    if hasattr(module, 'bias_db'):
+        bias_db = module.bias_db.detach()
+        mean_shift = bias_db.mean().item()
         if detailed:
-            result = {
+            return {
                 "mean": mean_shift,
-                "global_gain": global_gain_db,
-                "bands": band_shifts,
-                "mode": "frequency_band",
+                "per_odor_mean": bias_db.mean(dim=1).cpu().tolist(),  # Mean per odor
+                "per_band_mean": bias_db.mean(dim=0).cpu().tolist(),  # Mean per band
+                "mode": "optimal_bias",
             }
-            # Add per-odor shifts if conditional
-            if getattr(module, 'conditional', False) and hasattr(module, 'get_odor_shift_db_dict'):
-                result["conditional"] = True
-                result["odor_shifts"] = module.get_odor_shift_db_dict()
-            return result
         return mean_shift
-
-    # Original SpectralShiftBlock (per-channel)
-    if hasattr(module, 'log_scale'):
-        log_scale = module.log_scale
-        if log_scale.numel() > 0:
-            shift_db = 20.0 * log_scale / math.log(10)
-            if detailed:
-                return {
-                    "mean": shift_db.mean().item(),
-                    "std": shift_db.std().item(),
-                    "min": shift_db.min().item(),
-                    "max": shift_db.max().item(),
-                    "per_channel": shift_db.detach().cpu().tolist(),
-                    "mode": "flat",
-                }
-            return shift_db.mean().item()
     return None
 
 
@@ -1530,87 +1506,37 @@ def train(
 
     # Create SpectralShift modules OUTSIDE of FSDP (too small for sharding overhead)
     # but DO wrap with DDP for gradient synchronization in distributed training
-    from models import SpectralShiftBlock, FrequencyBandSpectralShift, OptimalSpectralBias, EnvelopeHistogramMatching
+    from models import OptimalSpectralBias, EnvelopeHistogramMatching
 
     spectral_shift_fwd = None
     spectral_shift_rev = None
     if config.get("use_spectral_shift", True):
-        # Initialize with predefined shift (from baseline PSD difference)
-        # SEPARATE modules for forward and reverse - no inverse constraint!
-        # This fixes the gradient conflict where both directions need same-sign correction.
-        init_shift_fwd = config.get("spectral_shift_init_fwd", 0.0)  # OB→PCx
-        init_shift_rev = config.get("spectral_shift_init_rev", 0.0)  # PCx→OB (independent)
-        shift_mode = config.get("spectral_shift_mode", "adaptive")
-        shift_conditional = config.get("spectral_shift_conditional", True)
-        shift_per_channel = config.get("spectral_shift_per_channel", False)
-
-        # Get correct channel counts for each direction
-        # Forward: source → target (e.g., PFC 64ch → CA1 32ch), SpectralShift operates on OUTPUT
-        # Reverse: target → source (e.g., CA1 32ch → PFC 64ch), SpectralShift operates on OUTPUT
+        # Fixed per-odor spectral bias correction (no signal-adaptive network!)
+        # Computes optimal bias directly from UNet output vs target PSD difference
+        sampling_rate = config.get("sampling_rate", SAMPLING_RATE_HZ)
         fwd_out_channels = config.get("out_channels", 32)  # Forward output channels
         rev_out_channels = config.get("in_channels", 32)   # Reverse output = forward input
-        sampling_rate = config.get("sampling_rate", SAMPLING_RATE_HZ)
+        n_odors = config.get("n_odors", 7)
+        band_width_hz = config.get("spectral_shift_band_width_hz", None)
 
-        if shift_mode == "adaptive":
-            # Fixed per-odor spectral bias correction (no signal-adaptive network!)
-            # Computes optimal bias directly from UNet output vs target PSD difference
-            n_odors = config.get("n_odors", 7)
-            band_width_hz = config.get("spectral_shift_band_width_hz", None)
+        spectral_shift_fwd = OptimalSpectralBias(
+            n_channels=fwd_out_channels,
+            n_odors=n_odors,
+            sample_rate=sampling_rate,
+            band_width_hz=band_width_hz,
+        ).to(device)
+        spectral_shift_rev = OptimalSpectralBias(
+            n_channels=rev_out_channels,
+            n_odors=n_odors,
+            sample_rate=sampling_rate,
+            band_width_hz=band_width_hz,
+        ).to(device)
 
-            spectral_shift_fwd = OptimalSpectralBias(
-                n_channels=fwd_out_channels,
-                n_odors=n_odors,
-                sample_rate=sampling_rate,
-                band_width_hz=band_width_hz,
-            ).to(device)
-            spectral_shift_rev = OptimalSpectralBias(
-                n_channels=rev_out_channels,
-                n_odors=n_odors,
-                sample_rate=sampling_rate,
-                band_width_hz=band_width_hz,
-            ).to(device)
-            if band_width_hz is not None:
-                band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
-            else:
-                band_str = ", 10 neuro bands"
-            mode_str = f"optimal_bias (fixed per-odor, n_odors={n_odors}{band_str})"
-        elif shift_mode == "frequency_band":
-            # Per-frequency-band scaling (delta/theta/alpha/beta/gamma or uniform)
-            # With optional odor conditioning (different shifts per odor)
-            # SEPARATE modules for forward and reverse - each learns independently
-            n_odors = config.get("n_odors", 7)
-            band_width_hz = config.get("spectral_shift_band_width_hz", None)
-            spectral_shift_fwd = FrequencyBandSpectralShift(
-                sample_rate=sampling_rate,
-                init_shift_db=init_shift_fwd,
-                per_channel=shift_per_channel,
-                n_odors=n_odors,
-                conditional=shift_conditional,
-                band_width_hz=band_width_hz,
-                n_channels=fwd_out_channels,
-            ).to(device)
-            spectral_shift_rev = FrequencyBandSpectralShift(
-                sample_rate=sampling_rate,
-                init_shift_db=init_shift_rev,
-                per_channel=shift_per_channel,
-                n_odors=n_odors,
-                conditional=shift_conditional,
-                band_width_hz=band_width_hz,
-                n_channels=rev_out_channels,
-            ).to(device)
-            cond_str = f", conditional (n_odors={n_odors})" if shift_conditional else ""
-            if band_width_hz is not None:
-                band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
-            else:
-                band_str = ", 10 neuro bands"
-            per_ch_str = ", per_channel" if shift_per_channel else ""
-            mode_str = f"frequency_band (separate fwd/rev{cond_str}{band_str}{per_ch_str})"
+        if band_width_hz is not None:
+            band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
         else:
-            # Flat per-channel scaling (original) - no conditioning support
-            # SEPARATE modules for forward and reverse
-            spectral_shift_fwd = SpectralShiftBlock(n_channels=fwd_out_channels, init_shift_db=init_shift_fwd).to(device)
-            spectral_shift_rev = SpectralShiftBlock(n_channels=rev_out_channels, init_shift_db=init_shift_rev).to(device)
-            mode_str = f"flat (fwd={fwd_out_channels}ch, rev={rev_out_channels}ch, separate)"
+            band_str = ", 10 neuro bands"
+        mode_str = f"optimal_bias (fixed per-odor, n_odors={n_odors}{band_str})"
 
         # Wrap with DDP for distributed training (gradient sync across ranks)
         # Note: NOT using FSDP since these are tiny
@@ -1623,7 +1549,7 @@ def train(
 
         if is_primary():
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
-            print(f"SpectralShift created{ddp_str} mode={mode_str} (fwd init: {init_shift_fwd:+.1f}dB, rev init: {init_shift_rev:+.1f}dB)")
+            print(f"SpectralShift created{ddp_str} mode={mode_str}")
 
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
