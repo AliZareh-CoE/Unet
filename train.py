@@ -183,6 +183,11 @@ DEFAULT_CONFIG = {
     "aug_amplitude_scale_range": (0.8, 1.2),  # Scale factor range (min, max)
     "aug_time_mask": False,         # Randomly mask time segments
     "aug_time_mask_ratio": 0.1,     # Fraction of time to mask
+    "aug_mixup": False,             # Mixup: blend random sample pairs
+    "aug_mixup_alpha": 0.4,         # Beta distribution alpha (higher = more mixing)
+    "aug_freq_mask": False,         # Frequency masking: zero out random freq bands
+    "aug_freq_mask_max_bands": 2,   # Max number of frequency bands to mask
+    "aug_freq_mask_max_width": 10,  # Max width of each masked band (in freq bins)
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -534,6 +539,84 @@ def aug_time_mask(x: torch.Tensor, mask_ratio: float = 0.1) -> torch.Tensor:
     return result
 
 
+def aug_mixup(
+    ob: torch.Tensor,
+    pcx: torch.Tensor,
+    alpha: float = 0.4
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply Mixup augmentation: blend random pairs of samples.
+
+    Mixup creates virtual training examples by linearly interpolating
+    between pairs of samples and their targets.
+
+    Args:
+        ob: Input tensor (batch, channels, time)
+        pcx: Target tensor (batch, channels, time)
+        alpha: Beta distribution parameter (higher = more mixing)
+
+    Returns:
+        Tuple of (mixed_ob, mixed_pcx)
+    """
+    batch_size = ob.shape[0]
+    if batch_size < 2:
+        return ob, pcx
+
+    # Sample mixing coefficients from Beta distribution
+    # lam ~ Beta(alpha, alpha), typically alpha in [0.2, 0.4]
+    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size,)).to(ob.device)
+    lam = lam.view(-1, 1, 1)  # Shape for broadcasting
+
+    # Random permutation for pairing
+    perm = torch.randperm(batch_size, device=ob.device)
+
+    # Mix samples: x_mix = lam * x + (1 - lam) * x[perm]
+    ob_mixed = lam * ob + (1 - lam) * ob[perm]
+    pcx_mixed = lam * pcx + (1 - lam) * pcx[perm]
+
+    return ob_mixed, pcx_mixed
+
+
+def aug_freq_mask(
+    x: torch.Tensor,
+    max_bands: int = 2,
+    max_width: int = 10
+) -> torch.Tensor:
+    """Apply frequency masking: zero out random frequency bands.
+
+    Similar to SpecAugment for audio, but applied to neural signals.
+    Operates in frequency domain via FFT.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        max_bands: Maximum number of frequency bands to mask
+        max_width: Maximum width of each masked band (in freq bins)
+
+    Returns:
+        Frequency-masked tensor (same shape)
+    """
+    batch_size, n_channels, time_len = x.shape
+
+    # FFT to frequency domain
+    x_fft = torch.fft.rfft(x, dim=-1)
+    n_freqs = x_fft.shape[-1]
+
+    if n_freqs <= max_width:
+        return x  # Signal too short for meaningful masking
+
+    # Create frequency mask
+    for i in range(batch_size):
+        n_bands = torch.randint(1, max_bands + 1, (1,)).item()
+        for _ in range(n_bands):
+            width = torch.randint(1, max_width + 1, (1,)).item()
+            start = torch.randint(0, n_freqs - width, (1,)).item()
+            x_fft[i, :, start:start + width] = 0
+
+    # Inverse FFT back to time domain
+    x_masked = torch.fft.irfft(x_fft, n=time_len, dim=-1)
+
+    return x_masked
+
+
 def apply_augmentations(
     ob: torch.Tensor,
     pcx: torch.Tensor,
@@ -601,6 +684,33 @@ def apply_augmentations(
                 start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
                 ob[i, :, start:start + mask_len] = 0
                 pcx[i, :, start:start + mask_len] = 0
+
+    # Mixup: blend random pairs (applied to both input and target coherently)
+    if config.get("aug_mixup", False):
+        alpha = config.get("aug_mixup_alpha", 0.4)
+        ob, pcx = aug_mixup(ob, pcx, alpha)
+
+    # Frequency masking: zero out random freq bands (same bands for both)
+    if config.get("aug_freq_mask", False):
+        max_bands = config.get("aug_freq_mask_max_bands", 2)
+        max_width = config.get("aug_freq_mask_max_width", 10)
+        # Apply same masking to both by concatenating, masking, and splitting
+        batch_size = ob.shape[0]
+        combined = torch.cat([ob, pcx], dim=0)  # (2*batch, channels, time)
+        # Generate mask indices once
+        combined_fft = torch.fft.rfft(combined, dim=-1)
+        n_freqs = combined_fft.shape[-1]
+        if n_freqs > max_width:
+            for i in range(batch_size):
+                n_bands_to_mask = torch.randint(1, max_bands + 1, (1,)).item()
+                for _ in range(n_bands_to_mask):
+                    width = torch.randint(1, max_width + 1, (1,)).item()
+                    start = torch.randint(0, n_freqs - width, (1,)).item()
+                    # Apply same mask to both ob[i] and pcx[i]
+                    combined_fft[i, :, start:start + width] = 0
+                    combined_fft[batch_size + i, :, start:start + width] = 0
+            combined = torch.fft.irfft(combined_fft, n=ob.shape[-1], dim=-1)
+            ob, pcx = combined[:batch_size], combined[batch_size:]
 
     return ob, pcx
 
@@ -3127,6 +3237,20 @@ def parse_args():
                         help="Disable time mask augmentation")
     parser.add_argument("--aug-time-mask-ratio", type=float, default=None,
                         help="Fraction of time to mask (default: 0.1)")
+    parser.add_argument("--aug-mixup", action="store_true", default=None,
+                        help="Enable Mixup augmentation (blend random sample pairs)")
+    parser.add_argument("--no-aug-mixup", action="store_false", dest="aug_mixup",
+                        help="Disable Mixup augmentation")
+    parser.add_argument("--aug-mixup-alpha", type=float, default=None,
+                        help="Mixup Beta distribution alpha (default: 0.4, higher=more mixing)")
+    parser.add_argument("--aug-freq-mask", action="store_true", default=None,
+                        help="Enable frequency masking augmentation")
+    parser.add_argument("--no-aug-freq-mask", action="store_false", dest="aug_freq_mask",
+                        help="Disable frequency masking augmentation")
+    parser.add_argument("--aug-freq-mask-max-bands", type=int, default=None,
+                        help="Max number of frequency bands to mask (default: 2)")
+    parser.add_argument("--aug-freq-mask-max-width", type=int, default=None,
+                        help="Max width of each masked band in freq bins (default: 10)")
 
     # Output scaling correction (learnable per-channel scale and bias in model)
     parser.add_argument("--output-scaling", action="store_true", default=True,
@@ -3289,10 +3413,20 @@ def main():
         config["aug_time_mask"] = args.aug_time_mask
     if args.aug_time_mask_ratio is not None:
         config["aug_time_mask_ratio"] = args.aug_time_mask_ratio
+    if args.aug_mixup is not None:
+        config["aug_mixup"] = args.aug_mixup
+    if args.aug_mixup_alpha is not None:
+        config["aug_mixup_alpha"] = args.aug_mixup_alpha
+    if args.aug_freq_mask is not None:
+        config["aug_freq_mask"] = args.aug_freq_mask
+    if args.aug_freq_mask_max_bands is not None:
+        config["aug_freq_mask_max_bands"] = args.aug_freq_mask_max_bands
+    if args.aug_freq_mask_max_width is not None:
+        config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
 
     # Print augmentation config if any are enabled
     aug_enabled = [
-        k for k in ["aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale", "aug_time_mask"]
+        k for k in ["aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale", "aug_time_mask", "aug_mixup", "aug_freq_mask"]
         if config.get(k, False)
     ]
     if aug_enabled and is_primary():
