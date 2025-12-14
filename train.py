@@ -60,7 +60,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.distribute
 # Local imports
 from models import (
     CondUNet1D,
-    HighFrequencySpectralLoss,
     build_wavelet_loss,
     pearson_batch,
     explained_variance_torch,
@@ -76,8 +75,6 @@ from models import (
     VQVAEEncoder,
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
-    # Residual distribution correction
-    ResidualDistributionCorrector,
     hilbert_torch,
 )
 from data import (
@@ -172,7 +169,6 @@ DEFAULT_CONFIG = {
 
     # Loss toggles (set False to disable)
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
-    "use_spectral_loss": True,  # PSD matching (log-domain spectral loss)
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -188,27 +184,9 @@ DEFAULT_CONFIG = {
     "spectral_shift_band_width_hz": 2,  # None=use predefined neuro bands, or float (e.g., 2.0 for 2Hz uniform bands)
     "spectral_shift_compute_bias": True,  # Compute optimal bias directly from UNet output vs target PSD
 
-    # Envelope loss (for spectral shift training, helps match signal envelope distribution)
-    # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
-    "use_envelope_loss": True,              # Enable envelope distribution matching loss
-    "envelope_loss_weight": 1.0,            # Weight for envelope loss
-    "envelope_loss_n_bins": 64,             # Number of histogram bins for distribution matching
-    "envelope_loss_type": "kl",             # Loss type: "kl" (KL divergence), "wasserstein", "mse"
-
     # Output scaling correction (learnable per-channel scale and bias)
     # Helps match target distribution, especially important for probabilistic losses
     "use_output_scaling": True,
-
-    # Residual distribution correction (replaces old Rayleigh-based approach)
-    # Learns to correct systematic distributional errors in UNet envelope output
-    # Key insight: Learn from actual target distribution, not a theoretical prior
-    # IMPORTANT: Gradients are isolated from UNet via .detach()
-    "use_residual_correction": False,  # Enable residual distribution correction
-    "residual_correction_n_bins": 32,  # Number of quantile bins for correction curve
-    "residual_correction_hidden_dim": 64,  # Hidden dim for correction network
-    "residual_correction_max": 0.5,  # Maximum correction (±50%)
-    "residual_correction_lambda": 0.1,  # Weight for distribution loss
-    "residual_correction_lr": 1e-3,  # Learning rate (separate optimizer)
 
     # Recording system (for Nature Methods publication)
     # WARNING: Recording is VERY slow - only enable for final runs!
@@ -737,7 +715,6 @@ def evaluate(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     wavelet_loss: Optional[nn.Module] = None,
-    spectral_loss: Optional[nn.Module] = None,
     compute_phase: bool = False,
     reverse_model: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -748,7 +725,6 @@ def evaluate(
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
-    residual_corrector: Optional[nn.Module] = None,
     envelope_matcher_fwd: Optional[nn.Module] = None,
     envelope_matcher_rev: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
@@ -757,12 +733,11 @@ def evaluate(
     Returns composite validation loss that mirrors training loss.
 
     Args:
-        spectral_only: If True, composite loss uses ONLY spectral loss (Stage 2 mode)
-        disable_spectral: If True, disable SpectralShift and exclude spectral from composite loss (Stage 1 mode)
+        spectral_only: If True, Stage 2 mode (UNet frozen, only SpectralShift active)
+        disable_spectral: If True, disable SpectralShift (Stage 1 mode)
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        residual_corrector: Optional ResidualDistributionCorrector for envelope correction
     """
     model.eval()
     if reverse_model is not None:
@@ -773,8 +748,6 @@ def evaluate(
         spectral_shift_fwd.eval()
     if spectral_shift_rev is not None:
         spectral_shift_rev.eval()
-    if residual_corrector is not None:
-        residual_corrector.eval()
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -784,7 +757,7 @@ def evaluate(
 
     # Reverse direction (PCx→OB)
     mse_list_rev, mae_list_rev, corr_list_rev = [], [], []
-    wavelet_list_rev, spectral_list_rev = [], []
+    wavelet_list_rev = []
     plv_list_rev, pli_list_rev = [], []
     r2_list_rev, nrmse_list_rev = [], []
     psd_err_list_rev, psd_diff_list_rev = [], []
@@ -794,14 +767,6 @@ def evaluate(
     baseline_corr_list, baseline_r2_list, baseline_nrmse_list = [], [], []
     baseline_psd_err_list, baseline_psd_diff_list = [], []
     baseline_plv_list, baseline_pli_list = [], []
-
-    # For composite loss (forward)
-    spectral_list = []
-
-    # Envelope metrics (residual correction)
-    env_cv2_list = []  # Envelope CV² of prediction
-    env_cv2_target_list = []  # Target envelope CV² (ground truth)
-    mean_correction_list = []  # Mean correction magnitude
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
@@ -855,11 +820,6 @@ def evaluate(
             if envelope_matcher_fwd is not None and not disable_spectral:
                 pred = envelope_matcher_fwd(pred, odor_ids=odor)
 
-            # Apply residual distribution correction (learns to match target envelope)
-            # This is the FINAL output that should be used for metrics
-            if residual_corrector is not None and cond_emb is not None:
-                pred = residual_corrector(pred, cond_emb)
-
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
             ob_c = crop_to_target_torch(ob)
@@ -880,44 +840,15 @@ def evaluate(
             if wavelet_loss is not None:
                 wavelet_list.append(wavelet_loss(pred_f32, pcx_f32).item())
 
-            if spectral_loss is not None:
-                spectral_list.append(spectral_loss(pred_f32, pcx_f32).item())
-
             # Skip expensive phase metrics in fast_mode
             if compute_phase and not fast_mode:
                 plv_list.append(plv_torch(pred_f32, pcx_f32).item())
                 pli_list.append(pli_torch(pred_f32, pcx_f32).item())
 
-            # Skip expensive PSD metrics in fast_mode (spectral_loss already covers frequency info)
+            # Skip expensive PSD metrics in fast_mode
             if not fast_mode:
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
                 psd_diff_list.append(psd_diff_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
-
-            # Envelope metrics for residual correction monitoring (on CROPPED signals)
-            if residual_corrector is not None and cond_emb is not None:
-                # Compute envelope using Hilbert transform
-                analytic_pred = hilbert_torch(pred_f32)
-                envelope_pred = torch.abs(analytic_pred)
-
-                analytic_target = hilbert_torch(pcx_f32)
-                envelope_target = torch.abs(analytic_target)
-
-                # Envelope CV² = Var(A) / Mean(A)²
-                env_mean = envelope_pred.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                env_var = ((envelope_pred - env_mean) ** 2).mean(dim=-1)
-                env_cv2 = (env_var / (env_mean.squeeze(-1) ** 2)).mean()
-                env_cv2_list.append(env_cv2.item())
-
-                # Target envelope CV² for comparison
-                tgt_mean = envelope_target.mean(dim=-1, keepdim=True).clamp(min=1e-8)
-                tgt_var = ((envelope_target - tgt_mean) ** 2).mean(dim=-1)
-                tgt_cv2 = (tgt_var / (tgt_mean.squeeze(-1) ** 2)).mean()
-                env_cv2_target_list.append(tgt_cv2.item())
-
-                # Get mean correction magnitude
-                corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-                mean_corr = corr_module.get_mean_correction(cond_emb.detach()).mean()
-                mean_correction_list.append(mean_corr.item())
 
             # Baseline metrics: Compare raw source vs target
             # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
@@ -973,9 +904,6 @@ def evaluate(
                 if wavelet_loss is not None:
                     wavelet_list_rev.append(wavelet_loss(pred_rev_f32, ob_f32).item())
 
-                if spectral_loss is not None:
-                    spectral_list_rev.append(spectral_loss(pred_rev_f32, ob_f32).item())
-
                 # Skip expensive phase metrics in fast_mode
                 if compute_phase and not fast_mode:
                     plv_list_rev.append(plv_torch(pred_rev_f32, ob_f32).item())
@@ -1002,8 +930,6 @@ def evaluate(
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
     if wavelet_list:
         results["wavelet"] = float(np.mean(wavelet_list))
-    if spectral_list:
-        results["spectral"] = float(np.mean(spectral_list))
     if plv_list:
         results["plv"] = float(np.mean(plv_list))
     if pli_list:
@@ -1023,8 +949,6 @@ def evaluate(
         results["psd_diff_db_rev"] = float(np.mean(psd_diff_list_rev))
     if wavelet_list_rev:
         results["wavelet_rev"] = float(np.mean(wavelet_list_rev))
-    if spectral_list_rev:
-        results["spectral_rev"] = float(np.mean(spectral_list_rev))
     if plv_list_rev:
         results["plv_rev"] = float(np.mean(plv_list_rev))
     if pli_list_rev:
@@ -1042,46 +966,29 @@ def evaluate(
     if baseline_pli_list:
         results["baseline_pli"] = float(np.mean(baseline_pli_list))
 
-    # Envelope metrics (residual correction)
-    if env_cv2_list:
-        results["env_cv2"] = float(np.mean(env_cv2_list))  # Pred envelope CV²
-    if env_cv2_target_list:
-        results["env_cv2_target"] = float(np.mean(env_cv2_target_list))  # Target envelope CV²
-    if mean_correction_list:
-        results["mean_correction"] = float(np.mean(mean_correction_list))  # Mean correction magnitude
-
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
     if config is not None:
         if spectral_only:
-            # Stage 2: ONLY spectral loss (UNet frozen, pure PSD optimization)
-            w_spec = config.get("weight_spectral", 1.0) if config.get("use_spectral_loss", True) else 0.0
-            val_loss = 0.0
-            if "spectral" in results:
-                val_loss += w_spec * results["spectral"]
-            if "spectral_rev" in results:
-                val_loss += w_spec * results["spectral_rev"]
+            # Stage 2: Use PSD error for validation (SpectralShift optimization)
+            val_loss = results.get("psd_err_db", results["mae"])
+            if "psd_err_db_rev" in results:
+                val_loss += results["psd_err_db_rev"]
         else:
-            # Stage 1: L1 + wavelet (spectral excluded if disable_spectral=True)
+            # Stage 1: L1 + wavelet
             w_l1 = config.get("weight_l1", 1.0)
             w_wav = config.get("weight_wavelet", 1.0) if config.get("use_wavelet_loss", True) else 0.0
-            # Spectral weight is 0 if disabled (Stage 1 mode)
-            w_spec = 0.0 if disable_spectral else (config.get("weight_spectral", 1.0) if config.get("use_spectral_loss", True) else 0.0)
 
             # Forward loss
             val_loss = w_l1 * results["mae"]
             if "wavelet" in results:
                 val_loss += w_wav * results["wavelet"]
-            if "spectral" in results and not disable_spectral:
-                val_loss += w_spec * results["spectral"]
 
             # Reverse loss (if bidirectional)
             if "mae_rev" in results:
                 val_loss += w_l1 * results["mae_rev"]
                 if "wavelet_rev" in results:
                     val_loss += w_wav * results["wavelet_rev"]
-                if "spectral_rev" in results and not disable_spectral:
-                    val_loss += w_spec * results["spectral_rev"]
 
         results["loss"] = val_loss
 
@@ -1126,7 +1033,6 @@ def train_epoch(
     device: torch.device,
     config: Dict[str, Any],
     wavelet_loss: Optional[nn.Module] = None,
-    spectral_loss: Optional[nn.Module] = None,
     reverse_model: Optional[nn.Module] = None,
     epoch: int = 0,
     num_epochs: int = 0,
@@ -1135,20 +1041,13 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
-    residual_corrector: Optional[nn.Module] = None,
-    residual_optimizer: Optional[torch.optim.Optimizer] = None,
-    prob_loss: Optional[nn.Module] = None,
-    envelope_loss: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
-        stage2_spectral_only: If True, ONLY use spectral loss (Stage 2 mode where UNet is frozen)
-        disable_spectral: If True, disable SpectralShift application and spectral loss (Stage 1 mode)
+        stage2_spectral_only: If True, Stage 2 mode (UNet frozen, SpectralShift active)
+        disable_spectral: If True, disable SpectralShift application (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        residual_corrector: Optional ResidualDistributionCorrector for envelope correction
-        residual_optimizer: Optional separate optimizer for residual corrector
-        envelope_loss: Optional envelope distribution matching loss (for SpectralShift)
     """
     model.train()
     if reverse_model is not None:
@@ -1159,8 +1058,6 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
-    if residual_corrector is not None:
-        residual_corrector.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1256,24 +1153,19 @@ def train_epoch(
             pred_shifted = pred_raw
             pred_shifted_c = pred_raw_c
 
-        # Stage 2 (UNet frozen): ONLY spectral loss for PSD correction
-        # Stage 1 (UNet trainable): L1 + wavelet (NO spectral)
+        # Stage 2 (UNet frozen): OptimalSpectralBias computes bias from statistics (no training needed)
+        # Stage 1 (UNet trainable): L1 + wavelet
         if stage2_spectral_only:
-            # ONLY spectral loss - UNet is frozen, we're fine-tuning SpectralShift for PSD
-            if config.get("use_spectral_loss", True) and spectral_loss is not None:
-                loss = config.get("weight_spectral", 1.0) * spectral_loss(pred_shifted_c, pcx_c)
-                loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + loss.detach()
+            # Stage 2: No loss needed - OptimalSpectralBias uses closed-form solution
+            # Just use wavelet loss if available for validation consistency
+            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+                loss = config["weight_wavelet"] * wavelet_loss(pred_shifted_c, pcx_c)
+                loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + loss.detach()
             else:
                 loss = torch.tensor(0.0, device=device)
 
-            # Envelope loss (forward) - helps SpectralShift match envelope distribution
-            # Uses pred_shifted (SpectralShift gets gradients)
-            if config.get("use_envelope_loss", True) and envelope_loss is not None:
-                env_loss = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_shifted_c, pcx_c)
-                loss = loss + env_loss
-                loss_components["envelope_fwd"] = loss_components["envelope_fwd"] + env_loss.detach()
         else:
-            # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+            # Stage 1: L1/Huber + wavelet
             # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
             loss_type = config.get("loss_type", "huber_wavelet")
             if loss_type in ("huber", "huber_wavelet"):
@@ -1288,26 +1180,6 @@ def train_epoch(
                 w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
                 loss = loss + w_loss
                 loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
-
-            # Spectral loss (forward) - DISABLED in Stage 1, enabled in joint training
-            # uses pred_shifted (SpectralShift DOES get gradients here)
-            if not disable_spectral and config.get("use_spectral_loss", True) and spectral_loss is not None:
-                spec_loss = config.get("weight_spectral", 1.0) * spectral_loss(pred_shifted_c, pcx_c)
-                loss = loss + spec_loss
-                loss_components["spectral_fwd"] = loss_components["spectral_fwd"] + spec_loss.detach()
-
-            # Envelope loss (forward) - DISABLED in Stage 1, enabled in joint training
-            # Uses pred_shifted (SpectralShift gets gradients)
-            if not disable_spectral and config.get("use_envelope_loss", True) and envelope_loss is not None:
-                env_loss = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_shifted_c, pcx_c)
-                loss = loss + env_loss
-                loss_components["envelope_fwd"] = loss_components["envelope_fwd"] + env_loss.detach()
-
-            # Probabilistic loss (forward) - for tier 2.5, added ON TOP of base loss
-            if prob_loss is not None:
-                p_loss = prob_loss(pred_raw_c, pcx_c)
-                loss = loss + p_loss
-                loss_components["prob_fwd"] = loss_components["prob_fwd"] + p_loss.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -1335,21 +1207,15 @@ def train_epoch(
                 pred_rev_shifted = pred_rev_raw
                 pred_rev_shifted_c = pred_rev_raw_c
 
-            # Stage 2: ONLY spectral loss for reverse direction too
+            # Stage 2: No training needed for reverse (OptimalSpectralBias uses closed-form)
             if stage2_spectral_only:
-                # ONLY spectral loss - UNet frozen, fine-tuning SpectralShift
-                if config.get("use_spectral_loss", True) and spectral_loss is not None:
-                    spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + spec_loss_rev
-                    loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
-
-                # Envelope loss (reverse) - helps SpectralShift match envelope distribution
-                if config.get("use_envelope_loss", True) and envelope_loss is not None:
-                    env_loss_rev = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + env_loss_rev
-                    loss_components["envelope_rev"] = loss_components["envelope_rev"] + env_loss_rev.detach()
+                # Just use wavelet loss if available for validation consistency
+                if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+                    w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_shifted_c, ob_c)
+                    loss = loss + w_loss_rev
+                    loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
             else:
-                # Stage 1: L1/Huber + wavelet (spectral disabled if disable_spectral=True)
+                # Stage 1: L1/Huber + wavelet
                 # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
                 loss_type = config.get("loss_type", "huber_wavelet")
                 if loss_type in ("huber", "huber_wavelet"):
@@ -1364,25 +1230,6 @@ def train_epoch(
                     w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
                     loss = loss + w_loss_rev
                     loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
-
-                # Spectral loss (reverse) - DISABLED in Stage 1, enabled in joint training
-                # uses pred_rev_shifted (SpectralShift DOES get gradients)
-                if not disable_spectral and config.get("use_spectral_loss", True) and spectral_loss is not None:
-                    spec_loss_rev = config.get("weight_spectral", 1.0) * spectral_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + spec_loss_rev
-                    loss_components["spectral_rev"] = loss_components["spectral_rev"] + spec_loss_rev.detach()
-
-                # Envelope loss (reverse) - DISABLED in Stage 1, enabled in joint training
-                if not disable_spectral and config.get("use_envelope_loss", True) and envelope_loss is not None:
-                    env_loss_rev = config.get("envelope_loss_weight", 1.0) * envelope_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + env_loss_rev
-                    loss_components["envelope_rev"] = loss_components["envelope_rev"] + env_loss_rev.detach()
-
-                # Probabilistic loss (reverse) - for tier 2.5
-                if prob_loss is not None:
-                    p_loss_rev = prob_loss(pred_rev_raw_c, ob_c)
-                    loss = loss + p_loss_rev
-                    loss_components["prob_rev"] = loss_components["prob_rev"] + p_loss_rev.detach()
 
                 # Cycle consistency: OB → PCx → OB (use raw, no spectral shift in cycle)
                 # Skip in Stage 2 since UNet is frozen
@@ -1404,50 +1251,6 @@ def train_epoch(
                 cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
                 loss = loss + cycle_loss_pcx
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
-
-        # =====================================================================
-        # Residual Distribution Correction (experimental)
-        # CRITICAL: Input is DETACHED to ensure gradient isolation
-        # Distribution losses train ONLY the corrector, not UNet
-        # Key: Learns to match actual target distribution, not a theoretical prior
-        #
-        # IMPORTANT: Apply corrector AFTER spectral shift to match evaluation flow!
-        # Training:   UNet → SpectralShift → ResidualCorrector → Loss
-        # Evaluation: UNet → SpectralShift → ResidualCorrector → Metrics
-        # =====================================================================
-        residual_loss = torch.tensor(0.0, device=device)
-        if residual_corrector is not None and cond_emb is not None:
-            # Use spectral-shifted output if available, otherwise raw output
-            # This matches the evaluation pipeline exactly
-            if spectral_shift_fwd is not None and not disable_spectral:
-                corrector_input = pred_shifted.detach()
-            else:
-                corrector_input = pred_raw.detach()
-
-            # Apply residual correction with DETACHED input
-            # This prevents correction gradients from flowing back to UNet/SpectralShift
-            y_corrected = residual_corrector(corrector_input, cond_emb.detach())
-
-            # IMPORTANT: Crop BEFORE computing loss to match target dimensions!
-            y_corrected_c = crop_to_target_torch(y_corrected)
-
-            # Compute distribution matching loss against TARGET
-            # Uses 1D optimal transport (sorted envelope comparison)
-            corr_module = residual_corrector.module if hasattr(residual_corrector, 'module') else residual_corrector
-            corr_losses = corr_module.compute_loss(y_corrected_c, pcx_c)
-
-            # Weighted loss
-            lambda_dist = config.get("residual_correction_lambda", 0.1)
-            residual_loss = lambda_dist * corr_losses["distribution_loss"]
-
-            loss_components["dist_loss"] = loss_components["dist_loss"] + corr_losses["distribution_loss"].detach()
-
-            # Separate backward/step for residual corrector (always use separate optimizer)
-            if residual_optimizer is not None:
-                residual_loss.backward()
-                torch.nn.utils.clip_grad_norm_(residual_corrector.parameters(), GRAD_CLIP)
-                residual_optimizer.step()
-                residual_optimizer.zero_grad(set_to_none=True)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -1825,50 +1628,6 @@ def train(
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
-    # Create residual distribution corrector (experimental)
-    # IMPORTANT: Gradient isolation - corrector input is DETACHED from UNet
-    # This ensures UNet training is not affected by distribution losses
-    # Key improvement: Learns to match actual target distribution, not a theoretical prior
-    residual_corrector = None
-    residual_optimizer = None
-    if config.get("use_residual_correction", False):
-        # Requires spectro_temporal conditioning to work
-        if cond_source != "spectro_temporal":
-            if is_primary():
-                print("WARNING: Residual correction requires spectro_temporal conditioning. Disabling.")
-        else:
-            residual_corrector = ResidualDistributionCorrector(
-                condition_dim=emb_dim,
-                n_bins=config.get("residual_correction_n_bins", 32),
-                hidden_dim=config.get("residual_correction_hidden_dim", 64),
-                max_correction=config.get("residual_correction_max", 0.5),
-            )
-
-            # Convert to bf16 if FSDP uses mixed precision (match cond_encoder dtype)
-            # NOTE: Correction uses FFT internally which needs float32,
-            # but the correction_net (Linear layers) should match input dtype
-            if config.get("fsdp_bf16", False):
-                residual_corrector = residual_corrector.to(device, dtype=torch.bfloat16)
-            else:
-                residual_corrector = residual_corrector.to(device)
-
-            # Wrap with DDP for distributed training
-            if is_distributed:
-                residual_corrector = DDP(residual_corrector, device_ids=[local_rank])
-
-            if is_primary():
-                corr_params = sum(p.numel() for p in residual_corrector.parameters())
-                print(f"Residual corrector created: {corr_params:,} params, n_bins={config.get('residual_correction_n_bins', 32)}, max_correction={config.get('residual_correction_max', 0.5)}")
-
-            # Always use separate optimizer for gradient isolation
-            residual_optimizer = AdamW(
-                residual_corrector.parameters(),
-                lr=config.get("residual_correction_lr", 1e-3),
-                betas=betas,
-            )
-            if is_primary():
-                print(f"Residual corrector using separate optimizer, lr={config.get('residual_correction_lr', 1e-3)}")
-
     # Create loss functions
     wavelet_loss = None
     if config.get("use_wavelet_loss", True):
@@ -1878,50 +1637,10 @@ def train(
             omega0=config.get("wavelet_omega0", 5.0),
         ).to(device)
 
-    spectral_loss = None
-    if config.get("use_spectral_loss", True):
-        spectral_loss = HighFrequencySpectralLoss(
-            sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-            low_freq_cutoff=0.0,
-            high_freq_boost=1.0,
-            max_freq=MAX_FREQ_HZ,
-            use_log_psd=True,
-        ).to(device)
-
-    # Envelope loss (for SpectralShift training - matches envelope distribution)
-    # IMPORTANT: Applied with detach() so only SpectralShift gets gradients, not UNet
-    envelope_loss = None
-    if config.get("use_envelope_loss", True):
-        from models import EnvelopeLoss
-        envelope_loss = EnvelopeLoss(
-            n_bins=config.get("envelope_loss_n_bins", 64),
-            loss_type=config.get("envelope_loss_type", "kl"),
-        ).to(device)
-        if is_primary():
-            print(f"Envelope loss: {config.get('envelope_loss_type', 'kl')} (weight={config.get('envelope_loss_weight', 1.0)}, bins={config.get('envelope_loss_n_bins', 64)})")
-
-    # Probabilistic loss (tier 2.5 - added ON TOP of base loss)
-    prob_loss = None
-    prob_loss_type = config.get("prob_loss_type", "none")
-    prob_loss_weight = config.get("prob_loss_weight", 1.0)
-    if prob_loss_type != "none":
-        try:
-            from experiments.study3_loss.losses.neural_probabilistic_losses import (
-                create_neural_prob_loss
-            )
-            prob_loss = create_neural_prob_loss(prob_loss_type, weight=prob_loss_weight).to(device)
-            if is_primary():
-                print(f"Probabilistic loss: {prob_loss_type} (weight={prob_loss_weight})")
-        except Exception as e:
-            if is_primary():
-                print(f"Warning: Could not create probabilistic loss '{prob_loss_type}': {e}")
-            prob_loss = None
-
     # Create optimizer with parameter groups
     # SpectralShift needs MUCH higher lr because it's just 32 scalars trying to make dB-scale changes
     lr = config.get("learning_rate", 1e-4)
     spectral_shift_lr = config.get("spectral_shift_lr", 0.1)  # 500x higher for fast amplitude adaptation
-    # Note: betas is defined earlier (before distribution block) since it's used by multiple optimizers
 
     # Build parameter groups with different learning rates
     param_groups = [
@@ -1936,12 +1655,6 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
-    # Note: Residual corrector always uses separate optimizer for gradient isolation
-    # Add probabilistic loss parameters (if any) with model learning rate
-    if prob_loss is not None:
-        prob_params = list(prob_loss.parameters())
-        if prob_params:
-            param_groups.append({"params": prob_params, "lr": lr, "name": "prob_loss"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
     if is_primary():
@@ -2053,28 +1766,23 @@ def train(
 
             train_metrics = train_epoch(
                 model, loaders["train"], optimizer, device, config,
-                wavelet_loss, spectral_loss,
+                wavelet_loss,
                 reverse_model, epoch, num_epochs,
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
-                residual_optimizer=residual_optimizer,
-                prob_loss=prob_loss,
-                envelope_loss=envelope_loss,
             )
 
             barrier()
 
             val_metrics = evaluate(
-                model, loaders["val"], device, wavelet_loss, spectral_loss,
+                model, loaders["val"], device, wavelet_loss,
                 compute_phase=False, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
                 fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                residual_corrector=residual_corrector,
             )
 
             # Sync val_loss across ranks (for early stopping)
@@ -2264,7 +1972,7 @@ def train(
 
             # Evaluate on VALIDATION set - ALL ranks must call this (FSDP requirement)
             val_metrics_stage1 = evaluate(
-                model, loaders["val"], device, wavelet_loss, spectral_loss,
+                model, loaders["val"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,
@@ -2276,7 +1984,7 @@ def train(
 
             # Evaluate on TEST set - ALL ranks must call this (FSDP requirement)
             test_metrics_stage1 = evaluate(
-                model, loaders["test"], device, wavelet_loss, spectral_loss,
+                model, loaders["test"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
                 disable_spectral=use_two_stage,
@@ -2966,13 +2674,12 @@ def train(
 
         # Evaluate with optimal bias applied
         val_metrics = evaluate(
-            model, loaders["val"], device, wavelet_loss, spectral_loss,
+            model, loaders["val"], device, wavelet_loss,
             compute_phase=False, reverse_model=reverse_model, config=config,
             spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
             spectral_only=True, fast_mode=False,
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             cond_encoder=cond_encoder,
-            residual_corrector=residual_corrector,
         )
 
         psd_err_fwd = val_metrics.get("psd_err_db", float("inf"))
@@ -3010,7 +2717,7 @@ def train(
 
     # Final test evaluation (full metrics, fast_mode=False)
     test_metrics = evaluate(
-        model, loaders["test"], device, wavelet_loss, spectral_loss,
+        model, loaders["test"], device, wavelet_loss,
         compute_phase=True, reverse_model=reverse_model, config=config,
         spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
         fast_mode=False,  # Full metrics for final evaluation
@@ -3273,19 +2980,6 @@ def parse_args():
     parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
                         help="Disable output scaling correction in model")
 
-    # Envelope loss (for SpectralShift training)
-    parser.add_argument("--envelope-loss", action="store_true", default=True,
-                        help="Enable envelope distribution matching loss (default: True)")
-    parser.add_argument("--no-envelope-loss", action="store_false", dest="envelope_loss",
-                        help="Disable envelope loss")
-    parser.add_argument("--envelope-loss-weight", type=float, default=1.0,
-                        help="Weight for envelope loss (default: 1.0)")
-    parser.add_argument("--envelope-loss-bins", type=int, default=64,
-                        help="Number of histogram bins for envelope loss (default: 64)")
-    parser.add_argument("--envelope-loss-type", type=str, default="kl",
-                        choices=["kl", "wasserstein", "mse"],
-                        help="Envelope loss type: kl, wasserstein, or mse (default: kl)")
-
     # Loss function selection (for tier1 fair comparison)
     LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
     parser.add_argument("--loss", type=str, default=None,
@@ -3294,28 +2988,6 @@ def parse_args():
                              "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet), "
                              "'huber_wavelet' (Huber + Wavelet combined). "
                              "If not specified, uses config default (huber_wavelet)")
-
-    # Probabilistic loss (for tier 2.5 - added ON TOP of base loss)
-    PROB_LOSS_CHOICES = [
-        "none",               # No probabilistic loss (baseline)
-        "gaussian_nll",       # Gaussian negative log-likelihood
-        "laplacian_nll",      # Laplacian NLL (robust to outliers)
-        "rayleigh",           # Signal envelope distribution
-        "von_mises",          # Phase distribution (circular statistics)
-        "kl_divergence",      # Distribution matching
-        "cauchy_nll",         # Heavy-tailed (very robust)
-        "student_t_nll",      # Controllable heavy tails
-        "gumbel",             # Peak/extreme value distribution
-        "gamma",              # Positive-valued signals
-        "log_normal",         # Multiplicative processes
-        "mixture",            # Gaussian mixture (multi-modal)
-    ]
-    parser.add_argument("--prob-loss", type=str, default="none",
-                        choices=PROB_LOSS_CHOICES,
-                        help="Probabilistic loss to ADD on top of base loss (for tier 2.5). "
-                             "Default: 'none' (no probabilistic loss)")
-    parser.add_argument("--prob-loss-weight", type=float, default=1.0,
-                        help="Weight for probabilistic loss (default: 1.0)")
 
     return parser.parse_args()
 
@@ -3474,12 +3146,6 @@ def main():
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
 
-    # Probabilistic loss (tier 2.5) - added ON TOP of base loss
-    config["prob_loss_type"] = args.prob_loss if hasattr(args, 'prob_loss') else "none"
-    config["prob_loss_weight"] = args.prob_loss_weight if hasattr(args, 'prob_loss_weight') else 1.0
-    if config["prob_loss_type"] != "none" and is_primary():
-        print(f"Probabilistic loss: {config['prob_loss_type']} (weight={config['prob_loss_weight']})")
-
     # Per-channel normalization (default: enabled)
     config["per_channel_norm"] = args.per_channel_norm if hasattr(args, 'per_channel_norm') else True
     if is_primary():
@@ -3489,12 +3155,6 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
-
-    # Envelope loss configuration
-    config["use_envelope_loss"] = getattr(args, 'envelope_loss', True)
-    config["envelope_loss_weight"] = getattr(args, 'envelope_loss_weight', 1.0)
-    config["envelope_loss_n_bins"] = getattr(args, 'envelope_loss_bins', 64)
-    config["envelope_loss_type"] = getattr(args, 'envelope_loss_type', 'kl')
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
