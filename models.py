@@ -2555,6 +2555,45 @@ def feature_matching_loss(
 # Loss Functions
 # =============================================================================
 
+def correlation_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """Differentiable Pearson correlation loss.
+
+    Directly optimizes correlation between prediction and target.
+    Loss = 1 - correlation (so minimizing loss maximizes correlation).
+
+    Args:
+        pred: Predicted signal [B, C, T]
+        target: Target signal [B, C, T]
+        reduction: "mean" (average over batch/channels) or "none"
+
+    Returns:
+        Loss in range [0, 2] where 0 = perfect correlation, 2 = perfect anti-correlation
+    """
+    # Flatten spatial dims for correlation computation
+    # [B, C, T] -> [B*C, T]
+    pred_flat = pred.reshape(-1, pred.shape[-1])
+    target_flat = target.reshape(-1, target.shape[-1])
+
+    # Center the signals (subtract mean)
+    pred_centered = pred_flat - pred_flat.mean(dim=-1, keepdim=True)
+    target_centered = target_flat - target_flat.mean(dim=-1, keepdim=True)
+
+    # Compute correlation per sample
+    # r = cov(x,y) / (std(x) * std(y))
+    numerator = (pred_centered * target_centered).sum(dim=-1)
+    pred_std = torch.sqrt((pred_centered ** 2).sum(dim=-1) + 1e-8)
+    target_std = torch.sqrt((target_centered ** 2).sum(dim=-1) + 1e-8)
+
+    corr = numerator / (pred_std * target_std + 1e-8)
+
+    # Loss = 1 - r (so perfect correlation = 0 loss)
+    loss = 1.0 - corr
+
+    if reduction == "mean":
+        return loss.mean()
+    return loss
+
+
 class TemporalSmoothness(nn.Module):
     """Temporal smoothness loss (second derivative penalty)."""
     def forward(self, signal: torch.Tensor) -> torch.Tensor:

@@ -149,12 +149,14 @@ DEFAULT_CONFIG = {
     # Adversarial fine-tuning (Stage 2) - improves r² and correlation
     "use_adversarial": False,     # Enable adversarial fine-tuning stage
     "adversarial_epochs": 20,     # Number of adversarial training epochs (more epochs with lower LR)
-    "adversarial_lambda": 1.0,    # Weight for adversarial loss (must be high to affect converged model!)
-    "adversarial_lr_g": 1e-4,     # Generator learning rate (conservative to prevent catastrophic forgetting)
-    "adversarial_lr_d": 4e-4,     # Discriminator learning rate (4x generator)
+    "adversarial_lambda": 0.0,    # Weight for adversarial/GAN loss (0 = disable GAN, use correlation only)
+    "adversarial_lr_g": 2e-4,     # Generator learning rate for fine-tuning
+    "adversarial_lr_d": 4e-4,     # Discriminator learning rate (unused if lambda=0)
     "adversarial_loss_type": "lsgan",  # lsgan (stable), vanilla (BCE), or hinge
-    "adversarial_recon_scale": 0.5,    # Scale factor for L1 loss (0.5 = balance preservation vs adversarial)
-    "adversarial_use_wavelet": False,  # Disable wavelet loss during adversarial (already converged, would fight)
+    "adversarial_recon_scale": 0.3,    # Scale factor for L1 loss (balance with correlation)
+    "adversarial_use_wavelet": False,  # Disable wavelet loss during fine-tuning
+    "adversarial_use_corr_loss": True, # Use direct correlation loss (MUCH better than GAN!)
+    "adversarial_corr_lambda": 1.0,    # Weight for correlation loss
 
     # Model
     "base_channels": 64,
@@ -1290,37 +1292,45 @@ def adversarial_train_epoch(
     num_epochs: int = 0,
     cond_encoder: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
-    """Train one epoch with adversarial loss for improved correlation.
+    """Train one epoch with optional adversarial + correlation loss for improved correlation.
 
-    Uses LSGAN loss for stability + L1 reconstruction loss for content preservation.
+    Can use:
+    - Correlation loss (direct optimization of what we care about)
+    - L1 reconstruction loss (for content preservation)
+    - Adversarial/GAN loss (optional, set lambda=0 to disable)
+    - Wavelet loss (optional, usually disabled in fine-tuning)
 
     Args:
         generator: Forward UNet model (OB → PCx)
-        discriminator: Forward discriminator
+        discriminator: Forward discriminator (can be None if lambda_adv=0)
         reverse_generator: Reverse UNet model (PCx → OB)
         reverse_discriminator: Reverse discriminator
         wavelet_loss: Optional wavelet loss for frequency content
     """
-    from models import adversarial_loss
+    from models import adversarial_loss, correlation_loss
 
     generator.train()
-    discriminator.train()
     if reverse_generator is not None:
         reverse_generator.train()
-    if reverse_discriminator is not None:
-        reverse_discriminator.train()
     if cond_encoder is not None:
         cond_encoder.train()
 
-    # Loss weights for adversarial fine-tuning
-    # Key insight: Model already converged on L1/wavelet in Stage 1
-    # Balance: enough recon to prevent forgetting, enough adv to improve
-    lambda_adv = config.get("adversarial_lambda", 1.0)  # GAN loss weight (high!)
-    recon_scale = config.get("adversarial_recon_scale", 0.5)  # Balance preservation vs change
+    # Loss weights for fine-tuning
+    lambda_adv = config.get("adversarial_lambda", 0.0)  # GAN loss (0 = disabled)
+    use_corr_loss = config.get("adversarial_use_corr_loss", True)  # Direct correlation loss
+    lambda_corr = config.get("adversarial_corr_lambda", 1.0)  # Correlation loss weight
+    recon_scale = config.get("adversarial_recon_scale", 0.3)  # L1 scale
     lambda_l1 = config.get("weight_l1", 1.0) * recon_scale
-    use_wavelet = config.get("adversarial_use_wavelet", False)  # Disable by default
+    use_wavelet = config.get("adversarial_use_wavelet", False)
     lambda_wav = config.get("weight_wavelet", 3.0) if use_wavelet else 0.0
     gan_loss_type = config.get("adversarial_loss_type", "lsgan")
+
+    # Only train discriminator if we're using adversarial loss
+    use_discriminator = lambda_adv > 0 and discriminator is not None
+    if use_discriminator:
+        discriminator.train()
+        if reverse_discriminator is not None:
+            reverse_discriminator.train()
 
     # Accumulators
     total_g_loss = torch.tensor(0.0, device=device)
@@ -1329,6 +1339,7 @@ def adversarial_train_epoch(
     total_d_fake = torch.tensor(0.0, device=device)
     total_recon_loss = torch.tensor(0.0, device=device)
     total_adv_loss = torch.tensor(0.0, device=device)
+    total_corr_loss = torch.tensor(0.0, device=device)
 
     # Determine compute dtype
     use_bf16 = config.get("fsdp_bf16", False)
@@ -1359,58 +1370,63 @@ def adversarial_train_epoch(
             if cond_source == "spectro_temporal":
                 cond_emb = cond_encoder(ob)
 
-        # =====================================================================
-        # DISCRIMINATOR UPDATE (Conditional - judges source->output pairs)
-        # =====================================================================
-        d_optimizer.zero_grad(set_to_none=True)
-
-        # Crop source for conditional discriminator
+        # Crop signals for loss computation
         real_ob_c = crop_to_target_torch(ob)
         real_pcx_c = crop_to_target_torch(pcx)
 
-        # Generate fake samples (detached from generator graph)
-        with torch.no_grad():
-            if cond_emb is not None:
-                fake_pcx = generator(ob, cond_emb=cond_emb)
-            else:
-                fake_pcx = generator(ob, odor)
-            fake_pcx_c = crop_to_target_torch(fake_pcx)
+        # =====================================================================
+        # DISCRIMINATOR UPDATE (only if using adversarial loss)
+        # =====================================================================
+        d_loss = torch.tensor(0.0, device=device)
+        d_loss_real = torch.tensor(0.0, device=device)
+        d_loss_fake = torch.tensor(0.0, device=device)
 
-        # Discriminator loss on REAL pairs: (source, real_target) -> should be real
-        d_real_pred = discriminator(real_pcx_c, condition=real_ob_c)
-        d_loss_real = adversarial_loss(d_real_pred, target_is_real=True, loss_type=gan_loss_type)
+        if use_discriminator:
+            d_optimizer.zero_grad(set_to_none=True)
 
-        # Discriminator loss on FAKE pairs: (source, fake_target) -> should be fake
-        d_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
-        d_loss_fake = adversarial_loss(d_fake_pred, target_is_real=False, loss_type=gan_loss_type)
-
-        d_loss = (d_loss_real + d_loss_fake) * 0.5
-
-        # Reverse direction discriminator
-        if reverse_generator is not None and reverse_discriminator is not None:
+            # Generate fake samples (detached from generator graph)
             with torch.no_grad():
                 if cond_emb is not None:
-                    fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
+                    fake_pcx = generator(ob, cond_emb=cond_emb)
                 else:
-                    fake_ob = reverse_generator(pcx, odor)
-                fake_ob_c = crop_to_target_torch(fake_ob)
+                    fake_pcx = generator(ob, odor)
+                fake_pcx_c = crop_to_target_torch(fake_pcx)
 
-            # REAL pairs: (target, real_source) -> should be real
-            d_real_pred_rev = reverse_discriminator(real_ob_c, condition=real_pcx_c)
-            d_loss_real_rev = adversarial_loss(d_real_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+            # Discriminator loss on REAL pairs: (source, real_target) -> should be real
+            d_real_pred = discriminator(real_pcx_c, condition=real_ob_c)
+            d_loss_real = adversarial_loss(d_real_pred, target_is_real=True, loss_type=gan_loss_type)
 
-            # FAKE pairs: (target, fake_source) -> should be fake
-            d_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
-            d_loss_fake_rev = adversarial_loss(d_fake_pred_rev, target_is_real=False, loss_type=gan_loss_type)
+            # Discriminator loss on FAKE pairs: (source, fake_target) -> should be fake
+            d_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
+            d_loss_fake = adversarial_loss(d_fake_pred, target_is_real=False, loss_type=gan_loss_type)
 
-            d_loss_rev = (d_loss_real_rev + d_loss_fake_rev) * 0.5
-            d_loss = d_loss + d_loss_rev
+            d_loss = (d_loss_real + d_loss_fake) * 0.5
 
-        d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
-        if reverse_discriminator is not None:
-            torch.nn.utils.clip_grad_norm_(reverse_discriminator.parameters(), GRAD_CLIP)
-        d_optimizer.step()
+            # Reverse direction discriminator
+            if reverse_generator is not None and reverse_discriminator is not None:
+                with torch.no_grad():
+                    if cond_emb is not None:
+                        fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
+                    else:
+                        fake_ob = reverse_generator(pcx, odor)
+                    fake_ob_c = crop_to_target_torch(fake_ob)
+
+                # REAL pairs: (target, real_source) -> should be real
+                d_real_pred_rev = reverse_discriminator(real_ob_c, condition=real_pcx_c)
+                d_loss_real_rev = adversarial_loss(d_real_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+
+                # FAKE pairs: (target, fake_source) -> should be fake
+                d_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
+                d_loss_fake_rev = adversarial_loss(d_fake_pred_rev, target_is_real=False, loss_type=gan_loss_type)
+
+                d_loss_rev = (d_loss_real_rev + d_loss_fake_rev) * 0.5
+                d_loss = d_loss + d_loss_rev
+
+            d_loss.backward()
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), GRAD_CLIP)
+            if reverse_discriminator is not None:
+                torch.nn.utils.clip_grad_norm_(reverse_discriminator.parameters(), GRAD_CLIP)
+            d_optimizer.step()
 
         # =====================================================================
         # GENERATOR UPDATE
@@ -1424,39 +1440,60 @@ def adversarial_train_epoch(
             fake_pcx = generator(ob, odor)
         fake_pcx_c = crop_to_target_torch(fake_pcx)
 
-        # Adversarial loss - fool discriminator with (source, fake_target) pair
-        g_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
-        g_adv_loss = adversarial_loss(g_fake_pred, target_is_real=True, loss_type=gan_loss_type)
+        # Adversarial loss (optional - only if discriminator is used)
+        g_adv_loss = torch.tensor(0.0, device=device)
+        if use_discriminator:
+            g_fake_pred = discriminator(fake_pcx_c, condition=real_ob_c)
+            g_adv_loss = adversarial_loss(g_fake_pred, target_is_real=True, loss_type=gan_loss_type)
 
-        # Reconstruction loss (L1)
+        # Correlation loss - DIRECT optimization of what we care about!
+        g_corr_loss = torch.tensor(0.0, device=device)
+        if use_corr_loss:
+            g_corr_loss = correlation_loss(fake_pcx_c, real_pcx_c)
+
+        # Reconstruction loss (L1) - for content preservation
         g_l1_loss = F.l1_loss(fake_pcx_c, real_pcx_c)
 
         # Wavelet loss (optional)
         g_wav_loss = torch.tensor(0.0, device=device)
-        if wavelet_loss is not None:
+        if wavelet_loss is not None and lambda_wav > 0:
             g_wav_loss = wavelet_loss(fake_pcx_c.float(), real_pcx_c.float())
 
         # Total generator loss
-        g_loss = lambda_adv * g_adv_loss + lambda_l1 * g_l1_loss + lambda_wav * g_wav_loss
+        g_loss = (lambda_adv * g_adv_loss +
+                  lambda_corr * g_corr_loss +
+                  lambda_l1 * g_l1_loss +
+                  lambda_wav * g_wav_loss)
 
         # Reverse direction
-        if reverse_generator is not None and reverse_discriminator is not None:
+        if reverse_generator is not None:
             if cond_emb is not None:
                 fake_ob = reverse_generator(pcx, cond_emb=cond_emb)
             else:
                 fake_ob = reverse_generator(pcx, odor)
             fake_ob_c = crop_to_target_torch(fake_ob)
 
-            # Fool reverse discriminator with (target, fake_source) pair
-            g_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
-            g_adv_loss_rev = adversarial_loss(g_fake_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+            # Adversarial loss for reverse (optional)
+            g_adv_loss_rev = torch.tensor(0.0, device=device)
+            if use_discriminator and reverse_discriminator is not None:
+                g_fake_pred_rev = reverse_discriminator(fake_ob_c, condition=real_pcx_c)
+                g_adv_loss_rev = adversarial_loss(g_fake_pred_rev, target_is_real=True, loss_type=gan_loss_type)
+
+            # Correlation loss for reverse
+            g_corr_loss_rev = torch.tensor(0.0, device=device)
+            if use_corr_loss:
+                g_corr_loss_rev = correlation_loss(fake_ob_c, real_ob_c)
+
             g_l1_loss_rev = F.l1_loss(fake_ob_c, real_ob_c)
 
             g_wav_loss_rev = torch.tensor(0.0, device=device)
-            if wavelet_loss is not None:
+            if wavelet_loss is not None and lambda_wav > 0:
                 g_wav_loss_rev = wavelet_loss(fake_ob_c.float(), real_ob_c.float())
 
-            g_loss_rev = lambda_adv * g_adv_loss_rev + lambda_l1 * g_l1_loss_rev + lambda_wav * g_wav_loss_rev
+            g_loss_rev = (lambda_adv * g_adv_loss_rev +
+                         lambda_corr * g_corr_loss_rev +
+                         lambda_l1 * g_l1_loss_rev +
+                         lambda_wav * g_wav_loss_rev)
             g_loss = g_loss + g_loss_rev
 
         g_loss.backward()
@@ -1475,12 +1512,19 @@ def adversarial_train_epoch(
         total_d_fake = total_d_fake + d_loss_fake.detach()
         total_recon_loss = total_recon_loss + g_l1_loss.detach()
         total_adv_loss = total_adv_loss + g_adv_loss.detach()
+        total_corr_loss = total_corr_loss + g_corr_loss.detach()
 
-        # Update progress bar
-        pbar.set_postfix({
-            "G": f"{g_loss.item():.3f}",
-            "D": f"{d_loss.item():.3f}",
-        })
+        # Update progress bar - show correlation loss if using it
+        if use_corr_loss:
+            pbar.set_postfix({
+                "L": f"{g_loss.item():.3f}",
+                "corr": f"{g_corr_loss.item():.3f}",
+            })
+        else:
+            pbar.set_postfix({
+                "G": f"{g_loss.item():.3f}",
+                "D": f"{d_loss.item():.3f}",
+            })
 
     pbar.close()
     sys.stdout.flush()
@@ -1493,6 +1537,7 @@ def adversarial_train_epoch(
         "d_fake": total_d_fake.item() / n_batches,
         "recon_loss": total_recon_loss.item() / n_batches,
         "adv_loss": total_adv_loss.item() / n_batches,
+        "corr_loss": total_corr_loss.item() / n_batches,
     }
 
 
@@ -2216,20 +2261,21 @@ def train(
 
     if should_run_adversarial:
         if is_primary():
-            adv_lambda = config.get('adversarial_lambda', 1.0)
-            recon_scale = config.get('adversarial_recon_scale', 0.5)
+            adv_lambda = config.get('adversarial_lambda', 0.0)
+            corr_lambda = config.get('adversarial_corr_lambda', 1.0)
+            use_corr = config.get('adversarial_use_corr_loss', True)
+            recon_scale = config.get('adversarial_recon_scale', 0.3)
             use_wav = config.get('adversarial_use_wavelet', False)
             print(f"\n{'='*70}")
-            print("STAGE 2: ADVERSARIAL FINE-TUNING")
+            print("STAGE 2: CORRELATION FINE-TUNING")
             print(f"{'='*70}")
             print(f"  Epochs: {adversarial_epochs}")
-            print(f"  Generator LR: {config.get('adversarial_lr_g', 1e-4)}")
-            print(f"  Discriminator LR: {config.get('adversarial_lr_d', 4e-4)}")
-            print(f"  Loss type: {config.get('adversarial_loss_type', 'lsgan')}")
+            print(f"  Generator LR: {config.get('adversarial_lr_g', 2e-4)}")
             print(f"  Loss weights:")
-            print(f"    - Adversarial (λ_adv): {adv_lambda}")
-            print(f"    - L1 scale (λ_l1 × {recon_scale}): {config.get('weight_l1', 1.0) * recon_scale}")
-            print(f"    - Wavelet: {'ENABLED' if use_wav else 'DISABLED (converged in Stage 1)'}")
+            print(f"    - Correlation (λ_corr): {corr_lambda if use_corr else 'DISABLED'}")
+            print(f"    - L1 (λ_l1 × {recon_scale}): {config.get('weight_l1', 1.0) * recon_scale}")
+            print(f"    - GAN/Adversarial: {'λ=' + str(adv_lambda) if adv_lambda > 0 else 'DISABLED'}")
+            print(f"    - Wavelet: {'ENABLED' if use_wav else 'DISABLED'}")
 
         # If adversarial_only mode, load Stage 1 checkpoint
         if adversarial_only:
@@ -2250,48 +2296,52 @@ def train(
             )
             barrier()
 
-        # Create discriminators for forward and reverse directions
+        # Create discriminators ONLY if adversarial loss is used (saves memory!)
         from models import MultiScaleDiscriminator, adversarial_loss, feature_matching_loss
+
+        use_discriminator = config.get("adversarial_lambda", 0.0) > 0
 
         # Match dtype to the generator (bf16 when using FSDP)
         use_bf16 = config.get("fsdp_bf16", False) or is_fsdp_wrapped
         compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-        out_channels = config.get("out_channels", 32)
-        disc_fwd = MultiScaleDiscriminator(
-            in_channels=out_channels,
-            n_discriminators=3,
-            base_channels=64,
-        ).to(device=device, dtype=compute_dtype)
-
+        disc_fwd = None
         disc_rev = None
-        if reverse_model is not None:
-            in_channels = config.get("in_channels", 32)
-            disc_rev = MultiScaleDiscriminator(
-                in_channels=in_channels,
+        d_optimizer = None
+
+        if use_discriminator:
+            out_channels = config.get("out_channels", 32)
+            disc_fwd = MultiScaleDiscriminator(
+                in_channels=out_channels,
                 n_discriminators=3,
                 base_channels=64,
             ).to(device=device, dtype=compute_dtype)
 
-        # Create optimizers for adversarial training
-        # Generator (UNet) uses lower LR to preserve Stage 1 features
-        g_lr = config.get("adversarial_lr_g", 1e-5)
-        d_lr = config.get("adversarial_lr_d", 4e-5)
+            if reverse_model is not None:
+                in_channels = config.get("in_channels", 32)
+                disc_rev = MultiScaleDiscriminator(
+                    in_channels=in_channels,
+                    n_discriminators=3,
+                    base_channels=64,
+                ).to(device=device, dtype=compute_dtype)
 
+            d_lr = config.get("adversarial_lr_d", 4e-4)
+            d_params = list(disc_fwd.parameters())
+            if disc_rev is not None:
+                d_params += list(disc_rev.parameters())
+            d_optimizer = torch.optim.AdamW(
+                d_params,
+                lr=d_lr,
+                betas=(0.5, 0.999),
+                weight_decay=1e-4,
+            )
+
+        # Create generator optimizer
+        g_lr = config.get("adversarial_lr_g", 2e-4)
         g_optimizer = torch.optim.AdamW(
             list(model.parameters()) + (list(reverse_model.parameters()) if reverse_model else []),
             lr=g_lr,
-            betas=(0.5, 0.999),  # Standard GAN betas
-            weight_decay=1e-4,
-        )
-
-        d_params = list(disc_fwd.parameters())
-        if disc_rev is not None:
-            d_params += list(disc_rev.parameters())
-        d_optimizer = torch.optim.AdamW(
-            d_params,
-            lr=d_lr,
-            betas=(0.5, 0.999),
+            betas=(0.9, 0.999),  # Standard Adam betas for correlation optimization
             weight_decay=1e-4,
         )
 
@@ -2347,8 +2397,15 @@ def train(
 
             if is_primary():
                 print(f"\n[Stage 2 Epoch {epoch+1}/{adversarial_epochs}]")
-                print(f"  G_loss={epoch_metrics['g_loss']:.4f}, D_loss={epoch_metrics['d_loss']:.4f}")
-                print(f"  recon={epoch_metrics['recon_loss']:.4f}, adv={epoch_metrics['adv_loss']:.4f}")
+                # Show appropriate metrics based on what's being used
+                use_corr = config.get('adversarial_use_corr_loss', True)
+                use_adv = config.get('adversarial_lambda', 0.0) > 0
+                print(f"  Total_loss={epoch_metrics['g_loss']:.4f}")
+                if use_corr:
+                    print(f"  corr_loss={epoch_metrics['corr_loss']:.4f} (train: 1-r)")
+                print(f"  recon_loss={epoch_metrics['recon_loss']:.4f}")
+                if use_adv:
+                    print(f"  adv_loss={epoch_metrics['adv_loss']:.4f}, D_loss={epoch_metrics['d_loss']:.4f}")
                 print(f"  Val: corr={val_metrics['corr']:.4f}, r2={val_metrics['r2']:.4f}")
 
             # Save best model based on validation correlation
@@ -2412,7 +2469,14 @@ def train(
         best_epoch = best_adv_epoch
 
         # Clean up discriminators (no longer needed)
-        del disc_fwd, disc_rev, g_optimizer, d_optimizer
+        # Clean up (some may be None if not using discriminator)
+        del g_optimizer
+        if disc_fwd is not None:
+            del disc_fwd
+        if disc_rev is not None:
+            del disc_rev
+        if d_optimizer is not None:
+            del d_optimizer
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         if is_primary():
