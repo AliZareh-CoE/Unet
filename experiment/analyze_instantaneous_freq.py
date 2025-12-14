@@ -80,28 +80,30 @@ def compute_instantaneous_frequency(
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> Tuple[CondUNet1D, Dict]:
     """Load model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Get config from checkpoint
     config = checkpoint.get('config', {})
 
-    # Build model
+    # Build model with correct parameter names matching CondUNet1D.__init__
     model = CondUNet1D(
         in_channels=config.get('in_channels', 32),
         out_channels=config.get('out_channels', 32),
-        n_conditions=config.get('n_conditions', 7),
-        base_channels=config.get('base_channels', 64),
-        n_downsample=config.get('n_downsample', 4),
+        base=config.get('base_channels', 64),  # config uses 'base_channels', model uses 'base'
+        n_odors=config.get('n_odors', 7),  # NOT n_conditions
+        emb_dim=config.get('emb_dim', 128),
         dropout=config.get('dropout', 0.0),
         use_attention=config.get('use_attention', True),
         attention_type=config.get('attention_type', 'cross_freq_v2'),
         norm_type=config.get('norm_type', 'batch'),
         cond_mode=config.get('cond_mode', 'cross_attn_gated'),
+        use_spectral_shift=config.get('use_spectral_shift', True),
+        n_downsample=config.get('n_downsample', 4),
         conv_type=config.get('conv_type', 'inception'),
         use_se=config.get('use_se', True),
         conv_kernel_size=config.get('conv_kernel_size', 7),
-        conv_dilations=config.get('conv_dilations', (1, 4, 16, 32)),
-        kernel_sizes=config.get('kernel_sizes', (3, 5, 7)),
+        dilations=tuple(config.get('conv_dilations', (1, 4, 16, 32))),  # config uses 'conv_dilations'
+        kernel_sizes=tuple(config.get('kernel_sizes', (3, 5, 7))),
         use_dilation_grid=config.get('use_dilation_grid', False),
         use_output_scaling=config.get('use_output_scaling', True),
     ).to(device)
