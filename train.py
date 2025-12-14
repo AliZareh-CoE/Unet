@@ -2359,7 +2359,8 @@ def train(
         for epoch in range(adversarial_epochs):
             # Train epoch
             model.train()
-            disc_fwd.train()
+            if disc_fwd is not None:
+                disc_fwd.train()
             if reverse_model is not None:
                 reverse_model.train()
             if disc_rev is not None:
