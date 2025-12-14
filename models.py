@@ -2471,17 +2471,22 @@ class MultiScaleDiscriminator(nn.Module):
         return outputs
 
 
-def adversarial_loss(pred: torch.Tensor, target_is_real: bool, loss_type: str = "lsgan") -> torch.Tensor:
+def adversarial_loss(pred, target_is_real: bool, loss_type: str = "lsgan") -> torch.Tensor:
     """Compute adversarial loss.
 
     Args:
-        pred: Discriminator prediction
+        pred: Discriminator prediction - can be a tensor or list of tensors (multi-scale)
         target_is_real: Whether target should be real (True) or fake (False)
         loss_type: Loss type - 'lsgan' (MSE), 'vanilla' (BCE), or 'hinge'
 
     Returns:
         Scalar loss value
     """
+    # Handle multi-scale discriminator output (list of tensors)
+    if isinstance(pred, list):
+        losses = [adversarial_loss(p, target_is_real, loss_type) for p in pred]
+        return sum(losses) / len(losses)
+
     if loss_type == "lsgan":
         # Least-squares GAN (more stable)
         target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
