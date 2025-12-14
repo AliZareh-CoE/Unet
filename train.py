@@ -2240,12 +2240,16 @@ def train(
         # Create discriminators for forward and reverse directions
         from models import MultiScaleDiscriminator, adversarial_loss, feature_matching_loss
 
+        # Match dtype to the generator (bf16 when using FSDP)
+        use_bf16 = config.get("fsdp_bf16", False) or is_fsdp_wrapped
+        compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
         out_channels = config.get("out_channels", 32)
         disc_fwd = MultiScaleDiscriminator(
             in_channels=out_channels,
             n_discriminators=3,
             base_channels=64,
-        ).to(device)
+        ).to(device=device, dtype=compute_dtype)
 
         disc_rev = None
         if reverse_model is not None:
@@ -2254,7 +2258,7 @@ def train(
                 in_channels=in_channels,
                 n_discriminators=3,
                 base_channels=64,
-            ).to(device)
+            ).to(device=device, dtype=compute_dtype)
 
         # Create optimizers for adversarial training
         # Generator (UNet) uses lower LR to preserve Stage 1 features
