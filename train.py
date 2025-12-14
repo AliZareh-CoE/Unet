@@ -1875,22 +1875,29 @@ def train(
     use_two_stage = config.get("use_two_stage", False)
     spectral_finetune_epochs = config.get("spectral_finetune_epochs", 10)
     stage2_only = config.get("stage2_only", False)
+    adversarial_only = config.get("adversarial_only", False)
     stage1_checkpoint = config.get("stage1_checkpoint", None)
 
-    # Validate stage2_only requirements
-    if stage2_only:
+    # Validate stage2_only or adversarial_only requirements
+    if stage2_only or adversarial_only:
         if stage1_checkpoint is None:
-            raise ValueError("stage2_only=True requires stage1_checkpoint path to be set!")
+            raise ValueError("stage2_only/adversarial_only requires stage1_checkpoint path to be set!")
         stage1_checkpoint = Path(stage1_checkpoint)
         if not stage1_checkpoint.exists():
             raise FileNotFoundError(f"Stage 1 checkpoint not found: {stage1_checkpoint}")
         if is_primary():
             print(f"\n{'='*70}")
-            print("STAGE 2 ONLY MODE")
+            if adversarial_only:
+                print("ADVERSARIAL-ONLY MODE (Stage 2)")
+            else:
+                print("STAGE 2+ ONLY MODE")
             print(f"{'='*70}")
             print(f"  Skipping Stage 1 - loading checkpoint from:")
             print(f"    {stage1_checkpoint}")
-            print(f"  Fine-tuning ONLY SpectralShift for {spectral_finetune_epochs} epochs")
+            if adversarial_only:
+                print(f"  Running Stage 2: Adversarial fine-tuning for {config.get('adversarial_epochs', 10)} epochs")
+            if not adversarial_only or stage2_only:
+                print(f"  Running Stage 3: Post-hoc calibration")
             print(f"{'='*70}\n")
 
     elif is_primary() and use_two_stage:
@@ -2195,8 +2202,8 @@ def train(
     # The generator (UNet) is fine-tuned with both reconstruction loss and adversarial loss.
 
     use_adversarial = config.get("use_adversarial", False)
-    adversarial_only = config.get("adversarial_only", False)
     adversarial_epochs = config.get("adversarial_epochs", 10)
+    # Note: adversarial_only is already extracted at the top of this function
 
     should_run_adversarial = use_adversarial and adversarial_epochs > 0
 
