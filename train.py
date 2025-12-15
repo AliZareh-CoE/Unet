@@ -178,21 +178,33 @@ DEFAULT_CONFIG = {
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
 
     # Data augmentation (applied during training only)
-    "aug_time_shift": False,        # Random circular time shift
-    "aug_time_shift_max": 0.1,      # Max shift as fraction of signal length (0.1 = 10%)
-    "aug_noise": False,             # Add Gaussian noise
-    "aug_noise_std": 0.05,          # Noise std relative to signal std
-    "aug_channel_dropout": False,   # Randomly zero out channels
-    "aug_channel_dropout_p": 0.1,   # Probability of dropping each channel
-    "aug_amplitude_scale": False,   # Random amplitude scaling
-    "aug_amplitude_scale_range": (0.8, 1.2),  # Scale factor range (min, max)
-    "aug_time_mask": False,         # Randomly mask time segments
-    "aug_time_mask_ratio": 0.1,     # Fraction of time to mask
-    "aug_mixup": False,             # Mixup: blend random sample pairs
-    "aug_mixup_alpha": 0.4,         # Beta distribution alpha (higher = more mixing)
-    "aug_freq_mask": False,         # Frequency masking: zero out random freq bands
-    "aug_freq_mask_max_bands": 2,   # Max number of frequency bands to mask
-    "aug_freq_mask_max_width": 10,  # Max width of each masked band (in freq bins)
+    # HEAVY augmentation for cross-session generalization
+    "aug_time_shift": True,         # Random circular time shift
+    "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
+    "aug_noise": True,              # Add Gaussian noise
+    "aug_noise_std": 0.1,           # Noise std relative to signal std (heavy)
+    "aug_channel_dropout": True,    # Randomly zero out channels
+    "aug_channel_dropout_p": 0.2,   # Probability of dropping each channel (heavy)
+    "aug_amplitude_scale": True,    # Random amplitude scaling
+    "aug_amplitude_scale_range": (0.5, 1.5),  # Scale factor range (heavy - simulates gain drift)
+    "aug_time_mask": True,          # Randomly mask time segments
+    "aug_time_mask_ratio": 0.15,    # Fraction of time to mask
+    "aug_mixup": True,              # Mixup: blend random sample pairs
+    "aug_mixup_alpha": 0.4,         # Beta distribution alpha
+    "aug_freq_mask": True,          # Frequency masking: zero out random freq bands
+    "aug_freq_mask_max_bands": 3,   # Max number of frequency bands to mask
+    "aug_freq_mask_max_width": 20,  # Max width of each masked band (in freq bins)
+
+    # Session-specific augmentation (simulates cross-session variability)
+    "aug_channel_scale": True,      # Per-channel random scaling (simulates electrode drift)
+    "aug_channel_scale_range": (0.7, 1.4),  # Per-channel scale range
+    "aug_dc_offset": True,          # Random DC offset per channel
+    "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
+
+    # Contrastive learning for session-invariant representations
+    "use_contrastive": False,       # Enable CEBRA-style contrastive learning
+    "contrastive_weight": 0.1,      # Weight for contrastive loss
+    "contrastive_temperature": 0.1, # Temperature for InfoNCE loss
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -630,6 +642,61 @@ def aug_freq_mask(
     return x_masked
 
 
+def aug_channel_scale(
+    x: torch.Tensor,
+    scale_range: Tuple[float, float] = (0.7, 1.4)
+) -> torch.Tensor:
+    """Apply random per-channel scaling (simulates electrode drift/impedance changes).
+
+    Each channel gets a different random scale factor, simulating how electrodes
+    drift differently across recording sessions.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        scale_range: (min_scale, max_scale) range for per-channel scaling
+
+    Returns:
+        Channel-scaled tensor (same shape)
+    """
+    batch_size, n_channels, _ = x.shape
+    min_scale, max_scale = scale_range
+
+    # Generate per-channel scales (same for all samples in batch for consistency)
+    scales = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_scale, max_scale)
+    scales = scales.expand(batch_size, -1, -1)
+
+    return x * scales
+
+
+def aug_dc_offset(
+    x: torch.Tensor,
+    offset_range: Tuple[float, float] = (-0.3, 0.3)
+) -> torch.Tensor:
+    """Apply random per-channel DC offset (simulates baseline drift).
+
+    Each channel gets a different random offset, simulating how electrode
+    baselines drift differently across sessions.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        offset_range: (min_offset, max_offset) range relative to signal std
+
+    Returns:
+        Offset-adjusted tensor (same shape)
+    """
+    batch_size, n_channels, _ = x.shape
+    min_offset, max_offset = offset_range
+
+    # Compute signal std for reference scaling
+    signal_std = x.std(dim=-1, keepdim=True).mean()
+
+    # Generate per-channel offsets
+    offsets = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_offset, max_offset)
+    offsets = offsets.expand(batch_size, -1, -1) * signal_std
+
+    return x + offsets
+
+
 def apply_augmentations(
     ob: torch.Tensor,
     pcx: torch.Tensor,
@@ -724,6 +791,28 @@ def apply_augmentations(
                     combined_fft[batch_size + i, :, start:start + width] = 0
             combined = torch.fft.irfft(combined_fft, n=ob.shape[-1], dim=-1)
             ob, pcx = combined[:batch_size], combined[batch_size:]
+
+    # Session-specific augmentations (simulate cross-session variability)
+
+    # Per-channel scaling: apply same scale pattern to both (simulates electrode drift)
+    if config.get("aug_channel_scale", False):
+        scale_range = config.get("aug_channel_scale_range", (0.7, 1.4))
+        batch_size, n_channels, _ = ob.shape
+        min_scale, max_scale = scale_range
+        # Same per-channel scale for both OB and PCx (electrodes drift together in same rig)
+        scales = torch.empty(1, n_channels, 1, device=ob.device).uniform_(min_scale, max_scale)
+        scales = scales.expand(batch_size, -1, -1)
+        ob = ob * scales
+        # Different scale pattern for PCx (different electrodes)
+        scales_pcx = torch.empty(1, n_channels, 1, device=pcx.device).uniform_(min_scale, max_scale)
+        scales_pcx = scales_pcx.expand(batch_size, -1, -1)
+        pcx = pcx * scales_pcx
+
+    # DC offset: apply independently (baseline drift is independent per electrode)
+    if config.get("aug_dc_offset", False):
+        offset_range = config.get("aug_dc_offset_range", (-0.3, 0.3))
+        ob = aug_dc_offset(ob, offset_range)
+        pcx = aug_dc_offset(pcx, offset_range)
 
     return ob, pcx
 
@@ -3532,11 +3621,17 @@ def main():
 
     # Print augmentation config if any are enabled
     aug_enabled = [
-        k for k in ["aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale", "aug_time_mask", "aug_mixup", "aug_freq_mask"]
+        k for k in [
+            "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
+            "aug_time_mask", "aug_mixup", "aug_freq_mask",
+            "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
+        ]
         if config.get(k, False)
     ]
     if aug_enabled and is_primary():
         print(f"Data augmentation ENABLED: {', '.join(aug_enabled)}")
+        if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
+            print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
 
     # Loss function selection (for tier1 fair comparison)
     # Only override config if --loss is explicitly provided
