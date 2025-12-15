@@ -1445,6 +1445,74 @@ def prepare_data(
     ob = normalized[:, 0]  # [trials, channels, time]
     pcx = normalized[:, 1]
 
+    # =========================================================================
+    # SESSION ANALYSIS: Analyze per-split statistics to diagnose performance gaps
+    # =========================================================================
+    if split_by_session and split_info is not None:
+        print("\n" + "=" * 70)
+        print("SESSION DATA ANALYSIS (diagnosing val vs test gaps)")
+        print("=" * 70)
+
+        def pearson_corr(x, y):
+            """Compute Pearson correlation."""
+            x_flat = x.flatten()
+            y_flat = y.flatten()
+            mx, my = x_flat.mean(), y_flat.mean()
+            sx, sy = x_flat.std(), y_flat.std()
+            if sx < 1e-10 or sy < 1e-10:
+                return 0.0
+            return ((x_flat - mx) * (y_flat - my)).mean() / (sx * sy)
+
+        for name, indices in [
+            ("TRAIN", train_idx),
+            (f"VAL ({split_info['val_sessions']})", val_idx),
+            (f"TEST ({split_info['test_sessions']})", test_idx),
+        ]:
+            ob_split = ob[indices]
+            pcx_split = pcx[indices]
+
+            # Basic statistics
+            ob_mean, ob_std = ob_split.mean(), ob_split.std()
+            pcx_mean, pcx_std = pcx_split.mean(), pcx_split.std()
+
+            # CRITICAL: Baseline OB↔PCx correlation (natural similarity)
+            # This is what the model is trying to improve upon
+            baseline_corr = pearson_corr(ob_split, pcx_split)
+
+            # Per-trial correlations
+            per_trial_corrs = []
+            for i in range(len(indices)):
+                c = pearson_corr(ob_split[i], pcx_split[i])
+                per_trial_corrs.append(c)
+            per_trial_corrs = np.array(per_trial_corrs)
+
+            print(f"\n{name} ({len(indices)} trials):")
+            print(f"  OB stats:  mean={ob_mean:.4f}, std={ob_std:.4f}")
+            print(f"  PCx stats: mean={pcx_mean:.4f}, std={pcx_std:.4f}")
+            print(f"  BASELINE OB↔PCx corr: {baseline_corr:.4f}")
+            print(f"  Per-trial corr: mean={per_trial_corrs.mean():.4f}, "
+                  f"std={per_trial_corrs.std():.4f}, "
+                  f"range=[{per_trial_corrs.min():.4f}, {per_trial_corrs.max():.4f}]")
+
+        # Compare val vs test baseline correlations
+        val_ob, val_pcx = ob[val_idx], pcx[val_idx]
+        test_ob, test_pcx = ob[test_idx], pcx[test_idx]
+        val_baseline = pearson_corr(val_ob, val_pcx)
+        test_baseline = pearson_corr(test_ob, test_pcx)
+
+        gap = val_baseline - test_baseline
+        if abs(gap) > 0.05:
+            print(f"\n⚠️  WARNING: Baseline correlation gap = {gap:.4f}")
+            print(f"    VAL baseline: {val_baseline:.4f}")
+            print(f"    TEST baseline: {test_baseline:.4f}")
+            if gap > 0:
+                print(f"    TEST session has LOWER natural OB↔PCx correlation!")
+                print(f"    This explains why model performance is worse on test!")
+            else:
+                print(f"    VAL session has LOWER natural OB↔PCx correlation!")
+
+        print("=" * 70 + "\n")
+
     result = {
         "ob": ob,
         "pcx": pcx,
