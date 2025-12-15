@@ -17,8 +17,8 @@ Usage:
     python calibrate.py --checkpoint artifacts/checkpoints/best_model.pt
 
 Notes:
-    - Odor conditioning is DISABLED by default (unconditional model)
-    - Use --cond-mode cross_attn_gated to enable odor conditioning if needed
+    - Auto-conditioning from input signal (--conditioning spectro_temporal) is the default
+    - This is NOT odor conditioning - it learns conditioning from the signal dynamics
     - Session-based splitting is used for proper cross-session generalization
 """
 from __future__ import annotations
@@ -170,7 +170,7 @@ DEFAULT_CONFIG = {
     "use_attention": True,
     "attention_type": "cross_freq_v2",  # Cross-frequency coupling attention (theta-gamma)
     "norm_type": "batch",
-    "cond_mode": "none",  # No odor conditioning (unconditional model for cross-session generalization)
+    "cond_mode": "cross_attn_gated",  # Cross-attention with gating (uses auto-conditioning from --conditioning)
     
     # U-Net depth (controls frequency resolution at bottleneck)
     # n_downsample=2: 4x downsample → 125 Hz Nyquist (full gamma, uses more memory)
