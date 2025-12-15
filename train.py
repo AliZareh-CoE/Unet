@@ -2836,7 +2836,7 @@ def train(
                     model, session_loader, device, wavelet_loss,
                     compute_phase=False, reverse_model=None, config=config,
                     spectral_shift_fwd=spectral_shift_fwd,
-                    fast_mode=True,
+                    fast_mode=False,  # Need full metrics for baseline
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
                 )
