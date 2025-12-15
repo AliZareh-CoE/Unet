@@ -178,7 +178,6 @@ case ${MODE} in
         run_smoke_test
         ;;
     "full")
-        run_smoke_test
         run_full_experiment
         ;;
     *)
