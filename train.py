@@ -1584,7 +1584,7 @@ def train_epoch(
     use_bf16 = config.get("fsdp_bf16", False)
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    for ob, pcx, odor in pbar:
+    for batch_idx, (ob, pcx, odor) in enumerate(pbar):
         # non_blocking=True enables async CPU->GPU transfer (overlaps with compute)
         ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
@@ -1788,11 +1788,38 @@ def train_epoch(
             # bottleneck_fwd: (batch, bottleneck_channels) - already pooled in model forward
             fwd_embed = projection_head_fwd(bottleneck_fwd)  # -> (batch, 128)
 
+            # Debug: Print shapes and stats on first batch of first epoch
+            if is_primary() and batch_idx == 0 and epoch == 1:
+                print(f"\n{'='*60}")
+                print(f"CEBRA CONTRASTIVE LEARNING - First Batch Debug")
+                print(f"{'='*60}")
+                print(f"  Bottleneck features shape: {bottleneck_fwd.shape}")
+                print(f"  Bottleneck dtype: {bottleneck_fwd.dtype}")
+                print(f"  Bottleneck stats: mean={bottleneck_fwd.float().mean().item():.4f}, std={bottleneck_fwd.float().std().item():.4f}")
+                print(f"  Projected embedding shape: {fwd_embed.shape}")
+                print(f"  Embedding stats: mean={fwd_embed.float().mean().item():.4f}, std={fwd_embed.float().std().item():.4f}")
+                print(f"  Odor labels in batch: {odor.tolist()}")
+                print(f"  Unique odors: {odor.unique().tolist()} (n={odor.unique().numel()})")
+                # Count positive pairs
+                labels = odor.view(-1, 1)
+                pos_mask = (labels == labels.t()).float()
+                n_pos_pairs = (pos_mask.sum() - pos_mask.shape[0]).item()  # Exclude diagonal
+                print(f"  Positive pairs in batch: {int(n_pos_pairs)} (same odor, different sample)")
+
             # Compute contrastive loss (same odor = positive pair)
             # Cast to float32 for stable loss computation
             contrastive_loss_fwd = info_nce_loss(fwd_embed.float(), odor, temperature=contrastive_temp)
             loss = loss + contrastive_weight * contrastive_loss_fwd
             loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
+
+            # Debug: Print loss on first batch of first epoch
+            if is_primary() and batch_idx == 0 and epoch == 1:
+                print(f"  Contrastive loss (fwd): {contrastive_loss_fwd.item():.4f}")
+                print(f"  Weighted contrastive (fwd): {(contrastive_weight * contrastive_loss_fwd).item():.4f}")
+
+            # Periodic print every 10 batches on first epoch
+            if is_primary() and epoch == 1 and batch_idx > 0 and batch_idx % 10 == 0:
+                print(f"  [Batch {batch_idx}] Contrastive fwd: {contrastive_loss_fwd.item():.4f}")
 
             # Reverse direction contrastive loss (on reverse model's bottleneck)
             if reverse_model is not None and projection_head_rev is not None and bottleneck_rev is not None:
@@ -1800,6 +1827,14 @@ def train_epoch(
                 contrastive_loss_rev = info_nce_loss(rev_embed.float(), odor, temperature=contrastive_temp)
                 loss = loss + contrastive_weight * contrastive_loss_rev
                 loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
+
+                if is_primary() and batch_idx == 0 and epoch == 1:
+                    print(f"  Contrastive loss (rev): {contrastive_loss_rev.item():.4f}")
+                    print(f"  Weighted contrastive (rev): {(contrastive_weight * contrastive_loss_rev).item():.4f}")
+
+            if is_primary() and batch_idx == 0 and epoch == 1:
+                print(f"  Total loss (with contrastive): {loss.item():.4f}")
+                print(f"{'='*60}\n")
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -2426,9 +2461,16 @@ def train(
                 if "corr_rev" in val_metrics:
                     rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
+                # Add contrastive loss if present
+                contr_str = ""
+                if "contrastive_fwd" in train_metrics:
+                    contr_str = f" | Contr: {train_metrics['contrastive_fwd']:.3f}"
+                    if "contrastive_rev" in train_metrics:
+                        contr_str += f"/{train_metrics['contrastive_rev']:.3f}"
+
                 print(f"Epoch {epoch}/{num_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
+                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
                       f"Best: {best_val_loss:.3f}")
                 sys.stdout.flush()
 
