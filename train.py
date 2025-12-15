@@ -817,6 +817,128 @@ def apply_augmentations(
     return ob, pcx
 
 
+# =============================================================================
+# Contrastive Learning for Session-Invariant Representations
+# =============================================================================
+
+class ProjectionHead(nn.Module):
+    """MLP projection head for contrastive learning.
+
+    Projects encoder features to a lower-dimensional embedding space
+    where contrastive loss is applied.
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def info_nce_loss(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.1
+) -> torch.Tensor:
+    """InfoNCE contrastive loss (CEBRA-style).
+
+    Pulls together samples with the same label (odor), pushes apart different labels.
+    This encourages the model to learn odor-specific representations that are
+    invariant to session-specific noise (since different augmentations simulate
+    different sessions).
+
+    Args:
+        embeddings: (batch, embedding_dim) normalized embeddings
+        labels: (batch,) odor labels
+        temperature: Temperature for softmax (lower = sharper)
+
+    Returns:
+        Scalar InfoNCE loss
+    """
+    # Normalize embeddings
+    embeddings = F.normalize(embeddings, dim=1)
+
+    batch_size = embeddings.shape[0]
+    if batch_size < 2:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # Compute similarity matrix
+    sim_matrix = torch.mm(embeddings, embeddings.t()) / temperature
+
+    # Create mask for positive pairs (same odor)
+    labels = labels.view(-1, 1)
+    pos_mask = (labels == labels.t()).float()
+
+    # Remove diagonal (self-similarity)
+    eye_mask = torch.eye(batch_size, device=embeddings.device)
+    pos_mask = pos_mask - eye_mask
+
+    # Check if there are any positive pairs
+    if pos_mask.sum() == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # For numerical stability, subtract max
+    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
+
+    # Compute log-softmax over all pairs (excluding self)
+    exp_sim = torch.exp(sim_matrix) * (1 - eye_mask)
+    log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Mean log-probability over positive pairs
+    pos_log_prob = (log_prob * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-8)
+
+    # Only include samples that have at least one positive pair
+    valid_mask = pos_mask.sum(dim=1) > 0
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    loss = -pos_log_prob[valid_mask].mean()
+
+    return loss
+
+
+def get_encoder_features(
+    model: nn.Module,
+    x: torch.Tensor,
+    cond: torch.Tensor
+) -> torch.Tensor:
+    """Extract bottleneck features from the UNet encoder.
+
+    Runs the encoder part of the UNet and returns the bottleneck features
+    (before the decoder). These features are used for contrastive learning.
+
+    Args:
+        model: CondUNet1D model
+        x: Input tensor (batch, channels, time)
+        cond: Conditioning tensor
+
+    Returns:
+        Bottleneck features (batch, feature_dim)
+    """
+    # Get conditioning embedding
+    cond_embed = model.cond_encoder(cond)
+
+    # Run through encoder blocks
+    skips = []
+    h = x
+    for down in model.encoder:
+        h = down(h, cond_embed)
+        skips.append(h)
+
+    # Bottleneck
+    h = model.bottleneck(h, cond_embed)
+
+    # Global average pool to get fixed-size features
+    # h shape: (batch, channels, time)
+    features = h.mean(dim=-1)  # (batch, channels)
+
+    return features
+
+
 def load_checkpoint(
     path: Path,
     model: nn.Module,
