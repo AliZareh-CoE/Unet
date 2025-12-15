@@ -178,21 +178,33 @@ DEFAULT_CONFIG = {
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
 
     # Data augmentation (applied during training only)
-    "aug_time_shift": False,        # Random circular time shift
-    "aug_time_shift_max": 0.1,      # Max shift as fraction of signal length (0.1 = 10%)
-    "aug_noise": False,             # Add Gaussian noise
-    "aug_noise_std": 0.05,          # Noise std relative to signal std
-    "aug_channel_dropout": False,   # Randomly zero out channels
-    "aug_channel_dropout_p": 0.1,   # Probability of dropping each channel
-    "aug_amplitude_scale": False,   # Random amplitude scaling
-    "aug_amplitude_scale_range": (0.8, 1.2),  # Scale factor range (min, max)
-    "aug_time_mask": False,         # Randomly mask time segments
-    "aug_time_mask_ratio": 0.1,     # Fraction of time to mask
-    "aug_mixup": False,             # Mixup: blend random sample pairs
-    "aug_mixup_alpha": 0.4,         # Beta distribution alpha (higher = more mixing)
-    "aug_freq_mask": False,         # Frequency masking: zero out random freq bands
-    "aug_freq_mask_max_bands": 2,   # Max number of frequency bands to mask
-    "aug_freq_mask_max_width": 10,  # Max width of each masked band (in freq bins)
+    # HEAVY augmentation for cross-session generalization
+    "aug_time_shift": True,         # Random circular time shift
+    "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
+    "aug_noise": True,              # Add Gaussian noise
+    "aug_noise_std": 0.1,           # Noise std relative to signal std (heavy)
+    "aug_channel_dropout": True,    # Randomly zero out channels
+    "aug_channel_dropout_p": 0.2,   # Probability of dropping each channel (heavy)
+    "aug_amplitude_scale": True,    # Random amplitude scaling
+    "aug_amplitude_scale_range": (0.5, 1.5),  # Scale factor range (heavy - simulates gain drift)
+    "aug_time_mask": True,          # Randomly mask time segments
+    "aug_time_mask_ratio": 0.15,    # Fraction of time to mask
+    "aug_mixup": True,              # Mixup: blend random sample pairs
+    "aug_mixup_alpha": 0.4,         # Beta distribution alpha
+    "aug_freq_mask": True,          # Frequency masking: zero out random freq bands
+    "aug_freq_mask_max_bands": 3,   # Max number of frequency bands to mask
+    "aug_freq_mask_max_width": 20,  # Max width of each masked band (in freq bins)
+
+    # Session-specific augmentation (simulates cross-session variability)
+    "aug_channel_scale": True,      # Per-channel random scaling (simulates electrode drift)
+    "aug_channel_scale_range": (0.7, 1.4),  # Per-channel scale range
+    "aug_dc_offset": True,          # Random DC offset per channel
+    "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
+
+    # Contrastive learning for session-invariant representations
+    "use_contrastive": False,       # Enable CEBRA-style contrastive learning
+    "contrastive_weight": 0.1,      # Weight for contrastive loss
+    "contrastive_temperature": 0.1, # Temperature for InfoNCE loss
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -630,6 +642,61 @@ def aug_freq_mask(
     return x_masked
 
 
+def aug_channel_scale(
+    x: torch.Tensor,
+    scale_range: Tuple[float, float] = (0.7, 1.4)
+) -> torch.Tensor:
+    """Apply random per-channel scaling (simulates electrode drift/impedance changes).
+
+    Each channel gets a different random scale factor, simulating how electrodes
+    drift differently across recording sessions.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        scale_range: (min_scale, max_scale) range for per-channel scaling
+
+    Returns:
+        Channel-scaled tensor (same shape)
+    """
+    batch_size, n_channels, _ = x.shape
+    min_scale, max_scale = scale_range
+
+    # Generate per-channel scales (same for all samples in batch for consistency)
+    scales = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_scale, max_scale)
+    scales = scales.expand(batch_size, -1, -1)
+
+    return x * scales
+
+
+def aug_dc_offset(
+    x: torch.Tensor,
+    offset_range: Tuple[float, float] = (-0.3, 0.3)
+) -> torch.Tensor:
+    """Apply random per-channel DC offset (simulates baseline drift).
+
+    Each channel gets a different random offset, simulating how electrode
+    baselines drift differently across sessions.
+
+    Args:
+        x: Input tensor (batch, channels, time)
+        offset_range: (min_offset, max_offset) range relative to signal std
+
+    Returns:
+        Offset-adjusted tensor (same shape)
+    """
+    batch_size, n_channels, _ = x.shape
+    min_offset, max_offset = offset_range
+
+    # Compute signal std for reference scaling
+    signal_std = x.std(dim=-1, keepdim=True).mean()
+
+    # Generate per-channel offsets
+    offsets = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_offset, max_offset)
+    offsets = offsets.expand(batch_size, -1, -1) * signal_std
+
+    return x + offsets
+
+
 def apply_augmentations(
     ob: torch.Tensor,
     pcx: torch.Tensor,
@@ -725,7 +792,151 @@ def apply_augmentations(
             combined = torch.fft.irfft(combined_fft, n=ob.shape[-1], dim=-1)
             ob, pcx = combined[:batch_size], combined[batch_size:]
 
+    # Session-specific augmentations (simulate cross-session variability)
+
+    # Per-channel scaling: apply same scale pattern to both (simulates electrode drift)
+    if config.get("aug_channel_scale", False):
+        scale_range = config.get("aug_channel_scale_range", (0.7, 1.4))
+        batch_size, n_channels, _ = ob.shape
+        min_scale, max_scale = scale_range
+        # Same per-channel scale for both OB and PCx (electrodes drift together in same rig)
+        scales = torch.empty(1, n_channels, 1, device=ob.device).uniform_(min_scale, max_scale)
+        scales = scales.expand(batch_size, -1, -1)
+        ob = ob * scales
+        # Different scale pattern for PCx (different electrodes)
+        scales_pcx = torch.empty(1, n_channels, 1, device=pcx.device).uniform_(min_scale, max_scale)
+        scales_pcx = scales_pcx.expand(batch_size, -1, -1)
+        pcx = pcx * scales_pcx
+
+    # DC offset: apply independently (baseline drift is independent per electrode)
+    if config.get("aug_dc_offset", False):
+        offset_range = config.get("aug_dc_offset_range", (-0.3, 0.3))
+        ob = aug_dc_offset(ob, offset_range)
+        pcx = aug_dc_offset(pcx, offset_range)
+
     return ob, pcx
+
+
+# =============================================================================
+# Contrastive Learning for Session-Invariant Representations
+# =============================================================================
+
+class ProjectionHead(nn.Module):
+    """MLP projection head for contrastive learning.
+
+    Projects encoder features to a lower-dimensional embedding space
+    where contrastive loss is applied.
+    """
+    def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def info_nce_loss(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.1
+) -> torch.Tensor:
+    """InfoNCE contrastive loss (CEBRA-style).
+
+    Pulls together samples with the same label (odor), pushes apart different labels.
+    This encourages the model to learn odor-specific representations that are
+    invariant to session-specific noise (since different augmentations simulate
+    different sessions).
+
+    Args:
+        embeddings: (batch, embedding_dim) normalized embeddings
+        labels: (batch,) odor labels
+        temperature: Temperature for softmax (lower = sharper)
+
+    Returns:
+        Scalar InfoNCE loss
+    """
+    # Normalize embeddings
+    embeddings = F.normalize(embeddings, dim=1)
+
+    batch_size = embeddings.shape[0]
+    if batch_size < 2:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # Compute similarity matrix
+    sim_matrix = torch.mm(embeddings, embeddings.t()) / temperature
+
+    # Create mask for positive pairs (same odor)
+    labels = labels.view(-1, 1)
+    pos_mask = (labels == labels.t()).float()
+
+    # Remove diagonal (self-similarity)
+    eye_mask = torch.eye(batch_size, device=embeddings.device)
+    pos_mask = pos_mask - eye_mask
+
+    # Check if there are any positive pairs
+    if pos_mask.sum() == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    # For numerical stability, subtract max
+    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
+
+    # Compute log-softmax over all pairs (excluding self)
+    exp_sim = torch.exp(sim_matrix) * (1 - eye_mask)
+    log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
+
+    # Mean log-probability over positive pairs
+    pos_log_prob = (log_prob * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-8)
+
+    # Only include samples that have at least one positive pair
+    valid_mask = pos_mask.sum(dim=1) > 0
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=embeddings.device)
+
+    loss = -pos_log_prob[valid_mask].mean()
+
+    return loss
+
+
+def get_encoder_features(
+    model: nn.Module,
+    x: torch.Tensor,
+    cond: torch.Tensor
+) -> torch.Tensor:
+    """Extract bottleneck features from the UNet encoder.
+
+    Runs the encoder part of the UNet and returns the bottleneck features
+    (before the decoder). These features are used for contrastive learning.
+
+    Args:
+        model: CondUNet1D model
+        x: Input tensor (batch, channels, time)
+        cond: Conditioning tensor
+
+    Returns:
+        Bottleneck features (batch, feature_dim)
+    """
+    # Get conditioning embedding
+    cond_embed = model.cond_encoder(cond)
+
+    # Run through encoder blocks
+    skips = []
+    h = x
+    for down in model.encoder:
+        h = down(h, cond_embed)
+        skips.append(h)
+
+    # Bottleneck
+    h = model.bottleneck(h, cond_embed)
+
+    # Global average pool to get fixed-size features
+    # h shape: (batch, channels, time)
+    features = h.mean(dim=-1)  # (batch, channels)
+
+    return features
 
 
 def load_checkpoint(
@@ -3532,11 +3743,17 @@ def main():
 
     # Print augmentation config if any are enabled
     aug_enabled = [
-        k for k in ["aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale", "aug_time_mask", "aug_mixup", "aug_freq_mask"]
+        k for k in [
+            "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
+            "aug_time_mask", "aug_mixup", "aug_freq_mask",
+            "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
+        ]
         if config.get(k, False)
     ]
     if aug_enabled and is_primary():
         print(f"Data augmentation ENABLED: {', '.join(aug_enabled)}")
+        if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
+            print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
 
     # Loss function selection (for tier1 fair comparison)
     # Only override config if --loss is explicitly provided
