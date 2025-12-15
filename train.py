@@ -1541,6 +1541,8 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
+    projection_head_fwd: Optional[nn.Module] = None,
+    projection_head_rev: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1558,6 +1560,10 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
+    if projection_head_fwd is not None:
+        projection_head_fwd.train()
+    if projection_head_rev is not None:
+        projection_head_rev.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1755,12 +1761,40 @@ def train_epoch(
                 loss = loss + cycle_loss_pcx
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
+        # Contrastive loss for session-invariant learning (CEBRA-style)
+        # Uses odor labels as positive pairs: same odor = similar embedding
+        if config.get("use_contrastive", False) and projection_head_fwd is not None:
+            contrastive_weight = config.get("contrastive_weight", 0.1)
+            contrastive_temp = config.get("contrastive_temperature", 0.1)
+
+            # Get representations from predictions via global average pooling
+            # pred_raw: (batch, channels, time) -> pool -> (batch, channels)
+            pred_fwd_pooled = pred_raw.mean(dim=-1)  # Global average pooling
+            pred_fwd_embed = projection_head_fwd(pred_fwd_pooled.float())  # Project to embedding space
+
+            # Compute contrastive loss (same odor = positive pair)
+            contrastive_loss_fwd = info_nce_loss(pred_fwd_embed, odor, temperature=contrastive_temp)
+            loss = loss + contrastive_weight * contrastive_loss_fwd
+            loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
+
+            # Reverse direction contrastive loss
+            if reverse_model is not None and projection_head_rev is not None:
+                pred_rev_pooled = pred_rev_raw.mean(dim=-1)
+                pred_rev_embed = projection_head_rev(pred_rev_pooled.float())
+                contrastive_loss_rev = info_nce_loss(pred_rev_embed, odor, temperature=contrastive_temp)
+                loss = loss + contrastive_weight * contrastive_loss_rev
+                loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
+        if projection_head_fwd is not None:
+            torch.nn.utils.clip_grad_norm_(projection_head_fwd.parameters(), GRAD_CLIP)
+        if projection_head_rev is not None:
+            torch.nn.utils.clip_grad_norm_(projection_head_rev.parameters(), GRAD_CLIP)
             # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
         # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
@@ -2088,6 +2122,50 @@ def train(
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
             print(f"SpectralShift created{ddp_str} mode={mode_str}")
 
+    # Create projection heads for contrastive learning (if enabled)
+    projection_head_fwd = None
+    projection_head_rev = None
+    use_contrastive = config.get("use_contrastive", False)
+
+    if use_contrastive:
+        # Input dimension for projection heads:
+        # We apply contrastive loss on pooled predictions (batch, out_channels)
+        # Forward: OB->PCx, so input is out_channels (PCx channels)
+        # Reverse: PCx->OB, so input is in_channels (OB channels)
+        out_ch = config.get("out_channels", 32)
+        in_ch = config.get("in_channels", 32)
+
+        # Create projection heads (small MLP: channels -> 256 -> 128)
+        projection_head_fwd = ProjectionHead(
+            in_dim=out_ch,  # PCx channels for forward direction
+            hidden_dim=256,
+            out_dim=128,
+        )
+        projection_head_rev = ProjectionHead(
+            in_dim=in_ch,  # OB channels for reverse direction
+            hidden_dim=256,
+            out_dim=128,
+        )
+
+        # Handle device placement and dtype for FSDP compatibility
+        if is_fsdp_wrapped and check_bf16_support():
+            projection_head_fwd = projection_head_fwd.to(device, dtype=torch.bfloat16)
+            projection_head_rev = projection_head_rev.to(device, dtype=torch.bfloat16)
+        else:
+            projection_head_fwd = projection_head_fwd.to(device)
+            projection_head_rev = projection_head_rev.to(device)
+
+        # Wrap with DDP for gradient sync (too small for FSDP sharding)
+        if is_distributed and not is_fsdp_wrapped:
+            projection_head_fwd = DDP(projection_head_fwd, device_ids=[local_rank])
+            projection_head_rev = DDP(projection_head_rev, device_ids=[local_rank])
+
+        if is_primary():
+            contrastive_weight = config.get("contrastive_weight", 0.1)
+            contrastive_temp = config.get("contrastive_temperature", 0.1)
+            print(f"Contrastive learning ENABLED: weight={contrastive_weight}, temperature={contrastive_temp}")
+            print(f"  Projection heads: fwd={out_ch}->256->128, rev={in_ch}->256->128")
+
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
@@ -2118,6 +2196,11 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
+    # Projection heads for contrastive learning (use same lr as model)
+    if projection_head_fwd is not None:
+        param_groups.append({"params": list(projection_head_fwd.parameters()), "lr": lr, "name": "projection_head_fwd"})
+    if projection_head_rev is not None:
+        param_groups.append({"params": list(projection_head_rev.parameters()), "lr": lr, "name": "projection_head_rev"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
 
@@ -2277,6 +2360,8 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
+                projection_head_fwd=projection_head_fwd,
+                projection_head_rev=projection_head_rev,
             )
 
             barrier()
@@ -3437,6 +3522,16 @@ def parse_args():
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
 
+    # Contrastive learning for cross-session generalization (CEBRA-style)
+    parser.add_argument("--use-contrastive", action="store_true", default=None,
+                        help="Enable CEBRA-style contrastive learning for session-invariant representations")
+    parser.add_argument("--no-contrastive", action="store_true", default=None,
+                        help="Disable contrastive learning (default)")
+    parser.add_argument("--contrastive-weight", type=float, default=None,
+                        help="Weight for contrastive loss (default: 0.1)")
+    parser.add_argument("--contrastive-temperature", type=float, default=None,
+                        help="Temperature for InfoNCE loss (default: 0.1)")
+
     # Conditioning mode override
     COND_MODES = ["none", "cross_attn_gated"]
     parser.add_argument("--cond-mode", type=str, default=None,
@@ -3623,6 +3718,20 @@ def main():
         config["n_val_sessions"] = args.n_val_sessions
     if args.session_column is not None:
         config["session_column"] = args.session_column
+
+    # Contrastive learning config (CLI overrides config)
+    if args.use_contrastive:
+        config["use_contrastive"] = True
+    elif args.no_contrastive:
+        config["use_contrastive"] = False
+    if args.contrastive_weight is not None:
+        config["contrastive_weight"] = args.contrastive_weight
+    if args.contrastive_temperature is not None:
+        config["contrastive_temperature"] = args.contrastive_temperature
+
+    # Print contrastive learning info
+    if is_primary() and config.get("use_contrastive", False):
+        print(f"CONTRASTIVE LEARNING ENABLED: weight={config['contrastive_weight']}, temp={config['contrastive_temperature']}")
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
