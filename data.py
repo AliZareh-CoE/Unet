@@ -405,6 +405,8 @@ def load_or_create_session_splits(
     seed: int = 42,
     force_recreate: bool = False,
     idx_to_session: Optional[Dict[int, str]] = None,
+    test_sessions: Optional[List[str]] = None,  # Explicit test session names
+    val_sessions: Optional[List[str]] = None,   # Explicit val session names
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """Create train/val/test splits by holding out entire sessions.
 
@@ -419,6 +421,8 @@ def load_or_create_session_splits(
         seed: Random seed for reproducibility
         force_recreate: If True, recreate splits even if they exist
         idx_to_session: Optional mapping from integer index to original session name
+        test_sessions: Explicit list of session names to use for test (overrides n_test_sessions)
+        val_sessions: Explicit list of session names to use for val (overrides n_val_sessions)
 
     Returns:
         train_idx: Indices of training trials
@@ -426,8 +430,11 @@ def load_or_create_session_splits(
         test_idx: Indices of test trials
         split_info: Dictionary with split metadata
     """
-    # Check if splits already exist
-    if (not force_recreate and
+    # Check if using explicit session specification
+    use_explicit_sessions = test_sessions is not None or val_sessions is not None
+
+    # Check if splits already exist (skip if using explicit sessions)
+    if (not force_recreate and not use_explicit_sessions and
         SESSION_TRAIN_SPLIT_PATH.exists() and
         SESSION_VAL_SPLIT_PATH.exists() and
         SESSION_TEST_SPLIT_PATH.exists() and
@@ -447,20 +454,60 @@ def load_or_create_session_splits(
     unique_sessions = np.unique(session_ids)
     n_sessions = len(unique_sessions)
 
-    if n_test_sessions + n_val_sessions >= n_sessions:
-        raise ValueError(
-            f"Cannot hold out {n_test_sessions} test + {n_val_sessions} val sessions "
-            f"from only {n_sessions} total sessions. Need at least 1 for training."
-        )
+    # Build reverse mapping from session name to index
+    session_to_idx = {}
+    if idx_to_session is not None:
+        session_to_idx = {name: idx for idx, name in idx_to_session.items()}
 
-    # Shuffle sessions
-    shuffled_sessions = unique_sessions.copy()
-    rng.shuffle(shuffled_sessions)
+    # Handle explicit session specification
+    if use_explicit_sessions:
+        # Validate and convert explicit session names to indices
+        if test_sessions is not None:
+            test_session_ids = set()
+            for name in test_sessions:
+                if name not in session_to_idx:
+                    available = list(session_to_idx.keys())
+                    raise ValueError(f"Test session '{name}' not found. Available: {available}")
+                test_session_ids.add(session_to_idx[name])
+        else:
+            test_session_ids = set()
 
-    # Assign sessions to splits (these are integer indices)
-    test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
-    val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
-    train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
+        if val_sessions is not None:
+            val_session_ids = set()
+            for name in val_sessions:
+                if name not in session_to_idx:
+                    available = list(session_to_idx.keys())
+                    raise ValueError(f"Val session '{name}' not found. Available: {available}")
+                val_session_ids.add(session_to_idx[name])
+        else:
+            val_session_ids = set()
+
+        # Remaining sessions go to train
+        all_session_ids = set(unique_sessions.tolist())
+        train_session_ids = all_session_ids - test_session_ids - val_session_ids
+
+        if len(train_session_ids) == 0:
+            raise ValueError("No sessions left for training after specifying test/val sessions!")
+
+        print(f"\n[Explicit Session Split]")
+        print(f"  Test sessions: {test_sessions}")
+        print(f"  Val sessions: {val_sessions}")
+    else:
+        # Random session selection (original behavior)
+        if n_test_sessions + n_val_sessions >= n_sessions:
+            raise ValueError(
+                f"Cannot hold out {n_test_sessions} test + {n_val_sessions} val sessions "
+                f"from only {n_sessions} total sessions. Need at least 1 for training."
+            )
+
+        # Shuffle sessions
+        shuffled_sessions = unique_sessions.copy()
+        rng.shuffle(shuffled_sessions)
+
+        # Assign sessions to splits (these are integer indices)
+        test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
+        val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
+        train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
 
     # Create index arrays
     all_indices = np.arange(len(session_ids))
@@ -1276,6 +1323,8 @@ def prepare_data(
     n_val_sessions: int = 1,
     session_column: str = "recording_id",
     force_recreate_splits: bool = False,
+    test_sessions: Optional[List[str]] = None,  # Explicit test session names
+    val_sessions: Optional[List[str]] = None,   # Explicit val session names
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1288,6 +1337,8 @@ def prepare_data(
         n_val_sessions: Number of sessions to hold out for validation (if split_by_session=True)
         session_column: Column name in CSV containing session IDs
         force_recreate_splits: If True, recreate splits even if they exist on disk
+        test_sessions: Explicit list of session names for test (overrides n_test_sessions)
+        val_sessions: Explicit list of session names for val (overrides n_val_sessions)
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays
@@ -1322,6 +1373,8 @@ def prepare_data(
             seed=seed,
             force_recreate=force_recreate_splits,
             idx_to_session=idx_to_session,
+            test_sessions=test_sessions,
+            val_sessions=val_sessions,
         )
     else:
         # Random stratified splits (original behavior)

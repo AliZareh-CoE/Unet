@@ -3219,6 +3219,10 @@ def parse_args():
                         help="Number of sessions to hold out for validation (default: from config)")
     parser.add_argument("--session-column", type=str, default=None,
                         help="CSV column name containing session/recording IDs (default: from config)")
+    parser.add_argument("--test-sessions", type=str, nargs="+", default=None,
+                        help="Explicit session names for test set (e.g., --test-sessions 141208-1 170614)")
+    parser.add_argument("--val-sessions", type=str, nargs="+", default=None,
+                        help="Explicit session names for val set (e.g., --val-sessions 170609 170619)")
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
 
@@ -3440,6 +3444,8 @@ def main():
             session_column=config["session_column"],
             force_recreate_splits=args.force_recreate_splits,
             seed=config["seed"],
+            test_sessions=args.test_sessions,
+            val_sessions=args.val_sessions,
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
