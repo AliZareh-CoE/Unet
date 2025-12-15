@@ -1463,53 +1463,115 @@ def prepare_data(
                 return 0.0
             return ((x_flat - mx) * (y_flat - my)).mean() / (sx * sy)
 
+        # =====================================================================
+        # STEP 1: Check RAW data statistics (BEFORE global normalization)
+        # =====================================================================
+        print("\n[STEP 1] RAW DATA (before any normalization):")
+        raw_ob = windowed[:, 0]  # Before normalization
+        raw_pcx = windowed[:, 1]
+
         for name, indices in [
             ("TRAIN", train_idx),
-            (f"VAL ({split_info['val_sessions']})", val_idx),
-            (f"TEST ({split_info['test_sessions']})", test_idx),
+            (f"VAL", val_idx),
+            (f"TEST", test_idx),
+        ]:
+            raw_ob_split = raw_ob[indices]
+            raw_pcx_split = raw_pcx[indices]
+            print(f"  {name}: OB mean={raw_ob_split.mean():.4f}, std={raw_ob_split.std():.4f} | "
+                  f"PCx mean={raw_pcx_split.mean():.4f}, std={raw_pcx_split.std():.4f}")
+
+        # =====================================================================
+        # STEP 2: Check AFTER global normalization (using train stats)
+        # =====================================================================
+        print("\n[STEP 2] AFTER GLOBAL NORMALIZATION (using train stats):")
+        print(f"  Norm stats computed from TRAIN: mean_shape={norm_stats.mean.shape}, std_shape={norm_stats.std.shape}")
+
+        for name, indices in [
+            ("TRAIN", train_idx),
+            (f"VAL", val_idx),
+            (f"TEST", test_idx),
         ]:
             ob_split = ob[indices]
             pcx_split = pcx[indices]
+            print(f"  {name}: OB mean={ob_split.mean():.6f}, std={ob_split.std():.4f} | "
+                  f"PCx mean={pcx_split.mean():.6f}, std={pcx_split.std():.4f}")
 
-            # Basic statistics
-            ob_mean, ob_std = ob_split.mean(), ob_split.std()
-            pcx_mean, pcx_std = pcx_split.mean(), pcx_split.std()
+        # Check if val/test are properly normalized (should be close to 0 mean, 1 std)
+        val_ob_mean, val_ob_std = ob[val_idx].mean(), ob[val_idx].std()
+        test_ob_mean, test_ob_std = ob[test_idx].mean(), ob[test_idx].std()
 
-            # CRITICAL: Baseline OB↔PCx correlation (natural similarity)
-            # This is what the model is trying to improve upon
+        if abs(test_ob_mean) > 0.5 or abs(test_ob_std - 1.0) > 0.5:
+            print(f"\n  ⚠️  TEST SESSION POORLY NORMALIZED!")
+            print(f"      Expected: mean≈0, std≈1")
+            print(f"      Got: mean={test_ob_mean:.4f}, std={test_ob_std:.4f}")
+            print(f"      Train normalization stats don't fit test session!")
+
+        # =====================================================================
+        # STEP 3: Simulate per-channel normalization (as done at runtime)
+        # =====================================================================
+        print("\n[STEP 3] AFTER PER-CHANNEL NORMALIZATION (simulated):")
+
+        def per_ch_norm_np(x):
+            """Per-channel normalize numpy array: (trials, channels, time) -> normalized"""
+            mean = x.mean(axis=-1, keepdims=True)
+            std = x.std(axis=-1, keepdims=True)
+            std = np.clip(std, 1e-6, None)
+            return (x - mean) / std
+
+        for name, indices in [
+            ("TRAIN", train_idx),
+            (f"VAL", val_idx),
+            (f"TEST", test_idx),
+        ]:
+            ob_split = per_ch_norm_np(ob[indices])
+            pcx_split = per_ch_norm_np(pcx[indices])
             baseline_corr = pearson_corr(ob_split, pcx_split)
 
-            # Per-trial correlations
+            # Per-trial correlations (this is what the model sees!)
             per_trial_corrs = []
             for i in range(len(indices)):
                 c = pearson_corr(ob_split[i], pcx_split[i])
                 per_trial_corrs.append(c)
             per_trial_corrs = np.array(per_trial_corrs)
 
-            print(f"\n{name} ({len(indices)} trials):")
-            print(f"  OB stats:  mean={ob_mean:.4f}, std={ob_std:.4f}")
-            print(f"  PCx stats: mean={pcx_mean:.4f}, std={pcx_std:.4f}")
-            print(f"  BASELINE OB↔PCx corr: {baseline_corr:.4f}")
-            print(f"  Per-trial corr: mean={per_trial_corrs.mean():.4f}, "
-                  f"std={per_trial_corrs.std():.4f}, "
-                  f"range=[{per_trial_corrs.min():.4f}, {per_trial_corrs.max():.4f}]")
+            print(f"  {name} ({len(indices)} trials):")
+            print(f"    OB mean={ob_split.mean():.6f}, std={ob_split.std():.4f}")
+            print(f"    PCx mean={pcx_split.mean():.6f}, std={pcx_split.std():.4f}")
+            print(f"    BASELINE OB↔PCx corr: {baseline_corr:.4f}")
+            print(f"    Per-trial corr: mean={per_trial_corrs.mean():.4f}, std={per_trial_corrs.std():.4f}")
 
-        # Compare val vs test baseline correlations
-        val_ob, val_pcx = ob[val_idx], pcx[val_idx]
-        test_ob, test_pcx = ob[test_idx], pcx[test_idx]
-        val_baseline = pearson_corr(val_ob, val_pcx)
-        test_baseline = pearson_corr(test_ob, test_pcx)
+        # =====================================================================
+        # STEP 4: Compare val vs test - THE KEY DIAGNOSTIC
+        # =====================================================================
+        print("\n[STEP 4] VAL vs TEST COMPARISON (the smoking gun):")
 
-        gap = val_baseline - test_baseline
+        val_ob_norm = per_ch_norm_np(ob[val_idx])
+        val_pcx_norm = per_ch_norm_np(pcx[val_idx])
+        test_ob_norm = per_ch_norm_np(ob[test_idx])
+        test_pcx_norm = per_ch_norm_np(pcx[test_idx])
+
+        val_corrs = [pearson_corr(val_ob_norm[i], val_pcx_norm[i]) for i in range(len(val_idx))]
+        test_corrs = [pearson_corr(test_ob_norm[i], test_pcx_norm[i]) for i in range(len(test_idx))]
+
+        val_mean_corr = np.mean(val_corrs)
+        test_mean_corr = np.mean(test_corrs)
+        gap = val_mean_corr - test_mean_corr
+
+        print(f"  VAL per-trial baseline corr: {val_mean_corr:.4f} (std={np.std(val_corrs):.4f})")
+        print(f"  TEST per-trial baseline corr: {test_mean_corr:.4f} (std={np.std(test_corrs):.4f})")
+        print(f"  GAP (val - test): {gap:.4f}")
+
         if abs(gap) > 0.05:
-            print(f"\n⚠️  WARNING: Baseline correlation gap = {gap:.4f}")
-            print(f"    VAL baseline: {val_baseline:.4f}")
-            print(f"    TEST baseline: {test_baseline:.4f}")
+            print(f"\n  ⚠️  SIGNIFICANT BASELINE GAP DETECTED!")
             if gap > 0:
-                print(f"    TEST session has LOWER natural OB↔PCx correlation!")
-                print(f"    This explains why model performance is worse on test!")
+                print(f"      TEST session has LOWER natural OB↔PCx correlation.")
+                print(f"      The model CANNOT perform better than this baseline!")
+                print(f"      This is DATA REALITY, not a normalization bug.")
             else:
-                print(f"    VAL session has LOWER natural OB↔PCx correlation!")
+                print(f"      VAL session has LOWER natural OB↔PCx correlation.")
+        else:
+            print(f"\n  ✓ Baselines are similar - performance gap is NOT due to data differences")
+            print(f"    If model still shows gap, it's a training/model issue!")
 
         print("=" * 70 + "\n")
 
