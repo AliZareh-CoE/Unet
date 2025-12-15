@@ -1272,6 +1272,14 @@ def evaluate(
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
+    # Debug: Track data statistics across batches
+    debug_eval = config.get("debug_eval", False) if config else False
+    batch_count = 0
+    total_samples = 0
+    ob_means, pcx_means = [], []
+    ob_stds, pcx_stds = [], []
+    raw_corrs = []
+
     with torch.inference_mode():  # Faster than no_grad() - disables view tracking
         for ob, pcx, odor in loader:
             ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
@@ -2660,6 +2668,24 @@ def train(
                 print(f"  NRMSE: {test_metrics_stage1.get('nrmse', 'N/A')}")
                 if 'psd_err_db' in test_metrics_stage1:
                     print(f"  PSD Error: {test_metrics_stage1['psd_err_db']:.2f} dB")
+
+                # Debug: Print split statistics for session holdout
+                if "split_info" in data:
+                    print(f"\n[SESSION SPLIT DEBUG]")
+                    print(f"  Train sessions: {data['split_info']['train_sessions']} ({data['split_info']['n_train_trials']} trials)")
+                    print(f"  Val sessions: {data['split_info']['val_sessions']} ({data['split_info']['n_val_trials']} trials)")
+                    print(f"  Test sessions: {data['split_info']['test_sessions']} ({data['split_info']['n_test_trials']} trials)")
+
+                    # Check for index overlap (critical validation)
+                    train_set = set(data['train_idx'].tolist())
+                    val_set = set(data['val_idx'].tolist())
+                    test_set = set(data['test_idx'].tolist())
+                    train_val_overlap = len(train_set & val_set)
+                    train_test_overlap = len(train_set & test_set)
+                    val_test_overlap = len(val_set & test_set)
+                    print(f"  Index overlap check: train-val={train_val_overlap}, train-test={train_test_overlap}, val-test={val_test_overlap}")
+                    if train_val_overlap > 0 or train_test_overlap > 0 or val_test_overlap > 0:
+                        print(f"  ⚠️  WARNING: DATA LEAKAGE DETECTED! Overlapping indices between splits!")
 
                 # Machine-parseable results (for tier1/tier1.5 scripts)
                 # Validation metrics

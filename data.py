@@ -444,9 +444,40 @@ def load_or_create_session_splits(
         val_idx = np.load(SESSION_VAL_SPLIT_PATH)
         test_idx = np.load(SESSION_TEST_SPLIT_PATH)
         split_info = json.loads(SESSION_SPLIT_INFO_PATH.read_text())
-        print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
-              f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
-        return train_idx, val_idx, test_idx, split_info
+
+        # VALIDATION: Check that loaded indices don't exceed data size
+        max_idx = len(session_ids) - 1
+        if train_idx.max() > max_idx or val_idx.max() > max_idx or test_idx.max() > max_idx:
+            print(f"WARNING: Cached split indices exceed data size! Recreating splits...")
+            # Don't return - fall through to recreate splits
+        else:
+            # Validate no overlap
+            train_set = set(train_idx.tolist())
+            val_set = set(val_idx.tolist())
+            test_set = set(test_idx.tolist())
+            has_overlap = bool(train_set & val_set) or bool(train_set & test_set) or bool(val_set & test_set)
+            if has_overlap:
+                print(f"WARNING: Loaded splits have overlapping indices! Recreating splits...")
+            else:
+                # Verify sessions are separate
+                train_sessions_check = set(session_ids[train_idx])
+                val_sessions_check = set(session_ids[val_idx])
+                test_sessions_check = set(session_ids[test_idx])
+
+                session_overlap = (
+                    bool(train_sessions_check & val_sessions_check) or
+                    bool(train_sessions_check & test_sessions_check) or
+                    bool(val_sessions_check & test_sessions_check)
+                )
+                if session_overlap:
+                    print(f"WARNING: Loaded splits have overlapping sessions! This shouldn't happen!")
+                    print(f"  Train sessions: {train_sessions_check}")
+                    print(f"  Val sessions: {val_sessions_check}")
+                    print(f"  Test sessions: {test_sessions_check}")
+
+                print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
+                      f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+                return train_idx, val_idx, test_idx, split_info
 
     rng = np.random.default_rng(seed)
 
@@ -514,6 +545,30 @@ def load_or_create_session_splits(
     train_idx = all_indices[np.isin(session_ids, list(train_session_ids))]
     val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
     test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
+
+    # CRITICAL VALIDATION: Ensure no overlap between splits
+    train_set = set(train_idx.tolist())
+    val_set = set(val_idx.tolist())
+    test_set = set(test_idx.tolist())
+
+    if train_set & val_set:
+        raise ValueError(f"BUG: Train-Val overlap detected! {len(train_set & val_set)} overlapping indices")
+    if train_set & test_set:
+        raise ValueError(f"BUG: Train-Test overlap detected! {len(train_set & test_set)} overlapping indices")
+    if val_set & test_set:
+        raise ValueError(f"BUG: Val-Test overlap detected! {len(val_set & test_set)} overlapping indices")
+
+    # Verify that sessions are truly separate
+    train_sessions_check = set(session_ids[train_idx])
+    val_sessions_check = set(session_ids[val_idx])
+    test_sessions_check = set(session_ids[test_idx])
+
+    if train_sessions_check & val_sessions_check:
+        print(f"WARNING: Train and Val have overlapping sessions: {train_sessions_check & val_sessions_check}")
+    if train_sessions_check & test_sessions_check:
+        print(f"WARNING: Train and Test have overlapping sessions: {train_sessions_check & test_sessions_check}")
+    if val_sessions_check & test_sessions_check:
+        print(f"WARNING: Val and Test have overlapping sessions: {val_sessions_check & test_sessions_check}")
 
     # Shuffle within splits
     rng.shuffle(train_idx)
