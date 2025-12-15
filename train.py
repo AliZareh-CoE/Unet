@@ -1769,19 +1769,21 @@ def train_epoch(
 
             # Get representations from predictions via global average pooling
             # pred_raw: (batch, channels, time) -> pool -> (batch, channels)
+            # Keep dtype consistent with model output (bfloat16 for FSDP)
             pred_fwd_pooled = pred_raw.mean(dim=-1)  # Global average pooling
-            pred_fwd_embed = projection_head_fwd(pred_fwd_pooled.float())  # Project to embedding space
+            pred_fwd_embed = projection_head_fwd(pred_fwd_pooled)  # Project to embedding space
 
             # Compute contrastive loss (same odor = positive pair)
-            contrastive_loss_fwd = info_nce_loss(pred_fwd_embed, odor, temperature=contrastive_temp)
+            # Cast to float32 for stable loss computation
+            contrastive_loss_fwd = info_nce_loss(pred_fwd_embed.float(), odor, temperature=contrastive_temp)
             loss = loss + contrastive_weight * contrastive_loss_fwd
             loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
 
             # Reverse direction contrastive loss
             if reverse_model is not None and projection_head_rev is not None:
                 pred_rev_pooled = pred_rev_raw.mean(dim=-1)
-                pred_rev_embed = projection_head_rev(pred_rev_pooled.float())
-                contrastive_loss_rev = info_nce_loss(pred_rev_embed, odor, temperature=contrastive_temp)
+                pred_rev_embed = projection_head_rev(pred_rev_pooled)
+                contrastive_loss_rev = info_nce_loss(pred_rev_embed.float(), odor, temperature=contrastive_temp)
                 loss = loss + contrastive_weight * contrastive_loss_rev
                 loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
 
