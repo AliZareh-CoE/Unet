@@ -1,4 +1,7 @@
-"""Training pipeline for neural signal translation with CondUNet1D.
+"""Stage 1 Training: Neural signal translation with UNet1D.
+
+This script trains a UNet model for OB → PCx signal translation.
+For post-hoc calibration (Stage 2), use calibrate.py after training.
 
 Usage:
     # Train model (single GPU)
@@ -6,6 +9,17 @@ Usage:
 
     # Distributed training with FSDP
     torchrun --nproc_per_node=4 train.py --epochs 80 --fsdp
+
+    # Cross-session evaluation with 4 test sessions
+    python train.py --epochs 80 --n-test-sessions 4
+
+    # After training, run calibration:
+    python calibrate.py --checkpoint artifacts/checkpoints/best_model.pt
+
+Notes:
+    - Odor conditioning is DISABLED by default (unconditional model)
+    - Use --cond-mode cross_attn_gated to enable odor conditioning if needed
+    - Session-based splitting is used for proper cross-session generalization
 """
 from __future__ import annotations
 
@@ -83,6 +97,7 @@ from data import (
     prepare_pfc_data,
     create_dataloaders,
     create_pfc_dataloaders,
+    create_single_session_dataloader,
     crop_to_target_torch,
     SAMPLING_RATE_HZ,
     PFC_SAMPLING_RATE_HZ,
@@ -155,7 +170,7 @@ DEFAULT_CONFIG = {
     "use_attention": True,
     "attention_type": "cross_freq_v2",  # Cross-frequency coupling attention (theta-gamma)
     "norm_type": "batch",
-    "cond_mode": "cross_attn_gated",  # Cross-attention with output gating
+    "cond_mode": "none",  # No odor conditioning (unconditional model for cross-session generalization)
     
     # U-Net depth (controls frequency resolution at bottleneck)
     # n_downsample=2: 4x downsample → 125 Hz Nyquist (full gamma, uses more memory)
@@ -2669,24 +2684,6 @@ def train(
                 if 'psd_err_db' in test_metrics_stage1:
                     print(f"  PSD Error: {test_metrics_stage1['psd_err_db']:.2f} dB")
 
-                # Debug: Print split statistics for session holdout
-                if "split_info" in data:
-                    print(f"\n[SESSION SPLIT DEBUG]")
-                    print(f"  Train sessions: {data['split_info']['train_sessions']} ({data['split_info']['n_train_trials']} trials)")
-                    print(f"  Val sessions: {data['split_info']['val_sessions']} ({data['split_info']['n_val_trials']} trials)")
-                    print(f"  Test sessions: {data['split_info']['test_sessions']} ({data['split_info']['n_test_trials']} trials)")
-
-                    # Check for index overlap (critical validation)
-                    train_set = set(data['train_idx'].tolist())
-                    val_set = set(data['val_idx'].tolist())
-                    test_set = set(data['test_idx'].tolist())
-                    train_val_overlap = len(train_set & val_set)
-                    train_test_overlap = len(train_set & test_set)
-                    val_test_overlap = len(val_set & test_set)
-                    print(f"  Index overlap check: train-val={train_val_overlap}, train-test={train_test_overlap}, val-test={val_test_overlap}")
-                    if train_val_overlap > 0 or train_test_overlap > 0 or val_test_overlap > 0:
-                        print(f"  ⚠️  WARNING: DATA LEAKAGE DETECTED! Overlapping indices between splits!")
-
                 # Machine-parseable results (for tier1/tier1.5 scripts)
                 # Validation metrics
                 print(f"STAGE1_VAL_R2={val_metrics_stage1['r2']:.4f}")
@@ -2703,692 +2700,16 @@ def train(
                     print(f"STAGE1_RESULT_PSD_ERR_DB={test_metrics_stage1['psd_err_db']:.4f}")
 
     # =============================================================================
-    # STAGE 2: POST-HOC CALIBRATION (OptimalSpectralBias + EnvelopeHistogramMatching)
+    # POST-HOC CALIBRATION MOVED TO calibrate.py
     # =============================================================================
-    # Only run Stage 2 if:
-    # 1. Two-stage training is enabled OR stage2_only mode
-    # 2. SpectralShift is available
-    # 3. spectral_finetune_epochs > 0 (skip if --skip-spectral-finetune was used)
+    # Stage 2 (spectral bias + envelope matching) is now in a separate script.
+    # Run: python calibrate.py --checkpoint artifacts/checkpoints/best_model.pt
+    #
+    # This keeps train.py focused on Stage 1 (UNet training) only.
 
-    # Initialize envelope matchers OUTSIDE the block so they're always defined
+    # Initialize envelope matchers to None (calibrate.py handles these)
     envelope_matcher_fwd = None
     envelope_matcher_rev = None
-
-    should_run_stage2 = (
-        (use_two_stage or stage2_only) and
-        spectral_shift_fwd is not None and
-        spectral_finetune_epochs > 0
-    )
-
-    if should_run_stage2:
-        # Determine checkpoint path: user-provided (stage2_only) or best from stage1
-        if stage2_only:
-            # Loading from user-provided checkpoint
-            checkpoint_path = stage1_checkpoint
-            checkpoint_source = f"user-provided: {stage1_checkpoint}"
-        else:
-            # Use Stage 1 checkpoint
-            checkpoint_path = CHECKPOINT_DIR / "best_model.pt"
-            checkpoint_source = f"best from Stage 1 (epoch {best_epoch})"
-
-        if is_primary():
-            print(f"\n{'='*70}")
-            print(f"STAGE 2: POST-HOC CALIBRATION (OptimalSpectralBias + EnvelopeHistogramMatching)")
-            print(f"{'='*70}")
-            print(f"Loading UNet from checkpoint: {checkpoint_source}")
-
-        # Load UNet checkpoint
-        barrier()
-        expected_cond = config.get("cond_mode") if stage2_only else None
-        load_checkpoint(
-            checkpoint_path,
-            model, reverse_model,
-            spectral_shift_fwd, spectral_shift_rev,
-            load_spectral_only=False,
-            skip_spectral=stage2_only,
-            expected_cond_mode=expected_cond,
-        )
-        barrier()
-
-        if stage2_only and is_primary():
-            print(f"SpectralShift: using FRESH initialization (not loaded from checkpoint)")
-
-        # FREEZE UNet parameters (forward and reverse) - stays frozen for all of Stage 2
-        freeze_model_params(model)
-        if reverse_model is not None:
-            freeze_model_params(reverse_model)
-
-        spectral_shift_lr_finetune = config.get("spectral_shift_lr", 0.1)
-
-        # Split epochs between phases (can be configured)
-        phase_epochs = spectral_finetune_epochs // 2
-        if phase_epochs < 1:
-            phase_epochs = spectral_finetune_epochs  # If only 1 epoch, use it for both
-
-        # =====================================================================
-        # COMPUTE OPTIMAL BIAS FROM DATA (if enabled)
-        # =====================================================================
-        compute_bias_from_data = config.get("spectral_shift_compute_bias", True)
-
-        if compute_bias_from_data and spectral_shift_fwd is not None:
-            if is_primary():
-                print(f"\n{'='*70}")
-                print("COMPUTING OPTIMAL BIAS FROM UNet OUTPUT vs TARGET PSD")
-                print(f"{'='*70}")
-
-            # Collect UNet outputs and targets for all training data
-            model.eval()
-            if reverse_model is not None:
-                reverse_model.eval()
-
-            all_unet_outputs = []
-            all_targets = []
-            all_odor_ids = []
-
-            # Use ONLY TRAIN data for computing bias (never val or test!)
-            # This ensures proper train/test separation
-            bias_loaders = [("train", loaders["train"])]
-
-            with torch.no_grad():
-                for loader_name, loader in bias_loaders:
-                    for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing bias ({loader_name})", disable=not is_primary()):
-                        ob_batch = ob_batch.to(device)
-                        pcx_batch = pcx_batch.to(device)
-                        odor_batch = odor_batch.to(device)
-
-                        # Apply per-channel normalization if enabled
-                        if config.get("per_channel_norm", True):
-                            ob_batch = per_channel_normalize(ob_batch)
-                            pcx_batch = per_channel_normalize(pcx_batch)
-
-                        # Forward pass through UNet (frozen)
-                        unet_out = model(ob_batch, odor_batch)
-
-                        all_unet_outputs.append(unet_out.cpu())
-                        all_targets.append(pcx_batch.cpu())
-                        all_odor_ids.append(odor_batch.cpu())
-
-            # Concatenate all batches
-            all_unet_outputs = torch.cat(all_unet_outputs, dim=0)
-            all_targets = torch.cat(all_targets, dim=0)
-            all_odor_ids = torch.cat(all_odor_ids, dim=0)
-
-            if is_primary():
-                print(f"Collected {len(all_unet_outputs)} samples")
-
-            # Compute and set optimal bias for FORWARD SpectralShift
-            spectral_shift_fwd_module = get_module(spectral_shift_fwd)
-            spectral_shift_fwd_module.set_bias_from_data(
-                all_unet_outputs.to(device),
-                all_targets.to(device),
-                all_odor_ids.to(device),
-            )
-
-            # Also compute for REVERSE if exists
-            if spectral_shift_rev is not None and reverse_model is not None:
-                all_rev_outputs = []
-                all_rev_targets = []
-                all_rev_odor_ids = []
-
-                with torch.no_grad():
-                    for loader_name, loader in bias_loaders:
-                        for ob_batch, pcx_batch, odor_batch in tqdm(loader, desc=f"Computing reverse bias ({loader_name})", disable=not is_primary()):
-                            ob_batch = ob_batch.to(device)
-                            pcx_batch = pcx_batch.to(device)
-                            odor_batch = odor_batch.to(device)
-
-                            # Apply per-channel normalization if enabled
-                            if config.get("per_channel_norm", True):
-                                ob_batch = per_channel_normalize(ob_batch)
-                                pcx_batch = per_channel_normalize(pcx_batch)
-
-                            # Reverse pass: PCx -> OB
-                            rev_out = reverse_model(pcx_batch, odor_batch)
-
-                            all_rev_outputs.append(rev_out.cpu())
-                            all_rev_targets.append(ob_batch.cpu())
-                            all_rev_odor_ids.append(odor_batch.cpu())
-
-                all_rev_outputs = torch.cat(all_rev_outputs, dim=0)
-                all_rev_targets = torch.cat(all_rev_targets, dim=0)
-                all_rev_odor_ids = torch.cat(all_rev_odor_ids, dim=0)
-
-                spectral_shift_rev_module = get_module(spectral_shift_rev)
-                spectral_shift_rev_module.set_bias_from_data(
-                    all_rev_outputs.to(device),
-                    all_rev_targets.to(device),
-                    all_rev_odor_ids.to(device),
-                )
-
-            # Clean up spectral bias data
-            del all_unet_outputs, all_odor_ids
-            if spectral_shift_rev is not None:
-                del all_rev_outputs, all_rev_targets, all_rev_odor_ids
-            torch.cuda.empty_cache()
-
-            barrier()
-
-        # =====================================================================
-        # COMPUTE ENVELOPE MATCHING FROM TARGET DATA
-        # =====================================================================
-        # EnvelopeHistogramMatching corrects amplitude dynamics (bursty vs smooth)
-        # This is the third closed-form correction after output scaling and spectral bias
-        use_envelope_matching = config.get("use_envelope_matching", True)
-
-        if use_envelope_matching and spectral_shift_fwd is not None:
-            if is_primary():
-                print(f"\n{'='*70}")
-                print("COMPUTING ENVELOPE MATCHING FROM TARGET DATA")
-                print(f"{'='*70}")
-
-            n_odors = config.get("n_odors", 7)
-
-            # Create envelope matchers
-            envelope_matcher_fwd = EnvelopeHistogramMatching(n_odors=n_odors).to(device)
-            envelope_matcher_rev = EnvelopeHistogramMatching(n_odors=n_odors).to(device) if reverse_model is not None else None
-
-            # Collect target data for fitting (reuse from spectral bias if available)
-            all_targets_fwd = []
-            all_targets_rev = []
-            all_odor_ids_env = []
-
-            with torch.no_grad():
-                # Use ONLY TRAIN data for envelope statistics (never val or test!)
-                # This ensures proper train/test separation
-                for ob_batch, pcx_batch, odor_batch in tqdm(loaders["train"], desc="Collecting train targets", disable=not is_primary()):
-                    pcx_batch = pcx_batch.to(device)
-                    ob_batch = ob_batch.to(device)
-                    odor_batch = odor_batch.to(device)
-
-                    # Apply per-channel normalization if enabled
-                    if config.get("per_channel_norm", True):
-                        ob_batch = per_channel_normalize(ob_batch)
-                        pcx_batch = per_channel_normalize(pcx_batch)
-
-                    all_targets_fwd.append(pcx_batch.cpu())
-                    all_targets_rev.append(ob_batch.cpu())
-                    all_odor_ids_env.append(odor_batch.cpu())
-
-            all_targets_fwd = torch.cat(all_targets_fwd, dim=0)
-            all_targets_rev = torch.cat(all_targets_rev, dim=0)
-            all_odor_ids_env = torch.cat(all_odor_ids_env, dim=0)
-
-            # Fit envelope matchers
-            envelope_matcher_fwd.fit(all_targets_fwd.to(device), all_odor_ids_env.to(device))
-            if envelope_matcher_rev is not None:
-                envelope_matcher_rev.fit(all_targets_rev.to(device), all_odor_ids_env.to(device))
-
-            # Clean up
-            del all_targets_fwd, all_targets_rev, all_odor_ids_env
-            torch.cuda.empty_cache()
-
-            barrier()
-
-        # =====================================================================
-        # DEBUG: Save distribution plots (envelope, PSD, instantaneous frequency)
-        # =====================================================================
-        if is_primary() and envelope_matcher_fwd is not None:
-            print(f"\n{'='*70}")
-            print("DEBUG: Computing distributions (envelope, PSD, inst. frequency)")
-            print(f"{'='*70}")
-
-            import json
-            from models import hilbert_torch
-            from scipy.signal import welch
-
-            # Create dedicated debug folder
-            debug_dir = Path("debug_plots")
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            print(f"  Saving debug plots to: {debug_dir.absolute()}")
-
-            sampling_rate = config.get("sampling_rate", SAMPLING_RATE_HZ)
-
-            debug_stats = {
-                "target": {"mean": [], "std": [], "cv": []},
-                "pred_raw": {"mean": [], "std": [], "cv": []},
-                "pred_corrected": {"mean": [], "std": [], "cv": []},
-            }
-
-            # Collect ALL values for plotting
-            all_target_env = []
-            all_pred_raw_env = []
-            all_pred_corr_env = []
-
-            # Collect signals for PSD
-            all_target_signals = []
-            all_pred_raw_signals = []
-            all_pred_corr_signals = []
-
-            # Collect instantaneous frequencies
-            all_target_inst_freq = []
-            all_pred_raw_inst_freq = []
-            all_pred_corr_inst_freq = []
-
-            # Sample batches from validation set
-            n_debug_batches = min(10, len(loaders["val"]))
-            debug_iter = iter(loaders["val"])
-
-            with torch.no_grad():
-                for batch_idx in range(n_debug_batches):
-                    ob_batch, pcx_batch, odor_batch = next(debug_iter)
-                    ob_batch = ob_batch.to(device)
-                    pcx_batch = pcx_batch.to(device)
-                    odor_batch = odor_batch.to(device)
-
-                    if config.get("per_channel_norm", True):
-                        ob_batch = per_channel_normalize(ob_batch)
-                        pcx_batch = per_channel_normalize(pcx_batch)
-
-                    # Get UNet prediction
-                    if cond_encoder is not None:
-                        cond_source = config.get("conditioning_source", "odor_onehot")
-                        if cond_source == "spectro_temporal":
-                            cond_emb = cond_encoder(ob_batch)
-                        else:
-                            cond_emb = None
-                        pred_raw = model(ob_batch, cond_emb=cond_emb) if cond_emb is not None else model(ob_batch, odor_batch)
-                    else:
-                        pred_raw = model(ob_batch, odor_batch)
-
-                    # Apply spectral shift
-                    pred_shifted = spectral_shift_fwd(pred_raw, odor_ids=odor_batch)
-
-                    # Apply envelope correction
-                    pred_corrected = envelope_matcher_fwd(pred_shifted, odor_ids=odor_batch)
-
-                    # Compute analytic signals and envelopes
-                    B, C, T = pcx_batch.shape
-
-                    target_analytic = hilbert_torch(pcx_batch.view(B*C, T).float())
-                    pred_raw_analytic = hilbert_torch(pred_shifted.view(B*C, T).float())
-                    pred_corr_analytic = hilbert_torch(pred_corrected.view(B*C, T).float())
-
-                    target_env = target_analytic.abs()
-                    pred_raw_env = pred_raw_analytic.abs()
-                    pred_corr_env = pred_corr_analytic.abs()
-
-                    # Compute instantaneous frequency from phase derivative
-                    # inst_freq = d(phase)/dt / (2*pi) * sampling_rate
-                    target_phase = target_analytic.angle()
-                    pred_raw_phase = pred_raw_analytic.angle()
-                    pred_corr_phase = pred_corr_analytic.angle()
-
-                    # Unwrap phase and compute derivative
-                    def compute_inst_freq(phase, fs):
-                        # phase: [N, T]
-                        phase_np = phase.cpu().numpy()
-                        inst_freq_list = []
-                        for i in range(phase_np.shape[0]):
-                            unwrapped = np.unwrap(phase_np[i])
-                            # Derivative (central difference)
-                            inst_freq = np.diff(unwrapped) * fs / (2 * np.pi)
-                            inst_freq_list.append(inst_freq)
-                        return np.concatenate(inst_freq_list)
-
-                    target_inst_freq = compute_inst_freq(target_phase, sampling_rate)
-                    pred_raw_inst_freq = compute_inst_freq(pred_raw_phase, sampling_rate)
-                    pred_corr_inst_freq = compute_inst_freq(pred_corr_phase, sampling_rate)
-
-                    # Collect envelope values
-                    all_target_env.append(target_env.flatten().cpu().numpy())
-                    all_pred_raw_env.append(pred_raw_env.flatten().cpu().numpy())
-                    all_pred_corr_env.append(pred_corr_env.flatten().cpu().numpy())
-
-                    # Collect signals for PSD (flatten channels, keep time)
-                    # Convert to float32 first (bfloat16 not supported by numpy)
-                    all_target_signals.append(pcx_batch.view(B*C, T).float().cpu().numpy())
-                    all_pred_raw_signals.append(pred_shifted.view(B*C, T).float().cpu().numpy())
-                    all_pred_corr_signals.append(pred_corrected.view(B*C, T).float().cpu().numpy())
-
-                    # Collect instantaneous frequencies
-                    all_target_inst_freq.append(target_inst_freq)
-                    all_pred_raw_inst_freq.append(pred_raw_inst_freq)
-                    all_pred_corr_inst_freq.append(pred_corr_inst_freq)
-
-                    # Envelope stats
-                    debug_stats["target"]["mean"].append(target_env.mean().item())
-                    debug_stats["target"]["std"].append(target_env.std().item())
-                    debug_stats["target"]["cv"].append((target_env.std() / target_env.mean().clamp(min=1e-8)).item())
-
-                    debug_stats["pred_raw"]["mean"].append(pred_raw_env.mean().item())
-                    debug_stats["pred_raw"]["std"].append(pred_raw_env.std().item())
-                    debug_stats["pred_raw"]["cv"].append((pred_raw_env.std() / pred_raw_env.mean().clamp(min=1e-8)).item())
-
-                    debug_stats["pred_corrected"]["mean"].append(pred_corr_env.mean().item())
-                    debug_stats["pred_corrected"]["std"].append(pred_corr_env.std().item())
-                    debug_stats["pred_corrected"]["cv"].append((pred_corr_env.std() / pred_corr_env.mean().clamp(min=1e-8)).item())
-
-            # Concatenate all values
-            all_target_env = np.concatenate(all_target_env)
-            all_pred_raw_env = np.concatenate(all_pred_raw_env)
-            all_pred_corr_env = np.concatenate(all_pred_corr_env)
-
-            all_target_signals = np.vstack(all_target_signals)  # [N_total, T]
-            all_pred_raw_signals = np.vstack(all_pred_raw_signals)
-            all_pred_corr_signals = np.vstack(all_pred_corr_signals)
-
-            all_target_inst_freq = np.concatenate(all_target_inst_freq)
-            all_pred_raw_inst_freq = np.concatenate(all_pred_raw_inst_freq)
-            all_pred_corr_inst_freq = np.concatenate(all_pred_corr_inst_freq)
-
-            # Aggregate stats
-            for key in ["target", "pred_raw", "pred_corrected"]:
-                debug_stats[key]["mean_avg"] = sum(debug_stats[key]["mean"]) / len(debug_stats[key]["mean"])
-                debug_stats[key]["std_avg"] = sum(debug_stats[key]["std"]) / len(debug_stats[key]["std"])
-                debug_stats[key]["cv_avg"] = sum(debug_stats[key]["cv"]) / len(debug_stats[key]["cv"])
-
-            # Print summary
-            print(f"\nEnvelope Statistics (averaged over {n_debug_batches} batches):")
-            print(f"  TARGET:     mean={debug_stats['target']['mean_avg']:.4f}, std={debug_stats['target']['std_avg']:.4f}, CV={debug_stats['target']['cv_avg']:.4f}")
-            print(f"  PRED (raw): mean={debug_stats['pred_raw']['mean_avg']:.4f}, std={debug_stats['pred_raw']['std_avg']:.4f}, CV={debug_stats['pred_raw']['cv_avg']:.4f}")
-            print(f"  PRED (fix): mean={debug_stats['pred_corrected']['mean_avg']:.4f}, std={debug_stats['pred_corrected']['std_avg']:.4f}, CV={debug_stats['pred_corrected']['cv_avg']:.4f}")
-
-            print("\nGenerating debug plots...")
-
-            # =====================================================================
-            # PLOT 1: ENVELOPE DISTRIBUTIONS (overlay)
-            # =====================================================================
-            fig, ax = plt.subplots(figsize=(10, 6))
-
-            all_vals = np.concatenate([all_target_env, all_pred_raw_env, all_pred_corr_env])
-            bins = np.linspace(np.percentile(all_vals, 1), np.percentile(all_vals, 99), 100)
-
-            ax.hist(all_target_env, bins=bins, alpha=0.5, color='green', label=f'Target (μ={np.mean(all_target_env):.3f}, σ={np.std(all_target_env):.3f})', density=True)
-            ax.hist(all_pred_raw_env, bins=bins, alpha=0.5, color='red', label=f'Pred Raw (μ={np.mean(all_pred_raw_env):.3f}, σ={np.std(all_pred_raw_env):.3f})', density=True)
-            ax.hist(all_pred_corr_env, bins=bins, alpha=0.5, color='blue', label=f'Pred Corrected (μ={np.mean(all_pred_corr_env):.3f}, σ={np.std(all_pred_corr_env):.3f})', density=True)
-
-            ax.set_title('Envelope Distribution Comparison')
-            ax.set_xlabel('Envelope Amplitude')
-            ax.set_ylabel('Density')
-            ax.legend(loc='upper right')
-            ax.grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.savefig(debug_dir / "envelope_distribution.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: {debug_dir / 'envelope_distribution.png'}")
-
-            # =====================================================================
-            # PLOT 2: PSD COMPARISON (Welch method)
-            # =====================================================================
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-            # Compute average PSD using Welch
-            nperseg = min(1024, all_target_signals.shape[1] // 4)
-
-            # Average PSD across all signals
-            def compute_avg_psd(signals, fs, nperseg):
-                psds = []
-                for sig in signals[:100]:  # Limit to 100 signals for speed
-                    f, psd = welch(sig, fs=fs, nperseg=nperseg)
-                    psds.append(psd)
-                return f, np.mean(psds, axis=0), np.std(psds, axis=0)
-
-            f_target, psd_target, psd_target_std = compute_avg_psd(all_target_signals, sampling_rate, nperseg)
-            f_raw, psd_raw, psd_raw_std = compute_avg_psd(all_pred_raw_signals, sampling_rate, nperseg)
-            f_corr, psd_corr, psd_corr_std = compute_avg_psd(all_pred_corr_signals, sampling_rate, nperseg)
-
-            # Linear scale PSD
-            axes[0].semilogy(f_target, psd_target, 'g-', linewidth=2, label='Target')
-            axes[0].semilogy(f_raw, psd_raw, 'r-', linewidth=2, label='Pred (raw)')
-            axes[0].semilogy(f_corr, psd_corr, 'b-', linewidth=2, label='Pred (corrected)')
-            axes[0].fill_between(f_target, psd_target - psd_target_std, psd_target + psd_target_std, alpha=0.2, color='green')
-            axes[0].fill_between(f_raw, psd_raw - psd_raw_std, psd_raw + psd_raw_std, alpha=0.2, color='red')
-            axes[0].fill_between(f_corr, psd_corr - psd_corr_std, psd_corr + psd_corr_std, alpha=0.2, color='blue')
-            axes[0].set_xlabel('Frequency (Hz)')
-            axes[0].set_ylabel('PSD (log scale)')
-            axes[0].set_title('Power Spectral Density (Welch)')
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-            axes[0].set_xlim([0, min(150, sampling_rate/2)])
-
-            # PSD difference in dB
-            eps = 1e-10
-            psd_diff_raw = 10 * np.log10((psd_raw + eps) / (psd_target + eps))
-            psd_diff_corr = 10 * np.log10((psd_corr + eps) / (psd_target + eps))
-
-            axes[1].plot(f_target, psd_diff_raw, 'r-', linewidth=2, label=f'Raw - Target (mean: {np.mean(psd_diff_raw):.2f} dB)')
-            axes[1].plot(f_target, psd_diff_corr, 'b-', linewidth=2, label=f'Corrected - Target (mean: {np.mean(psd_diff_corr):.2f} dB)')
-            axes[1].axhline(0, color='k', linestyle='--', alpha=0.5)
-            axes[1].set_xlabel('Frequency (Hz)')
-            axes[1].set_ylabel('PSD Difference (dB)')
-            axes[1].set_title('PSD Difference from Target')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-            axes[1].set_xlim([0, min(150, sampling_rate/2)])
-            axes[1].set_ylim([-10, 10])
-
-            plt.tight_layout()
-            plt.savefig(debug_dir / "psd_welch.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: {debug_dir / 'psd_welch.png'}")
-
-            # =====================================================================
-            # PLOT 3: INSTANTANEOUS FREQUENCY DISTRIBUTION
-            # =====================================================================
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-            # Filter to valid frequency range (0 to Nyquist)
-            max_freq = sampling_rate / 2
-            valid_mask_target = (all_target_inst_freq > 0) & (all_target_inst_freq < max_freq)
-            valid_mask_raw = (all_pred_raw_inst_freq > 0) & (all_pred_raw_inst_freq < max_freq)
-            valid_mask_corr = (all_pred_corr_inst_freq > 0) & (all_pred_corr_inst_freq < max_freq)
-
-            target_freq_valid = all_target_inst_freq[valid_mask_target]
-            raw_freq_valid = all_pred_raw_inst_freq[valid_mask_raw]
-            corr_freq_valid = all_pred_corr_inst_freq[valid_mask_corr]
-
-            # Histogram of instantaneous frequencies
-            freq_bins = np.linspace(0, min(150, max_freq), 100)
-
-            axes[0].hist(target_freq_valid, bins=freq_bins, alpha=0.5, color='green', label=f'Target (median: {np.median(target_freq_valid):.1f} Hz)', density=True)
-            axes[0].hist(raw_freq_valid, bins=freq_bins, alpha=0.5, color='red', label=f'Pred Raw (median: {np.median(raw_freq_valid):.1f} Hz)', density=True)
-            axes[0].hist(corr_freq_valid, bins=freq_bins, alpha=0.5, color='blue', label=f'Pred Corrected (median: {np.median(corr_freq_valid):.1f} Hz)', density=True)
-
-            axes[0].set_xlabel('Instantaneous Frequency (Hz)')
-            axes[0].set_ylabel('Density')
-            axes[0].set_title('Instantaneous Frequency Distribution')
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-
-            # CDF of instantaneous frequencies
-            target_sorted = np.sort(target_freq_valid)
-            raw_sorted = np.sort(raw_freq_valid)
-            corr_sorted = np.sort(corr_freq_valid)
-
-            step_t = max(1, len(target_sorted) // 1000)
-            step_r = max(1, len(raw_sorted) // 1000)
-            step_c = max(1, len(corr_sorted) // 1000)
-
-            axes[1].plot(target_sorted[::step_t], np.linspace(0, 1, len(target_sorted))[::step_t], 'g-', linewidth=2, label='Target')
-            axes[1].plot(raw_sorted[::step_r], np.linspace(0, 1, len(raw_sorted))[::step_r], 'r-', linewidth=2, label='Pred (raw)')
-            axes[1].plot(corr_sorted[::step_c], np.linspace(0, 1, len(corr_sorted))[::step_c], 'b-', linewidth=2, label='Pred (corrected)')
-
-            axes[1].set_xlabel('Instantaneous Frequency (Hz)')
-            axes[1].set_ylabel('Cumulative Probability')
-            axes[1].set_title('Instantaneous Frequency CDF')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-            axes[1].set_xlim([0, min(150, max_freq)])
-
-            plt.tight_layout()
-            plt.savefig(debug_dir / "instantaneous_frequency.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: {debug_dir / 'instantaneous_frequency.png'}")
-
-            # =====================================================================
-            # PLOT 4: Q-Q PLOTS (envelope)
-            # =====================================================================
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-            n_qq = min(10000, len(all_target_env))
-            idx = np.random.choice(len(all_target_env), n_qq, replace=False)
-
-            target_sorted = np.sort(all_target_env[idx])
-            raw_sorted = np.sort(all_pred_raw_env[idx])
-            corr_sorted = np.sort(all_pred_corr_env[idx])
-
-            axes[0].scatter(target_sorted, raw_sorted, alpha=0.3, s=1, color='red')
-            axes[0].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x')
-            axes[0].set_xlabel('Target Envelope Quantiles')
-            axes[0].set_ylabel('Pred (Raw) Envelope Quantiles')
-            axes[0].set_title('Q-Q Plot: Raw vs Target')
-            axes[0].legend()
-            axes[0].grid(True, alpha=0.3)
-
-            axes[1].scatter(target_sorted, corr_sorted, alpha=0.3, s=1, color='blue')
-            axes[1].plot([target_sorted.min(), target_sorted.max()], [target_sorted.min(), target_sorted.max()], 'k--', label='y=x')
-            axes[1].set_xlabel('Target Envelope Quantiles')
-            axes[1].set_ylabel('Pred (Corrected) Envelope Quantiles')
-            axes[1].set_title('Q-Q Plot: Corrected vs Target')
-            axes[1].legend()
-            axes[1].grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.savefig(debug_dir / "envelope_qq.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: {debug_dir / 'envelope_qq.png'}")
-
-            # =====================================================================
-            # PLOT 5: SIGNAL COMPARISON (Real vs Generated vs Corrected + Overlap)
-            # =====================================================================
-            # 4 columns: Real | Generated | Corrected | Overlap (all three)
-            n_signals_to_plot = 4  # Number of example signals to show
-            fig, axes = plt.subplots(n_signals_to_plot, 4, figsize=(20, 3 * n_signals_to_plot))
-
-            # Pick random signals to display
-            n_available = all_target_signals.shape[0]
-            signal_indices = np.random.choice(n_available, min(n_signals_to_plot, n_available), replace=False)
-
-            # Time axis (use first 1000 samples for clarity)
-            T_display = min(1000, all_target_signals.shape[1])
-            t = np.arange(T_display) / sampling_rate * 1000  # Convert to ms
-
-            for row, sig_idx in enumerate(signal_indices):
-                real_sig = all_target_signals[sig_idx, :T_display]
-                gen_sig = all_pred_raw_signals[sig_idx, :T_display]
-                corr_sig = all_pred_corr_signals[sig_idx, :T_display]
-
-                # Compute correlations for titles
-                corr_gen = np.corrcoef(real_sig, gen_sig)[0, 1]
-                corr_corr = np.corrcoef(real_sig, corr_sig)[0, 1]
-
-                # Column 1: Real signal
-                axes[row, 0].plot(t, real_sig, 'g-', linewidth=0.8, label='Real')
-                axes[row, 0].set_ylabel(f'Sig {sig_idx}', fontsize=10)
-                if row == 0:
-                    axes[row, 0].set_title('Real (Target)', fontsize=12, fontweight='bold')
-                axes[row, 0].grid(True, alpha=0.3)
-                axes[row, 0].set_xlim([t[0], t[-1]])
-
-                # Column 2: Generated (raw + spectral shift)
-                axes[row, 1].plot(t, gen_sig, 'r-', linewidth=0.8, label='Generated')
-                if row == 0:
-                    axes[row, 1].set_title('Generated (UNet+SpectralShift)', fontsize=12, fontweight='bold')
-                axes[row, 1].set_ylabel(f'r={corr_gen:.3f}', fontsize=9, color='red')
-                axes[row, 1].grid(True, alpha=0.3)
-                axes[row, 1].set_xlim([t[0], t[-1]])
-
-                # Column 3: Corrected (with envelope matching)
-                axes[row, 2].plot(t, corr_sig, 'b-', linewidth=0.8, label='Corrected')
-                if row == 0:
-                    axes[row, 2].set_title('Corrected (+EnvelopeMatch)', fontsize=12, fontweight='bold')
-                axes[row, 2].set_ylabel(f'r={corr_corr:.3f}', fontsize=9, color='blue')
-                axes[row, 2].grid(True, alpha=0.3)
-                axes[row, 2].set_xlim([t[0], t[-1]])
-
-                # Column 4: Overlap of all three
-                axes[row, 3].plot(t, real_sig, 'g-', linewidth=1.0, alpha=0.8, label='Real')
-                axes[row, 3].plot(t, gen_sig, 'r-', linewidth=0.8, alpha=0.6, label='Generated')
-                axes[row, 3].plot(t, corr_sig, 'b--', linewidth=0.8, alpha=0.6, label='Corrected')
-                if row == 0:
-                    axes[row, 3].set_title('Overlap Comparison', fontsize=12, fontweight='bold')
-                    axes[row, 3].legend(loc='upper right', fontsize=8)
-                axes[row, 3].grid(True, alpha=0.3)
-                axes[row, 3].set_xlim([t[0], t[-1]])
-
-                # Add x-label to bottom row
-                if row == n_signals_to_plot - 1:
-                    for col in range(4):
-                        axes[row, col].set_xlabel('Time (ms)')
-
-            plt.suptitle('Signal Comparison: Real vs Generated vs Corrected', fontsize=14, fontweight='bold', y=1.02)
-            plt.tight_layout()
-            plt.savefig(debug_dir / "signal_comparison.png", dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: {debug_dir / 'signal_comparison.png'}")
-
-            # Save stats to JSON
-            with open(debug_dir / "debug_stats.json", "w") as f:
-                json.dump(debug_stats, f, indent=2)
-            print(f"  Saved: {debug_dir / 'debug_stats.json'}")
-
-            print(f"\nAll debug plots saved to: {debug_dir.absolute()}")
-            print(f"{'='*70}\n")
-
-        # =====================================================================
-        # STAGE 2: Optimal Bias Applied (No Training Needed!)
-        # =====================================================================
-        # With OptimalSpectralBias, we just compute the bias from data and apply it.
-        # No gradient-based training is required - the bias is fixed per-odor.
-
-        if is_primary():
-            print(f"\n{'='*70}")
-            print("STAGE 2: Optimal Spectral Bias Applied")
-            print(f"{'='*70}")
-            print("  Bias computed directly from UNet output vs target PSD difference")
-            print("  No training required - bias is fixed per-odor per-band")
-            print(f"{'='*70}")
-
-        # Freeze all bias parameters (no training)
-        for param in spectral_shift_fwd.parameters():
-            param.requires_grad = False
-        if spectral_shift_rev is not None:
-            for param in spectral_shift_rev.parameters():
-                param.requires_grad = False
-
-        # Evaluate with optimal bias applied
-        val_metrics = evaluate(
-            model, loaders["val"], device, wavelet_loss,
-            compute_phase=False, reverse_model=reverse_model, config=config,
-            spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-            spectral_only=True, fast_mode=False,
-            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-            cond_encoder=cond_encoder,
-        )
-
-        psd_err_fwd = val_metrics.get("psd_err_db", float("inf"))
-        psd_bias_fwd = val_metrics.get('psd_diff_db', 0)
-        psd_err_rev = val_metrics.get("psd_err_db_rev", float("inf"))
-        psd_bias_rev = val_metrics.get('psd_diff_db_rev', 0)
-
-        if is_primary():
-            print(f"\nValidation with Optimal Bias:")
-            print(f"  Forward: PSD_err={psd_err_fwd:.2f}dB (bias={psd_bias_fwd:+.2f}dB)")
-            if spectral_shift_rev is not None:
-                print(f"  Reverse: PSD_err={psd_err_rev:.2f}dB (bias={psd_bias_rev:+.2f}dB)")
-
-        # Save checkpoint with computed bias
-        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        save_checkpoint(
-            model, optimizer, num_epochs,  # Use Stage 1 optimizer/epoch since no Stage 2 training
-            CHECKPOINT_DIR / "best_model_stage2.pt",
-            is_fsdp=is_fsdp_wrapped,
-            reverse_model=reverse_model,
-            spectral_shift_fwd=spectral_shift_fwd,
-            spectral_shift_rev=spectral_shift_rev,
-            config=config,
-        )
-
-        if is_primary():
-            print(f"\n{'='*70}")
-            print("STAGE 2 COMPLETE: Post-hoc Calibration Applied")
-            print(f"{'='*70}")
-            print(f"  Optimal bias computed and saved (no training)")
-            print(f"  FWD PSD_err = {psd_err_fwd:.2f} dB")
-            if spectral_shift_rev is not None:
-                print(f"  REV PSD_err = {psd_err_rev:.2f} dB")
-            print(f"{'='*70}\n")
 
     # Final test evaluation (full metrics, fast_mode=False)
     test_metrics = evaluate(
@@ -3468,6 +2789,90 @@ def train(
                 delta_plv_rev = test_metrics['plv_rev'] - test_metrics.get('baseline_plv', 0)
                 print(f"  PLV: {test_metrics['plv_rev']:.4f} (Δ={delta_plv_rev:+.4f})")
                 print(f"  PLI: {test_metrics['pli_rev']:.4f}")
+
+    # =========================================================================
+    # PER-SESSION TEST EVALUATION (for cross-session generalization analysis)
+    # =========================================================================
+    if is_primary() and "split_info" in data and "session_ids" in data:
+        split_info = data.get("split_info", {})
+        test_sessions = split_info.get("test_sessions", [])
+        session_ids = data.get("session_ids")
+        idx_to_session = data.get("idx_to_session", {})
+        test_idx = data["test_idx"]
+
+        if len(test_sessions) > 1:
+            print("\n" + "=" * 70)
+            print("PER-SESSION TEST RESULTS")
+            print("=" * 70)
+
+            # Create session name to int ID mapping
+            session_to_id = {name: idx for idx, name in idx_to_session.items()}
+
+            per_session_results = []
+
+            for session_name in test_sessions:
+                # Find indices for this session
+                session_id = session_to_id.get(session_name)
+                if session_id is None:
+                    continue
+
+                # Get indices for this session that are in test set
+                session_mask = session_ids[test_idx] == session_id
+                session_indices = test_idx[session_mask]
+
+                if len(session_indices) == 0:
+                    continue
+
+                # Create dataloader for this session
+                session_loader = create_single_session_dataloader(
+                    data, session_name, session_indices,
+                    batch_size=config.get("batch_size", 16),
+                    num_workers=4,
+                    distributed=False,  # Per-session eval on primary only
+                )
+
+                # Evaluate this session
+                session_metrics = evaluate(
+                    model, session_loader, device, wavelet_loss,
+                    compute_phase=False, reverse_model=None, config=config,
+                    spectral_shift_fwd=spectral_shift_fwd,
+                    fast_mode=True,
+                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    cond_encoder=cond_encoder,
+                )
+
+                per_session_results.append({
+                    "session": session_name,
+                    "n_trials": len(session_indices),
+                    "corr": session_metrics["corr"],
+                    "baseline_corr": session_metrics.get("baseline_corr", 0),
+                    "r2": session_metrics["r2"],
+                    "psd_err_db": session_metrics.get("psd_err_db", 0),
+                })
+
+            # Print summary table
+            if per_session_results:
+                print(f"\n{'Session':<15} {'Trials':>8} {'Corr':>8} {'Baseline':>10} {'Δ Corr':>10} {'R²':>8}")
+                print("-" * 70)
+
+                for r in per_session_results:
+                    delta = r['corr'] - r['baseline_corr']
+                    print(f"{r['session']:<15} {r['n_trials']:>8} {r['corr']:>8.4f} {r['baseline_corr']:>10.4f} {delta:>+10.4f} {r['r2']:>8.4f}")
+
+                # Compute aggregate stats
+                avg_corr = np.mean([r['corr'] for r in per_session_results])
+                avg_baseline = np.mean([r['baseline_corr'] for r in per_session_results])
+                avg_delta = avg_corr - avg_baseline
+                avg_r2 = np.mean([r['r2'] for r in per_session_results])
+                total_trials = sum(r['n_trials'] for r in per_session_results)
+
+                print("-" * 70)
+                print(f"{'AVERAGE':<15} {total_trials:>8} {avg_corr:>8.4f} {avg_baseline:>10.4f} {avg_delta:>+10.4f} {avg_r2:>8.4f}")
+                print("=" * 70)
+
+                # Machine-parseable output
+                print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
+                print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
 
     if is_distributed:
         dist.barrier()
