@@ -220,6 +220,14 @@ DEFAULT_CONFIG = {
     "saliency_epoch_interval": 5,  # Compute saliency every N epochs
     "neuroscience_epoch_interval": 10,  # Compute neuroscience metrics every N epochs
     "recording_output_dir": "artifacts/recordings",  # Output directory for recordings
+
+    # Session-based splitting (for cross-session generalization)
+    # When True, entire recording sessions are held out for val/test
+    # This tests true cross-session generalization (harder but more realistic)
+    "split_by_session": False,  # Use session-based holdout instead of random splits
+    "n_test_sessions": 1,       # Number of sessions to hold out for testing
+    "n_val_sessions": 1,        # Number of sessions to hold out for validation
+    "session_column": "recording_id",  # CSV column containing session/recording IDs
 }
 
 
@@ -3199,15 +3207,22 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default: from config)")
 
     # Session-based split arguments (for held-out session evaluation)
-    parser.add_argument("--split-by-session", action="store_true",
+    # Use default=None so CLI doesn't override config file values
+    parser.add_argument("--split-by-session", action="store_true", default=None,
                         help="Use session-based holdout instead of random splits. "
                              "Entire recording sessions are held out for test/val.")
-    parser.add_argument("--n-test-sessions", type=int, default=1,
-                        help="Number of sessions to hold out for testing (requires --split-by-session)")
-    parser.add_argument("--n-val-sessions", type=int, default=1,
-                        help="Number of sessions to hold out for validation (requires --split-by-session)")
-    parser.add_argument("--session-column", type=str, default="recording_id",
-                        help="CSV column name containing session/recording IDs")
+    parser.add_argument("--no-split-by-session", action="store_true", default=None,
+                        help="Disable session-based splits (use random splits)")
+    parser.add_argument("--n-test-sessions", type=int, default=None,
+                        help="Number of sessions to hold out for testing (default: from config)")
+    parser.add_argument("--n-val-sessions", type=int, default=None,
+                        help="Number of sessions to hold out for validation (default: from config)")
+    parser.add_argument("--session-column", type=str, default=None,
+                        help="CSV column name containing session/recording IDs (default: from config)")
+    parser.add_argument("--test-sessions", type=str, nargs="+", default=None,
+                        help="Explicit session names for test set (e.g., --test-sessions 141208-1 170614)")
+    parser.add_argument("--val-sessions", type=str, nargs="+", default=None,
+                        help="Explicit session names for val set (e.g., --val-sessions 170609 170619)")
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
 
@@ -3363,9 +3378,6 @@ def main():
     if is_primary():
         print("Loading data...")
         print(f"Dataset: {args.dataset.upper()}")
-        if args.split_by_session:
-            print(f"Using SESSION-BASED SPLITS: {args.n_test_sessions} test, {args.n_val_sessions} val sessions")
-            print(f"Session column: {args.session_column}")
 
     # Build config FIRST - only override from args if explicitly provided
     config = DEFAULT_CONFIG.copy()
@@ -3388,13 +3400,31 @@ def main():
     if args.seed is not None:
         config["seed"] = args.seed
 
+    # Session-based split config (CLI overrides config if explicitly provided)
+    if args.split_by_session:
+        config["split_by_session"] = True
+    elif args.no_split_by_session:
+        config["split_by_session"] = False
+    # else: use value from config
+    if args.n_test_sessions is not None:
+        config["n_test_sessions"] = args.n_test_sessions
+    if args.n_val_sessions is not None:
+        config["n_val_sessions"] = args.n_val_sessions
+    if args.session_column is not None:
+        config["session_column"] = args.session_column
+
+    # Print session split info
+    if is_primary() and config["split_by_session"]:
+        print(f"Using SESSION-BASED SPLITS: {config['n_test_sessions']} test, {config['n_val_sessions']} val sessions")
+        print(f"Session column: {config['session_column']}")
+
     # Load data based on dataset choice
     if args.dataset == "pfc":
         # PFC/Hippocampus dataset
         data = prepare_pfc_data(
-            split_by_session=args.split_by_session,
-            n_test_sessions=args.n_test_sessions,
-            n_val_sessions=args.n_val_sessions,
+            split_by_session=config["split_by_session"],
+            n_test_sessions=config["n_test_sessions"],
+            n_val_sessions=config["n_val_sessions"],
             force_recreate_splits=args.force_recreate_splits,
             resample_to_1khz=args.resample_pfc,
         )
@@ -3408,12 +3438,14 @@ def main():
     else:
         # Olfactory dataset (default)
         data = prepare_data(
-            split_by_session=args.split_by_session,
-            n_test_sessions=args.n_test_sessions,
-            n_val_sessions=args.n_val_sessions,
-            session_column=args.session_column,
+            split_by_session=config["split_by_session"],
+            n_test_sessions=config["n_test_sessions"],
+            n_val_sessions=config["n_val_sessions"],
+            session_column=config["session_column"],
             force_recreate_splits=args.force_recreate_splits,
             seed=config["seed"],
+            test_sessions=args.test_sessions,
+            val_sessions=args.val_sessions,
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
