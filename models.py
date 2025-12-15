@@ -2213,7 +2213,8 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_bottleneck: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass.
 
         Args:
@@ -2221,9 +2222,11 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
+            return_bottleneck: If True, also return bottleneck features for contrastive learning
 
         Returns:
-            Predicted signal [B, C, T]
+            If return_bottleneck=False: Predicted signal [B, C, T]
+            If return_bottleneck=True: (predicted signal, bottleneck features [B, bottleneck_ch])
         """
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2237,15 +2240,20 @@ class CondUNet1D(nn.Module):
         skips = [self.inc(ob, emb)]
         for encoder in self.encoders:
             skips.append(encoder(skips[-1], emb))
-        
+
         # Bottleneck
-        x = self.mid(skips[-1])
-        
+        bottleneck = self.mid(skips[-1])
+
+        # Save bottleneck features for contrastive learning (CEBRA-style)
+        # Global average pool: (B, C, T) -> (B, C) for fixed-size embedding
+        bottleneck_features = bottleneck.mean(dim=-1) if return_bottleneck else None
+
         # Decoder path with skip connections (reverse order)
+        x = bottleneck
         for i, decoder in enumerate(self.decoders):
             skip_idx = self.n_downsample - i - 1
             x = decoder(x, skips[skip_idx], emb)
-        
+
         delta = self.outc(x)
 
         # Residual connection: output = input + learned_delta
@@ -2261,6 +2269,8 @@ class CondUNet1D(nn.Module):
             out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
+        if return_bottleneck:
+            return out, bottleneck_features
         return out
 
     # =========================================================================

@@ -1639,10 +1639,18 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
+        # If contrastive learning enabled, also get bottleneck features
+        use_contrastive = config.get("use_contrastive", False) and projection_head_fwd is not None
         if cond_emb is not None:
-            pred_raw = model(ob, cond_emb=cond_emb)
+            fwd_result = model(ob, cond_emb=cond_emb, return_bottleneck=use_contrastive)
         else:
-            pred_raw = model(ob, odor)
+            fwd_result = model(ob, odor, return_bottleneck=use_contrastive)
+
+        if use_contrastive:
+            pred_raw, bottleneck_fwd = fwd_result
+        else:
+            pred_raw = fwd_result
+            bottleneck_fwd = None
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -1696,12 +1704,19 @@ def train_epoch(
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
 
         # Bidirectional training with cycle consistency
+        bottleneck_rev = None  # Initialize for contrastive loss check later
         if reverse_model is not None:
             # Reverse: PCx → OB (use same cond_emb from forward - conditioning is symmetric)
+            # If contrastive learning enabled, also get bottleneck features
             if cond_emb is not None:
-                pred_rev_raw = reverse_model(pcx, cond_emb=cond_emb)
+                rev_result = reverse_model(pcx, cond_emb=cond_emb, return_bottleneck=use_contrastive)
             else:
-                pred_rev_raw = reverse_model(pcx, odor)
+                rev_result = reverse_model(pcx, odor, return_bottleneck=use_contrastive)
+
+            if use_contrastive:
+                pred_rev_raw, bottleneck_rev = rev_result
+            else:
+                pred_rev_raw = rev_result
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
@@ -1762,28 +1777,27 @@ def train_epoch(
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
         # Contrastive loss for session-invariant learning (CEBRA-style)
-        # Uses odor labels as positive pairs: same odor = similar embedding
-        if config.get("use_contrastive", False) and projection_head_fwd is not None:
+        # Uses BOTTLENECK features (encoder output) with odor labels as positive pairs
+        # This encourages the encoder to learn session-invariant representations:
+        # same odor, different session/augmentation → similar bottleneck embedding
+        if use_contrastive and bottleneck_fwd is not None:
             contrastive_weight = config.get("contrastive_weight", 0.1)
             contrastive_temp = config.get("contrastive_temperature", 0.1)
 
-            # Get representations from predictions via global average pooling
-            # pred_raw: (batch, channels, time) -> pool -> (batch, channels)
-            # Keep dtype consistent with model output (bfloat16 for FSDP)
-            pred_fwd_pooled = pred_raw.mean(dim=-1)  # Global average pooling
-            pred_fwd_embed = projection_head_fwd(pred_fwd_pooled)  # Project to embedding space
+            # Project bottleneck features to embedding space
+            # bottleneck_fwd: (batch, bottleneck_channels) - already pooled in model forward
+            fwd_embed = projection_head_fwd(bottleneck_fwd)  # -> (batch, 128)
 
             # Compute contrastive loss (same odor = positive pair)
             # Cast to float32 for stable loss computation
-            contrastive_loss_fwd = info_nce_loss(pred_fwd_embed.float(), odor, temperature=contrastive_temp)
+            contrastive_loss_fwd = info_nce_loss(fwd_embed.float(), odor, temperature=contrastive_temp)
             loss = loss + contrastive_weight * contrastive_loss_fwd
             loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
 
-            # Reverse direction contrastive loss
-            if reverse_model is not None and projection_head_rev is not None:
-                pred_rev_pooled = pred_rev_raw.mean(dim=-1)
-                pred_rev_embed = projection_head_rev(pred_rev_pooled)
-                contrastive_loss_rev = info_nce_loss(pred_rev_embed.float(), odor, temperature=contrastive_temp)
+            # Reverse direction contrastive loss (on reverse model's bottleneck)
+            if reverse_model is not None and projection_head_rev is not None and bottleneck_rev is not None:
+                rev_embed = projection_head_rev(bottleneck_rev)
+                contrastive_loss_rev = info_nce_loss(rev_embed.float(), odor, temperature=contrastive_temp)
                 loss = loss + contrastive_weight * contrastive_loss_rev
                 loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
 
@@ -2130,21 +2144,21 @@ def train(
     use_contrastive = config.get("use_contrastive", False)
 
     if use_contrastive:
-        # Input dimension for projection heads:
-        # We apply contrastive loss on pooled predictions (batch, out_channels)
-        # Forward: OB->PCx, so input is out_channels (PCx channels)
-        # Reverse: PCx->OB, so input is in_channels (OB channels)
-        out_ch = config.get("out_channels", 32)
-        in_ch = config.get("in_channels", 32)
+        # CEBRA-style: Apply contrastive loss on BOTTLENECK features (encoder output)
+        # This encourages the encoder to learn session-invariant representations
+        # Bottleneck dim = min(base_channels * 2^n_downsample, base_channels * 8)
+        base_ch = config.get("base_channels", 64)
+        n_downsample = config.get("n_downsample", 4)
+        bottleneck_dim = min(base_ch * (2 ** n_downsample), base_ch * 8)
 
-        # Create projection heads (small MLP: channels -> 256 -> 128)
+        # Create projection heads (small MLP: bottleneck -> 256 -> 128)
         projection_head_fwd = ProjectionHead(
-            in_dim=out_ch,  # PCx channels for forward direction
+            in_dim=bottleneck_dim,  # Bottleneck channels (512 for default config)
             hidden_dim=256,
             out_dim=128,
         )
         projection_head_rev = ProjectionHead(
-            in_dim=in_ch,  # OB channels for reverse direction
+            in_dim=bottleneck_dim,  # Same for reverse (symmetric architecture)
             hidden_dim=256,
             out_dim=128,
         )
@@ -2165,8 +2179,8 @@ def train(
         if is_primary():
             contrastive_weight = config.get("contrastive_weight", 0.1)
             contrastive_temp = config.get("contrastive_temperature", 0.1)
-            print(f"Contrastive learning ENABLED: weight={contrastive_weight}, temperature={contrastive_temp}")
-            print(f"  Projection heads: fwd={out_ch}->256->128, rev={in_ch}->256->128")
+            print(f"Contrastive learning ENABLED (CEBRA-style): weight={contrastive_weight}, temperature={contrastive_temp}")
+            print(f"  Projection heads: {bottleneck_dim}->256->128 (bottleneck features)")
 
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
