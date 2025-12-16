@@ -174,18 +174,18 @@ DEFAULT_CONFIG = {
     "stage1_checkpoint": "best_model.pt",    # Path to Stage 1 checkpoint
 
     # Model
-    "base_channels": 64,
+    "base_channels": 32,
     "dropout": 0.0,
     "use_attention": True,
     "attention_type": "cross_freq_v2",  # Cross-frequency coupling attention (theta-gamma)
     "norm_type": "batch",
     "cond_mode": "cross_attn_gated",  # Cross-attention with gating (uses auto-conditioning from --conditioning)
-    
+
     # U-Net depth (controls frequency resolution at bottleneck)
     # n_downsample=2: 4x downsample → 125 Hz Nyquist (full gamma, uses more memory)
     # n_downsample=3: 8x downsample → 62 Hz Nyquist (low gamma)
     # n_downsample=4: 16x downsample → 31 Hz Nyquist (default)
-    "n_downsample": 4,
+    "n_downsample": 3,
 
     # Modern convolutions (for improved correlation in Stage 1)
     "conv_type": "modern",  # "standard" (Conv1d k=3) or "modern" (multi-scale dilated depthwise sep + SE)
@@ -203,7 +203,7 @@ DEFAULT_CONFIG = {
 
     # Data augmentation (applied during training only)
     # Master toggle - set to False to disable ALL augmentations at once
-    "aug_enabled": True,            # Master switch for all augmentations
+    "aug_enabled": False,            # Master switch for all augmentations
     # HEAVY augmentation for cross-session generalization
     "aug_time_shift": True,         # Random circular time shift
     "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
@@ -228,7 +228,7 @@ DEFAULT_CONFIG = {
     "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
 
     # Bidirectional training
-    "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
+    "use_bidirectional": False,  # Train both OB→PCx and PCx→OB
 
     # Spectral shift block
     "use_spectral_shift": True,  # Per-channel amplitude scaling for PSD correction
@@ -2757,6 +2757,7 @@ def train(
                 idx_to_session=idx_to_session,
                 formats=["png"],  # Fast - only PNG for training
                 quick=True,  # Essential plots only
+                cond_encoder=cond_encoder,  # Pass conditioning encoder for auto-conditioning
             )
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")

@@ -53,6 +53,21 @@ except ImportError:
 
 
 # =============================================================================
+# Distributed Training Utilities
+# =============================================================================
+
+def _is_primary_rank() -> bool:
+    """Check if current process is rank 0 (primary) for printing.
+
+    In distributed training, only rank 0 should print to avoid duplicate output.
+    Returns True if not in distributed mode or if rank == 0.
+    """
+    import os
+    rank = int(os.environ.get("RANK", 0))
+    return rank == 0
+
+
+# =============================================================================
 # Dataset Type Enum
 # =============================================================================
 
@@ -190,7 +205,8 @@ def load_pfc_signals(path: Path = PFC_DATA_PATH) -> Tuple[np.ndarray, np.ndarray
         raise ValueError(f"Expected shape (trials, time, channels), got {arr.shape}")
 
     n_trials, n_time, n_channels = arr.shape
-    print(f"Loaded PFC data: {n_trials} trials, {n_time} time points, {n_channels} channels")
+    if _is_primary_rank():
+        print(f"Loaded PFC data: {n_trials} trials, {n_time} time points, {n_channels} channels")
 
     if n_channels != PFC_TOTAL_CHANNELS:
         raise ValueError(f"Expected {PFC_TOTAL_CHANNELS} channels, got {n_channels}")
@@ -202,7 +218,8 @@ def load_pfc_signals(path: Path = PFC_DATA_PATH) -> Tuple[np.ndarray, np.ndarray
     pfc = arr[:, PFC_CHANNEL_START:PFC_CHANNEL_END, :]  # (494, 64, 6250)
     ca1 = arr[:, CA1_CHANNEL_START:CA1_CHANNEL_END, :]  # (494, 32, 6250)
 
-    print(f"Split into PFC: {pfc.shape}, CA1: {ca1.shape}")
+    if _is_primary_rank():
+        print(f"Split into PFC: {pfc.shape}, CA1: {ca1.shape}")
 
     return pfc, ca1
 
@@ -247,8 +264,9 @@ def load_pfc_metadata(
             vocab[name] = len(vocab)
         ids[idx] = vocab[name]
 
-    print(f"PFC trial types: {vocab}")
-    print(f"Trial type distribution: {np.bincount(ids)}")
+    if _is_primary_rank():
+        print(f"PFC trial types: {vocab}")
+        print(f"Trial type distribution: {np.bincount(ids)}")
 
     return ids, vocab, df
 
@@ -288,7 +306,8 @@ def load_pfc_session_ids(
 
     session_ids = np.array([session_to_idx[s] for s in raw_sessions], dtype=np.int64)
 
-    print(f"Found {len(unique_sessions)} unique PFC sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
+    if _is_primary_rank():
+        print(f"Found {len(unique_sessions)} unique PFC sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
 
     return session_ids, session_to_idx, idx_to_session
 
@@ -326,7 +345,8 @@ def load_pfc_rat_ids(
 
     rat_ids = np.array([rat_to_idx[r] for r in raw_rats], dtype=np.int64)
 
-    print(f"Found {len(unique_rats)} unique rats: {unique_rats}")
+    if _is_primary_rank():
+        print(f"Found {len(unique_rats)} unique rats: {unique_rats}")
 
     return rat_ids, rat_to_idx, idx_to_rat
 
@@ -407,7 +427,8 @@ def load_session_ids(
     # Convert to integer indices
     session_ids = np.array([session_to_idx[s] for s in raw_sessions], dtype=np.int64)
 
-    print(f"Found {len(unique_sessions)} unique sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
+    if _is_primary_rank():
+        print(f"Found {len(unique_sessions)} unique sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
 
     return session_ids, session_to_idx, idx_to_session
 
@@ -467,7 +488,8 @@ def load_or_create_session_splits(
         # VALIDATION: Check that loaded indices don't exceed data size
         max_idx = len(session_ids) - 1
         if train_idx.max() > max_idx or val_idx.max() > max_idx or test_idx.max() > max_idx:
-            print(f"WARNING: Cached split indices exceed data size! Recreating splits...")
+            if _is_primary_rank():
+                print(f"WARNING: Cached split indices exceed data size! Recreating splits...")
             # Don't return - fall through to recreate splits
         else:
             # Validate no overlap
@@ -476,7 +498,8 @@ def load_or_create_session_splits(
             test_set = set(test_idx.tolist())
             has_overlap = bool(train_set & val_set) or bool(train_set & test_set) or bool(val_set & test_set)
             if has_overlap:
-                print(f"WARNING: Loaded splits have overlapping indices! Recreating splits...")
+                if _is_primary_rank():
+                    print(f"WARNING: Loaded splits have overlapping indices! Recreating splits...")
             else:
                 # Verify sessions are separate
                 train_sessions_check = set(session_ids[train_idx])
@@ -488,14 +511,15 @@ def load_or_create_session_splits(
                     bool(train_sessions_check & test_sessions_check) or
                     bool(val_sessions_check & test_sessions_check)
                 )
-                if session_overlap:
+                if session_overlap and _is_primary_rank():
                     print(f"WARNING: Loaded splits have overlapping sessions! This shouldn't happen!")
                     print(f"  Train sessions: {train_sessions_check}")
                     print(f"  Val sessions: {val_sessions_check}")
                     print(f"  Test sessions: {test_sessions_check}")
 
-                print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
-                      f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+                if _is_primary_rank():
+                    print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
+                          f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
                 return train_idx, val_idx, test_idx, split_info
 
     rng = np.random.default_rng(seed)
@@ -539,9 +563,10 @@ def load_or_create_session_splits(
         if len(train_session_ids) == 0:
             raise ValueError("No sessions left for training after specifying test/val sessions!")
 
-        print(f"\n[Explicit Session Split]")
-        print(f"  Test sessions: {test_sessions}")
-        print(f"  Val sessions: {val_sessions}")
+        if _is_primary_rank():
+            print(f"\n[Explicit Session Split]")
+            print(f"  Test sessions: {test_sessions}")
+            print(f"  Val sessions: {val_sessions}")
     else:
         # Random session selection (original behavior)
         # If no_test_set, all held-out sessions go to validation
@@ -603,12 +628,13 @@ def load_or_create_session_splits(
     val_sessions_check = set(session_ids[val_idx])
     test_sessions_check = set(session_ids[test_idx])
 
-    if train_sessions_check & val_sessions_check:
-        print(f"WARNING: Train and Val have overlapping sessions: {train_sessions_check & val_sessions_check}")
-    if train_sessions_check & test_sessions_check:
-        print(f"WARNING: Train and Test have overlapping sessions: {train_sessions_check & test_sessions_check}")
-    if val_sessions_check & test_sessions_check:
-        print(f"WARNING: Val and Test have overlapping sessions: {val_sessions_check & test_sessions_check}")
+    if _is_primary_rank():
+        if train_sessions_check & val_sessions_check:
+            print(f"WARNING: Train and Val have overlapping sessions: {train_sessions_check & val_sessions_check}")
+        if train_sessions_check & test_sessions_check:
+            print(f"WARNING: Train and Test have overlapping sessions: {train_sessions_check & test_sessions_check}")
+        if val_sessions_check & test_sessions_check:
+            print(f"WARNING: Val and Test have overlapping sessions: {val_sessions_check & test_sessions_check}")
 
     # Shuffle within splits
     rng.shuffle(train_idx)
@@ -661,24 +687,25 @@ def load_or_create_session_splits(
             for sess_name, indices in val_idx_per_session.items()
         }
 
-    # Print summary
-    print(f"\n{'='*60}")
-    if no_test_set:
-        print("SESSION-BASED SPLIT (No Test Set - All Held-Out Sessions for Validation)")
-    else:
-        print("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
-    print(f"{'='*60}")
-    print(f"Total sessions: {n_sessions}")
-    print(f"Train sessions: {train_session_names} ({len(train_idx)} trials)")
-    if separate_val_sessions and val_idx_per_session is not None:
-        print(f"Val sessions (SEPARATE):")
-        for sess_name, indices in val_idx_per_session.items():
-            print(f"  - {sess_name}: {len(indices)} trials")
-    else:
-        print(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
-    if not no_test_set:
-        print(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
-    print(f"{'='*60}\n")
+    # Print summary (only on primary rank to avoid duplicate output)
+    if _is_primary_rank():
+        print(f"\n{'='*60}")
+        if no_test_set:
+            print("SESSION-BASED SPLIT (No Test Set - All Held-Out Sessions for Validation)")
+        else:
+            print("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
+        print(f"{'='*60}")
+        print(f"Total sessions: {n_sessions}")
+        print(f"Train sessions: {train_session_names} ({len(train_idx)} trials)")
+        if separate_val_sessions and val_idx_per_session is not None:
+            print(f"Val sessions (SEPARATE):")
+            for sess_name, indices in val_idx_per_session.items():
+                print(f"  - {sess_name}: {len(indices)} trials")
+        else:
+            print(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
+        if not no_test_set:
+            print(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
+        print(f"{'='*60}\n")
 
     # Save splits (skip saving if using separate_val_sessions - it's not serializable)
     if not separate_val_sessions:
@@ -775,9 +802,10 @@ def load_or_create_stratified_splits(
         rng.shuffle(test_idx)
 
         # Log the balanced split info
-        print(f"Balanced split: {n_per_odor_train} train, {n_per_odor_val} val, "
-              f"{n_per_odor_test} test per odor (x{n_odors} odors)")
-        print(f"Total: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+        if _is_primary_rank():
+            print(f"Balanced split: {n_per_odor_train} train, {n_per_odor_val} val, "
+                  f"{n_per_odor_test} test per odor (x{n_odors} odors)")
+            print(f"Total: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
     else:
         # PROPORTIONAL SPLIT: Maintains original class proportions
@@ -831,7 +859,8 @@ def load_or_create_pfc_stratified_splits(
         train_idx = np.load(PFC_TRAIN_SPLIT_PATH)
         val_idx = np.load(PFC_VAL_SPLIT_PATH)
         test_idx = np.load(PFC_TEST_SPLIT_PATH)
-        print(f"Loaded existing PFC splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+        if _is_primary_rank():
+            print(f"Loaded existing PFC splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
         return train_idx, val_idx, test_idx
 
     rng = np.random.default_rng(seed)
@@ -855,13 +884,14 @@ def load_or_create_pfc_stratified_splits(
     test_idx = temp_idx[test_mask]
 
     # Print split statistics
-    print(f"\nPFC Dataset Splits:")
-    print(f"  Train: {len(train_idx)} samples")
-    for tt in np.unique(trial_types):
-        count = np.sum(trial_types[train_idx] == tt)
-        print(f"    - Type {tt}: {count}")
-    print(f"  Val: {len(val_idx)} samples")
-    print(f"  Test: {len(test_idx)} samples")
+    if _is_primary_rank():
+        print(f"\nPFC Dataset Splits:")
+        print(f"  Train: {len(train_idx)} samples")
+        for tt in np.unique(trial_types):
+            count = np.sum(trial_types[train_idx] == tt)
+            print(f"    - Type {tt}: {count}")
+        print(f"  Val: {len(val_idx)} samples")
+        print(f"  Test: {len(test_idx)} samples")
 
     # Save splits
     PFC_TRAIN_SPLIT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -912,8 +942,9 @@ def load_or_create_pfc_session_splits(
         val_idx = np.load(pfc_session_val)
         test_idx = np.load(pfc_session_test)
         split_info = json.loads(pfc_session_info.read_text())
-        print(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
-              f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+        if _is_primary_rank():
+            print(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
+                  f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
         return train_idx, val_idx, test_idx, split_info
 
     rng = np.random.default_rng(seed)
@@ -967,10 +998,11 @@ def load_or_create_pfc_session_splits(
         "n_test_trials": len(test_idx),
     }
 
-    print(f"\nPFC SESSION-BASED SPLIT:")
-    print(f"  Train sessions: {split_info['train_sessions']} ({len(train_idx)} trials)")
-    print(f"  Val sessions: {split_info['val_sessions']} ({len(val_idx)} trials)")
-    print(f"  Test sessions: {split_info['test_sessions']} ({len(test_idx)} trials)")
+    if _is_primary_rank():
+        print(f"\nPFC SESSION-BASED SPLIT:")
+        print(f"  Train sessions: {split_info['train_sessions']} ({len(train_idx)} trials)")
+        print(f"  Val sessions: {split_info['val_sessions']} ({len(val_idx)} trials)")
+        print(f"  Test sessions: {split_info['test_sessions']} ({len(test_idx)} trials)")
 
     # Save
     pfc_session_train.parent.mkdir(parents=True, exist_ok=True)
@@ -1465,11 +1497,11 @@ def apply_euclidean_alignment_to_data(
         ea_ob and ea_pcx are the fitted EuclideanAlignment instances (for later use)
     """
     if not EA_AVAILABLE:
-        if verbose:
+        if verbose and _is_primary_rank():
             print("WARNING: Euclidean Alignment requested but not available (import failed)")
         return ob, pcx, None, None
 
-    if verbose:
+    if verbose and _is_primary_rank():
         print(f"\n{'='*60}")
         print("Applying Euclidean Alignment (EA)")
         print(f"{'='*60}")
@@ -1489,7 +1521,7 @@ def apply_euclidean_alignment_to_data(
         train_sessions_ob[sess_name] = ob[train_sess_mask]
         train_sessions_pcx[sess_name] = pcx[train_sess_mask]
 
-    if verbose:
+    if verbose and _is_primary_rank():
         print(f"  Training sessions: {len(unique_train_sessions)}")
         for sess_name, data in train_sessions_ob.items():
             print(f"    {sess_name}: {data.shape[0]} trials")
@@ -1533,7 +1565,7 @@ def apply_euclidean_alignment_to_data(
                 sess_data_pcx, compute_cov_from_data=True
             )
 
-    if verbose:
+    if verbose and _is_primary_rank():
         print(f"Euclidean Alignment applied to all {len(unique_sessions)} sessions")
         print(f"{'='*60}\n")
 
@@ -1642,9 +1674,11 @@ def prepare_data(
     ea_ob, ea_pcx = None, None
     if use_euclidean_alignment:
         if not split_by_session:
-            print("WARNING: Euclidean Alignment requires split_by_session=True. Skipping EA.")
+            if _is_primary_rank():
+                print("WARNING: Euclidean Alignment requires split_by_session=True. Skipping EA.")
         elif not EA_AVAILABLE:
-            print("WARNING: Euclidean Alignment not available (import failed). Skipping EA.")
+            if _is_primary_rank():
+                print("WARNING: Euclidean Alignment not available (import failed). Skipping EA.")
         else:
             ob, pcx, ea_ob, ea_pcx = apply_euclidean_alignment_to_data(
                 ob=ob,
@@ -1727,9 +1761,10 @@ def prepare_pfc_data(
     - dataset_type: DatasetType.PFC_HPC
     - split_info: (if split_by_session/rat) metadata about splits
     """
-    print(f"\n{'='*60}")
-    print("Loading PFC/Hippocampus Dataset")
-    print(f"{'='*60}")
+    if _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Loading PFC/Hippocampus Dataset")
+        print(f"{'='*60}")
 
     # Load raw signals
     pfc, ca1 = load_pfc_signals(data_path)
@@ -1739,7 +1774,8 @@ def prepare_pfc_data(
     if resample_to_1khz:
         from scipy.signal import resample
         target_len = int(PFC_TIME_POINTS * SAMPLING_RATE_HZ / PFC_SAMPLING_RATE_HZ)
-        print(f"Resampling from {PFC_TIME_POINTS} to {target_len} time points (1250Hz -> 1000Hz)")
+        if _is_primary_rank():
+            print(f"Resampling from {PFC_TIME_POINTS} to {target_len} time points (1250Hz -> 1000Hz)")
         pfc_resampled = np.zeros((num_trials, PFC_CHANNELS, target_len), dtype=np.float32)
         ca1_resampled = np.zeros((num_trials, CA1_CHANNELS, target_len), dtype=np.float32)
         for i in range(num_trials):
@@ -1794,11 +1830,12 @@ def prepare_pfc_data(
     pfc_normalized = normalize(pfc, norm_stats_pfc)
     ca1_normalized = normalize(ca1, norm_stats_ca1)
 
-    print(f"\nFinal shapes:")
-    print(f"  PFC: {pfc_normalized.shape}")
-    print(f"  CA1: {ca1_normalized.shape}")
-    print(f"  Trial types: {len(vocab)} classes - {vocab}")
-    print(f"  Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+    if _is_primary_rank():
+        print(f"\nFinal shapes:")
+        print(f"  PFC: {pfc_normalized.shape}")
+        print(f"  CA1: {ca1_normalized.shape}")
+        print(f"  Trial types: {len(vocab)} classes - {vocab}")
+        print(f"  Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
     result = {
         # Signal arrays (analogous to ob/pcx in olfactory dataset)
