@@ -4411,6 +4411,665 @@ def plot_pac_modulation_index(
 
 
 # =============================================================================
+# New Gallery and Per-Session Plots (39-44)
+# =============================================================================
+
+def plot_per_odor_signal_gallery(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+    n_examples_per_odor: int = 3,
+):
+    """Plot 39: Per-odor signal gallery showing real vs generated for each condition.
+
+    Shows example waveforms for each odor/condition, making it easy to see how well
+    the model captures condition-specific neural dynamics.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+
+    # Get unique odors
+    odor_names = np.array(signals["odor_names"])
+    unique_odors = np.unique(odor_names)
+    n_odors = len(unique_odors)
+
+    # Compute time axis
+    T = signals["target_real"].shape[-1]
+    time = np.arange(T) / fs + 0.5  # Offset by 0.5s (crop start)
+
+    # Create figure: rows=odors, cols=examples
+    fig, axes = plt.subplots(n_odors, n_examples_per_odor, figsize=(4*n_examples_per_odor, 3*n_odors))
+    if n_odors == 1:
+        axes = axes.reshape(1, -1)
+
+    rng = np.random.RandomState(42)
+
+    for i, odor in enumerate(unique_odors):
+        mask = odor_names == odor
+        odor_indices = np.where(mask)[0]
+
+        # Sample examples for this odor
+        n_avail = len(odor_indices)
+        n_show = min(n_examples_per_odor, n_avail)
+        selected = rng.choice(odor_indices, n_show, replace=False)
+
+        for j, idx in enumerate(selected):
+            ax = axes[i, j]
+
+            # Use first channel for clarity
+            real = signals["target_real"][idx, 0, :]
+            gen = signals["target_gen"][idx, 0, :]
+            corr = np.corrcoef(real, gen)[0, 1]
+
+            ax.plot(time, real, color=COLORS["real"], alpha=0.8, linewidth=1, label="Real")
+            ax.plot(time, gen, color=COLORS["generated"], alpha=0.8, linewidth=1, label="Gen")
+            ax.axvline(x=2.0, color="gray", linestyle="--", alpha=0.3, label="Odor onset")
+
+            ax.set_title(f"r={corr:.3f}", fontsize=10)
+
+            if j == 0:
+                ax.set_ylabel(f"{odor}\nAmplitude", fontsize=9)
+            if i == n_odors - 1:
+                ax.set_xlabel("Time (s)", fontsize=9)
+            if i == 0 and j == 0:
+                ax.legend(fontsize=7, loc="upper right")
+
+            ax.tick_params(labelsize=8)
+
+        # Fill empty columns if fewer examples
+        for j in range(n_show, n_examples_per_odor):
+            axes[i, j].axis('off')
+
+    plt.suptitle(f"Per-Odor Signal Gallery: Real vs Generated {tgt}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "39_per_odor_signal_gallery", formats)
+    plt.close(fig)
+
+
+def plot_success_gallery(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+    n_examples: int = 16,
+):
+    """Plot 40: Success gallery - trials with highest correlation.
+
+    Shows the best-performing trials to understand what the model does well.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+
+    # Compute per-trial correlations (using first channel)
+    n_trials = signals["target_real"].shape[0]
+    correlations = np.array([
+        np.corrcoef(signals["target_real"][i, 0, :], signals["target_gen"][i, 0, :])[0, 1]
+        for i in range(n_trials)
+    ])
+
+    # Get top N trials
+    top_indices = np.argsort(correlations)[-n_examples:][::-1]  # Descending
+
+    # Time axis
+    T = signals["target_real"].shape[-1]
+    time = np.arange(T) / fs + 0.5
+
+    # Create grid
+    n_rows = 4
+    n_cols = (n_examples + n_rows - 1) // n_rows
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
+    axes = axes.flatten()
+
+    odor_names = np.array(signals["odor_names"])
+
+    for i, idx in enumerate(top_indices):
+        if i >= len(axes):
+            break
+        ax = axes[i]
+
+        real = signals["target_real"][idx, 0, :]
+        gen = signals["target_gen"][idx, 0, :]
+        corr = correlations[idx]
+        odor = odor_names[idx]
+
+        ax.plot(time, real, color=COLORS["real"], alpha=0.8, linewidth=1, label="Real")
+        ax.plot(time, gen, color=COLORS["generated"], alpha=0.8, linewidth=1, label="Gen")
+        ax.axvline(x=2.0, color="gray", linestyle="--", alpha=0.3)
+
+        ax.set_title(f"#{i+1} Trial {idx} ({odor})\nr={corr:.4f}", fontsize=10)
+
+        if i >= len(axes) - n_cols:
+            ax.set_xlabel("Time (s)", fontsize=9)
+        if i % n_cols == 0:
+            ax.set_ylabel("Amplitude", fontsize=9)
+        if i == 0:
+            ax.legend(fontsize=7, loc="upper right")
+
+        ax.tick_params(labelsize=8)
+        # Add green border for success
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#2ecc71')
+            spine.set_linewidth(2)
+
+    # Hide unused axes
+    for i in range(len(top_indices), len(axes)):
+        axes[i].axis('off')
+
+    plt.suptitle(f"SUCCESS GALLERY: Top {n_examples} Best {tgt} Reconstructions",
+                 fontsize=14, fontweight="bold", color="#2ecc71")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "40_success_gallery", formats)
+    plt.close(fig)
+
+
+def plot_failure_gallery(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+    n_examples: int = 16,
+):
+    """Plot 41: Failure gallery - trials with lowest correlation.
+
+    Shows the worst-performing trials to diagnose failure modes.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+
+    # Compute per-trial correlations (using first channel)
+    n_trials = signals["target_real"].shape[0]
+    correlations = np.array([
+        np.corrcoef(signals["target_real"][i, 0, :], signals["target_gen"][i, 0, :])[0, 1]
+        for i in range(n_trials)
+    ])
+
+    # Get bottom N trials
+    bottom_indices = np.argsort(correlations)[:n_examples]  # Ascending
+
+    # Time axis
+    T = signals["target_real"].shape[-1]
+    time = np.arange(T) / fs + 0.5
+
+    # Create grid
+    n_rows = 4
+    n_cols = (n_examples + n_rows - 1) // n_rows
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
+    axes = axes.flatten()
+
+    odor_names = np.array(signals["odor_names"])
+
+    for i, idx in enumerate(bottom_indices):
+        if i >= len(axes):
+            break
+        ax = axes[i]
+
+        real = signals["target_real"][idx, 0, :]
+        gen = signals["target_gen"][idx, 0, :]
+        corr = correlations[idx]
+        odor = odor_names[idx]
+
+        ax.plot(time, real, color=COLORS["real"], alpha=0.8, linewidth=1, label="Real")
+        ax.plot(time, gen, color=COLORS["generated"], alpha=0.8, linewidth=1, label="Gen")
+        ax.axvline(x=2.0, color="gray", linestyle="--", alpha=0.3)
+
+        ax.set_title(f"#{i+1} Trial {idx} ({odor})\nr={corr:.4f}", fontsize=10)
+
+        if i >= len(axes) - n_cols:
+            ax.set_xlabel("Time (s)", fontsize=9)
+        if i % n_cols == 0:
+            ax.set_ylabel("Amplitude", fontsize=9)
+        if i == 0:
+            ax.legend(fontsize=7, loc="upper right")
+
+        ax.tick_params(labelsize=8)
+        # Add red border for failure
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#e74c3c')
+            spine.set_linewidth(2)
+
+    # Hide unused axes
+    for i in range(len(bottom_indices), len(axes)):
+        axes[i].axis('off')
+
+    plt.suptitle(f"FAILURE GALLERY: Bottom {n_examples} Worst {tgt} Reconstructions",
+                 fontsize=14, fontweight="bold", color="#e74c3c")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "41_failure_gallery", formats)
+    plt.close(fig)
+
+
+def plot_per_session_metrics(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+):
+    """Plot 42: Per-session performance metrics summary.
+
+    Shows how model performance varies across recording sessions.
+    Requires session_ids in signals dict.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    # Check if session info is available
+    if "session_ids" not in signals:
+        print("  Skipping per-session metrics (no session_ids in signals)")
+        return
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+
+    session_ids = signals["session_ids"]
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+
+    # Get session names if available
+    idx_to_session = signals.get("idx_to_session", {})
+
+    # Compute per-session metrics
+    session_names = []
+    corr_means = []
+    corr_stds = []
+    r2_means = []
+    mse_means = []
+    n_trials_list = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        n_trials = mask.sum()
+        n_trials_list.append(n_trials)
+
+        sess_name = idx_to_session.get(sess_id, f"Session {sess_id}")
+        session_names.append(sess_name)
+
+        # Compute correlations for this session
+        correlations = np.array([
+            np.corrcoef(signals["target_real"][i, 0, :], signals["target_gen"][i, 0, :])[0, 1]
+            for i in np.where(mask)[0]
+        ])
+        corr_means.append(np.mean(correlations))
+        corr_stds.append(np.std(correlations))
+
+        # Compute R2
+        real_flat = signals["target_real"][mask].flatten()
+        gen_flat = signals["target_gen"][mask].flatten()
+        ss_res = np.sum((real_flat - gen_flat) ** 2)
+        ss_tot = np.sum((real_flat - real_flat.mean()) ** 2)
+        r2 = 1 - (ss_res / (ss_tot + 1e-10))
+        r2_means.append(r2)
+
+        # Compute MSE
+        mse = np.mean((signals["target_real"][mask] - signals["target_gen"][mask]) ** 2)
+        mse_means.append(mse)
+
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    x = np.arange(n_sessions)
+    width = 0.6
+
+    # Plot 1: Correlation by session
+    ax = axes[0, 0]
+    bars = ax.bar(x, corr_means, width, yerr=corr_stds, capsize=4,
+                  color=COLORS["generated"], alpha=0.8, edgecolor='black')
+    ax.axhline(np.mean(corr_means), color='red', linestyle='--', label=f'Mean: {np.mean(corr_means):.3f}')
+    ax.set_xticks(x)
+    ax.set_xticklabels(session_names, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel("Correlation", fontsize=11)
+    ax.set_title("Correlation by Session", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.set_ylim([0, 1])
+
+    # Color bars by performance
+    for bar, val in zip(bars, corr_means):
+        if val > np.mean(corr_means):
+            bar.set_color('#2ecc71')  # Green for above average
+        else:
+            bar.set_color('#e74c3c')  # Red for below average
+
+    # Plot 2: R² by session
+    ax = axes[0, 1]
+    bars = ax.bar(x, r2_means, width, color=COLORS["forward"], alpha=0.8, edgecolor='black')
+    ax.axhline(np.mean(r2_means), color='red', linestyle='--', label=f'Mean: {np.mean(r2_means):.3f}')
+    ax.set_xticks(x)
+    ax.set_xticklabels(session_names, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel("R²", fontsize=11)
+    ax.set_title("R² by Session", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+
+    # Plot 3: MSE by session
+    ax = axes[1, 0]
+    bars = ax.bar(x, mse_means, width, color=COLORS["reverse"], alpha=0.8, edgecolor='black')
+    ax.axhline(np.mean(mse_means), color='red', linestyle='--', label=f'Mean: {np.mean(mse_means):.4f}')
+    ax.set_xticks(x)
+    ax.set_xticklabels(session_names, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel("MSE", fontsize=11)
+    ax.set_title("MSE by Session", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+
+    # Plot 4: Trial count by session
+    ax = axes[1, 1]
+    bars = ax.bar(x, n_trials_list, width, color='steelblue', alpha=0.8, edgecolor='black')
+    ax.axhline(np.mean(n_trials_list), color='red', linestyle='--', label=f'Mean: {np.mean(n_trials_list):.0f}')
+    ax.set_xticks(x)
+    ax.set_xticklabels(session_names, rotation=45, ha='right', fontsize=9)
+    ax.set_ylabel("Number of Trials", fontsize=11)
+    ax.set_title("Trial Count by Session", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+
+    plt.suptitle(f"Per-Session Performance Summary: {tgt}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "42_per_session_metrics", formats)
+    plt.close(fig)
+
+
+def plot_per_session_signal_examples(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+    n_examples_per_session: int = 2,
+):
+    """Plot 43: Signal examples from each session.
+
+    Shows representative examples from each recording session.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    if "session_ids" not in signals:
+        print("  Skipping per-session signal examples (no session_ids)")
+        return
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+
+    session_ids = signals["session_ids"]
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+    idx_to_session = signals.get("idx_to_session", {})
+
+    T = signals["target_real"].shape[-1]
+    time = np.arange(T) / fs + 0.5
+
+    rng = np.random.RandomState(42)
+
+    # Create figure
+    fig, axes = plt.subplots(n_sessions, n_examples_per_session,
+                             figsize=(5*n_examples_per_session, 2.5*n_sessions))
+    if n_sessions == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, sess_id in enumerate(unique_sessions):
+        mask = session_ids == sess_id
+        sess_indices = np.where(mask)[0]
+        sess_name = idx_to_session.get(sess_id, f"Session {sess_id}")
+
+        # Compute correlations for this session to show representative examples
+        correlations = np.array([
+            np.corrcoef(signals["target_real"][idx, 0, :], signals["target_gen"][idx, 0, :])[0, 1]
+            for idx in sess_indices
+        ])
+
+        # Select examples: median performers (representative)
+        sorted_idx = np.argsort(correlations)
+        mid = len(sorted_idx) // 2
+        selected = sess_indices[sorted_idx[max(0, mid-1):mid+n_examples_per_session-1]]
+
+        for j, idx in enumerate(selected[:n_examples_per_session]):
+            ax = axes[i, j]
+
+            real = signals["target_real"][idx, 0, :]
+            gen = signals["target_gen"][idx, 0, :]
+            corr = np.corrcoef(real, gen)[0, 1]
+
+            ax.plot(time, real, color=COLORS["real"], alpha=0.8, linewidth=1, label="Real")
+            ax.plot(time, gen, color=COLORS["generated"], alpha=0.8, linewidth=1, label="Gen")
+            ax.axvline(x=2.0, color="gray", linestyle="--", alpha=0.3)
+
+            ax.set_title(f"Trial {idx} (r={corr:.3f})", fontsize=10)
+
+            if j == 0:
+                ax.set_ylabel(f"{sess_name}\nAmplitude", fontsize=9)
+            if i == n_sessions - 1:
+                ax.set_xlabel("Time (s)", fontsize=9)
+            if i == 0 and j == 0:
+                ax.legend(fontsize=7, loc="upper right")
+
+            ax.tick_params(labelsize=8)
+
+    plt.suptitle(f"Per-Session Signal Examples: {tgt}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "43_per_session_signals", formats)
+    plt.close(fig)
+
+
+def plot_correlation_distribution_by_odor(
+    signals: Dict[str, np.ndarray],
+    output_dir: Path,
+    formats: List[str] = None,
+    fs: float = SAMPLING_RATE_HZ,
+):
+    """Plot 44: Correlation distribution violin plot by odor.
+
+    Shows the distribution of per-trial correlations for each odor/condition.
+    """
+    if formats is None:
+        formats = ["png", "svg", "pdf"]
+
+    labels = get_region_labels(signals)
+    tgt = labels["target"]
+    condition_name = labels.get("condition", "Odor")
+
+    odor_names = np.array(signals["odor_names"])
+    unique_odors = np.unique(odor_names)
+    n_odors = len(unique_odors)
+
+    # Compute per-trial correlations
+    n_trials = signals["target_real"].shape[0]
+    correlations = np.array([
+        np.corrcoef(signals["target_real"][i, 0, :], signals["target_gen"][i, 0, :])[0, 1]
+        for i in range(n_trials)
+    ])
+
+    # Organize by odor
+    odor_correlations = {odor: correlations[odor_names == odor] for odor in unique_odors}
+
+    # Create figure
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Plot 1: Violin plot
+    ax = axes[0]
+    positions = np.arange(n_odors)
+    violin_data = [odor_correlations[odor] for odor in unique_odors]
+
+    parts = ax.violinplot(violin_data, positions=positions, showmeans=True, showextrema=True)
+    for pc in parts['bodies']:
+        pc.set_facecolor(COLORS["generated"])
+        pc.set_alpha(0.7)
+    parts['cmeans'].set_color('red')
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(unique_odors, rotation=45, ha='right', fontsize=10)
+    ax.set_ylabel("Correlation", fontsize=11)
+    ax.set_xlabel(condition_name, fontsize=11)
+    ax.set_title(f"Correlation Distribution by {condition_name}", fontsize=12, fontweight="bold")
+    ax.axhline(np.mean(correlations), color='gray', linestyle='--', alpha=0.5, label=f'Overall mean: {np.mean(correlations):.3f}')
+    ax.legend(fontsize=9)
+    ax.set_ylim([min(0, correlations.min()-0.1), 1.05])
+
+    # Plot 2: Box plot with individual points
+    ax = axes[1]
+    bp = ax.boxplot(violin_data, positions=positions, patch_artist=True, widths=0.6)
+    for patch in bp['boxes']:
+        patch.set_facecolor(COLORS["forward"])
+        patch.set_alpha(0.7)
+
+    # Add individual points with jitter
+    for i, odor in enumerate(unique_odors):
+        y = odor_correlations[odor]
+        x = np.random.normal(i, 0.1, size=len(y))
+        ax.scatter(x, y, alpha=0.3, color='black', s=10)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(unique_odors, rotation=45, ha='right', fontsize=10)
+    ax.set_ylabel("Correlation", fontsize=11)
+    ax.set_xlabel(condition_name, fontsize=11)
+    ax.set_title(f"Correlation Box Plot by {condition_name}", fontsize=12, fontweight="bold")
+
+    # Add mean annotation for each odor
+    means = [np.mean(odor_correlations[odor]) for odor in unique_odors]
+    for i, m in enumerate(means):
+        ax.annotate(f'{m:.3f}', xy=(i, m), xytext=(5, 0), textcoords='offset points',
+                   fontsize=8, color='red', fontweight='bold')
+
+    plt.suptitle(f"Per-{condition_name} Correlation Analysis: {tgt}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    save_figure(fig, output_dir, "44_correlation_by_odor", formats)
+    plt.close(fig)
+
+
+# =============================================================================
+# Training Integration API
+# =============================================================================
+
+def generate_training_plots(
+    model_fwd: nn.Module,
+    model_rev: nn.Module,
+    spectral_shift_fwd: nn.Module,
+    spectral_shift_rev: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+    vocab: Dict[str, int],
+    output_dir: Path,
+    config: Optional[Dict[str, Any]] = None,
+    session_ids: Optional[np.ndarray] = None,
+    idx_to_session: Optional[Dict[int, str]] = None,
+    formats: List[str] = None,
+    quick: bool = True,
+):
+    """Generate validation plots after training.
+
+    This is the main API for generating plots from train.py at the end of training.
+
+    Args:
+        model_fwd: Forward translation model (already on device)
+        model_rev: Reverse translation model (already on device)
+        spectral_shift_fwd: SpectralShift for forward output
+        spectral_shift_rev: SpectralShift for reverse output
+        dataloader: DataLoader for validation/test data
+        device: Torch device
+        vocab: Label vocabulary (name → id)
+        output_dir: Directory to save plots
+        config: Model/dataset config with 'source_name', 'target_name', 'sampling_rate'
+        session_ids: Optional array of session IDs for each sample
+        idx_to_session: Optional mapping from session ID to session name
+        formats: Output formats (default: png only for training speed)
+        quick: If True, only generate essential plots (galleries, per-odor, per-session)
+
+    Returns:
+        Dict with summary metrics
+    """
+    if formats is None:
+        formats = ["png"]  # Quick mode only saves PNG
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "="*60)
+    print("GENERATING VALIDATION PLOTS")
+    print("="*60)
+
+    # Generate signals
+    print("Generating signals from validation data...")
+    signals = generate_signals(
+        model_fwd, model_rev,
+        spectral_shift_fwd, spectral_shift_rev,
+        dataloader, device, vocab,
+        config=config,
+    )
+
+    # Add session info if provided
+    if session_ids is not None:
+        signals["session_ids"] = session_ids
+    if idx_to_session is not None:
+        signals["idx_to_session"] = idx_to_session
+
+    print(f"  Generated {signals['target_gen'].shape[0]} samples")
+
+    fs = config.get("sampling_rate", SAMPLING_RATE_HZ) if config else SAMPLING_RATE_HZ
+
+    # Define which plots to generate
+    if quick:
+        # Essential plots only
+        plot_functions = [
+            ("39_per_odor_signal_gallery", plot_per_odor_signal_gallery),
+            ("40_success_gallery", plot_success_gallery),
+            ("41_failure_gallery", plot_failure_gallery),
+            ("42_per_session_metrics", plot_per_session_metrics),
+            ("43_per_session_signals", plot_per_session_signal_examples),
+            ("44_correlation_by_odor", plot_correlation_distribution_by_odor),
+            ("16_example_trials", plot_example_trials),
+            ("06_correlation_histogram", plot_correlation_histogram),
+        ]
+    else:
+        # All gallery and summary plots
+        plot_functions = [
+            ("01_psd_comparison", plot_psd_comparison),
+            ("03_mean_waveform", plot_mean_waveform),
+            ("06_correlation_histogram", plot_correlation_histogram),
+            ("14_channel_performance", plot_channel_performance),
+            ("16_example_trials", plot_example_trials),
+            ("22_odor_metrics_heatmap", plot_odor_metrics_heatmap),
+            ("39_per_odor_signal_gallery", plot_per_odor_signal_gallery),
+            ("40_success_gallery", plot_success_gallery),
+            ("41_failure_gallery", plot_failure_gallery),
+            ("42_per_session_metrics", plot_per_session_metrics),
+            ("43_per_session_signals", plot_per_session_signal_examples),
+            ("44_correlation_by_odor", plot_correlation_distribution_by_odor),
+        ]
+
+    print(f"Generating {len(plot_functions)} plots...")
+
+    import inspect
+    for plot_name, plot_func in plot_functions:
+        try:
+            sig = inspect.signature(plot_func)
+            if 'fs' in sig.parameters:
+                plot_func(signals, output_dir, formats, fs=fs)
+            else:
+                plot_func(signals, output_dir, formats)
+            print(f"  Saved: {plot_name}")
+        except Exception as e:
+            print(f"  ERROR in {plot_name}: {e}")
+
+    # Compute summary metrics
+    print("\nComputing summary metrics...")
+    metrics = compute_summary_metrics(signals, fs=fs)
+
+    metrics_path = output_dir / "training_summary_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics to: {metrics_path}")
+
+    print(f"\nPlots saved to: {output_dir}")
+    print("="*60)
+
+    return metrics
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -4633,17 +5292,27 @@ def main():
     print(f"Source signal shape: {signals['source_real'].shape}")
     print(f"Target signal shape: {signals['target_real'].shape}")
 
+    # Add session info to signals if available (for per-session plots)
+    if "session_ids" in data:
+        # Get the indices from the split being evaluated
+        split_key = f"{args.split}_idx"
+        if split_key in data:
+            split_indices = data[split_key]
+            signals["session_ids"] = data["session_ids"][split_indices]
+            signals["idx_to_session"] = data.get("idx_to_session", {})
+            print(f"  Added session info for {len(np.unique(signals['session_ids']))} sessions")
+
     # Handle --only_gradient_analysis shortcut
     if args.only_gradient_analysis:
         args.skip_plots = True
         args.run_gradient_analysis = True
         config["enable_gradient_analysis"] = True
 
-    # Generate all plots (38 total) - skip if --skip_plots
+    # Generate all plots (44 total) - skip if --skip_plots
     if args.skip_plots:
         print("\nSkipping standard plots (--skip_plots enabled)")
     else:
-        print("\nGenerating plots (38 total)...")
+        print("\nGenerating plots (44 total)...")
 
     # Define all plot functions (name without extension, function)
     plot_functions = [
@@ -4690,6 +5359,13 @@ def main():
         # Phase-Amplitude Coupling (PAC) plots (37-38)
         ("37_pac_comodulogram", plot_pac_comodulogram),
         ("38_pac_modulation_index", plot_pac_modulation_index),
+        # Gallery and per-session plots (39-44)
+        ("39_per_odor_signal_gallery", plot_per_odor_signal_gallery),
+        ("40_success_gallery", plot_success_gallery),
+        ("41_failure_gallery", plot_failure_gallery),
+        ("42_per_session_metrics", plot_per_session_metrics),
+        ("43_per_session_signals", plot_per_session_signal_examples),
+        ("44_correlation_by_odor", plot_correlation_distribution_by_odor),
     ]
 
     # Skip plots if --skip_plots or --only_gradient_analysis
