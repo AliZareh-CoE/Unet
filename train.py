@@ -193,6 +193,8 @@ DEFAULT_CONFIG = {
     "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
 
     # Data augmentation (applied during training only)
+    # Master toggle - set to False to disable ALL augmentations at once
+    "aug_enabled": True,            # Master switch for all augmentations
     # HEAVY augmentation for cross-session generalization
     "aug_time_shift": True,         # Random circular time shift
     "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
@@ -256,8 +258,10 @@ DEFAULT_CONFIG = {
     # This tests true cross-session generalization (harder but more realistic)
     "split_by_session": False,  # Use session-based holdout instead of random splits
     "n_test_sessions": 1,       # Number of sessions to hold out for testing
-    "n_val_sessions": 1,        # Number of sessions to hold out for validation
+    "n_val_sessions": 4,        # Number of sessions to hold out for validation
     "session_column": "recording_id",  # CSV column containing session/recording IDs
+    "no_test_set": True,        # If True, no test set - all held-out sessions for validation
+    "separate_val_sessions": True,  # If True, evaluate each val session separately
 }
 
 
@@ -734,6 +738,10 @@ def apply_augmentations(
     Returns:
         Tuple of (augmented_ob, augmented_pcx)
     """
+    # Master toggle - if disabled, skip ALL augmentations
+    if not config.get("aug_enabled", True):
+        return ob, pcx
+
     # Time shift: apply same shift to both (maintains correspondence)
     if config.get("aug_time_shift", False):
         max_shift = config.get("aug_time_shift_max", 0.1)
@@ -2620,6 +2628,21 @@ def train(
                 cond_encoder=cond_encoder,
             )
 
+            # Per-session validation (if separate_val_sessions is enabled)
+            per_session_metrics = {}
+            if "val_sessions" in loaders and config.get("separate_val_sessions", False):
+                for sess_name, sess_loader in loaders["val_sessions"].items():
+                    sess_metrics = evaluate(
+                        model, sess_loader, device, wavelet_loss,
+                        compute_phase=False, reverse_model=reverse_model, config=config,
+                        spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+                        disable_spectral=use_two_stage,
+                        fast_mode=True,
+                        sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                        cond_encoder=cond_encoder,
+                    )
+                    per_session_metrics[sess_name] = sess_metrics
+
             # Sync val_loss across ranks (for early stopping)
             val_loss = val_metrics.get("loss", val_metrics["mae"])  # fallback to mae if no composite
             if dist.is_initialized():
@@ -2665,9 +2688,22 @@ def train(
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
                       f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
                       f"Best: {best_val_loss:.3f}")
+
+                # Print per-session metrics if available
+                if per_session_metrics:
+                    sess_strs = []
+                    for sess_name, sess_m in per_session_metrics.items():
+                        sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
+                    print("  Per-session: " + " | ".join(sess_strs))
+
                 sys.stdout.flush()
 
-            history.append({"epoch": epoch, **train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}})
+            # Build history entry with per-session metrics if available
+            history_entry = {"epoch": epoch, **train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
+            for sess_name, sess_m in per_session_metrics.items():
+                for k, v in sess_m.items():
+                    history_entry[f"val_{sess_name}_{k}"] = v
+            history.append(history_entry)
 
             # =========================================================================
             # Recording: Log epoch metrics and run periodic analyses
@@ -3180,6 +3216,14 @@ def parse_args():
                         help="Explicit session names for val set (e.g., --val-sessions 170609 170619)")
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
+    parser.add_argument("--no-test-set", action="store_true", default=None,
+                        help="No test set - all held-out sessions are used for validation only")
+    parser.add_argument("--with-test-set", action="store_false", dest="no_test_set",
+                        help="Keep test set (default)")
+    parser.add_argument("--separate-val-sessions", action="store_true", default=None,
+                        help="Evaluate each validation session separately (per-session metrics)")
+    parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
+                        help="Combine all validation sessions (default)")
 
     # Contrastive learning for cross-session generalization (CEBRA-style)
     parser.add_argument("--use-contrastive", action="store_true", default=None,
@@ -3260,6 +3304,12 @@ def parse_args():
                         help="Disable per-channel normalization")
 
     # Data augmentation (default=None means use config value, not override)
+    # Master toggle for all augmentations
+    parser.add_argument("--aug-enabled", action="store_true", default=None,
+                        help="Enable ALL data augmentations (master switch)")
+    parser.add_argument("--no-aug", "--no-augmentation", action="store_false", dest="aug_enabled",
+                        help="Disable ALL data augmentations (master switch)")
+    # Individual augmentation toggles
     parser.add_argument("--aug-time-shift", action="store_true", default=None,
                         help="Enable random circular time shift augmentation")
     parser.add_argument("--no-aug-time-shift", action="store_false", dest="aug_time_shift",
@@ -3386,6 +3436,10 @@ def main():
         config["n_val_sessions"] = args.n_val_sessions
     if args.session_column is not None:
         config["session_column"] = args.session_column
+    if args.no_test_set is not None:
+        config["no_test_set"] = args.no_test_set
+    if args.separate_val_sessions is not None:
+        config["separate_val_sessions"] = args.separate_val_sessions
 
     # Contrastive learning config (CLI overrides config)
     if args.use_contrastive:
@@ -3412,8 +3466,13 @@ def main():
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
-        print(f"Using SESSION-BASED SPLITS: {config['n_test_sessions']} test, {config['n_val_sessions']} val sessions")
+        if config.get("no_test_set", False):
+            print(f"Using SESSION-BASED SPLITS: NO TEST SET, {config['n_val_sessions']} val sessions")
+        else:
+            print(f"Using SESSION-BASED SPLITS: {config['n_test_sessions']} test, {config['n_val_sessions']} val sessions")
         print(f"Session column: {config['session_column']}")
+        if config.get("separate_val_sessions", False):
+            print("  Per-session validation ENABLED (metrics reported per session)")
 
     # Load data based on dataset choice
     if args.dataset == "pfc":
@@ -3443,6 +3502,8 @@ def main():
             seed=config["seed"],
             test_sessions=args.test_sessions,
             val_sessions=args.val_sessions,
+            no_test_set=config.get("no_test_set", False),
+            separate_val_sessions=config.get("separate_val_sessions", False),
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
@@ -3492,6 +3553,9 @@ def main():
             print("Bidirectional training DISABLED (--no-bidirectional)")
 
     # Data augmentation config from CLI (only override if explicitly set, not None)
+    # Master toggle first
+    if args.aug_enabled is not None:
+        config["aug_enabled"] = args.aug_enabled
     if args.aug_time_shift is not None:
         config["aug_time_shift"] = args.aug_time_shift
     if args.aug_time_shift_max is not None:
@@ -3527,19 +3591,25 @@ def main():
     if args.aug_freq_mask_max_width is not None:
         config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
 
-    # Print augmentation config if any are enabled
-    aug_enabled = [
-        k for k in [
-            "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
-            "aug_time_mask", "aug_mixup", "aug_freq_mask",
-            "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
-        ]
-        if config.get(k, False)
-    ]
-    if aug_enabled and is_primary():
-        print(f"Data augmentation ENABLED: {', '.join(aug_enabled)}")
-        if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
-            print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
+    # Print augmentation config
+    if is_primary():
+        if not config.get("aug_enabled", True):
+            print("Data augmentation DISABLED (master toggle off)")
+        else:
+            aug_active = [
+                k for k in [
+                    "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
+                    "aug_time_mask", "aug_mixup", "aug_freq_mask",
+                    "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
+                ]
+                if config.get(k, False)
+            ]
+            if aug_active:
+                print(f"Data augmentation ENABLED: {', '.join(aug_active)}")
+                if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
+                    print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
+            else:
+                print("Data augmentation: all individual augmentations disabled")
 
     # Loss function selection (for tier1 fair comparison)
     # Only override config if --loss is explicitly provided
