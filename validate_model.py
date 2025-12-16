@@ -5249,7 +5249,24 @@ def main():
     if split_key in checkpoint_split_info:
         # Use the SAME indices that were used during training!
         split_indices = np.array(checkpoint_split_info[split_key])
-        print(f"  Using {args.split} indices from checkpoint ({len(split_indices)} samples)")
+
+        # Handle empty split (e.g., test split when no_test_set=True)
+        if len(split_indices) == 0:
+            # Try to fall back to val split if test is empty
+            if args.split == "test" and "val_idx" in checkpoint_split_info:
+                print(f"  WARNING: test split has 0 samples (no_test_set mode was used)")
+                print(f"  Automatically falling back to validation split...")
+                split_indices = np.array(checkpoint_split_info["val_idx"])
+                args.split = "val"  # Update for downstream code
+                print(f"  Using val indices from checkpoint ({len(split_indices)} samples)")
+            else:
+                raise ValueError(
+                    f"Split '{args.split}' has 0 samples in checkpoint. "
+                    f"Available splits: {[k.replace('_idx', '') for k in checkpoint_split_info.keys() if k.endswith('_idx')]}. "
+                    f"Try using --split val"
+                )
+        else:
+            print(f"  Using {args.split} indices from checkpoint ({len(split_indices)} samples)")
 
         # Print session info if available
         if "val_sessions" in checkpoint_split_info and args.split == "val":
