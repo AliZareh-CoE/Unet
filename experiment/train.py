@@ -2902,6 +2902,16 @@ def parse_args():
     parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
                         help="Combine all validation sessions (default)")
 
+    # Covariance augmentation for cross-session robustness
+    parser.add_argument("--cov-aug", action="store_true", default=None,
+                        help="Enable covariance augmentation (generates synthetic sessions)")
+    parser.add_argument("--no-cov-aug", action="store_false", dest="cov_aug",
+                        help="Disable covariance augmentation")
+    parser.add_argument("--cov-aug-strength", type=float, default=None,
+                        help="Covariance perturbation strength (0-1, default: 0.3)")
+    parser.add_argument("--cov-aug-n-synthetic", type=int, default=None,
+                        help="Number of synthetic sessions per real session (default: 3)")
+
     # Conditioning mode override
     COND_MODES = ["none", "cross_attn_gated"]
     parser.add_argument("--cond-mode", type=str, default=None,
@@ -3105,6 +3115,19 @@ def main():
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
 
+    # Covariance augmentation config (CLI overrides config)
+    if args.cov_aug is not None:
+        config["use_covariance_augmentation"] = args.cov_aug
+    if args.cov_aug_strength is not None:
+        config["cov_aug_strength"] = args.cov_aug_strength
+    if args.cov_aug_n_synthetic is not None:
+        config["cov_aug_n_synthetic"] = args.cov_aug_n_synthetic
+
+    # Print covariance augmentation info
+    if is_primary() and config.get("use_covariance_augmentation", False):
+        print(f"Covariance Augmentation ENABLED: strength={config['cov_aug_strength']}, "
+              f"n_synthetic={config['cov_aug_n_synthetic']}")
+
     # Print session split info
     if is_primary() and config["split_by_session"]:
         if config.get("no_test_set", False):
@@ -3145,6 +3168,10 @@ def main():
             val_sessions=args.val_sessions,
             no_test_set=config.get("no_test_set", False),
             separate_val_sessions=config.get("separate_val_sessions", False),
+            # Covariance augmentation
+            use_covariance_augmentation=config.get("use_covariance_augmentation", False),
+            cov_aug_strength=config.get("cov_aug_strength", 0.3),
+            cov_aug_n_synthetic=config.get("cov_aug_n_synthetic", 3),
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
