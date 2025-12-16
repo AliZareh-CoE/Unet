@@ -1174,6 +1174,7 @@ def save_checkpoint(
     spectral_shift_fwd: Optional[nn.Module] = None,
     spectral_shift_rev: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
+    data: Optional[Dict[str, Any]] = None,  # Add data dict for split info
 ) -> None:
     """Save checkpoint with FSDP support (includes all models)."""
     if is_fsdp and isinstance(model, FSDP):
@@ -1184,6 +1185,23 @@ def save_checkpoint(
             # Save model config for compatibility checking
             "cond_mode": config.get("cond_mode", "unknown") if config else "unknown",
         }
+
+        # Save full config for validation
+        if config is not None:
+            checkpoint["config"] = config
+
+        # Save split info for validation to use same sessions
+        if data is not None:
+            split_info = {}
+            if "split_info" in data:
+                split_info = data["split_info"].copy()
+            if "val_idx" in data:
+                split_info["val_idx"] = data["val_idx"].tolist() if hasattr(data["val_idx"], 'tolist') else list(data["val_idx"])
+            if "test_idx" in data:
+                split_info["test_idx"] = data["test_idx"].tolist() if hasattr(data["test_idx"], 'tolist') else list(data["test_idx"])
+            if "train_idx" in data:
+                split_info["train_idx"] = data["train_idx"].tolist() if hasattr(data["train_idx"], 'tolist') else list(data["train_idx"])
+            checkpoint["split_info"] = split_info
 
         # Save forward model
         with FSDP.state_dict_type(
@@ -1222,6 +1240,24 @@ def save_checkpoint(
                 # Save model config for compatibility checking
                 "cond_mode": config.get("cond_mode", "unknown") if config else "unknown",
             }
+
+            # Save full config for validation
+            if config is not None:
+                checkpoint["config"] = config
+
+            # Save split info for validation to use same sessions
+            if data is not None:
+                split_info = {}
+                if "split_info" in data:
+                    split_info = data["split_info"].copy()
+                if "val_idx" in data:
+                    split_info["val_idx"] = data["val_idx"].tolist() if hasattr(data["val_idx"], 'tolist') else list(data["val_idx"])
+                if "test_idx" in data:
+                    split_info["test_idx"] = data["test_idx"].tolist() if hasattr(data["test_idx"], 'tolist') else list(data["test_idx"])
+                if "train_idx" in data:
+                    split_info["train_idx"] = data["train_idx"].tolist() if hasattr(data["train_idx"], 'tolist') else list(data["train_idx"])
+                checkpoint["split_info"] = split_info
+
             # Save reverse model if exists
             if reverse_model is not None:
                 rev_state = reverse_model.module.state_dict() if hasattr(reverse_model, 'module') else reverse_model.state_dict()
@@ -2675,6 +2711,7 @@ def train(
                     spectral_shift_fwd=spectral_shift_fwd,
                     spectral_shift_rev=spectral_shift_rev,
                     config=config,
+                    data=data,  # Save split info for validation
                 )
             else:
                 patience_counter += 1
