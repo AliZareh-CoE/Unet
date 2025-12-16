@@ -3839,13 +3839,14 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Print detailed traceback for debugging distributed training crashes
+        # Print detailed traceback only from rank 0 to avoid duplicate output
         rank = int(os.environ.get("RANK", 0))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        print(f"\n{'='*70}", file=sys.stderr, flush=True)
-        print(f"FATAL ERROR on rank {rank} (local_rank {local_rank})", file=sys.stderr, flush=True)
-        print(f"{'='*70}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        print(f"{'='*70}\n", file=sys.stderr, flush=True)
-        sys.stderr.flush()
+        if rank == 0:
+            print(f"\n{'='*70}", file=sys.stderr, flush=True)
+            print(f"FATAL ERROR on rank {rank} (local_rank {local_rank})", file=sys.stderr, flush=True)
+            print(f"{'='*70}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            print(f"{'='*70}\n", file=sys.stderr, flush=True)
+            sys.stderr.flush()
         raise
