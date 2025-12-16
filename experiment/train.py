@@ -227,14 +227,6 @@ DEFAULT_CONFIG = {
     "aug_dc_offset": True,          # Random DC offset per channel
     "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
 
-    # Contrastive learning for session-invariant representations
-    "use_contrastive": False,       # Enable CEBRA-style contrastive learning
-    "contrastive_weight": 0.1,      # Weight for contrastive loss
-    "contrastive_temperature": 0.1, # Temperature for InfoNCE loss
-    "contrastive_mode": "temporal", # "temporal" (true CEBRA) or "label" (behavior-supervised)
-    "contrastive_time_delta": 10,   # Time delta (in samples) for temporal positive pairs
-    "contrastive_num_samples": 32,  # Number of time points to sample per trial
-
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
 
@@ -850,226 +842,6 @@ def apply_augmentations(
         pcx = aug_dc_offset(pcx, offset_range)
 
     return ob, pcx
-
-
-# =============================================================================
-# Contrastive Learning for Session-Invariant Representations
-# =============================================================================
-
-class ProjectionHead(nn.Module):
-    """MLP projection head for contrastive learning.
-
-    Projects encoder features to a lower-dimensional embedding space
-    where contrastive loss is applied.
-    """
-    def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def info_nce_loss(
-    embeddings: torch.Tensor,
-    labels: torch.Tensor,
-    temperature: float = 0.1
-) -> torch.Tensor:
-    """InfoNCE contrastive loss (CEBRA-style).
-
-    Pulls together samples with the same label (odor), pushes apart different labels.
-    This encourages the model to learn odor-specific representations that are
-    invariant to session-specific noise (since different augmentations simulate
-    different sessions).
-
-    Args:
-        embeddings: (batch, embedding_dim) normalized embeddings
-        labels: (batch,) odor labels
-        temperature: Temperature for softmax (lower = sharper)
-
-    Returns:
-        Scalar InfoNCE loss
-    """
-    # Normalize embeddings
-    embeddings = F.normalize(embeddings, dim=1)
-
-    batch_size = embeddings.shape[0]
-    if batch_size < 2:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    # Compute similarity matrix
-    sim_matrix = torch.mm(embeddings, embeddings.t()) / temperature
-
-    # Create mask for positive pairs (same odor)
-    labels = labels.view(-1, 1)
-    pos_mask = (labels == labels.t()).float()
-
-    # Remove diagonal (self-similarity)
-    eye_mask = torch.eye(batch_size, device=embeddings.device)
-    pos_mask = pos_mask - eye_mask
-
-    # Check if there are any positive pairs
-    if pos_mask.sum() == 0:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    # For numerical stability, subtract max
-    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
-
-    # Compute log-softmax over all pairs (excluding self)
-    exp_sim = torch.exp(sim_matrix) * (1 - eye_mask)
-    log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
-
-    # Mean log-probability over positive pairs
-    pos_log_prob = (log_prob * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-8)
-
-    # Only include samples that have at least one positive pair
-    valid_mask = pos_mask.sum(dim=1) > 0
-    if valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    loss = -pos_log_prob[valid_mask].mean()
-
-    return loss
-
-
-def temporal_info_nce_loss(
-    features: torch.Tensor,
-    temperature: float = 0.1,
-    time_delta: int = 10,
-    num_samples: int = 32,
-) -> torch.Tensor:
-    """True CEBRA temporal contrastive loss.
-
-    Forms positive pairs from time points that are close in time (within delta),
-    and negative pairs from time points that are far apart.
-
-    This is the core innovation of CEBRA: learning embeddings where temporally
-    adjacent neural states map to similar embeddings, capturing the smooth
-    temporal dynamics of neural activity.
-
-    Args:
-        features: (batch, channels, time) bottleneck features (NOT pooled)
-        temperature: Temperature for softmax (lower = sharper)
-        time_delta: Maximum time offset for positive pairs (in samples)
-        num_samples: Number of time points to sample per trial
-
-    Returns:
-        Scalar InfoNCE loss
-    """
-    batch_size, n_channels, time_len = features.shape
-    device = features.device
-
-    if time_len < 2 * time_delta + 1:
-        # Signal too short for temporal contrastive learning
-        return torch.tensor(0.0, device=device)
-
-    # Sample anchor time indices (avoid edges to allow positive sampling)
-    # Valid range: [time_delta, time_len - time_delta - 1]
-    valid_start = time_delta
-    valid_end = time_len - time_delta
-    valid_range = valid_end - valid_start
-
-    if valid_range <= 0:
-        return torch.tensor(0.0, device=device)
-
-    # Limit number of samples to available range
-    actual_num_samples = min(num_samples, valid_range)
-
-    # Sample random anchor indices for each item in batch
-    # Shape: (batch, num_samples)
-    anchor_indices = torch.randint(
-        valid_start, valid_end, (batch_size, actual_num_samples), device=device
-    )
-
-    # Sample positive indices (within time_delta of anchor)
-    # For each anchor, sample a positive within [-time_delta, +time_delta] (excluding 0)
-    pos_offsets = torch.randint(-time_delta, time_delta + 1, (batch_size, actual_num_samples), device=device)
-    # Avoid sampling the anchor itself
-    pos_offsets = torch.where(pos_offsets == 0, torch.ones_like(pos_offsets), pos_offsets)
-    positive_indices = anchor_indices + pos_offsets
-
-    # Clamp to valid range
-    positive_indices = positive_indices.clamp(0, time_len - 1)
-
-    # Extract features at anchor and positive positions
-    # features: (batch, channels, time) -> need to gather at specific time indices
-    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, actual_num_samples)
-
-    # Gather anchor features: (batch, num_samples, channels)
-    anchor_feats = features.permute(0, 2, 1)[batch_idx, anchor_indices]  # (batch, num_samples, channels)
-    positive_feats = features.permute(0, 2, 1)[batch_idx, positive_indices]  # (batch, num_samples, channels)
-
-    # Flatten batch and samples: (batch * num_samples, channels)
-    anchor_flat = anchor_feats.reshape(-1, n_channels)
-    positive_flat = positive_feats.reshape(-1, n_channels)
-
-    # Normalize embeddings
-    anchor_flat = F.normalize(anchor_flat, dim=1)
-    positive_flat = F.normalize(positive_flat, dim=1)
-
-    n_total = anchor_flat.shape[0]
-    if n_total < 2:
-        return torch.tensor(0.0, device=device)
-
-    # Compute similarity matrix: each anchor against all positives
-    # Using all positives from all anchors as the candidate pool (contrastive negatives)
-    sim_matrix = torch.mm(anchor_flat, positive_flat.t()) / temperature
-
-    # The diagonal contains the positive pairs (anchor_i with positive_i)
-    # All off-diagonal entries are negatives (from different anchors or different trials)
-
-    # For numerical stability
-    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
-
-    # Create labels: each anchor should match its corresponding positive (diagonal)
-    labels = torch.arange(n_total, device=device)
-
-    # Cross-entropy loss (each anchor should be closest to its positive)
-    loss = F.cross_entropy(sim_matrix, labels)
-
-    return loss
-
-
-def get_encoder_features(
-    model: nn.Module,
-    x: torch.Tensor,
-    cond: torch.Tensor
-) -> torch.Tensor:
-    """Extract bottleneck features from the UNet encoder.
-
-    Runs the encoder part of the UNet and returns the bottleneck features
-    (before the decoder). These features are used for contrastive learning.
-
-    Args:
-        model: CondUNet1D model
-        x: Input tensor (batch, channels, time)
-        cond: Conditioning tensor
-
-    Returns:
-        Bottleneck features (batch, feature_dim)
-    """
-    # Get conditioning embedding
-    cond_embed = model.cond_encoder(cond)
-
-    # Run through encoder blocks
-    skips = []
-    h = x
-    for down in model.encoder:
-        h = down(h, cond_embed)
-        skips.append(h)
-
-    # Bottleneck
-    h = model.bottleneck(h, cond_embed)
-
-    # Global average pool to get fixed-size features
-    # h shape: (batch, channels, time)
-    features = h.mean(dim=-1)  # (batch, channels)
-
-    return features
 
 
 def load_checkpoint(
@@ -1718,8 +1490,6 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
-    projection_head_fwd: Optional[nn.Module] = None,
-    projection_head_rev: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1737,10 +1507,6 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
-    if projection_head_fwd is not None:
-        projection_head_fwd.train()
-    if projection_head_rev is not None:
-        projection_head_rev.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1816,32 +1582,10 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-        # If contrastive learning enabled, also get bottleneck features
-        # Note: For temporal CEBRA, projection heads are None but contrastive learning is still used
-        contrastive_mode = config.get("contrastive_mode", "temporal")  # "temporal" (true CEBRA) or "label"
-        use_contrastive = config.get("use_contrastive", False)
-        # For label mode, require projection heads; for temporal mode, no projection heads needed
-        if contrastive_mode == "label" and projection_head_fwd is None:
-            use_contrastive = False
-        use_temporal_cebra = use_contrastive and contrastive_mode == "temporal"
         if cond_emb is not None:
-            fwd_result = model(
-                ob, cond_emb=cond_emb,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
+            pred_raw = model(ob, cond_emb=cond_emb)
         else:
-            fwd_result = model(
-                ob, odor,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
-
-        if use_contrastive:
-            pred_raw, bottleneck_fwd = fwd_result
-        else:
-            pred_raw = fwd_result
-            bottleneck_fwd = None
+            pred_raw = model(ob, odor)
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -1895,27 +1639,12 @@ def train_epoch(
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
 
         # Bidirectional training with cycle consistency
-        bottleneck_rev = None  # Initialize for contrastive loss check later
         if reverse_model is not None:
             # Reverse: PCx → OB (use same cond_emb from forward - conditioning is symmetric)
-            # If contrastive learning enabled, also get bottleneck features
             if cond_emb is not None:
-                rev_result = reverse_model(
-                    pcx, cond_emb=cond_emb,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
+                pred_rev_raw = reverse_model(pcx, cond_emb=cond_emb)
             else:
-                rev_result = reverse_model(
-                    pcx, odor,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
-
-            if use_contrastive:
-                pred_rev_raw, bottleneck_rev = rev_result
-            else:
-                pred_rev_raw = rev_result
+                pred_rev_raw = reverse_model(pcx, odor)
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
@@ -1975,109 +1704,12 @@ def train_epoch(
                 loss = loss + cycle_loss_pcx
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
-        # Contrastive loss for session-invariant learning (CEBRA-style)
-        # Two modes:
-        # 1. "temporal" (True CEBRA): positive pairs from nearby time points
-        # 2. "label": positive pairs from same odor label
-        if use_contrastive and bottleneck_fwd is not None:
-            contrastive_weight = config.get("contrastive_weight", 0.1)
-            contrastive_temp = config.get("contrastive_temperature", 0.1)
-            time_delta = config.get("contrastive_time_delta", 10)
-            num_samples = config.get("contrastive_num_samples", 32)
-
-            # Debug: Print shapes and stats on first batch of first epoch
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"\n{'='*60}")
-                print(f"CEBRA CONTRASTIVE LEARNING - First Batch Debug")
-                print(f"{'='*60}")
-                print(f"  Mode: {contrastive_mode}")
-                print(f"  Bottleneck features shape: {bottleneck_fwd.shape}")
-                print(f"  Bottleneck dtype: {bottleneck_fwd.dtype}")
-                print(f"  Bottleneck stats: mean={bottleneck_fwd.float().mean().item():.4f}, std={bottleneck_fwd.float().std().item():.4f}")
-
-            if use_temporal_cebra:
-                # TEMPORAL CEBRA: Positive pairs from time points within delta
-                # bottleneck_fwd: (batch, channels, time) - unpooled temporal features
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Time delta: {time_delta} samples")
-                    print(f"  Num samples per trial: {num_samples}")
-                    if bottleneck_fwd.ndim == 3:
-                        print(f"  Temporal extent: {bottleneck_fwd.shape[-1]} time steps")
-
-                # Cast to float32 for stable loss computation
-                contrastive_loss_fwd = temporal_info_nce_loss(
-                    bottleneck_fwd.float(),
-                    temperature=contrastive_temp,
-                    time_delta=time_delta,
-                    num_samples=num_samples
-                )
-            else:
-                # LABEL-BASED: Positive pairs from same odor
-                # bottleneck_fwd: (batch, channels) - pooled features
-                fwd_embed = projection_head_fwd(bottleneck_fwd)  # -> (batch, 128)
-
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Projected embedding shape: {fwd_embed.shape}")
-                    print(f"  Embedding stats: mean={fwd_embed.float().mean().item():.4f}, std={fwd_embed.float().std().item():.4f}")
-                    print(f"  Odor labels in batch: {odor.tolist()}")
-                    print(f"  Unique odors: {odor.unique().tolist()} (n={odor.unique().numel()})")
-                    # Count positive pairs
-                    labels = odor.view(-1, 1)
-                    pos_mask = (labels == labels.t()).float()
-                    n_pos_pairs = (pos_mask.sum() - pos_mask.shape[0]).item()  # Exclude diagonal
-                    print(f"  Positive pairs in batch: {int(n_pos_pairs)} (same odor, different sample)")
-
-                # Cast to float32 for stable loss computation
-                contrastive_loss_fwd = info_nce_loss(fwd_embed.float(), odor, temperature=contrastive_temp)
-
-            loss = loss + contrastive_weight * contrastive_loss_fwd
-            loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
-
-            # Debug: Print loss on first batch of first epoch
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"  Contrastive loss (fwd): {contrastive_loss_fwd.item():.4f}")
-                print(f"  Weighted contrastive (fwd): {(contrastive_weight * contrastive_loss_fwd).item():.4f}")
-
-            # Periodic print every 10 batches on first epoch
-            if is_primary() and epoch == 1 and batch_idx > 0 and batch_idx % 10 == 0:
-                print(f"  [Batch {batch_idx}] Contrastive fwd: {contrastive_loss_fwd.item():.4f}")
-
-            # Reverse direction contrastive loss (on reverse model's bottleneck)
-            if reverse_model is not None and bottleneck_rev is not None:
-                if use_temporal_cebra:
-                    contrastive_loss_rev = temporal_info_nce_loss(
-                        bottleneck_rev.float(),
-                        temperature=contrastive_temp,
-                        time_delta=time_delta,
-                        num_samples=num_samples
-                    )
-                elif projection_head_rev is not None:
-                    rev_embed = projection_head_rev(bottleneck_rev)
-                    contrastive_loss_rev = info_nce_loss(rev_embed.float(), odor, temperature=contrastive_temp)
-                else:
-                    contrastive_loss_rev = torch.tensor(0.0, device=device)
-
-                loss = loss + contrastive_weight * contrastive_loss_rev
-                loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
-
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Contrastive loss (rev): {contrastive_loss_rev.item():.4f}")
-                    print(f"  Weighted contrastive (rev): {(contrastive_weight * contrastive_loss_rev).item():.4f}")
-
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"  Total loss (with contrastive): {loss.item():.4f}")
-                print(f"{'='*60}\n")
-
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
-        if projection_head_fwd is not None:
-            torch.nn.utils.clip_grad_norm_(projection_head_fwd.parameters(), GRAD_CLIP)
-        if projection_head_rev is not None:
-            torch.nn.utils.clip_grad_norm_(projection_head_rev.parameters(), GRAD_CLIP)
             # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
         # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
@@ -2405,64 +2037,6 @@ def train(
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
             print(f"SpectralShift created{ddp_str} mode={mode_str}")
 
-    # Create projection heads for contrastive learning (if enabled)
-    projection_head_fwd = None
-    projection_head_rev = None
-    use_contrastive = config.get("use_contrastive", False)
-    contrastive_mode = config.get("contrastive_mode", "temporal")
-
-    if use_contrastive:
-        # CEBRA-style: Apply contrastive loss on BOTTLENECK features (encoder output)
-        # This encourages the encoder to learn session-invariant representations
-        # Bottleneck dim = min(base_channels * 2^n_downsample, base_channels * 8)
-        base_ch = config.get("base_channels", 64)
-        n_downsample = config.get("n_downsample", 4)
-        bottleneck_dim = min(base_ch * (2 ** n_downsample), base_ch * 8)
-
-        if contrastive_mode == "label":
-            # Label-based mode: need projection heads for pooled features
-            # Create projection heads (small MLP: bottleneck -> 256 -> 128)
-            projection_head_fwd = ProjectionHead(
-                in_dim=bottleneck_dim,  # Bottleneck channels (512 for default config)
-                hidden_dim=256,
-                out_dim=128,
-            )
-            projection_head_rev = ProjectionHead(
-                in_dim=bottleneck_dim,  # Same for reverse (symmetric architecture)
-                hidden_dim=256,
-                out_dim=128,
-            )
-
-            # Handle device placement and dtype for FSDP compatibility
-            if is_fsdp_wrapped and check_bf16_support():
-                projection_head_fwd = projection_head_fwd.to(device, dtype=torch.bfloat16)
-                projection_head_rev = projection_head_rev.to(device, dtype=torch.bfloat16)
-            else:
-                projection_head_fwd = projection_head_fwd.to(device)
-                projection_head_rev = projection_head_rev.to(device)
-
-            # Wrap with DDP for gradient sync (too small for FSDP sharding)
-            if is_distributed and not is_fsdp_wrapped:
-                projection_head_fwd = DDP(projection_head_fwd, device_ids=[local_rank])
-                projection_head_rev = DDP(projection_head_rev, device_ids=[local_rank])
-
-            if is_primary():
-                contrastive_weight = config.get("contrastive_weight", 0.1)
-                contrastive_temp = config.get("contrastive_temperature", 0.1)
-                print(f"Contrastive learning ENABLED (label-based): weight={contrastive_weight}, temperature={contrastive_temp}")
-                print(f"  Projection heads: {bottleneck_dim}->256->128 (bottleneck features)")
-        else:
-            # Temporal CEBRA mode: no projection heads needed
-            # Loss is applied directly on normalized bottleneck features
-            if is_primary():
-                contrastive_weight = config.get("contrastive_weight", 0.1)
-                contrastive_temp = config.get("contrastive_temperature", 0.1)
-                time_delta = config.get("contrastive_time_delta", 10)
-                num_samples = config.get("contrastive_num_samples", 32)
-                print(f"Contrastive learning ENABLED (temporal CEBRA): weight={contrastive_weight}, temperature={contrastive_temp}")
-                print(f"  Temporal params: time_delta={time_delta} samples, num_samples={num_samples} per trial")
-                print(f"  No projection heads (loss on raw {bottleneck_dim}-dim bottleneck features)")
-
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
@@ -2493,11 +2067,6 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
-    # Projection heads for contrastive learning (use same lr as model)
-    if projection_head_fwd is not None:
-        param_groups.append({"params": list(projection_head_fwd.parameters()), "lr": lr, "name": "projection_head_fwd"})
-    if projection_head_rev is not None:
-        param_groups.append({"params": list(projection_head_rev.parameters()), "lr": lr, "name": "projection_head_rev"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
 
@@ -2657,8 +2226,6 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
-                projection_head_fwd=projection_head_fwd,
-                projection_head_rev=projection_head_rev,
             )
 
             barrier()
@@ -2723,16 +2290,9 @@ def train(
                 if "corr_rev" in val_metrics:
                     rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
-                # Add contrastive loss if present
-                contr_str = ""
-                if "contrastive_fwd" in train_metrics:
-                    contr_str = f" | Contr: {train_metrics['contrastive_fwd']:.3f}"
-                    if "contrastive_rev" in train_metrics:
-                        contr_str += f"/{train_metrics['contrastive_rev']:.3f}"
-
                 print(f"Epoch {epoch}/{num_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
+                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
                       f"Best: {best_val_loss:.3f}")
 
                 # Print per-session metrics if available
@@ -3333,25 +2893,6 @@ def parse_args():
     parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
                         help="Combine all validation sessions (default)")
 
-    # Contrastive learning for cross-session generalization (CEBRA-style)
-    parser.add_argument("--use-contrastive", action="store_true", default=None,
-                        help="Enable CEBRA-style contrastive learning for session-invariant representations")
-    parser.add_argument("--no-contrastive", action="store_true", default=None,
-                        help="Disable contrastive learning (default)")
-    parser.add_argument("--contrastive-weight", type=float, default=None,
-                        help="Weight for contrastive loss (default: 0.1)")
-    parser.add_argument("--contrastive-temperature", type=float, default=None,
-                        help="Temperature for InfoNCE loss (default: 0.1)")
-    parser.add_argument("--contrastive-mode", type=str, default=None,
-                        choices=["temporal", "label"],
-                        help="Contrastive mode: 'temporal' (true CEBRA with time-based positives) or "
-                             "'label' (behavior-supervised with odor labels). Default: temporal")
-    parser.add_argument("--contrastive-time-delta", type=int, default=None,
-                        help="Time delta in samples for temporal positive pairs (default: 10). "
-                             "Only used when --contrastive-mode=temporal")
-    parser.add_argument("--contrastive-num-samples", type=int, default=None,
-                        help="Number of time points to sample per trial for temporal CEBRA (default: 32)")
-
     # Conditioning mode override
     COND_MODES = ["none", "cross_attn_gated"]
     parser.add_argument("--cond-mode", type=str, default=None,
@@ -3554,29 +3095,6 @@ def main():
         config["no_test_set"] = args.no_test_set
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
-
-    # Contrastive learning config (CLI overrides config)
-    if args.use_contrastive:
-        config["use_contrastive"] = True
-    elif args.no_contrastive:
-        config["use_contrastive"] = False
-    if args.contrastive_weight is not None:
-        config["contrastive_weight"] = args.contrastive_weight
-    if args.contrastive_temperature is not None:
-        config["contrastive_temperature"] = args.contrastive_temperature
-    if args.contrastive_mode is not None:
-        config["contrastive_mode"] = args.contrastive_mode
-    if args.contrastive_time_delta is not None:
-        config["contrastive_time_delta"] = args.contrastive_time_delta
-    if args.contrastive_num_samples is not None:
-        config["contrastive_num_samples"] = args.contrastive_num_samples
-
-    # Print contrastive learning info
-    if is_primary() and config.get("use_contrastive", False):
-        mode = config.get("contrastive_mode", "temporal")
-        print(f"CONTRASTIVE LEARNING ENABLED: mode={mode}, weight={config['contrastive_weight']}, temp={config['contrastive_temperature']}")
-        if mode == "temporal":
-            print(f"  Temporal CEBRA: time_delta={config['contrastive_time_delta']}, num_samples={config['contrastive_num_samples']}")
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
