@@ -37,22 +37,6 @@ from torch.utils.data.distributed import DistributedSampler
 from sklearn.model_selection import StratifiedShuffleSplit
 
 # =============================================================================
-# Euclidean Alignment (EA) - Optional, for cross-session transfer learning
-# TO REMOVE: Delete this import and all EA-related code marked with "TO REMOVE"
-# =============================================================================
-try:
-    from euclidean_alignment import (
-        EuclideanAlignment,
-        fit_euclidean_alignment,
-        apply_euclidean_alignment,
-    )
-    EA_AVAILABLE = True
-except ImportError:
-    EA_AVAILABLE = False
-    EuclideanAlignment = None
-
-
-# =============================================================================
 # Distributed Training Utilities
 # =============================================================================
 
@@ -1464,115 +1448,6 @@ class MultiDomainDataset(Dataset):
 
 
 # =============================================================================
-# Euclidean Alignment Helper Functions
-# TO REMOVE: Delete this entire section when removing EA feature
-# =============================================================================
-
-def apply_euclidean_alignment_to_data(
-    ob: np.ndarray,
-    pcx: np.ndarray,
-    session_ids: np.ndarray,
-    idx_to_session: Dict[int, str],
-    train_idx: np.ndarray,
-    regularization: float = 1e-6,
-    reference_method: str = "arithmetic",
-    verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, Optional["EuclideanAlignment"], Optional["EuclideanAlignment"]]:
-    """Apply Euclidean Alignment to OB and PCx data.
-
-    Fits EA on training sessions only, then transforms all data.
-
-    Args:
-        ob: OB signal array [trials, channels, samples]
-        pcx: PCx signal array [trials, channels, samples]
-        session_ids: Session ID for each trial [trials]
-        idx_to_session: Mapping from session ID to session name
-        train_idx: Indices of training trials
-        regularization: Tikhonov regularization for covariance
-        reference_method: "arithmetic" or "geometric"
-        verbose: Print progress info
-
-    Returns:
-        Tuple of (aligned_ob, aligned_pcx, ea_ob, ea_pcx)
-        ea_ob and ea_pcx are the fitted EuclideanAlignment instances (for later use)
-    """
-    if not EA_AVAILABLE:
-        if verbose and _is_primary_rank():
-            print("WARNING: Euclidean Alignment requested but not available (import failed)")
-        return ob, pcx, None, None
-
-    if verbose and _is_primary_rank():
-        print(f"\n{'='*60}")
-        print("Applying Euclidean Alignment (EA)")
-        print(f"{'='*60}")
-
-    # Group training data by session
-    train_sessions_ob = {}
-    train_sessions_pcx = {}
-
-    train_session_ids = session_ids[train_idx]
-    unique_train_sessions = np.unique(train_session_ids)
-
-    for sess_id in unique_train_sessions:
-        sess_name = idx_to_session[sess_id]
-        sess_mask = session_ids == sess_id
-        train_sess_mask = sess_mask & np.isin(np.arange(len(session_ids)), train_idx)
-
-        train_sessions_ob[sess_name] = ob[train_sess_mask]
-        train_sessions_pcx[sess_name] = pcx[train_sess_mask]
-
-    if verbose and _is_primary_rank():
-        print(f"  Training sessions: {len(unique_train_sessions)}")
-        for sess_name, data in train_sessions_ob.items():
-            print(f"    {sess_name}: {data.shape[0]} trials")
-
-    # Fit EA on training sessions
-    ea_ob = fit_euclidean_alignment(
-        train_sessions_ob,
-        regularization=regularization,
-        reference_method=reference_method,
-        verbose=verbose,
-    )
-
-    ea_pcx = fit_euclidean_alignment(
-        train_sessions_pcx,
-        regularization=regularization,
-        reference_method=reference_method,
-        verbose=verbose,
-    )
-
-    # Transform all data (including val/test)
-    aligned_ob = np.zeros_like(ob)
-    aligned_pcx = np.zeros_like(pcx)
-
-    unique_sessions = np.unique(session_ids)
-    for sess_id in unique_sessions:
-        sess_name = idx_to_session[sess_id]
-        sess_mask = session_ids == sess_id
-        sess_data_ob = ob[sess_mask]
-        sess_data_pcx = pcx[sess_mask]
-
-        if sess_name in ea_ob.session_transforms:
-            # Known session - use precomputed transform
-            aligned_ob[sess_mask] = ea_ob.transform(sess_data_ob, sess_name)
-            aligned_pcx[sess_mask] = ea_pcx.transform(sess_data_pcx, sess_name)
-        else:
-            # New session (val/test) - compute transform from session data
-            aligned_ob[sess_mask] = ea_ob.transform_new_session(
-                sess_data_ob, compute_cov_from_data=True
-            )
-            aligned_pcx[sess_mask] = ea_pcx.transform_new_session(
-                sess_data_pcx, compute_cov_from_data=True
-            )
-
-    if verbose and _is_primary_rank():
-        print(f"Euclidean Alignment applied to all {len(unique_sessions)} sessions")
-        print(f"{'='*60}\n")
-
-    return aligned_ob, aligned_pcx, ea_ob, ea_pcx
-
-
-# =============================================================================
 # Data Preparation Pipeline
 # =============================================================================
 
@@ -1589,10 +1464,6 @@ def prepare_data(
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
     no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
     separate_val_sessions: bool = False,  # If True, return per-session val indices
-    # Euclidean Alignment parameters - TO REMOVE: delete these params when removing EA
-    use_euclidean_alignment: bool = False,
-    ea_regularization: float = 1e-6,
-    ea_reference_method: str = "arithmetic",
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1609,19 +1480,15 @@ def prepare_data(
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
         no_test_set: If True, no test set - all held-out sessions are for validation only
         separate_val_sessions: If True, return per-session validation indices
-        use_euclidean_alignment: If True, apply EA for cross-session transfer (TO REMOVE)
-        ea_regularization: Tikhonov regularization for EA covariances (TO REMOVE)
-        ea_reference_method: "arithmetic" or "geometric" for EA reference (TO REMOVE)
 
     Returns dictionary with:
-    - ob, pcx: Normalized signal arrays (optionally EA-aligned)
+    - ob, pcx: Normalized signal arrays
     - odors: Odor label array
     - vocab: Odor name to ID mapping
     - train_idx, val_idx, test_idx: Split indices
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
     - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
-    - ea_ob, ea_pcx: (only if use_euclidean_alignment) fitted EA instances
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -1667,31 +1534,6 @@ def prepare_data(
     ob = normalized[:, 0]  # [trials, channels, time]
     pcx = normalized[:, 1]
 
-    # ==========================================================================
-    # Euclidean Alignment (EA) - Optional cross-session alignment
-    # TO REMOVE: Delete this entire section when removing EA feature
-    # ==========================================================================
-    ea_ob, ea_pcx = None, None
-    if use_euclidean_alignment:
-        if not split_by_session:
-            if _is_primary_rank():
-                print("WARNING: Euclidean Alignment requires split_by_session=True. Skipping EA.")
-        elif not EA_AVAILABLE:
-            if _is_primary_rank():
-                print("WARNING: Euclidean Alignment not available (import failed). Skipping EA.")
-        else:
-            ob, pcx, ea_ob, ea_pcx = apply_euclidean_alignment_to_data(
-                ob=ob,
-                pcx=pcx,
-                session_ids=session_ids,
-                idx_to_session=idx_to_session,
-                train_idx=train_idx,
-                regularization=ea_regularization,
-                reference_method=ea_reference_method,
-                verbose=True,
-            )
-    # ==========================================================================
-
     result = {
         "ob": ob,
         "pcx": pcx,
@@ -1714,11 +1556,6 @@ def prepare_data(
     if split_by_session:
         result["session_ids"] = session_ids  # Integer session ID per trial
         result["idx_to_session"] = idx_to_session  # Map from int ID to session name
-
-    # Include EA instances if fitted (TO REMOVE when removing EA)
-    if ea_ob is not None:
-        result["ea_ob"] = ea_ob
-        result["ea_pcx"] = ea_pcx
 
     return result
 

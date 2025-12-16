@@ -265,15 +265,12 @@ DEFAULT_CONFIG = {
     "separate_val_sessions": True,  # If True, evaluate each val session separately
 
     # =========================================================================
-    # Euclidean Alignment (EA) for Cross-Session Transfer Learning
+    # Covariance Augmentation for Cross-Session Robustness
     # =========================================================================
-    # EA aligns covariance matrices across sessions to reduce domain shift.
-    # Paper: https://arxiv.org/html/2401.10746v3
-    # "EA should be a standard pre-processing step when training cross-subject models"
-    # TO REMOVE: Delete this section, euclidean_alignment.py, and related code in data.py
-    "use_euclidean_alignment": False,  # Enable EA preprocessing
-    "ea_regularization": 1e-6,         # Tikhonov regularization for covariance
-    "ea_reference_method": "arithmetic",  # "arithmetic" (fast) or "geometric" (accurate)
+    # Generates synthetic sessions by perturbing covariance structure
+    "use_covariance_augmentation": True,  # Enable covariance augmentation
+    "cov_aug_strength": 0.3,              # How much to perturb covariance
+    "cov_aug_n_synthetic": 3,             # How many synthetic sessions per real session
 }
 
 
@@ -2905,18 +2902,6 @@ def parse_args():
     parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
                         help="Combine all validation sessions (default)")
 
-    # Euclidean Alignment (EA) for cross-session transfer learning
-    # TO REMOVE: Delete this section and euclidean_alignment.py
-    parser.add_argument("--euclidean-alignment", action="store_true", default=None,
-                        help="Enable Euclidean Alignment for cross-session transfer learning")
-    parser.add_argument("--no-euclidean-alignment", action="store_false", dest="euclidean_alignment",
-                        help="Disable Euclidean Alignment (default)")
-    parser.add_argument("--ea-regularization", type=float, default=None,
-                        help="Tikhonov regularization for EA covariance matrices (default: 1e-6)")
-    parser.add_argument("--ea-reference-method", type=str, default=None,
-                        choices=["arithmetic", "geometric"],
-                        help="EA reference covariance method: 'arithmetic' (fast) or 'geometric' (accurate)")
-
     # Conditioning mode override
     COND_MODES = ["none", "cross_attn_gated"]
     parser.add_argument("--cond-mode", type=str, default=None,
@@ -3120,15 +3105,6 @@ def main():
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
 
-    # Euclidean Alignment config (CLI overrides config)
-    # TO REMOVE: Delete this section
-    if args.euclidean_alignment is not None:
-        config["use_euclidean_alignment"] = args.euclidean_alignment
-    if args.ea_regularization is not None:
-        config["ea_regularization"] = args.ea_regularization
-    if args.ea_reference_method is not None:
-        config["ea_reference_method"] = args.ea_reference_method
-
     # Print session split info
     if is_primary() and config["split_by_session"]:
         if config.get("no_test_set", False):
@@ -3138,12 +3114,6 @@ def main():
         print(f"Session column: {config['session_column']}")
         if config.get("separate_val_sessions", False):
             print("  Per-session validation ENABLED (metrics reported per session)")
-
-    # Print Euclidean Alignment info
-    # TO REMOVE: Delete this section
-    if is_primary() and config.get("use_euclidean_alignment", False):
-        print(f"Euclidean Alignment ENABLED: regularization={config['ea_regularization']}, "
-              f"method={config['ea_reference_method']}")
 
     # Load data based on dataset choice
     if args.dataset == "pfc":
@@ -3175,10 +3145,6 @@ def main():
             val_sessions=args.val_sessions,
             no_test_set=config.get("no_test_set", False),
             separate_val_sessions=config.get("separate_val_sessions", False),
-            # Euclidean Alignment - TO REMOVE: delete these params when removing EA
-            use_euclidean_alignment=config.get("use_euclidean_alignment", False),
-            ea_regularization=config.get("ea_regularization", 1e-6),
-            ea_reference_method=config.get("ea_reference_method", "arithmetic"),
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
