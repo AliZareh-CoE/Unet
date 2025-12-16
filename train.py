@@ -3703,17 +3703,26 @@ def main():
             print(f"Split type: Random stratified")
 
         print(f"Best validation loss: {results['best_val_loss']:.4f} (epoch {results['best_epoch']})")
-        print(f"Test loss: {results['test_metrics'].get('loss', 'N/A')}")
-        print(f"Test correlation: {results['test_metrics']['corr']:.4f}")
-        print(f"Test R2: {results['test_metrics']['r2']:.4f}")
+
+        # Handle case where no test set exists (using validation sessions instead)
+        if results['test_metrics']:
+            print(f"Test loss: {results['test_metrics'].get('loss', 'N/A')}")
+            print(f"Test correlation: {results['test_metrics']['corr']:.4f}")
+            print(f"Test R2: {results['test_metrics']['r2']:.4f}")
+        else:
+            print("No test set (using held-out validation sessions instead)")
+
         print(f"Model saved to: {CHECKPOINT_DIR / 'best_model.pt'}")
+
         # Machine-parseable results for experiment scripts
-        print(f"RESULT_CORR={results['test_metrics']['corr']:.4f}")
-        print(f"RESULT_R2={results['test_metrics']['r2']:.4f}")
+        if results['test_metrics']:
+            print(f"RESULT_CORR={results['test_metrics']['corr']:.4f}")
+            print(f"RESULT_R2={results['test_metrics']['r2']:.4f}")
         print(f"RESULT_LOSS={results['best_val_loss']:.4f}")
         if "split_info" in data:
             print(f"RESULT_SPLIT_TYPE=session_holdout")
-            print(f"RESULT_TEST_SESSIONS={data['split_info']['test_sessions']}")
+            if data['split_info'].get('test_sessions'):
+                print(f"RESULT_TEST_SESSIONS={data['split_info']['test_sessions']}")
 
 
 if __name__ == "__main__":
