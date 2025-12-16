@@ -2757,6 +2757,7 @@ def train(
                 idx_to_session=idx_to_session,
                 formats=["png"],  # Fast - only PNG for training
                 quick=True,  # Essential plots only
+                cond_encoder=cond_encoder,  # Pass conditioning encoder for auto-conditioning
             )
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")

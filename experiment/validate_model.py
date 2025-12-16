@@ -591,9 +591,10 @@ def generate_signals(
     device: torch.device,
     vocab: Dict[str, int],
     config: Optional[Dict[str, Any]] = None,
+    cond_encoder: Optional[nn.Module] = None,
 ) -> Dict[str, np.ndarray]:
     """Generate signals for all samples in dataloader.
-    
+
     Args:
         model_fwd: Forward translation model (source → target)
         model_rev: Reverse translation model (target → source)
@@ -603,6 +604,8 @@ def generate_signals(
         device: Torch device
         vocab: Label vocabulary (name → id)
         config: Dataset config with 'source_name', 'target_name', 'condition_name'
+        cond_encoder: Optional conditioning encoder for auto-conditioning modes
+                      (spectro_temporal, cpc, vqvae, etc.)
 
     Returns:
         Dictionary with keys:
@@ -613,7 +616,7 @@ def generate_signals(
         - condition_ids: Condition label indices [N]
         - condition_names: Condition names [N]
         - config: Dataset configuration
-        
+
         Also provides legacy keys for backward compatibility:
         - ob_real, pcx_real, pcx_gen, ob_gen, odor_ids, odor_names
     """
@@ -627,6 +630,13 @@ def generate_signals(
     condition_ids_list = []
     condition_names_list = []
 
+    # Set models to eval mode
+    model_fwd.eval()
+    if model_rev is not None:
+        model_rev.eval()
+    if cond_encoder is not None:
+        cond_encoder.eval()
+
     with torch.no_grad():
         for source, target, condition in tqdm(dataloader, desc="Generating signals"):
             source = source.to(device)
@@ -638,14 +648,36 @@ def generate_signals(
             source_norm = per_channel_normalize(source)
             target_norm = per_channel_normalize(target)
 
+            # Generate conditioning embedding if cond_encoder provided
+            cond_emb = None
+            if cond_encoder is not None:
+                cond_source = config.get("conditioning_source", "spectro_temporal") if config else "spectro_temporal"
+                if cond_source == "spectro_temporal":
+                    cond_emb = cond_encoder(source_norm)
+                elif cond_source == "cpc":
+                    cond_emb, _, _ = cond_encoder(source_norm)
+                elif cond_source == "vqvae":
+                    cond_emb, _ = cond_encoder(source_norm)
+                elif cond_source == "freq_disentangled":
+                    cond_emb, _ = cond_encoder(source_norm.float())
+                elif cond_source == "cycle_consistent":
+                    cond_emb, _ = cond_encoder(source_norm, target_norm)
+                # else: use odor_ids via condition
+
             # Forward: source → target
-            target_pred = model_fwd(source_norm, condition)
+            if cond_emb is not None:
+                target_pred = model_fwd(source_norm, cond_emb=cond_emb)
+            else:
+                target_pred = model_fwd(source_norm, condition)
             if spectral_shift_fwd is not None:
                 target_pred = spectral_shift_fwd(target_pred, odor_ids=condition)
 
             # Reverse: target → source (skip if no reverse model)
             if model_rev is not None:
-                source_pred = model_rev(target_norm, condition)
+                if cond_emb is not None:
+                    source_pred = model_rev(target_norm, cond_emb=cond_emb)
+                else:
+                    source_pred = model_rev(target_norm, condition)
                 if spectral_shift_rev is not None:
                     source_pred = spectral_shift_rev(source_pred, odor_ids=condition)
             else:
@@ -4941,6 +4973,7 @@ def generate_training_plots(
     idx_to_session: Optional[Dict[int, str]] = None,
     formats: List[str] = None,
     quick: bool = True,
+    cond_encoder: Optional[nn.Module] = None,
 ):
     """Generate validation plots after training.
 
@@ -4960,6 +4993,7 @@ def generate_training_plots(
         idx_to_session: Optional mapping from session ID to session name
         formats: Output formats (default: png only for training speed)
         quick: If True, only generate essential plots (galleries, per-odor, per-session)
+        cond_encoder: Optional conditioning encoder for auto-conditioning modes
 
     Returns:
         Dict with summary metrics
@@ -4992,6 +5026,7 @@ def generate_training_plots(
         spectral_shift_fwd, spectral_shift_rev,
         dataloader, device, vocab,
         config=config,
+        cond_encoder=cond_encoder,
     )
 
     # Add session info if provided
