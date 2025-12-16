@@ -3161,80 +3161,102 @@ def train(
                 session_ids_for_plots = data["session_ids"][plot_indices]
                 idx_to_session = data.get("idx_to_session", {})
 
-            # For FSDP models, we need to gather full params before inference
-            # FSDP flattens parameters for sharding, making embedding weights 1-D
-            # Use summon_full_params to materialize full parameters
-            is_fsdp_model = isinstance(model, FSDP)
+            # Load fresh models from checkpoint for inference
+            # This avoids issues with FSDP/DDP parameter sharding/flattening
+            # The checkpoint contains properly shaped 2-D weights
+            checkpoint_path = CHECKPOINT_DIR / "best_model.pt"
+            print(f"  Loading fresh models from checkpoint for plots: {checkpoint_path}")
 
-            if is_fsdp_model:
-                # Use context manager to gather full params for inference
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-                # Gather params for forward model
-                fsdp_context_fwd = FSDP.summon_full_params(model, writeback=False)
-                fsdp_context_rev = None
-                if reverse_model is not None and isinstance(reverse_model, FSDP):
-                    fsdp_context_rev = FSDP.summon_full_params(reverse_model, writeback=False)
+            # Create fresh forward model
+            fresh_model_fwd = CondUNet1D(
+                in_channels=config["in_channels"],
+                out_channels=config["out_channels"],
+                base_channels=config["base_channels"],
+                n_downsample=config.get("n_downsample", 4),
+                n_odors=config["n_odors"],
+                emb_dim=config.get("emb_dim", 128),
+                dropout=config.get("dropout", 0.1),
+                use_attention=config.get("use_attention", True),
+                attention_type=config.get("attention_type", "cross"),
+                norm_type=config.get("norm_type", "group"),
+                cond_mode=config.get("cond_mode", "film"),
+                conv_type=config.get("conv_type", "standard"),
+                use_se=config.get("use_se", True),
+                conv_kernel_size=config.get("conv_kernel_size", 7),
+                conv_dilations=config.get("conv_dilations", [1, 2, 4]),
+            ).to(device)
+            fresh_model_fwd.load_state_dict(checkpoint["model"])
+            fresh_model_fwd.eval()
 
-                fsdp_context_fwd.__enter__()
-                if fsdp_context_rev is not None:
-                    fsdp_context_rev.__enter__()
+            # Create fresh reverse model if bidirectional
+            fresh_model_rev = None
+            if "reverse_model" in checkpoint:
+                fresh_model_rev = CondUNet1D(
+                    in_channels=config["out_channels"],  # Swapped for reverse
+                    out_channels=config["in_channels"],
+                    base_channels=config["base_channels"],
+                    n_downsample=config.get("n_downsample", 4),
+                    n_odors=config["n_odors"],
+                    emb_dim=config.get("emb_dim", 128),
+                    dropout=config.get("dropout", 0.1),
+                    use_attention=config.get("use_attention", True),
+                    attention_type=config.get("attention_type", "cross"),
+                    norm_type=config.get("norm_type", "group"),
+                    cond_mode=config.get("cond_mode", "film"),
+                    conv_type=config.get("conv_type", "standard"),
+                    use_se=config.get("use_se", True),
+                    conv_kernel_size=config.get("conv_kernel_size", 7),
+                    conv_dilations=config.get("conv_dilations", [1, 2, 4]),
+                ).to(device)
+                fresh_model_rev.load_state_dict(checkpoint["reverse_model"])
+                fresh_model_rev.eval()
 
-                try:
-                    base_model = model.module if hasattr(model, 'module') else model
-                    base_reverse_model = None
-                    if reverse_model is not None:
-                        base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+            # Load fresh spectral shift modules
+            fresh_spectral_fwd = None
+            fresh_spectral_rev = None
+            if config.get("use_spectral_shift", False):
+                from models import OptimalSpectralBias
+                fresh_spectral_fwd = OptimalSpectralBias(
+                    sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    n_channels=config["out_channels"],
+                    n_odors=config["n_odors"],
+                ).to(device)
+                if "spectral_shift_fwd" in checkpoint:
+                    fresh_spectral_fwd.load_state_dict(checkpoint["spectral_shift_fwd"])
+                fresh_spectral_fwd.eval()
 
-                    base_model.eval()
-                    if base_reverse_model is not None:
-                        base_reverse_model.eval()
+                if fresh_model_rev is not None:
+                    fresh_spectral_rev = OptimalSpectralBias(
+                        sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                        n_channels=config["in_channels"],
+                        n_odors=config["n_odors"],
+                    ).to(device)
+                    if "spectral_shift_rev" in checkpoint:
+                        fresh_spectral_rev.load_state_dict(checkpoint["spectral_shift_rev"])
+                    fresh_spectral_rev.eval()
 
-                    generate_training_plots(
-                        model_fwd=base_model,
-                        model_rev=base_reverse_model,
-                        spectral_shift_fwd=spectral_shift_fwd,
-                        spectral_shift_rev=spectral_shift_rev,
-                        dataloader=plot_loader,
-                        device=device,
-                        vocab=data["vocab"],
-                        output_dir=plots_dir,
-                        config=config,
-                        session_ids=session_ids_for_plots,
-                        idx_to_session=idx_to_session,
-                        formats=["png"],
-                        quick=True,
-                    )
-                finally:
-                    if fsdp_context_rev is not None:
-                        fsdp_context_rev.__exit__(None, None, None)
-                    fsdp_context_fwd.__exit__(None, None, None)
-            else:
-                # Non-FSDP: simple unwrap
-                base_model = model.module if hasattr(model, 'module') else model
-                base_reverse_model = None
-                if reverse_model is not None:
-                    base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+            del checkpoint  # Free memory
 
-                base_model.eval()
-                if base_reverse_model is not None:
-                    base_reverse_model.eval()
+            generate_training_plots(
+                model_fwd=fresh_model_fwd,
+                model_rev=fresh_model_rev,
+                spectral_shift_fwd=fresh_spectral_fwd,
+                spectral_shift_rev=fresh_spectral_rev,
+                dataloader=plot_loader,
+                device=device,
+                vocab=data["vocab"],
+                output_dir=plots_dir,
+                config=config,
+                session_ids=session_ids_for_plots,
+                idx_to_session=idx_to_session,
+                formats=["png"],
+                quick=True,
+            )
 
-                generate_training_plots(
-                    model_fwd=base_model,
-                    model_rev=base_reverse_model,
-                    spectral_shift_fwd=spectral_shift_fwd,
-                    spectral_shift_rev=spectral_shift_rev,
-                    dataloader=plot_loader,
-                    device=device,
-                    vocab=data["vocab"],
-                    output_dir=plots_dir,
-                    config=config,
-                    session_ids=session_ids_for_plots,
-                    idx_to_session=idx_to_session,
-                    formats=["png"],
-                    quick=True,
-                )
+            # Clean up fresh models
+            del fresh_model_fwd, fresh_model_rev, fresh_spectral_fwd, fresh_spectral_rev
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")
             traceback.print_exc()
