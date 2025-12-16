@@ -1448,6 +1448,239 @@ class MultiDomainDataset(Dataset):
 
 
 # =============================================================================
+# Covariance Augmentation for Cross-Session Robustness
+# =============================================================================
+
+def _matrix_sqrt(A: np.ndarray, inverse: bool = False) -> np.ndarray:
+    """Compute matrix square root (or inverse square root) via eigendecomposition.
+
+    Args:
+        A: Symmetric positive definite matrix [C, C]
+        inverse: If True, compute A^(-1/2), else A^(1/2)
+
+    Returns:
+        Matrix square root [C, C]
+    """
+    w, V = np.linalg.eigh(A)
+    w = np.maximum(w, 1e-10)  # Numerical stability
+
+    if inverse:
+        w_sqrt = 1.0 / np.sqrt(w)
+    else:
+        w_sqrt = np.sqrt(w)
+
+    return V @ np.diag(w_sqrt) @ V.T
+
+
+def compute_covariance(data: np.ndarray, regularization: float = 1e-6) -> np.ndarray:
+    """Compute regularized covariance matrix.
+
+    Args:
+        data: Data array [trials, channels, samples] or [channels, samples]
+        regularization: Tikhonov regularization for numerical stability
+
+    Returns:
+        Covariance matrix [channels, channels]
+    """
+    if data.ndim == 2:
+        data = data[np.newaxis, ...]
+
+    trials, n_channels, n_samples = data.shape
+
+    # Concatenate all trials: [channels, trials * samples]
+    data_concat = data.transpose(1, 0, 2).reshape(n_channels, -1)
+
+    # Center the data
+    data_centered = data_concat - data_concat.mean(axis=1, keepdims=True)
+
+    # Compute covariance
+    n_total = data_centered.shape[1]
+    cov = (data_centered @ data_centered.T) / n_total
+
+    # Regularize
+    cov += regularization * np.eye(n_channels)
+
+    return cov
+
+
+def perturb_covariance(
+    cov: np.ndarray,
+    strength: float = 0.3,
+    rng: np.random.Generator = None,
+) -> np.ndarray:
+    """Perturb a covariance matrix to simulate session variability.
+
+    Args:
+        cov: Original covariance matrix [C, C]
+        strength: Perturbation strength (0 = no change, 1 = large change)
+        rng: Random number generator
+
+    Returns:
+        Perturbed covariance matrix [C, C]
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_channels = cov.shape[0]
+
+    # Eigendecomposition
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    eigenvalues = np.maximum(eigenvalues, 1e-10)
+
+    # Perturb eigenvalues (log-normal perturbation to keep positive)
+    log_eigenvalues = np.log(eigenvalues)
+    perturbation = rng.normal(0, strength, size=n_channels)
+    perturbed_log_eigenvalues = log_eigenvalues + perturbation
+    perturbed_eigenvalues = np.exp(perturbed_log_eigenvalues)
+
+    # Small rotation of eigenvectors (orthogonal perturbation)
+    # Generate antisymmetric matrix and exponentiate for orthogonal matrix
+    A = rng.normal(0, strength * 0.1, size=(n_channels, n_channels))
+    A = (A - A.T) / 2  # Make antisymmetric
+
+    # Approximate matrix exponential for small perturbations: exp(A) ≈ I + A
+    rotation = np.eye(n_channels) + A
+    # Re-orthogonalize via QR
+    rotation, _ = np.linalg.qr(rotation)
+
+    # Reconstruct perturbed covariance
+    perturbed_eigenvectors = eigenvectors @ rotation
+    perturbed_cov = perturbed_eigenvectors @ np.diag(perturbed_eigenvalues) @ perturbed_eigenvectors.T
+
+    # Ensure symmetry
+    perturbed_cov = (perturbed_cov + perturbed_cov.T) / 2
+
+    return perturbed_cov
+
+
+def generate_synthetic_session(
+    data: np.ndarray,
+    original_cov: np.ndarray,
+    target_cov: np.ndarray,
+) -> np.ndarray:
+    """Transform data from original covariance to target covariance.
+
+    Formula: X_new = Σ_target^(1/2) @ Σ_original^(-1/2) @ X
+
+    Args:
+        data: Original data [trials, channels, samples]
+        original_cov: Original covariance [C, C]
+        target_cov: Target covariance [C, C]
+
+    Returns:
+        Transformed data [trials, channels, samples]
+    """
+    # Compute transformation matrix
+    original_inv_sqrt = _matrix_sqrt(original_cov, inverse=True)
+    target_sqrt = _matrix_sqrt(target_cov, inverse=False)
+    transform = target_sqrt @ original_inv_sqrt
+
+    # Apply transformation
+    # data: [trials, channels, samples]
+    # transform: [channels, channels]
+    transformed = np.einsum('ij,njt->nit', transform, data)
+
+    return transformed
+
+
+def apply_covariance_augmentation(
+    source: np.ndarray,
+    target: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    strength: float = 0.3,
+    n_synthetic: int = 3,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Apply covariance augmentation to generate synthetic training sessions.
+
+    For each training sample, generates n_synthetic augmented versions by
+    perturbing the covariance structure, simulating cross-session variability.
+
+    Args:
+        source: Source signal array [trials, channels, samples]
+        target: Target signal array [trials, channels, samples]
+        labels: Label array [trials]
+        train_idx: Indices of training samples
+        strength: Perturbation strength (0-1)
+        n_synthetic: Number of synthetic sessions per real session
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        Tuple of (aug_source, aug_target, aug_labels, aug_train_idx)
+        Arrays are expanded with synthetic samples appended
+    """
+    rng = np.random.default_rng(seed)
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Applying Covariance Augmentation")
+        print(f"{'='*60}")
+        print(f"  Strength: {strength}")
+        print(f"  Synthetic sessions per real: {n_synthetic}")
+
+    # Get training data
+    train_source = source[train_idx]
+    train_target = target[train_idx]
+    train_labels = labels[train_idx]
+
+    # Compute original covariances from training data
+    cov_source = compute_covariance(train_source)
+    cov_target = compute_covariance(train_target)
+
+    if verbose and _is_primary_rank():
+        print(f"  Source cov trace: {np.trace(cov_source):.2f}")
+        print(f"  Target cov trace: {np.trace(cov_target):.2f}")
+
+    # Generate synthetic sessions
+    synthetic_sources = []
+    synthetic_targets = []
+    synthetic_labels = []
+
+    for i in range(n_synthetic):
+        # Perturb covariances
+        perturbed_cov_source = perturb_covariance(cov_source, strength, rng)
+        perturbed_cov_target = perturb_covariance(cov_target, strength, rng)
+
+        # Generate synthetic data
+        syn_source = generate_synthetic_session(train_source, cov_source, perturbed_cov_source)
+        syn_target = generate_synthetic_session(train_target, cov_target, perturbed_cov_target)
+
+        synthetic_sources.append(syn_source)
+        synthetic_targets.append(syn_target)
+        synthetic_labels.append(train_labels.copy())
+
+        if verbose and _is_primary_rank():
+            print(f"  Generated synthetic session {i+1}/{n_synthetic}")
+
+    # Concatenate original + synthetic
+    aug_source = np.concatenate([source] + synthetic_sources, axis=0)
+    aug_target = np.concatenate([target] + synthetic_targets, axis=0)
+    aug_labels = np.concatenate([labels] + synthetic_labels, axis=0)
+
+    # Update train indices to include synthetic samples
+    n_original = len(source)
+    n_train = len(train_idx)
+
+    # New train indices: original train_idx + all synthetic indices
+    synthetic_indices = []
+    for i in range(n_synthetic):
+        start_idx = n_original + i * n_train
+        synthetic_indices.extend(range(start_idx, start_idx + n_train))
+
+    aug_train_idx = np.concatenate([train_idx, np.array(synthetic_indices)])
+
+    if verbose and _is_primary_rank():
+        print(f"  Original training samples: {n_train}")
+        print(f"  Total training samples: {len(aug_train_idx)} ({n_synthetic + 1}x)")
+        print(f"{'='*60}\n")
+
+    return aug_source, aug_target, aug_labels, aug_train_idx
+
+
+# =============================================================================
 # Data Preparation Pipeline
 # =============================================================================
 
@@ -1464,6 +1697,10 @@ def prepare_data(
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
     no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
     separate_val_sessions: bool = False,  # If True, return per-session val indices
+    # Covariance augmentation
+    use_covariance_augmentation: bool = False,
+    cov_aug_strength: float = 0.3,
+    cov_aug_n_synthetic: int = 3,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1480,9 +1717,12 @@ def prepare_data(
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
         no_test_set: If True, no test set - all held-out sessions are for validation only
         separate_val_sessions: If True, return per-session validation indices
+        use_covariance_augmentation: If True, generate synthetic sessions via cov perturbation
+        cov_aug_strength: Perturbation strength (0-1)
+        cov_aug_n_synthetic: Number of synthetic sessions per real session
 
     Returns dictionary with:
-    - ob, pcx: Normalized signal arrays
+    - ob, pcx: Normalized signal arrays (augmented if use_covariance_augmentation)
     - odors: Odor label array
     - vocab: Odor name to ID mapping
     - train_idx, val_idx, test_idx: Split indices
@@ -1533,6 +1773,19 @@ def prepare_data(
     # Split into OB and PCx
     ob = normalized[:, 0]  # [trials, channels, time]
     pcx = normalized[:, 1]
+
+    # Apply covariance augmentation if enabled
+    if use_covariance_augmentation:
+        ob, pcx, odors, train_idx = apply_covariance_augmentation(
+            source=ob,
+            target=pcx,
+            labels=odors,
+            train_idx=train_idx,
+            strength=cov_aug_strength,
+            n_synthetic=cov_aug_n_synthetic,
+            seed=seed,
+            verbose=True,
+        )
 
     result = {
         "ob": ob,
