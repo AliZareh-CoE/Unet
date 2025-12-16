@@ -407,6 +407,8 @@ def load_or_create_session_splits(
     idx_to_session: Optional[Dict[int, str]] = None,
     test_sessions: Optional[List[str]] = None,  # Explicit test session names
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
+    no_test_set: bool = False,  # If True, no test set - all held-out sessions are validation
+    separate_val_sessions: bool = False,  # If True, return per-session val indices
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """Create train/val/test splits by holding out entire sessions.
 
@@ -416,18 +418,20 @@ def load_or_create_session_splits(
     Args:
         session_ids: Array of integer session indices for each trial
         odors: Array of odor labels for each trial
-        n_test_sessions: Number of sessions to hold out for testing
+        n_test_sessions: Number of sessions to hold out for testing (ignored if no_test_set=True)
         n_val_sessions: Number of sessions to hold out for validation
         seed: Random seed for reproducibility
         force_recreate: If True, recreate splits even if they exist
         idx_to_session: Optional mapping from integer index to original session name
         test_sessions: Explicit list of session names to use for test (overrides n_test_sessions)
         val_sessions: Explicit list of session names to use for val (overrides n_val_sessions)
+        no_test_set: If True, no test set - all held-out sessions are used for validation
+        separate_val_sessions: If True, return per-session validation indices as dict
 
     Returns:
         train_idx: Indices of training trials
-        val_idx: Indices of validation trials
-        test_idx: Indices of test trials
+        val_idx: Indices of validation trials (or dict if separate_val_sessions=True)
+        test_idx: Indices of test trials (empty array if no_test_set=True)
         split_info: Dictionary with split metadata
     """
     # Check if using explicit session specification
@@ -525,9 +529,11 @@ def load_or_create_session_splits(
         print(f"  Val sessions: {val_sessions}")
     else:
         # Random session selection (original behavior)
-        if n_test_sessions + n_val_sessions >= n_sessions:
+        # If no_test_set, all held-out sessions go to validation
+        n_holdout = n_val_sessions if no_test_set else (n_test_sessions + n_val_sessions)
+        if n_holdout >= n_sessions:
             raise ValueError(
-                f"Cannot hold out {n_test_sessions} test + {n_val_sessions} val sessions "
+                f"Cannot hold out {n_holdout} sessions "
                 f"from only {n_sessions} total sessions. Need at least 1 for training."
             )
 
@@ -536,15 +542,34 @@ def load_or_create_session_splits(
         rng.shuffle(shuffled_sessions)
 
         # Assign sessions to splits (these are integer indices)
-        test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
-        val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
-        train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
+        if no_test_set:
+            # No test set - all held-out sessions are validation
+            test_session_ids = set()
+            val_session_ids = set(shuffled_sessions[:n_val_sessions].tolist())
+            train_session_ids = set(shuffled_sessions[n_val_sessions:].tolist())
+        else:
+            test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
+            val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
+            train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
 
     # Create index arrays
     all_indices = np.arange(len(session_ids))
     train_idx = all_indices[np.isin(session_ids, list(train_session_ids))]
-    val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
     test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
+
+    # For validation, either combined or per-session
+    if separate_val_sessions:
+        # Create per-session validation indices (dict: session_name -> indices)
+        val_idx_per_session = {}
+        for sess_id in val_session_ids:
+            sess_name = idx_to_session[sess_id] if idx_to_session is not None else str(sess_id)
+            sess_indices = all_indices[session_ids == sess_id]
+            val_idx_per_session[sess_name] = sess_indices
+        # Also create combined val_idx for backward compatibility
+        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
+    else:
+        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
+        val_idx_per_session = None
 
     # CRITICAL VALIDATION: Ensure no overlap between splits
     train_set = set(train_idx.tolist())
@@ -607,24 +632,50 @@ def load_or_create_session_splits(
         "train_odor_distribution": get_odor_distribution(train_idx),
         "val_odor_distribution": get_odor_distribution(val_idx),
         "test_odor_distribution": get_odor_distribution(test_idx),
+        "no_test_set": no_test_set,
+        "separate_val_sessions": separate_val_sessions,
     }
+
+    # Add per-session validation info
+    if separate_val_sessions and val_idx_per_session is not None:
+        split_info["val_sessions_detail"] = {
+            sess_name: {
+                "n_trials": len(indices),
+                "odor_distribution": get_odor_distribution(indices)
+            }
+            for sess_name, indices in val_idx_per_session.items()
+        }
 
     # Print summary
     print(f"\n{'='*60}")
-    print("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
+    if no_test_set:
+        print("SESSION-BASED SPLIT (No Test Set - All Held-Out Sessions for Validation)")
+    else:
+        print("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
     print(f"{'='*60}")
     print(f"Total sessions: {n_sessions}")
     print(f"Train sessions: {train_session_names} ({len(train_idx)} trials)")
-    print(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
-    print(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
+    if separate_val_sessions and val_idx_per_session is not None:
+        print(f"Val sessions (SEPARATE):")
+        for sess_name, indices in val_idx_per_session.items():
+            print(f"  - {sess_name}: {len(indices)} trials")
+    else:
+        print(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
+    if not no_test_set:
+        print(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
     print(f"{'='*60}\n")
 
-    # Save splits
-    SESSION_TRAIN_SPLIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    np.save(SESSION_TRAIN_SPLIT_PATH, train_idx)
-    np.save(SESSION_VAL_SPLIT_PATH, val_idx)
-    np.save(SESSION_TEST_SPLIT_PATH, test_idx)
-    SESSION_SPLIT_INFO_PATH.write_text(json.dumps(split_info, indent=2))
+    # Save splits (skip saving if using separate_val_sessions - it's not serializable)
+    if not separate_val_sessions:
+        SESSION_TRAIN_SPLIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        np.save(SESSION_TRAIN_SPLIT_PATH, train_idx)
+        np.save(SESSION_VAL_SPLIT_PATH, val_idx)
+        np.save(SESSION_TEST_SPLIT_PATH, test_idx)
+        SESSION_SPLIT_INFO_PATH.write_text(json.dumps(split_info, indent=2))
+
+    # Add per-session indices to split_info for return
+    if separate_val_sessions and val_idx_per_session is not None:
+        split_info["val_idx_per_session"] = val_idx_per_session
 
     return train_idx, val_idx, test_idx, split_info
 
@@ -1380,6 +1431,8 @@ def prepare_data(
     force_recreate_splits: bool = False,
     test_sessions: Optional[List[str]] = None,  # Explicit test session names
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
+    no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
+    separate_val_sessions: bool = False,  # If True, return per-session val indices
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1394,6 +1447,8 @@ def prepare_data(
         force_recreate_splits: If True, recreate splits even if they exist on disk
         test_sessions: Explicit list of session names for test (overrides n_test_sessions)
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
+        no_test_set: If True, no test set - all held-out sessions are for validation only
+        separate_val_sessions: If True, return per-session validation indices
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays
@@ -1402,6 +1457,7 @@ def prepare_data(
     - train_idx, val_idx, test_idx: Split indices
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
+    - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -1430,6 +1486,8 @@ def prepare_data(
             idx_to_session=idx_to_session,
             test_sessions=test_sessions,
             val_sessions=val_sessions,
+            no_test_set=no_test_set,
+            separate_val_sessions=separate_val_sessions,
         )
     else:
         # Random stratified splits (original behavior)
@@ -1459,6 +1517,9 @@ def prepare_data(
 
     if split_info is not None:
         result["split_info"] = split_info
+        # Include per-session validation indices if available
+        if "val_idx_per_session" in split_info:
+            result["val_idx_per_session"] = split_info["val_idx_per_session"]
 
     # Include session info for per-session evaluation
     if split_by_session:
@@ -1739,12 +1800,27 @@ def create_dataloaders(
         generator=g,
     )
 
-    return {
+    result = {
         "train": train_loader,
         "val": val_loader,
         "test": test_loader,
         "train_sampler": train_sampler,
     }
+
+    # Add per-session validation loaders if available
+    if "val_idx_per_session" in data and data["val_idx_per_session"] is not None:
+        val_session_loaders = {}
+        for sess_name, sess_indices in data["val_idx_per_session"].items():
+            val_session_loaders[sess_name] = create_single_session_dataloader(
+                data, sess_name, sess_indices,
+                batch_size=val_batch_size,
+                num_workers=num_workers,
+                distributed=distributed,
+                seed=seed,
+            )
+        result["val_sessions"] = val_session_loaders
+
+    return result
 
 
 def create_single_session_dataloader(
