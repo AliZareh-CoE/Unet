@@ -2918,18 +2918,28 @@ def train(
     envelope_matcher_rev = None
 
     # Final test evaluation (full metrics, fast_mode=False)
-    test_metrics = evaluate(
-        model, loaders["test"], device, wavelet_loss,
-        compute_phase=True, reverse_model=reverse_model, config=config,
-        spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-        fast_mode=False,  # Full metrics for final evaluation
-        sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-        cond_encoder=cond_encoder,
-        envelope_matcher_fwd=envelope_matcher_fwd,
-        envelope_matcher_rev=envelope_matcher_rev,
-    )
+    # Skip if no test set (no_test_set=True means all held-out sessions are validation)
+    has_test_set = len(data.get("test_idx", [])) > 0
+    if has_test_set:
+        test_metrics = evaluate(
+            model, loaders["test"], device, wavelet_loss,
+            compute_phase=True, reverse_model=reverse_model, config=config,
+            spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+            fast_mode=False,  # Full metrics for final evaluation
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+            cond_encoder=cond_encoder,
+            envelope_matcher_fwd=envelope_matcher_fwd,
+            envelope_matcher_rev=envelope_matcher_rev,
+        )
+    else:
+        test_metrics = {}
+        if is_primary():
+            print("\n" + "="*60)
+            print("NO TEST SET (all held-out sessions used for validation)")
+            print("="*60)
+            print("Final evaluation uses per-session validation metrics above.")
 
-    if is_primary():
+    if is_primary() and has_test_set:
         print("\n" + "="*60)
         print("FINAL TEST RESULTS")
         print("="*60)
@@ -2999,7 +3009,7 @@ def train(
     # =========================================================================
     # PER-SESSION TEST EVALUATION (for cross-session generalization analysis)
     # =========================================================================
-    if is_primary() and "split_info" in data and "session_ids" in data:
+    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data:
         split_info = data.get("split_info", {})
         test_sessions = split_info.get("test_sessions", [])
         session_ids = data.get("session_ids")
