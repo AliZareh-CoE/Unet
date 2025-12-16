@@ -1,25 +1,26 @@
 """Euclidean Alignment (EA) for Cross-Session/Subject Transfer Learning.
 
 This module implements Euclidean Alignment as described in:
-"EEG-Bench: A Foundation for Assessing Deep Learning EEG Models"
-https://arxiv.org/html/2401.10746v3
+- He & Wu (2020): "Transfer Learning for Brain-Computer Interfaces"
+- "EEG-Bench: A Foundation for Assessing Deep Learning EEG Models"
+  https://arxiv.org/html/2401.10746v3
 
-EA aligns the marginal distributions of neural data across sessions/subjects
-by whitening each session's data with its own covariance and re-coloring
-with a reference covariance matrix.
+EA aligns neural data by whitening each session to identity covariance:
+
+    X_aligned = R^(-1/2) @ X
+
+Where R is the mean covariance matrix for that session/subject.
+
+Key insight: After EA, the mean covariance matrix of each domain equals the
+identity matrix, making EEG data distributions from different domains more
+consistent. EA focuses on the domain gap by re-centering each domain at the
+identity matrix.
 
 Key benefits:
 - Reduces inter-session/subject data discrepancies
 - Improves cross-subject model accuracy
 - Accelerates convergence (~70% faster)
-
-Usage:
-    # Compute reference matrix from all sessions
-    ea = EuclideanAlignment()
-    ea.fit(session_data_dict)  # {session_id: (trials, channels, samples)}
-
-    # Transform new data
-    aligned_data = ea.transform(data, session_id)
+- Simple: no reference covariance needed
 
 TO REMOVE THIS FEATURE:
 1. Delete this file (euclidean_alignment.py)
@@ -31,7 +32,7 @@ TO REMOVE THIS FEATURE:
 from __future__ import annotations
 
 import numpy as np
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 from pathlib import Path
 import warnings
 
@@ -97,97 +98,38 @@ def compute_session_covariance(
     return cov
 
 
-def compute_reference_covariance(
-    session_covariances: Dict[str, np.ndarray],
-    method: str = "arithmetic",
-) -> np.ndarray:
-    """Compute reference covariance matrix from all sessions.
-
-    Args:
-        session_covariances: Dict mapping session_id -> covariance [C, C]
-        method: Averaging method:
-            - "arithmetic": Simple arithmetic mean (default, fastest)
-            - "geometric": Riemannian geometric mean (more accurate but slower)
-
-    Returns:
-        Reference covariance matrix [C, C]
-    """
-    covs = list(session_covariances.values())
-
-    if method == "arithmetic":
-        # Simple arithmetic mean
-        return np.mean(covs, axis=0)
-
-    elif method == "geometric":
-        # Riemannian geometric mean (iterative algorithm)
-        # This is more principled for SPD matrices but slower
-        ref = np.mean(covs, axis=0)  # Initialize with arithmetic mean
-
-        for _ in range(10):  # Fixed iterations
-            ref_inv_sqrt = _matrix_sqrt(ref, inverse=True)
-
-            # Compute log-Euclidean mean
-            log_sum = np.zeros_like(ref)
-            for cov in covs:
-                # Log map: ref^(-1/2) @ cov @ ref^(-1/2)
-                transformed = ref_inv_sqrt @ cov @ ref_inv_sqrt
-                # Matrix logarithm via eigendecomposition
-                w, V = np.linalg.eigh(transformed)
-                w = np.maximum(w, 1e-10)
-                log_sum += V @ np.diag(np.log(w)) @ V.T
-
-            log_mean = log_sum / len(covs)
-
-            # Exp map back
-            w, V = np.linalg.eigh(log_mean)
-            exp_mean = V @ np.diag(np.exp(w)) @ V.T
-
-            # Update reference
-            ref_sqrt = _matrix_sqrt(ref, inverse=False)
-            ref = ref_sqrt @ exp_mean @ ref_sqrt
-
-        return ref
-
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'arithmetic' or 'geometric'")
-
-
 class EuclideanAlignment:
     """Euclidean Alignment for cross-session/subject transfer learning.
 
-    Aligns neural data by:
-    1. Whitening each session with its own covariance (removes session-specific patterns)
-    2. Re-coloring with reference covariance (applies shared structure)
+    Aligns neural data by whitening each session to identity covariance:
 
-    Formula: X_aligned = R^(1/2) @ Sigma^(-1/2) @ X
+        X_aligned = R^(-1/2) @ X
 
-    Where:
-        - Sigma: Session-specific covariance matrix
-        - R: Reference covariance (mean across sessions)
+    Where R is the mean covariance matrix for that session.
+
+    After EA, the mean covariance of each session equals the identity matrix,
+    making data distributions from different sessions more consistent.
 
     Attributes:
-        reference_cov: Reference covariance matrix [C, C]
         session_covariances: Dict of session covariances
-        session_transforms: Dict of precomputed transforms (R^(1/2) @ Sigma^(-1/2))
+        session_transforms: Dict of precomputed transforms (R^(-1/2))
         fitted: Whether fit() has been called
     """
 
     def __init__(
         self,
         regularization: float = 1e-6,
-        reference_method: str = "arithmetic",
+        reference_method: str = "arithmetic",  # Kept for API compatibility, not used
     ):
         """Initialize Euclidean Alignment.
 
         Args:
             regularization: Tikhonov regularization for covariance matrices
-            reference_method: Method for computing reference ("arithmetic" or "geometric")
+            reference_method: Kept for API compatibility (not used in true EA)
         """
         self.regularization = regularization
-        self.reference_method = reference_method
+        self.reference_method = reference_method  # Not used, kept for compatibility
 
-        self.reference_cov: Optional[np.ndarray] = None
-        self.reference_sqrt: Optional[np.ndarray] = None
         self.session_covariances: Dict[str, np.ndarray] = {}
         self.session_transforms: Dict[str, np.ndarray] = {}
         self.fitted = False
@@ -199,6 +141,9 @@ class EuclideanAlignment:
     ) -> "EuclideanAlignment":
         """Fit EA on training sessions.
 
+        For each session, computes the covariance matrix and its inverse
+        square root transform that will whiten the data to identity covariance.
+
         Args:
             session_data: Dict mapping session_id -> data [trials, channels, samples]
             verbose: Print progress info
@@ -209,34 +154,26 @@ class EuclideanAlignment:
         if verbose:
             print(f"Fitting Euclidean Alignment on {len(session_data)} sessions...")
 
-        # Step 1: Compute covariance for each session
+        # For each session: compute covariance and whitening transform
         for session_id, data in session_data.items():
+            # Step 1: Compute session covariance
             cov = compute_session_covariance(data, self.regularization)
             self.session_covariances[session_id] = cov
+
+            # Step 2: Compute whitening transform: R^(-1/2)
+            # This maps the session's covariance to identity
+            session_inv_sqrt = _matrix_sqrt(cov, inverse=True)
+            self.session_transforms[session_id] = session_inv_sqrt
+
             if verbose:
                 print(f"  Session {session_id}: cov shape {cov.shape}, "
-                      f"trace={np.trace(cov):.2f}")
-
-        # Step 2: Compute reference covariance
-        self.reference_cov = compute_reference_covariance(
-            self.session_covariances,
-            method=self.reference_method,
-        )
-        self.reference_sqrt = _matrix_sqrt(self.reference_cov, inverse=False)
-
-        if verbose:
-            print(f"  Reference cov: trace={np.trace(self.reference_cov):.2f}")
-
-        # Step 3: Precompute transforms for each session
-        for session_id, session_cov in self.session_covariances.items():
-            session_inv_sqrt = _matrix_sqrt(session_cov, inverse=True)
-            # Transform: R^(1/2) @ Sigma^(-1/2)
-            self.session_transforms[session_id] = self.reference_sqrt @ session_inv_sqrt
+                      f"trace={np.trace(cov):.2f} -> identity")
 
         self.fitted = True
 
         if verbose:
             print(f"Euclidean Alignment fitted successfully.")
+            print(f"  All sessions will be whitened to identity covariance.")
 
         return self
 
@@ -245,10 +182,7 @@ class EuclideanAlignment:
         session_id: str,
         data: np.ndarray,
     ) -> None:
-        """Add/update a single session's covariance (for online updates).
-
-        Note: After calling this, you should call recompute_reference() to
-        update the reference matrix.
+        """Add/update a single session's covariance and transform.
 
         Args:
             session_id: Session identifier
@@ -257,24 +191,9 @@ class EuclideanAlignment:
         cov = compute_session_covariance(data, self.regularization)
         self.session_covariances[session_id] = cov
 
-    def recompute_reference(self) -> None:
-        """Recompute reference covariance and all transforms.
-
-        Call this after adding new sessions with fit_single_session().
-        """
-        if not self.session_covariances:
-            raise ValueError("No sessions fitted. Call fit() or fit_single_session() first.")
-
-        self.reference_cov = compute_reference_covariance(
-            self.session_covariances,
-            method=self.reference_method,
-        )
-        self.reference_sqrt = _matrix_sqrt(self.reference_cov, inverse=False)
-
-        # Recompute all transforms
-        for session_id, session_cov in self.session_covariances.items():
-            session_inv_sqrt = _matrix_sqrt(session_cov, inverse=True)
-            self.session_transforms[session_id] = self.reference_sqrt @ session_inv_sqrt
+        # Compute whitening transform: R^(-1/2)
+        session_inv_sqrt = _matrix_sqrt(cov, inverse=True)
+        self.session_transforms[session_id] = session_inv_sqrt
 
         self.fitted = True
 
@@ -285,12 +204,14 @@ class EuclideanAlignment:
     ) -> np.ndarray:
         """Transform data using session-specific alignment.
 
+        Applies: X_aligned = R^(-1/2) @ X
+
         Args:
             data: Data to transform [trials, channels, samples] or [channels, samples]
             session_id: Session identifier (must have been seen during fit)
 
         Returns:
-            Aligned data (same shape as input)
+            Aligned data (same shape as input) with identity covariance
         """
         if not self.fitted:
             raise RuntimeError("EuclideanAlignment not fitted. Call fit() first.")
@@ -330,9 +251,8 @@ class EuclideanAlignment:
     ) -> np.ndarray:
         """Transform data from a new (unseen) session.
 
-        For new sessions not seen during training, we can either:
-        1. Compute the session's covariance from the data itself
-        2. Use identity transform (no alignment)
+        For new sessions not seen during training, we compute the session's
+        covariance from the data itself and apply EA.
 
         Args:
             data: Data to transform [trials, channels, samples]
@@ -340,18 +260,16 @@ class EuclideanAlignment:
                                    If False, return data unchanged.
 
         Returns:
-            Aligned data (same shape as input)
+            Aligned data (same shape as input) with identity covariance
         """
-        if not self.fitted:
-            raise RuntimeError("EuclideanAlignment not fitted. Call fit() first.")
-
         if not compute_cov_from_data:
             return data
 
         # Compute session covariance from the data
         session_cov = compute_session_covariance(data, self.regularization)
+
+        # Compute whitening transform: R^(-1/2)
         session_inv_sqrt = _matrix_sqrt(session_cov, inverse=True)
-        transform = self.reference_sqrt @ session_inv_sqrt
 
         # Apply transform
         squeeze = False
@@ -359,7 +277,7 @@ class EuclideanAlignment:
             data = data[np.newaxis, ...]
             squeeze = True
 
-        aligned = np.einsum('ij,njt->nit', transform, data)
+        aligned = np.einsum('ij,njt->nit', session_inv_sqrt, data)
 
         if squeeze:
             aligned = aligned[0]
@@ -377,8 +295,6 @@ class EuclideanAlignment:
 
         np.savez(
             path,
-            reference_cov=self.reference_cov,
-            reference_sqrt=self.reference_sqrt,
             regularization=self.regularization,
             reference_method=self.reference_method,
             session_ids=list(self.session_covariances.keys()),
@@ -402,9 +318,6 @@ class EuclideanAlignment:
             regularization=float(data["regularization"]),
             reference_method=str(data["reference_method"]),
         )
-
-        ea.reference_cov = data["reference_cov"]
-        ea.reference_sqrt = data["reference_sqrt"]
 
         session_ids = data["session_ids"]
         session_covs = data["session_covs"]
@@ -434,7 +347,7 @@ def fit_euclidean_alignment(
     Args:
         data_by_session: Dict mapping session_id -> data [trials, channels, samples]
         regularization: Tikhonov regularization
-        reference_method: "arithmetic" or "geometric"
+        reference_method: Kept for API compatibility (not used)
         verbose: Print progress
 
     Returns:
@@ -461,6 +374,6 @@ def apply_euclidean_alignment(
         ea: Fitted EuclideanAlignment instance
 
     Returns:
-        Aligned data
+        Aligned data with identity covariance
     """
     return ea.transform(data, session_id)
