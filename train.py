@@ -3161,32 +3161,80 @@ def train(
                 session_ids_for_plots = data["session_ids"][plot_indices]
                 idx_to_session = data.get("idx_to_session", {})
 
-            # Get the base models (unwrap FSDP/DDP if needed)
-            base_model = model.module if hasattr(model, 'module') else model
-            base_reverse_model = None
-            if reverse_model is not None:
-                base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+            # For FSDP models, we need to gather full params before inference
+            # FSDP flattens parameters for sharding, making embedding weights 1-D
+            # Use summon_full_params to materialize full parameters
+            is_fsdp_model = isinstance(model, FSDP)
 
-            # Put models in eval mode
-            base_model.eval()
-            if base_reverse_model is not None:
-                base_reverse_model.eval()
+            if is_fsdp_model:
+                # Use context manager to gather full params for inference
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-            generate_training_plots(
-                model_fwd=base_model,
-                model_rev=base_reverse_model,
-                spectral_shift_fwd=spectral_shift_fwd,
-                spectral_shift_rev=spectral_shift_rev,
-                dataloader=plot_loader,
-                device=device,
-                vocab=data["vocab"],
-                output_dir=plots_dir,
-                config=config,
-                session_ids=session_ids_for_plots,
-                idx_to_session=idx_to_session,
-                formats=["png"],  # Fast - only PNG for training
-                quick=True,  # Essential plots only
-            )
+                # Gather params for forward model
+                fsdp_context_fwd = FSDP.summon_full_params(model, writeback=False)
+                fsdp_context_rev = None
+                if reverse_model is not None and isinstance(reverse_model, FSDP):
+                    fsdp_context_rev = FSDP.summon_full_params(reverse_model, writeback=False)
+
+                fsdp_context_fwd.__enter__()
+                if fsdp_context_rev is not None:
+                    fsdp_context_rev.__enter__()
+
+                try:
+                    base_model = model.module if hasattr(model, 'module') else model
+                    base_reverse_model = None
+                    if reverse_model is not None:
+                        base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+
+                    base_model.eval()
+                    if base_reverse_model is not None:
+                        base_reverse_model.eval()
+
+                    generate_training_plots(
+                        model_fwd=base_model,
+                        model_rev=base_reverse_model,
+                        spectral_shift_fwd=spectral_shift_fwd,
+                        spectral_shift_rev=spectral_shift_rev,
+                        dataloader=plot_loader,
+                        device=device,
+                        vocab=data["vocab"],
+                        output_dir=plots_dir,
+                        config=config,
+                        session_ids=session_ids_for_plots,
+                        idx_to_session=idx_to_session,
+                        formats=["png"],
+                        quick=True,
+                    )
+                finally:
+                    if fsdp_context_rev is not None:
+                        fsdp_context_rev.__exit__(None, None, None)
+                    fsdp_context_fwd.__exit__(None, None, None)
+            else:
+                # Non-FSDP: simple unwrap
+                base_model = model.module if hasattr(model, 'module') else model
+                base_reverse_model = None
+                if reverse_model is not None:
+                    base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+
+                base_model.eval()
+                if base_reverse_model is not None:
+                    base_reverse_model.eval()
+
+                generate_training_plots(
+                    model_fwd=base_model,
+                    model_rev=base_reverse_model,
+                    spectral_shift_fwd=spectral_shift_fwd,
+                    spectral_shift_rev=spectral_shift_rev,
+                    dataloader=plot_loader,
+                    device=device,
+                    vocab=data["vocab"],
+                    output_dir=plots_dir,
+                    config=config,
+                    session_ids=session_ids_for_plots,
+                    idx_to_session=idx_to_session,
+                    formats=["png"],
+                    quick=True,
+                )
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")
             traceback.print_exc()
