@@ -32,9 +32,8 @@ import seaborn as sns
 # Local imports
 from models import (
     CondUNet1D,
-    FrequencyBandSpectralShift,
-    AdaptiveSpectralShift,
-    SpectralShiftBlock,
+    OptimalSpectralBias,
+    EnvelopeHistogramMatching,
     SAMPLING_RATE_HZ as MODEL_SAMPLING_RATE,
 )
 from data import (
@@ -103,18 +102,12 @@ DEFAULT_MODEL_CONFIG = {
 }
 
 # Spectral shift config derived from train.py DEFAULT_CONFIG
+# Uses OptimalSpectralBias (fixed per-odor PSD correction)
 DEFAULT_SPECTRAL_SHIFT_CONFIG = {
     "sample_rate": SAMPLING_RATE_HZ,
-    "init_shift_db": DEFAULT_CONFIG["spectral_shift_init_fwd"],
-    "per_channel": DEFAULT_CONFIG["spectral_shift_per_channel"],
     "n_channels": 32,
     "n_odors": 7,
-    "conditional": DEFAULT_CONFIG["spectral_shift_conditional"],
-    "band_width_hz": DEFAULT_CONFIG["spectral_shift_band_width_hz"],
-    "mode": DEFAULT_CONFIG["spectral_shift_mode"],
-    "emb_dim": DEFAULT_CONFIG.get("emb_dim", 128),
-    "hidden_dim": DEFAULT_CONFIG["spectral_shift_hidden_dim"],
-    "max_shift_db": DEFAULT_CONFIG["spectral_shift_max_db"],
+    "band_width_hz": DEFAULT_CONFIG.get("spectral_shift_band_width_hz", None),
 }
 
 
@@ -408,33 +401,15 @@ def create_model(config: Dict[str, Any], device: torch.device) -> CondUNet1D:
 
 def create_spectral_shift(config: Dict[str, Any], device: torch.device):
     """Create a spectral shift module from config.
-    
-    Supports both FrequencyBandSpectralShift and AdaptiveSpectralShift based on mode.
+
+    Uses OptimalSpectralBias - fixed per-odor PSD correction (not trainable).
     """
-    mode = config.get("mode", "frequency_band")
-    
-    if mode == "adaptive":
-        shift = AdaptiveSpectralShift(
-            n_channels=config["n_channels"],
-            n_odors=config["n_odors"],
-            emb_dim=config.get("emb_dim", 128),
-            hidden_dim=config.get("hidden_dim", 64),
-            sample_rate=config["sample_rate"],
-            band_width_hz=config.get("band_width_hz", None),
-            max_shift_db=config.get("max_shift_db", 12.0),
-            per_channel=config["per_channel"],
-        )
-    else:
-        # frequency_band or flat mode
-        shift = FrequencyBandSpectralShift(
-            sample_rate=config["sample_rate"],
-            init_shift_db=config["init_shift_db"],
-            per_channel=config["per_channel"],
-            n_channels=config["n_channels"],
-            n_odors=config["n_odors"],
-            conditional=config["conditional"],
-            band_width_hz=config.get("band_width_hz", None),
-        )
+    shift = OptimalSpectralBias(
+        n_channels=config["n_channels"],
+        n_odors=config["n_odors"],
+        sample_rate=config.get("sample_rate", SAMPLING_RATE_HZ),
+        band_width_hz=config.get("band_width_hz", None),
+    )
     return shift.to(device)
 
 
@@ -5481,8 +5456,8 @@ def main():
 def run_gradient_analysis(
     model_fwd: CondUNet1D,
     model_rev: CondUNet1D,
-    spectral_shift_fwd: Optional[FrequencyBandSpectralShift],
-    spectral_shift_rev: Optional[FrequencyBandSpectralShift],
+    spectral_shift_fwd: Optional[nn.Module],
+    spectral_shift_rev: Optional[nn.Module],
     dataloader,
     device: torch.device,
     output_dir: Path,
