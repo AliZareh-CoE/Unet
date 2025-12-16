@@ -41,6 +41,7 @@ from data import (
     create_dataloaders,
     prepare_pfc_data,
     create_pfc_dataloaders,
+    create_single_session_dataloader,
     crop_to_target_torch,
     SAMPLING_RATE_HZ,
     PFC_SAMPLING_RATE_HZ,
@@ -5231,15 +5232,47 @@ def main():
     print(f"Split: {args.split}")
     print(f"Gradient analysis: {'ENABLED' if config['enable_gradient_analysis'] else 'DISABLED'}")
 
+    # Load checkpoint to get split info (use same validation/test sets as training)
+    print("\nLoading checkpoint for split info...")
+    checkpoint_full = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint_split_info = checkpoint_full.get("split_info", {})
+
     # Load data based on dataset type
-    print("\nLoading data...")
+    print("Loading data...")
     if dataset_type == DatasetType.PFC:
         data = prepare_pfc_data()
-        loaders = create_pfc_dataloaders(data, batch_size=args.batch_size, num_workers=4)
     else:
         data = prepare_data()
-        loaders = create_dataloaders(data, batch_size=args.batch_size, num_workers=4)
-    dataloader = loaders[args.split]
+
+    # Check if checkpoint has the split indices we need
+    split_key = f"{args.split}_idx"
+    if split_key in checkpoint_split_info:
+        # Use the SAME indices that were used during training!
+        split_indices = np.array(checkpoint_split_info[split_key])
+        print(f"  Using {args.split} indices from checkpoint ({len(split_indices)} samples)")
+
+        # Print session info if available
+        if "val_sessions" in checkpoint_split_info and args.split == "val":
+            print(f"  Validation sessions: {checkpoint_split_info['val_sessions']}")
+        if "test_sessions" in checkpoint_split_info and args.split == "test":
+            print(f"  Test sessions: {checkpoint_split_info['test_sessions']}")
+
+        # Create dataloader with checkpoint indices
+        dataloader = create_single_session_dataloader(
+            data, f"checkpoint_{args.split}", split_indices,
+            batch_size=args.batch_size, num_workers=4, distributed=False
+        )
+    else:
+        # Fallback: checkpoint doesn't have split info, use new splits
+        print(f"  WARNING: Checkpoint has no {split_key}, creating new random splits!")
+        print(f"  (This means validation is NOT on the same data as training)")
+        if dataset_type == DatasetType.PFC:
+            loaders = create_pfc_dataloaders(data, batch_size=args.batch_size, num_workers=4)
+        else:
+            loaders = create_dataloaders(data, batch_size=args.batch_size, num_workers=4)
+        dataloader = loaders[args.split]
+
+    del checkpoint_full  # Free memory
     
     # Get number of conditions from data (handle different key names)
     n_conditions = data.get("n_odors", data.get("n_labels", data.get("n_conditions", ds_config["n_conditions"])))
@@ -5269,10 +5302,18 @@ def main():
 
     # Add session info to signals if available (for per-session plots)
     if "session_ids" in data:
-        # Get the indices from the split being evaluated
+        # Use split_indices from checkpoint (already computed above)
         split_key = f"{args.split}_idx"
-        if split_key in data:
+        if split_key in checkpoint_split_info:
+            # Use checkpoint indices
+            split_indices = np.array(checkpoint_split_info[split_key])
+        elif split_key in data:
+            # Fallback to data indices
             split_indices = data[split_key]
+        else:
+            split_indices = None
+
+        if split_indices is not None:
             signals["session_ids"] = data["session_ids"][split_indices]
             signals["idx_to_session"] = data.get("idx_to_session", {})
             print(f"  Added session info for {len(np.unique(signals['session_ids']))} sessions")
