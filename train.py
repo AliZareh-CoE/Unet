@@ -118,6 +118,14 @@ except ImportError:
     RecordingConfig = None
     NeuroVisualizer = None
 
+# Validation plotting (for end-of-training plots)
+try:
+    from validate_model import generate_training_plots
+    VALIDATION_PLOTS_AVAILABLE = True
+except ImportError:
+    VALIDATION_PLOTS_AVAILABLE = False
+    generate_training_plots = None
+
 
 # =============================================================================
 # Configuration
@@ -140,6 +148,7 @@ DEFAULT_CONFIG = {
     "lr_min_ratio": 0.01,           # Min lr as ratio of initial (for cosine)
     "early_stop_patience": 15,  # Increased for better PSD convergence
     "seed": 42,
+    "generate_plots": True,         # Generate validation plots at end of training
 
     # Loss weights
     "weight_l1": 1.0,  # Also used for Huber weight
@@ -3094,6 +3103,55 @@ def train(
         dist.barrier()
 
     # =========================================================================
+    # Generate Validation Plots (galleries, per-session, per-odor)
+    # =========================================================================
+    if is_primary() and VALIDATION_PLOTS_AVAILABLE and config.get("generate_plots", True):
+        try:
+            plots_dir = CHECKPOINT_DIR / "validation_plots"
+
+            # Determine which dataloader to use for plots
+            if has_test_set:
+                plot_loader = loaders["test"]
+                plot_indices = data.get("test_idx")
+            else:
+                plot_loader = loaders["val"]
+                plot_indices = data.get("val_idx")
+
+            # Get session info for the plots
+            session_ids_for_plots = None
+            idx_to_session = None
+            if "session_ids" in data and plot_indices is not None:
+                session_ids_for_plots = data["session_ids"][plot_indices]
+                idx_to_session = data.get("idx_to_session", {})
+
+            # Get the base models (unwrap FSDP/DDP if needed)
+            base_model = model.module if hasattr(model, 'module') else model
+            base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+
+            # Put models in eval mode
+            base_model.eval()
+            base_reverse_model.eval()
+
+            generate_training_plots(
+                model_fwd=base_model,
+                model_rev=base_reverse_model,
+                spectral_shift_fwd=spectral_shift_fwd,
+                spectral_shift_rev=spectral_shift_rev,
+                dataloader=plot_loader,
+                device=device,
+                vocab=data["vocab"],
+                output_dir=plots_dir,
+                config=config,
+                session_ids=session_ids_for_plots,
+                idx_to_session=idx_to_session,
+                formats=["png"],  # Fast - only PNG for training
+                quick=True,  # Essential plots only
+            )
+        except Exception as e:
+            print(f"\nWarning: Failed to generate validation plots: {e}")
+            traceback.print_exc()
+
+    # =========================================================================
     # Recording: Final report generation and cleanup
     # =========================================================================
     if recording_session is not None:
@@ -3367,6 +3425,12 @@ def parse_args():
     parser.add_argument("--aug-freq-mask-max-width", type=int, default=None,
                         help="Max width of each masked band in freq bins (default: 10)")
 
+    # Validation plot generation
+    parser.add_argument("--generate-plots", action="store_true", default=None,
+                        help="Generate validation plots at end of training (default: True)")
+    parser.add_argument("--no-plots", action="store_false", dest="generate_plots",
+                        help="Skip validation plot generation")
+
     # Output scaling correction (learnable per-channel scale and bias in model)
     parser.add_argument("--output-scaling", action="store_true", default=True,
                         help="Enable learnable per-channel output scaling in model (default: True)")
@@ -3600,6 +3664,12 @@ def main():
         config["aug_freq_mask_max_bands"] = args.aug_freq_mask_max_bands
     if args.aug_freq_mask_max_width is not None:
         config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
+
+    # Plot generation config
+    if args.generate_plots is not None:
+        config["generate_plots"] = args.generate_plots
+    if is_primary() and not config.get("generate_plots", True):
+        print("Validation plot generation DISABLED (--no-plots)")
 
     # Print augmentation config
     if is_primary():
