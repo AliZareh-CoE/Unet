@@ -631,7 +631,8 @@ def generate_signals(
         for source, target, condition in tqdm(dataloader, desc="Generating signals"):
             source = source.to(device)
             target = target.to(device)
-            condition = condition.to(device)
+            # Ensure condition is long tensor for embedding lookup
+            condition = condition.to(device).long()
 
             # Apply per-channel normalization (same as training)
             source_norm = per_channel_normalize(source)
@@ -639,11 +640,17 @@ def generate_signals(
 
             # Forward: source → target
             target_pred = model_fwd(source_norm, condition)
-            target_pred = spectral_shift_fwd(target_pred, odor_ids=condition)
+            if spectral_shift_fwd is not None:
+                target_pred = spectral_shift_fwd(target_pred, odor_ids=condition)
 
-            # Reverse: target → source
-            source_pred = model_rev(target_norm, condition)
-            source_pred = spectral_shift_rev(source_pred, odor_ids=condition)
+            # Reverse: target → source (skip if no reverse model)
+            if model_rev is not None:
+                source_pred = model_rev(target_norm, condition)
+                if spectral_shift_rev is not None:
+                    source_pred = spectral_shift_rev(source_pred, odor_ids=condition)
+            else:
+                # No reverse model - use zeros placeholder
+                source_pred = torch.zeros_like(source_norm)
 
             # Crop to target window
             # IMPORTANT: Use normalized versions for fair comparison with model outputs
@@ -4966,6 +4973,17 @@ def generate_training_plots(
     print("\n" + "="*60)
     print("GENERATING VALIDATION PLOTS")
     print("="*60)
+
+    # Debug: Check model state
+    print(f"  Forward model type: {type(model_fwd).__name__}")
+    if hasattr(model_fwd, 'embed') and model_fwd.embed is not None:
+        embed = model_fwd.embed
+        print(f"  Forward embed type: {type(embed).__name__}")
+        if hasattr(embed, 'weight'):
+            print(f"  Forward embed weight shape: {embed.weight.shape}, dtype: {embed.weight.dtype}")
+    else:
+        print(f"  Forward model has no embed or embed is None")
+    print(f"  Reverse model: {'None' if model_rev is None else type(model_rev).__name__}")
 
     # Generate signals
     print("Generating signals from validation data...")
