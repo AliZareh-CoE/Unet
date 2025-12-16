@@ -2214,6 +2214,7 @@ class CondUNet1D(nn.Module):
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
         return_bottleneck: bool = False,
+        return_bottleneck_temporal: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass.
 
@@ -2222,11 +2223,16 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
-            return_bottleneck: If True, also return bottleneck features for contrastive learning
+            return_bottleneck: If True, also return pooled bottleneck features [B, bottleneck_ch]
+                              for label-based contrastive learning
+            return_bottleneck_temporal: If True, return unpooled bottleneck features [B, bottleneck_ch, T']
+                                        for temporal CEBRA (time-based contrastive learning)
+                                        Takes precedence over return_bottleneck if both are True.
 
         Returns:
-            If return_bottleneck=False: Predicted signal [B, C, T]
-            If return_bottleneck=True: (predicted signal, bottleneck features [B, bottleneck_ch])
+            If return_bottleneck=False and return_bottleneck_temporal=False: Predicted signal [B, C, T]
+            If return_bottleneck=True: (predicted signal, pooled bottleneck features [B, bottleneck_ch])
+            If return_bottleneck_temporal=True: (predicted signal, unpooled bottleneck features [B, bottleneck_ch, T'])
         """
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2245,8 +2251,16 @@ class CondUNet1D(nn.Module):
         bottleneck = self.mid(skips[-1])
 
         # Save bottleneck features for contrastive learning (CEBRA-style)
-        # Global average pool: (B, C, T) -> (B, C) for fixed-size embedding
-        bottleneck_features = bottleneck.mean(dim=-1) if return_bottleneck else None
+        # For temporal CEBRA: keep time dimension (B, C, T') for time-based positive pairs
+        # For label-based: pool to (B, C) for label-based positive pairs
+        if return_bottleneck_temporal:
+            # Unpooled: (B, C, T') - preserves temporal structure for true CEBRA
+            bottleneck_features = bottleneck
+        elif return_bottleneck:
+            # Pooled: (B, C) - for label-supervised contrastive learning
+            bottleneck_features = bottleneck.mean(dim=-1)
+        else:
+            bottleneck_features = None
 
         # Decoder path with skip connections (reverse order)
         x = bottleneck
@@ -2269,7 +2283,7 @@ class CondUNet1D(nn.Module):
             out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
-        if return_bottleneck:
+        if return_bottleneck or return_bottleneck_temporal:
             return out, bottleneck_features
         return out
 
