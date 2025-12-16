@@ -3163,11 +3163,14 @@ def train(
 
             # Get the base models (unwrap FSDP/DDP if needed)
             base_model = model.module if hasattr(model, 'module') else model
-            base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
+            base_reverse_model = None
+            if reverse_model is not None:
+                base_reverse_model = reverse_model.module if hasattr(reverse_model, 'module') else reverse_model
 
             # Put models in eval mode
             base_model.eval()
-            base_reverse_model.eval()
+            if base_reverse_model is not None:
+                base_reverse_model.eval()
 
             generate_training_plots(
                 model_fwd=base_model,
