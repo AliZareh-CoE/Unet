@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""BEAST MODE: 8x A100 Multi-GPU Augmentation Explorer.
+"""GUARANTEED COVERAGE: Find augmentations that cover ALL validation sessions.
 
-256+ configurations evaluated in parallel across 8 GPUs.
-Find the ultimate augmentation combination for cross-session domination.
+The goal is NOT average coverage - it's WORST-CASE coverage.
+We need augmented training data to explain EVERY validation session.
+
+Key metrics:
+- MIN_SESSION_COVERAGE: Coverage of the WORST validation session (must be high!)
+- PER_SESSION_COVERAGE: Coverage for each validation session individually
+- COVERAGE_VARIANCE: Low variance = consistent coverage across sessions
 
 Usage:
     python experiment/augmentation_explorer_gpu.py --n-val-sessions 4 --output-dir figures/augmentation_exploration
-
-Author: Claude (Anthropic)
 """
 from __future__ import annotations
 
 import os
 import sys
-
-# Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ['OMP_NUM_THREADS'] = '8'
@@ -27,10 +28,7 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from itertools import product
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -43,19 +41,15 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
-# =============================================================================
-# Multi-GPU Setup
-# =============================================================================
-
+# Multi-GPU
 N_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
-print(f"=" * 70)
-print(f"BEAST MODE: {N_GPUS} GPUs DETECTED")
-print(f"=" * 70)
+print(f"{'='*70}")
+print(f"GUARANTEED COVERAGE MODE: {N_GPUS} GPUs")
+print(f"{'='*70}")
 if N_GPUS > 0:
     for i in range(N_GPUS):
         props = torch.cuda.get_device_properties(i)
-        print(f"  GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB)")
-    print(f"  TOTAL GPU MEMORY: {sum(torch.cuda.get_device_properties(i).total_memory for i in range(N_GPUS)) / 1e9:.1f} GB")
+        print(f"  GPU {i}: {props.name} ({props.total_memory/1e9:.1f} GB)")
 
 
 # =============================================================================
@@ -86,175 +80,193 @@ def load_data(n_val_sessions: int = 4, seed: int = 42) -> Dict[str, Any]:
 
     np.random.seed(seed)
     perm = np.random.permutation(unique_sessions)
-    val_sessions = set(perm[:n_val_sessions])
-    train_sessions = set(perm[n_val_sessions:])
+    val_session_set = set(perm[:n_val_sessions])
+    train_session_set = set(perm[n_val_sessions:])
 
-    train_idx = np.where([s not in val_sessions for s in session_ids])[0]
-    val_idx = np.where([s in val_sessions for s in session_ids])[0]
+    train_idx = np.where([s not in val_session_set for s in session_ids])[0]
+    val_idx = np.where([s in val_session_set for s in session_ids])[0]
 
-    print(f"  Train: {len(train_idx)} trials ({len(train_sessions)} sessions)")
-    print(f"  Val: {len(val_idx)} trials ({len(val_sessions)} sessions)")
+    # Get per-session indices for validation
+    val_session_indices = {}
+    for sess_id in val_session_set:
+        sess_idx = np.where(session_ids == sess_id)[0]
+        val_session_indices[idx_to_session[sess_id]] = sess_idx
+
+    print(f"  Train: {len(train_idx)} trials ({len(train_session_set)} sessions)")
+    print(f"  Val: {len(val_idx)} trials ({len(val_session_set)} sessions)")
+    for sess_name, sess_idx in val_session_indices.items():
+        print(f"    - {sess_name}: {len(sess_idx)} trials")
 
     return {
         'ob': ob, 'pcx': pcx, 'session_ids': session_ids,
         'idx_to_session': idx_to_session, 'train_idx': train_idx, 'val_idx': val_idx,
+        'val_session_indices': val_session_indices,
+        'train_session_set': train_session_set,
+        'val_session_set': val_session_set,
     }
 
 
 # =============================================================================
-# GPU Feature Extraction
+# Feature Extraction (GPU)
 # =============================================================================
 
 def extract_features_gpu(ob: np.ndarray, pcx: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Extract features using GPU acceleration."""
+    """Extract multi-scale features on GPU."""
     n_trials, n_channels, n_time = ob.shape
 
-    ob_t = torch.from_numpy(ob).float().to(device)
-    pcx_t = torch.from_numpy(pcx).float().to(device)
-    combined = torch.cat([ob_t, pcx_t], dim=1)
+    ob_t = torch.from_numpy(ob.astype(np.float32)).to(device)
+    pcx_t = torch.from_numpy(pcx.astype(np.float32)).to(device)
+    combined = torch.cat([ob_t, pcx_t], dim=1)  # (n_trials, 64, n_time)
 
-    features_list = []
+    features = []
 
-    # Band power features
+    # 1. Band power (5 bands × 64 channels = 320 features)
     fft = torch.fft.rfft(combined, dim=-1)
     psd = (fft.abs() ** 2) / n_time
     freqs = torch.fft.rfftfreq(n_time, d=1/1000).to(device)
 
     for f_low, f_high in [(1, 4), (4, 12), (12, 30), (30, 60), (60, 100)]:
         mask = (freqs >= f_low) & (freqs <= f_high)
-        features_list.append(psd[:, :, mask].mean(dim=-1))
+        features.append(psd[:, :, mask].mean(dim=-1))
 
-    # Temporal stats
-    features_list.extend([
-        combined.mean(dim=-1),
-        combined.std(dim=-1),
-        torch.diff(combined, dim=-1).abs().mean(dim=-1),
-        torch.diff(combined, dim=-1).std(dim=-1),
-    ])
+    # 2. Temporal stats (4 × 64 = 256 features)
+    features.append(combined.mean(dim=-1))
+    features.append(combined.std(dim=-1))
+    features.append(torch.diff(combined, dim=-1).abs().mean(dim=-1))
+    features.append(torch.diff(combined, dim=-1).std(dim=-1))
 
-    # RMS envelope
+    # 3. RMS envelope stats (2 × 64 = 128 features)
     rms = F.avg_pool1d(combined.abs(), kernel_size=50, stride=1, padding=25)[:, :, :n_time]
-    features_list.extend([rms.mean(dim=-1), rms.std(dim=-1)])
+    features.append(rms.mean(dim=-1))
+    features.append(rms.std(dim=-1))
 
-    # Covariance (batched)
-    triu_indices = torch.triu_indices(64, 64, offset=1, device=device)
-    cov_features = []
+    # 4. Covariance upper triangle (2016 features)
+    triu_idx = torch.triu_indices(64, 64, offset=1, device=device)
+    cov_feats = []
     for start in range(0, n_trials, 200):
         end = min(start + 200, n_trials)
         batch = combined[start:end]
-        batch_centered = batch - batch.mean(dim=-1, keepdim=True)
-        cov = torch.bmm(batch_centered, batch_centered.transpose(1, 2)) / n_time
-        cov_features.append(cov[:, triu_indices[0], triu_indices[1]])
-    features_list.append(torch.cat(cov_features, dim=0))
+        batch_c = batch - batch.mean(dim=-1, keepdim=True)
+        cov = torch.bmm(batch_c, batch_c.transpose(1, 2)) / n_time
+        cov_feats.append(cov[:, triu_idx[0], triu_idx[1]])
+    features.append(torch.cat(cov_feats, dim=0))
 
-    all_features = torch.cat(features_list, dim=1)
-    mean, std = all_features.mean(dim=0, keepdim=True), all_features.std(dim=0, keepdim=True) + 1e-8
-    return (all_features - mean) / std
-
-
-def extract_covariance_gpu(ob: np.ndarray, pcx: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Extract covariance matrices."""
-    n_trials, _, n_time = ob.shape
-    ob_t = torch.from_numpy(ob).float().to(device)
-    pcx_t = torch.from_numpy(pcx).float().to(device)
-    combined = torch.cat([ob_t, pcx_t], dim=1)
-    combined_centered = combined - combined.mean(dim=-1, keepdim=True)
-    return torch.bmm(combined_centered, combined_centered.transpose(1, 2)) / n_time
+    # Concatenate and normalize
+    all_feats = torch.cat(features, dim=1)
+    mean = all_feats.mean(dim=0, keepdim=True)
+    std = all_feats.std(dim=0, keepdim=True) + 1e-8
+    return (all_feats - mean) / std
 
 
 # =============================================================================
-# GPU Distance Metrics
+# GUARANTEED COVERAGE METRICS
 # =============================================================================
 
-def compute_mmd_gpu(X: torch.Tensor, Y: torch.Tensor) -> float:
-    """MMD with RBF kernel."""
-    gamma = 1.0 / X.shape[1]
-    max_samples = 800
+def compute_per_session_coverage(
+    train_features: torch.Tensor,
+    val_features_dict: Dict[str, torch.Tensor],
+    k: int = 5,
+    percentile: float = 95.0,
+) -> Dict[str, float]:
+    """Compute coverage for EACH validation session separately.
+
+    This is the key metric - we need ALL sessions to have high coverage.
+    """
+    # Compute threshold from training data k-NN distances
+    max_train = min(1000, len(train_features))
+    train_sub = train_features[torch.randperm(len(train_features))[:max_train]]
+
+    train_sq = (train_sub ** 2).sum(dim=1, keepdim=True)
+    train_dists = torch.sqrt(torch.clamp(train_sq + train_sq.T - 2 * torch.mm(train_sub, train_sub.T), min=0))
+    train_dists.fill_diagonal_(float('inf'))
+    knn_dists = train_dists.topk(k, dim=1, largest=False)[0][:, -1]
+    threshold = knn_dists.quantile(percentile / 100.0)
+
+    # Compute coverage for each validation session
+    coverages = {}
+    for sess_name, val_feats in val_features_dict.items():
+        val_sq = (val_feats ** 2).sum(dim=1, keepdim=True)
+        train_sq_full = (train_features ** 2).sum(dim=1, keepdim=True)
+
+        # Subsample train if needed for memory
+        max_compare = min(2000, len(train_features))
+        train_sub_idx = torch.randperm(len(train_features))[:max_compare]
+        train_sub_feats = train_features[train_sub_idx]
+        train_sq_sub = (train_sub_feats ** 2).sum(dim=1, keepdim=True)
+
+        val_train_dists = torch.sqrt(torch.clamp(
+            val_sq + train_sq_sub.T - 2 * torch.mm(val_feats, train_sub_feats.T), min=0
+        ))
+        min_dists = val_train_dists.min(dim=1)[0]
+        coverage = (min_dists <= threshold).float().mean().item()
+        coverages[sess_name] = coverage
+
+    return coverages
+
+
+def compute_mmd_multi_scale(X: torch.Tensor, Y: torch.Tensor) -> float:
+    """Multi-scale MMD with multiple kernel bandwidths."""
+    max_samples = 500
     if len(X) > max_samples:
         X = X[torch.randperm(len(X))[:max_samples]]
     if len(Y) > max_samples:
         Y = Y[torch.randperm(len(Y))[:max_samples]]
 
-    def rbf(A, B):
-        A_sq = (A ** 2).sum(dim=1, keepdim=True)
-        B_sq = (B ** 2).sum(dim=1, keepdim=True)
-        return torch.exp(-gamma * (A_sq + B_sq.T - 2 * torch.mm(A, B.T)))
+    # Multiple bandwidths for multi-scale comparison
+    base_gamma = 1.0 / X.shape[1]
+    gammas = [base_gamma * 0.1, base_gamma, base_gamma * 10]
 
-    K_XX, K_YY, K_XY = rbf(X, X), rbf(Y, Y), rbf(X, Y)
-    n, m = len(X), len(Y)
-    mmd2 = (K_XX.sum() - K_XX.trace()) / (n * (n - 1))
-    mmd2 += (K_YY.sum() - K_YY.trace()) / (m * (m - 1))
-    mmd2 -= 2 * K_XY.mean()
-    return float(max(0, mmd2.cpu().item()))
+    total_mmd = 0.0
+    for gamma in gammas:
+        def rbf(A, B):
+            A_sq = (A ** 2).sum(dim=1, keepdim=True)
+            B_sq = (B ** 2).sum(dim=1, keepdim=True)
+            return torch.exp(-gamma * (A_sq + B_sq.T - 2 * torch.mm(A, B.T)))
 
+        K_XX, K_YY, K_XY = rbf(X, X), rbf(Y, Y), rbf(X, Y)
+        n, m = len(X), len(Y)
+        mmd2 = (K_XX.sum() - K_XX.trace()) / (n * (n - 1))
+        mmd2 += (K_YY.sum() - K_YY.trace()) / (m * (m - 1))
+        mmd2 -= 2 * K_XY.mean()
+        total_mmd += max(0, mmd2.item())
 
-def compute_coverage_gpu(X_train: torch.Tensor, X_val: torch.Tensor, k: int = 5) -> float:
-    """Coverage metric."""
-    max_samples = 800
-    if len(X_train) > max_samples:
-        X_train = X_train[torch.randperm(len(X_train))[:max_samples]]
-    if len(X_val) > max_samples:
-        X_val = X_val[torch.randperm(len(X_val))[:max_samples]]
-
-    train_sq = (X_train ** 2).sum(dim=1, keepdim=True)
-    val_sq = (X_val ** 2).sum(dim=1, keepdim=True)
-
-    train_dists = torch.sqrt(torch.clamp(train_sq + train_sq.T - 2 * torch.mm(X_train, X_train.T), min=0))
-    train_dists.fill_diagonal_(float('inf'))
-    threshold = train_dists.topk(k, dim=1, largest=False)[0][:, -1].quantile(0.95)
-
-    val_train_dists = torch.sqrt(torch.clamp(val_sq + train_sq.T - 2 * torch.mm(X_val, X_train.T), min=0))
-    return float((val_train_dists.min(dim=1)[0] <= threshold).float().mean().cpu().item())
-
-
-def compute_cov_distance_gpu(cov1: torch.Tensor, cov2: torch.Tensor) -> float:
-    """Covariance Frobenius distance."""
-    diff = cov1.mean(dim=0) - cov2.mean(dim=0)
-    return float(torch.sqrt((diff ** 2).sum()).cpu().item() / 64)
+    return total_mmd / len(gammas)
 
 
 # =============================================================================
 # Augmentation Functions
 # =============================================================================
 
-def aug_covariance_expansion(ob, pcx, strength=0.3, mode='random'):
-    """Covariance augmentation - perturb eigenvalues."""
-    n_trials, n_channels, _ = ob.shape
+def aug_covariance(ob, pcx, strength=0.3, mode='random'):
+    """Covariance eigenvalue perturbation."""
+    n_trials, n_ch, _ = ob.shape
     ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
 
     for i in range(n_trials):
         try:
-            ob_eigvals, ob_eigvecs = eigh(np.cov(ob[i]))
-            pcx_eigvals, pcx_eigvecs = eigh(np.cov(pcx[i]))
-
-            if mode == 'expand':
-                scale = 1 + strength * np.random.rand(n_channels)
-            elif mode == 'shrink':
-                scale = 1 - strength * np.random.rand(n_channels)
-            else:
-                scale = 1 + strength * (2 * np.random.rand(n_channels) - 1)
-            scale = np.clip(scale, 0.1, 10.0)
-
-            ob_eigvals_new = np.maximum(ob_eigvals * scale, 1e-6)
-            pcx_eigvals_new = np.maximum(pcx_eigvals * scale, 1e-6)
-
-            ob_T = ob_eigvecs @ np.diag(np.sqrt(ob_eigvals_new / (ob_eigvals + 1e-10))) @ ob_eigvecs.T
-            pcx_T = pcx_eigvecs @ np.diag(np.sqrt(pcx_eigvals_new / (pcx_eigvals + 1e-10))) @ pcx_eigvecs.T
-
-            ob_c = ob[i] - ob[i].mean(axis=-1, keepdims=True)
-            pcx_c = pcx[i] - pcx[i].mean(axis=-1, keepdims=True)
-            ob_aug[i] = ob_T @ ob_c + ob[i].mean(axis=-1, keepdims=True)
-            pcx_aug[i] = pcx_T @ pcx_c + pcx[i].mean(axis=-1, keepdims=True)
+            for arr, aug_arr in [(ob, ob_aug), (pcx, pcx_aug)]:
+                eigvals, eigvecs = eigh(np.cov(arr[i]))
+                if mode == 'expand':
+                    scale = 1 + strength * np.random.rand(n_ch)
+                elif mode == 'shrink':
+                    scale = 1 - strength * np.random.rand(n_ch)
+                else:
+                    scale = 1 + strength * (2 * np.random.rand(n_ch) - 1)
+                scale = np.clip(scale, 0.1, 10.0)
+                eigvals_new = np.maximum(eigvals * scale, 1e-6)
+                T = eigvecs @ np.diag(np.sqrt(eigvals_new / (eigvals + 1e-10))) @ eigvecs.T
+                centered = arr[i] - arr[i].mean(axis=-1, keepdims=True)
+                aug_arr[i] = T @ centered + arr[i].mean(axis=-1, keepdims=True)
         except:
             ob_aug[i], pcx_aug[i] = ob[i], pcx[i]
     return ob_aug, pcx_aug
 
 
-def aug_cross_session_mixing(ob, pcx, session_ids, alpha=0.3):
-    """Cross-session mixup."""
+def aug_cross_session_mix(ob, pcx, session_ids, alpha=0.3):
+    """Mixup between sessions."""
     n_trials = ob.shape[0]
-    unique_sessions = np.unique(session_ids)
-    if len(unique_sessions) < 2:
+    unique_sess = np.unique(session_ids)
+    if len(unique_sess) < 2:
         return ob, pcx
 
     ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
@@ -270,36 +282,36 @@ def aug_cross_session_mixing(ob, pcx, session_ids, alpha=0.3):
     return ob_aug, pcx_aug
 
 
-def aug_euclidean_alignment(ob, pcx):
-    """Euclidean Alignment - whiten to identity covariance."""
-    n_trials, n_channels, _ = ob.shape
+def aug_euclidean_align(ob, pcx):
+    """Whiten to identity covariance."""
+    n_trials, n_ch, _ = ob.shape
     try:
-        ob_mean_cov = np.array([np.cov(ob[i]) for i in range(n_trials)]).mean(axis=0)
-        pcx_mean_cov = np.array([np.cov(pcx[i]) for i in range(n_trials)]).mean(axis=0)
-        ob_align = np.real(np.linalg.inv(sqrtm(ob_mean_cov + 1e-6 * np.eye(n_channels))))
-        pcx_align = np.real(np.linalg.inv(sqrtm(pcx_mean_cov + 1e-6 * np.eye(n_channels))))
+        ob_cov = np.array([np.cov(ob[i]) for i in range(n_trials)]).mean(axis=0)
+        pcx_cov = np.array([np.cov(pcx[i]) for i in range(n_trials)]).mean(axis=0)
+        ob_T = np.real(np.linalg.inv(sqrtm(ob_cov + 1e-6 * np.eye(n_ch))))
+        pcx_T = np.real(np.linalg.inv(sqrtm(pcx_cov + 1e-6 * np.eye(n_ch))))
     except:
         return ob, pcx
 
-    ob_aligned, pcx_aligned = np.zeros_like(ob), np.zeros_like(pcx)
+    ob_out, pcx_out = np.zeros_like(ob), np.zeros_like(pcx)
     for i in range(n_trials):
         ob_c = ob[i] - ob[i].mean(axis=-1, keepdims=True)
         pcx_c = pcx[i] - pcx[i].mean(axis=-1, keepdims=True)
-        ob_aligned[i] = ob_align @ ob_c + ob[i].mean(axis=-1, keepdims=True)
-        pcx_aligned[i] = pcx_align @ pcx_c + pcx[i].mean(axis=-1, keepdims=True)
-    return ob_aligned, pcx_aligned
+        ob_out[i] = ob_T @ ob_c + ob[i].mean(axis=-1, keepdims=True)
+        pcx_out[i] = pcx_T @ pcx_c + pcx[i].mean(axis=-1, keepdims=True)
+    return ob_out, pcx_out
 
 
-def aug_amplitude_jitter(ob, pcx, scale_range=(0.7, 1.3)):
-    """Per-channel amplitude jittering."""
-    n_trials, n_channels, _ = ob.shape
-    s_ob = np.random.uniform(scale_range[0], scale_range[1], (n_trials, n_channels, 1))
-    s_pcx = np.random.uniform(scale_range[0], scale_range[1], (n_trials, n_channels, 1))
+def aug_amplitude(ob, pcx, scale_range=(0.7, 1.3)):
+    """Per-channel amplitude jitter."""
+    n_trials, n_ch, _ = ob.shape
+    s_ob = np.random.uniform(scale_range[0], scale_range[1], (n_trials, n_ch, 1))
+    s_pcx = np.random.uniform(scale_range[0], scale_range[1], (n_trials, n_ch, 1))
     return ob * s_ob, pcx * s_pcx
 
 
 def aug_noise(ob, pcx, std=0.1):
-    """Gaussian noise injection."""
+    """Gaussian noise."""
     return (ob + np.random.randn(*ob.shape) * std * ob.std(axis=-1, keepdims=True),
             pcx + np.random.randn(*pcx.shape) * std * pcx.std(axis=-1, keepdims=True))
 
@@ -314,30 +326,39 @@ def aug_time_shift(ob, pcx, max_shift=0.1):
 
 
 def aug_channel_dropout(ob, pcx, p=0.1):
-    """Random channel dropout."""
-    n_trials, n_channels, _ = ob.shape
-    mask = (np.random.rand(n_trials, n_channels, 1) > p).astype(np.float32)
+    """Random channel zeroing."""
+    mask = (np.random.rand(ob.shape[0], ob.shape[1], 1) > p).astype(np.float32)
     return ob * mask, pcx * mask
 
 
-def aug_freq_mask(ob, pcx, max_freq=100, n_masks=2):
-    """Frequency band masking."""
-    n_trials, n_channels, n_time = ob.shape
+def aug_freq_mask(ob, pcx, n_masks=2, max_width=20):
+    """Zero out random frequency bands."""
+    n_trials, _, n_time = ob.shape
     ob_aug, pcx_aug = ob.copy(), pcx.copy()
+    freqs = np.fft.rfftfreq(n_time, d=1/1000)
+
     for i in range(n_trials):
+        ob_fft = np.fft.rfft(ob_aug[i], axis=-1)
+        pcx_fft = np.fft.rfft(pcx_aug[i], axis=-1)
         for _ in range(n_masks):
-            f_start = np.random.randint(0, max_freq - 10)
-            f_width = np.random.randint(5, 20)
-            # Simple lowpass/bandstop approximation via FFT
-            ob_fft = np.fft.rfft(ob_aug[i], axis=-1)
-            pcx_fft = np.fft.rfft(pcx_aug[i], axis=-1)
-            freqs = np.fft.rfftfreq(n_time, d=1/1000)
+            f_start = np.random.randint(1, 80)
+            f_width = np.random.randint(5, max_width)
             mask = (freqs >= f_start) & (freqs <= f_start + f_width)
             ob_fft[:, mask] = 0
             pcx_fft[:, mask] = 0
-            ob_aug[i] = np.fft.irfft(ob_fft, n=n_time, axis=-1)
-            pcx_aug[i] = np.fft.irfft(pcx_fft, n=n_time, axis=-1)
+        ob_aug[i] = np.fft.irfft(ob_fft, n=n_time, axis=-1)
+        pcx_aug[i] = np.fft.irfft(pcx_fft, n=n_time, axis=-1)
     return ob_aug, pcx_aug
+
+
+def aug_dc_shift(ob, pcx, max_shift=0.3):
+    """Random per-channel DC offset."""
+    n_trials, n_ch, _ = ob.shape
+    ob_std = ob.std()
+    pcx_std = pcx.std()
+    ob_shift = np.random.uniform(-max_shift, max_shift, (n_trials, n_ch, 1)) * ob_std
+    pcx_shift = np.random.uniform(-max_shift, max_shift, (n_trials, n_ch, 1)) * pcx_std
+    return ob + ob_shift, pcx + pcx_shift
 
 
 # =============================================================================
@@ -358,224 +379,246 @@ class AugConfig:
     use_noise: bool = False
     noise_std: float = 0.1
     use_time_shift: bool = False
-    time_shift_max: float = 0.1
-    use_channel_dropout: bool = False
-    channel_dropout_p: float = 0.1
+    shift_max: float = 0.1
+    use_dropout: bool = False
+    dropout_p: float = 0.1
     use_freq_mask: bool = False
-    n_passes: int = 2
+    use_dc_shift: bool = False
+    dc_max: float = 0.3
+    n_passes: int = 3  # More passes for stability
 
     def to_dict(self):
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+        return {k: v for k, v in self.__dict__.items()}
 
 
 def apply_augmentation(ob, pcx, session_ids, config: AugConfig):
-    """Apply full augmentation pipeline."""
+    """Apply augmentation pipeline."""
     ob_aug, pcx_aug = ob.copy(), pcx.copy()
 
     if config.use_ea:
-        ob_aug, pcx_aug = aug_euclidean_alignment(ob_aug, pcx_aug)
+        ob_aug, pcx_aug = aug_euclidean_align(ob_aug, pcx_aug)
     if config.use_cov:
-        ob_aug, pcx_aug = aug_covariance_expansion(ob_aug, pcx_aug, config.cov_strength, config.cov_mode)
+        ob_aug, pcx_aug = aug_covariance(ob_aug, pcx_aug, config.cov_strength, config.cov_mode)
     if config.use_csm:
-        ob_aug, pcx_aug = aug_cross_session_mixing(ob_aug, pcx_aug, session_ids, config.csm_alpha)
+        ob_aug, pcx_aug = aug_cross_session_mix(ob_aug, pcx_aug, session_ids, config.csm_alpha)
     if config.use_amp:
-        ob_aug, pcx_aug = aug_amplitude_jitter(ob_aug, pcx_aug, config.amp_range)
+        ob_aug, pcx_aug = aug_amplitude(ob_aug, pcx_aug, config.amp_range)
     if config.use_noise:
         ob_aug, pcx_aug = aug_noise(ob_aug, pcx_aug, config.noise_std)
     if config.use_time_shift:
-        ob_aug, pcx_aug = aug_time_shift(ob_aug, pcx_aug, config.time_shift_max)
-    if config.use_channel_dropout:
-        ob_aug, pcx_aug = aug_channel_dropout(ob_aug, pcx_aug, config.channel_dropout_p)
+        ob_aug, pcx_aug = aug_time_shift(ob_aug, pcx_aug, config.shift_max)
+    if config.use_dropout:
+        ob_aug, pcx_aug = aug_channel_dropout(ob_aug, pcx_aug, config.dropout_p)
     if config.use_freq_mask:
         ob_aug, pcx_aug = aug_freq_mask(ob_aug, pcx_aug)
+    if config.use_dc_shift:
+        ob_aug, pcx_aug = aug_dc_shift(ob_aug, pcx_aug, config.dc_max)
 
     return ob_aug, pcx_aug
 
 
 # =============================================================================
-# BEAST MODE: 256+ Configurations
+# Search Space - AGGRESSIVE
 # =============================================================================
 
-def generate_beast_search_space() -> List[AugConfig]:
-    """Generate 256+ augmentation configurations - GO WILD."""
+def generate_search_space() -> List[AugConfig]:
+    """Generate search space focused on GUARANTEED coverage."""
     configs = []
 
     # Baseline
     configs.append(AugConfig(name='baseline'))
-
-    # Individual augmentations - fine-grained sweeps
     configs.append(AugConfig(name='ea_only', use_ea=True))
 
-    # Covariance: 3 modes x 7 strengths = 21
-    for strength in [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9]:
-        for mode in ['expand', 'shrink', 'random']:
-            configs.append(AugConfig(name=f'cov_{mode}_{strength}', use_cov=True, cov_strength=strength, cov_mode=mode))
+    # Single augmentations - comprehensive sweep
+    for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
+        for m in ['expand', 'shrink', 'random']:
+            configs.append(AugConfig(name=f'cov_{m}_{s}', use_cov=True, cov_strength=s, cov_mode=m))
 
-    # Cross-session mixing: 8 alphas
-    for alpha in [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6]:
-        configs.append(AugConfig(name=f'csm_{alpha}', use_csm=True, csm_alpha=alpha))
+    for a in [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        configs.append(AugConfig(name=f'csm_{a}', use_csm=True, csm_alpha=a))
 
-    # Noise: 6 levels
-    for std in [0.02, 0.05, 0.1, 0.15, 0.2, 0.3]:
-        configs.append(AugConfig(name=f'noise_{std}', use_noise=True, noise_std=std))
+    for n in [0.05, 0.1, 0.15, 0.2, 0.25]:
+        configs.append(AugConfig(name=f'noise_{n}', use_noise=True, noise_std=n))
 
-    # Amplitude: 5 ranges
-    for lo, hi in [(0.8, 1.2), (0.7, 1.3), (0.6, 1.4), (0.5, 1.5), (0.9, 1.1)]:
-        configs.append(AugConfig(name=f'amp_{lo}_{hi}', use_amp=True, amp_range=(lo, hi)))
+    # EA + Cov - key combination
+    for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
+        for m in ['expand', 'shrink', 'random']:
+            configs.append(AugConfig(name=f'ea_cov_{m}_{s}', use_ea=True, use_cov=True, cov_strength=s, cov_mode=m))
 
-    # Time shift: 4 levels
-    for shift in [0.05, 0.1, 0.15, 0.2]:
-        configs.append(AugConfig(name=f'tshift_{shift}', use_time_shift=True, time_shift_max=shift))
+    # EA + CSM
+    for a in [0.1, 0.2, 0.3, 0.4, 0.5]:
+        configs.append(AugConfig(name=f'ea_csm_{a}', use_ea=True, use_csm=True, csm_alpha=a))
 
-    # Channel dropout: 4 levels
-    for p in [0.05, 0.1, 0.15, 0.2]:
-        configs.append(AugConfig(name=f'chdrop_{p}', use_channel_dropout=True, channel_dropout_p=p))
+    # Cov + CSM (no EA)
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4]:
+            configs.append(AugConfig(name=f'cov_{s}_csm_{a}', use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a))
 
-    # Freq mask
-    configs.append(AugConfig(name='freqmask', use_freq_mask=True))
+    # EA + Cov + CSM - triple combo
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4]:
+            configs.append(AugConfig(name=f'ea_cov_{s}_csm_{a}', use_ea=True, use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a))
 
-    # EA + Cov combinations: 5 strengths x 3 modes = 15
-    for strength in [0.1, 0.2, 0.3, 0.5, 0.7]:
-        for mode in ['expand', 'shrink', 'random']:
-            configs.append(AugConfig(name=f'ea_cov_{mode}_{strength}', use_ea=True, use_cov=True, cov_strength=strength, cov_mode=mode))
-
-    # EA + CSM: 6 alphas
-    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
-        configs.append(AugConfig(name=f'ea_csm_{alpha}', use_ea=True, use_csm=True, csm_alpha=alpha))
-
-    # Cov + CSM: 4x4 = 16
-    for strength in [0.1, 0.2, 0.3, 0.5]:
-        for alpha in [0.1, 0.2, 0.3, 0.4]:
-            configs.append(AugConfig(name=f'cov_{strength}_csm_{alpha}', use_cov=True, cov_strength=strength, use_csm=True, csm_alpha=alpha))
-
-    # EA + Cov + CSM: 4x4 = 16
-    for strength in [0.1, 0.2, 0.3, 0.5]:
-        for alpha in [0.1, 0.2, 0.3, 0.4]:
-            configs.append(AugConfig(name=f'ea_cov_{strength}_csm_{alpha}', use_ea=True, use_cov=True, cov_strength=strength, use_csm=True, csm_alpha=alpha))
-
-    # Triple combos with noise: 3x3x3 = 27
-    for strength in [0.2, 0.3, 0.5]:
-        for alpha in [0.2, 0.3, 0.4]:
-            for noise in [0.05, 0.1, 0.15]:
+    # With noise
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3]:
+            for n in [0.05, 0.1, 0.15]:
                 configs.append(AugConfig(
-                    name=f'ea_cov_{strength}_csm_{alpha}_n_{noise}',
-                    use_ea=True, use_cov=True, cov_strength=strength,
-                    use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise
+                    name=f'ea_cov_{s}_csm_{a}_n_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a, use_noise=True, noise_std=n
                 ))
 
-    # Quad combos with amplitude: 3x3x2x2 = 36
-    for strength in [0.2, 0.3, 0.5]:
-        for alpha in [0.2, 0.3, 0.4]:
-            for noise in [0.05, 0.1]:
-                for amp in [(0.8, 1.2), (0.7, 1.3)]:
-                    configs.append(AugConfig(
-                        name=f'ea_cov_{strength}_csm_{alpha}_n_{noise}_amp_{amp[0]}',
-                        use_ea=True, use_cov=True, cov_strength=strength, cov_mode='random',
-                        use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise,
-                        use_amp=True, amp_range=amp
-                    ))
-
-    # Kitchen sink with time shift: 2x2x2x2 = 16
-    for strength in [0.2, 0.3]:
-        for alpha in [0.2, 0.3]:
-            for noise in [0.05, 0.1]:
-                for tshift in [0.05, 0.1]:
-                    configs.append(AugConfig(
-                        name=f'full_{strength}_{alpha}_{noise}_{tshift}',
-                        use_ea=True, use_cov=True, cov_strength=strength,
-                        use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise,
-                        use_amp=True, amp_range=(0.8, 1.2), use_time_shift=True, time_shift_max=tshift
-                    ))
-
-    # ULTRA combos with channel dropout: 2x2x2x2 = 16
-    for strength in [0.2, 0.3]:
-        for alpha in [0.2, 0.3]:
-            for noise in [0.05, 0.1]:
-                for cdrop in [0.05, 0.1]:
-                    configs.append(AugConfig(
-                        name=f'ultra_{strength}_{alpha}_{noise}_{cdrop}',
-                        use_ea=True, use_cov=True, cov_strength=strength,
-                        use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise,
-                        use_amp=True, amp_range=(0.8, 1.2), use_channel_dropout=True, channel_dropout_p=cdrop
-                    ))
-
-    # MEGA combos with freq mask: 2x2x2 = 8
-    for strength in [0.2, 0.3]:
-        for alpha in [0.2, 0.3]:
-            for noise in [0.05, 0.1]:
+    # With amplitude
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3]:
+            for amp_lo in [0.6, 0.7, 0.8]:
+                amp_hi = 2.0 - amp_lo
                 configs.append(AugConfig(
-                    name=f'mega_{strength}_{alpha}_{noise}',
-                    use_ea=True, use_cov=True, cov_strength=strength,
-                    use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise,
-                    use_amp=True, amp_range=(0.8, 1.2), use_freq_mask=True
+                    name=f'ea_cov_{s}_csm_{a}_amp_{amp_lo}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a, use_amp=True, amp_range=(amp_lo, amp_hi)
                 ))
 
-    # INSANE: ALL THE THINGS: 2x2x2 = 8
-    for strength in [0.2, 0.3]:
-        for alpha in [0.2, 0.3]:
-            for noise in [0.05, 0.1]:
+    # Full combo with time shift
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3]:
+            for n in [0.05, 0.1]:
+                for ts in [0.05, 0.1]:
+                    configs.append(AugConfig(
+                        name=f'full_{s}_{a}_{n}_{ts}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_noise=True, noise_std=n,
+                        use_amp=True, amp_range=(0.7, 1.3),
+                        use_time_shift=True, shift_max=ts
+                    ))
+
+    # Ultra with DC shift
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3]:
+            for dc in [0.1, 0.2, 0.3]:
                 configs.append(AugConfig(
-                    name=f'insane_{strength}_{alpha}_{noise}',
-                    use_ea=True, use_cov=True, cov_strength=strength,
-                    use_csm=True, csm_alpha=alpha, use_noise=True, noise_std=noise,
+                    name=f'ultra_{s}_{a}_dc_{dc}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_noise=True, noise_std=0.1,
                     use_amp=True, amp_range=(0.7, 1.3),
-                    use_time_shift=True, time_shift_max=0.1,
-                    use_channel_dropout=True, channel_dropout_p=0.1,
-                    use_freq_mask=True
+                    use_dc_shift=True, dc_max=dc
                 ))
 
-    print(f"\n  GENERATED {len(configs)} CONFIGURATIONS - LET'S GO!")
+    # Mega with dropout
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for dp in [0.05, 0.1, 0.15]:
+                configs.append(AugConfig(
+                    name=f'mega_{s}_{a}_dp_{dp}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_noise=True, noise_std=0.1,
+                    use_dropout=True, dropout_p=dp
+                ))
+
+    # INSANE: everything
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3]:
+            configs.append(AugConfig(
+                name=f'insane_{s}_{a}',
+                use_ea=True, use_cov=True, cov_strength=s, cov_mode='random',
+                use_csm=True, csm_alpha=a,
+                use_noise=True, noise_std=0.1,
+                use_amp=True, amp_range=(0.6, 1.4),
+                use_time_shift=True, shift_max=0.1,
+                use_dropout=True, dropout_p=0.1,
+                use_freq_mask=True,
+                use_dc_shift=True, dc_max=0.2
+            ))
+
+    print(f"\n  Generated {len(configs)} configurations")
     return configs
 
 
 # =============================================================================
-# Parallel Evaluation
+# Evaluation with GUARANTEED metrics
 # =============================================================================
 
-def evaluate_single_config(args):
-    """Evaluate a single config on a specific GPU."""
-    config, ob_train, pcx_train, ob_val, pcx_val, session_ids_train, gpu_id = args
-
-    device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() and gpu_id >= 0 else 'cpu')
+def evaluate_config(
+    config: AugConfig,
+    ob_train: np.ndarray,
+    pcx_train: np.ndarray,
+    ob_val: np.ndarray,
+    pcx_val: np.ndarray,
+    session_ids_train: np.ndarray,
+    val_session_indices: Dict[str, np.ndarray],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Evaluate with per-session coverage guarantee."""
 
     try:
-        # Extract validation features
-        val_features = extract_features_gpu(ob_val, pcx_val, device)
-        val_cov = extract_covariance_gpu(ob_val, pcx_val, device)
-
-        # Apply augmentation and extract features
-        all_features, all_covs = [], []
+        # Multiple augmentation passes
+        all_features = []
         for _ in range(config.n_passes):
             ob_aug, pcx_aug = apply_augmentation(ob_train, pcx_train, session_ids_train, config)
-            all_features.append(extract_features_gpu(ob_aug, pcx_aug, device))
-            all_covs.append(extract_covariance_gpu(ob_aug, pcx_aug, device))
+            feats = extract_features_gpu(ob_aug, pcx_aug, device)
+            all_features.append(feats)
 
         train_features = torch.cat(all_features, dim=0)
-        train_cov = torch.cat(all_covs, dim=0)
 
-        # Compute metrics
-        mmd = compute_mmd_gpu(train_features, val_features)
-        coverage = compute_coverage_gpu(train_features, val_features)
-        cov_dist = compute_cov_distance_gpu(train_cov, val_cov)
-        score = coverage - 0.3 * mmd - 0.1 * cov_dist
+        # Extract features for each validation session
+        val_features_dict = {}
+        for sess_name, sess_idx in val_session_indices.items():
+            ob_sess = ob_val[np.isin(np.arange(len(ob_val)), sess_idx - val_session_indices[list(val_session_indices.keys())[0]][0] + np.arange(len(sess_idx)))]
+            # Actually we need to index correctly
+            pass
+
+        # Simpler: just get val features per session from original indices
+        val_features_all = extract_features_gpu(ob_val, pcx_val, device)
+
+        # Split val features by session
+        val_features_dict = {}
+        start_idx = 0
+        for sess_name, sess_idx in val_session_indices.items():
+            n_sess = len(sess_idx)
+            val_features_dict[sess_name] = val_features_all[start_idx:start_idx + n_sess]
+            start_idx += n_sess
+
+        # Compute per-session coverage
+        per_session_cov = compute_per_session_coverage(train_features, val_features_dict)
+
+        # Key metrics
+        min_coverage = min(per_session_cov.values())
+        mean_coverage = np.mean(list(per_session_cov.values()))
+        coverage_std = np.std(list(per_session_cov.values()))
+
+        # Overall MMD
+        mmd = compute_mmd_multi_scale(train_features, val_features_all)
+
+        # Score: prioritize WORST-CASE coverage
+        # High min_coverage + low variance + low MMD
+        score = min_coverage * 100 - coverage_std * 50 - mmd * 10
 
         # Cleanup
-        del val_features, val_cov, train_features, train_cov, all_features, all_covs
+        del train_features, val_features_all, all_features
         torch.cuda.empty_cache()
 
         return {
             'config': config.to_dict(),
+            'min_coverage': min_coverage,
+            'mean_coverage': mean_coverage,
+            'coverage_std': coverage_std,
+            'per_session_coverage': per_session_cov,
             'mmd': mmd,
-            'coverage': coverage,
-            'cov_distance': cov_dist,
             'score': score,
         }
+
     except Exception as e:
         return {
             'config': config.to_dict(),
+            'min_coverage': 0.0,
+            'mean_coverage': 0.0,
+            'coverage_std': 1.0,
+            'per_session_coverage': {},
             'mmd': 999.0,
-            'coverage': 0.0,
-            'cov_distance': 999.0,
             'score': -999.0,
             'error': str(e),
         }
@@ -586,69 +629,110 @@ def evaluate_single_config(args):
 # =============================================================================
 
 def plot_results(results: List[Dict], output_dir: Path):
-    """Generate comprehensive visualizations."""
+    """Visualize with focus on per-session coverage."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results_sorted = sorted(results, key=lambda r: r['score'], reverse=True)
-    top_n = min(30, len(results_sorted))
-    top_results = results_sorted[:top_n]
+    top_n = min(25, len(results_sorted))
+    top = results_sorted[:top_n]
 
-    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
 
-    names = [r['config']['name'][:30] for r in top_results]
-    scores = [r['score'] for r in top_results]
-    mmds = [r['mmd'] for r in top_results]
-    coverages = [r['coverage'] for r in top_results]
+    names = [r['config']['name'][:25] for r in top]
+    min_covs = [r['min_coverage'] for r in top]
+    mean_covs = [r['mean_coverage'] for r in top]
+    scores = [r['score'] for r in top]
 
-    # Score bar chart
+    # Min coverage (most important!)
     ax = axes[0, 0]
-    colors = [plt.cm.RdYlGn((s - min(scores)) / (max(scores) - min(scores) + 1e-10)) for s in scores]
-    bars = ax.barh(range(top_n), scores, color=colors)
+    colors = [plt.cm.RdYlGn(c) for c in min_covs]
+    ax.barh(range(top_n), min_covs, color=colors)
+    ax.axvline(x=0.95, color='red', linestyle='--', label='95% threshold')
+    ax.axvline(x=0.99, color='green', linestyle='--', label='99% threshold')
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(names, fontsize=7)
-    ax.set_xlabel('Combined Score (higher is better)')
-    ax.set_title(f'Top {top_n} Augmentation Configurations')
+    ax.set_xlabel('MIN Session Coverage (MUST BE HIGH!)')
+    ax.set_title('Worst-Case Coverage per Config')
+    ax.legend()
     ax.invert_yaxis()
 
-    # MMD bar chart
+    # Mean coverage
     ax = axes[0, 1]
-    colors = [plt.cm.RdYlGn_r((m - min(mmds)) / (max(mmds) - min(mmds) + 1e-10)) for m in mmds]
-    ax.barh(range(top_n), mmds, color=colors)
+    colors = [plt.cm.RdYlGn(c) for c in mean_covs]
+    ax.barh(range(top_n), mean_covs, color=colors)
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(names, fontsize=7)
-    ax.set_xlabel('MMD (lower is better)')
-    ax.set_title('Maximum Mean Discrepancy')
+    ax.set_xlabel('Mean Coverage')
+    ax.set_title('Average Coverage')
     ax.invert_yaxis()
 
-    # Coverage bar chart
+    # Score
     ax = axes[1, 0]
-    colors = [plt.cm.RdYlGn((c - min(coverages)) / (max(coverages) - min(coverages) + 1e-10)) for c in coverages]
-    ax.barh(range(top_n), coverages, color=colors)
+    score_norm = [(s - min(scores)) / (max(scores) - min(scores) + 1e-10) for s in scores]
+    colors = [plt.cm.RdYlGn(s) for s in score_norm]
+    ax.barh(range(top_n), scores, color=colors)
     ax.set_yticks(range(top_n))
     ax.set_yticklabels(names, fontsize=7)
-    ax.set_xlabel('Coverage (higher is better)')
-    ax.set_title('Validation Coverage')
+    ax.set_xlabel('Score (higher = better)')
+    ax.set_title('Combined Score')
     ax.invert_yaxis()
 
-    # Scatter: all configs
+    # Scatter: min vs mean coverage
     ax = axes[1, 1]
+    all_min = [r['min_coverage'] for r in results]
+    all_mean = [r['mean_coverage'] for r in results]
     all_scores = [r['score'] for r in results]
-    all_mmds = [r['mmd'] for r in results]
-    all_coverages = [r['coverage'] for r in results]
-    scatter = ax.scatter(all_mmds, all_coverages, c=all_scores, cmap='RdYlGn', alpha=0.6, s=30)
+    scatter = ax.scatter(all_mean, all_min, c=all_scores, cmap='RdYlGn', alpha=0.6, s=40)
     plt.colorbar(scatter, ax=ax, label='Score')
-    ax.set_xlabel('MMD (lower is better)')
-    ax.set_ylabel('Coverage (higher is better)')
-    ax.set_title(f'All {len(results)} Configurations')
+    ax.axhline(y=0.95, color='red', linestyle='--', alpha=0.5)
+    ax.axhline(y=0.99, color='green', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Mean Coverage')
+    ax.set_ylabel('MIN Coverage (guarantee)')
+    ax.set_title('Coverage: Mean vs Worst-Case')
 
     # Mark top 5
     for i, r in enumerate(results_sorted[:5]):
-        ax.annotate(str(i+1), (r['mmd'], r['coverage']), fontsize=10, fontweight='bold', color='black')
+        ax.annotate(str(i+1), (r['mean_coverage'], r['min_coverage']), fontsize=10, fontweight='bold')
 
     plt.tight_layout()
-    plt.savefig(output_dir / 'augmentation_comparison.png', dpi=200, bbox_inches='tight')
+    plt.savefig(output_dir / 'guaranteed_coverage_results.png', dpi=200, bbox_inches='tight')
     plt.close()
-    print(f"\nSaved: {output_dir / 'augmentation_comparison.png'}")
+
+    # Per-session coverage heatmap for top configs
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    top_10 = results_sorted[:10]
+    sessions = list(top_10[0]['per_session_coverage'].keys()) if top_10[0]['per_session_coverage'] else []
+
+    if sessions:
+        matrix = []
+        for r in top_10:
+            row = [r['per_session_coverage'].get(s, 0) for s in sessions]
+            matrix.append(row)
+        matrix = np.array(matrix)
+
+        im = ax.imshow(matrix, cmap='RdYlGn', vmin=0, vmax=1, aspect='auto')
+        ax.set_xticks(range(len(sessions)))
+        ax.set_xticklabels(sessions, rotation=45, ha='right')
+        ax.set_yticks(range(len(top_10)))
+        ax.set_yticklabels([r['config']['name'][:20] for r in top_10])
+        ax.set_xlabel('Validation Session')
+        ax.set_ylabel('Augmentation Config')
+        ax.set_title('Per-Session Coverage Heatmap (Top 10 Configs)')
+        plt.colorbar(im, ax=ax, label='Coverage')
+
+        # Add text annotations
+        for i in range(len(top_10)):
+            for j in range(len(sessions)):
+                ax.text(j, i, f'{matrix[i,j]:.2f}', ha='center', va='center', fontsize=8,
+                       color='white' if matrix[i,j] < 0.5 else 'black')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'per_session_coverage_heatmap.png', dpi=200, bbox_inches='tight')
+    plt.close()
+
+    print(f"\nSaved: {output_dir}/guaranteed_coverage_results.png")
+    print(f"Saved: {output_dir}/per_session_coverage_heatmap.png")
 
 
 # =============================================================================
@@ -656,7 +740,7 @@ def plot_results(results: List[Dict], output_dir: Path):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='BEAST MODE Augmentation Explorer')
+    parser = argparse.ArgumentParser(description='Guaranteed Coverage Augmentation Explorer')
     parser.add_argument('--n-val-sessions', type=int, default=4)
     parser.add_argument('--output-dir', type=str, default='figures/augmentation_exploration')
     parser.add_argument('--seed', type=int, default=42)
@@ -667,6 +751,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
     # Load data
     print("\n1. Loading data...")
     data = load_data(args.n_val_sessions, args.seed)
@@ -674,45 +760,50 @@ def main():
     ob, pcx = data['ob'], data['pcx']
     train_idx, val_idx = data['train_idx'], data['val_idx']
     session_ids = data['session_ids']
+    val_session_indices = data['val_session_indices']
 
     ob_train, pcx_train = ob[train_idx], pcx[train_idx]
     ob_val, pcx_val = ob[val_idx], pcx[val_idx]
     session_ids_train = session_ids[train_idx]
 
     # Generate configs
-    print("\n2. Generating BEAST MODE search space...")
-    configs = generate_beast_search_space()
+    print("\n2. Generating search space...")
+    configs = generate_search_space()
 
-    # Evaluate - distribute across GPUs
+    # Evaluate
     print(f"\n3. Evaluating {len(configs)} configurations...")
     results = []
 
-    # Create tasks with round-robin GPU assignment
-    tasks = []
-    for i, config in enumerate(configs):
-        gpu_id = i % max(1, N_GPUS)
-        tasks.append((config, ob_train, pcx_train, ob_val, pcx_val, session_ids_train, gpu_id))
-
-    # Run with progress bar
-    for task in tqdm(tasks, desc="BEAST MODE"):
-        result = evaluate_single_config(task)
+    for config in tqdm(configs, desc="Evaluating"):
+        result = evaluate_config(
+            config, ob_train, pcx_train, ob_val, pcx_val,
+            session_ids_train, val_session_indices, device
+        )
         results.append(result)
 
-    # Sort and report
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Sort by score
     results_sorted = sorted(results, key=lambda r: r['score'], reverse=True)
 
-    print("\n" + "=" * 70)
-    print("TOP 15 AUGMENTATION CONFIGURATIONS")
-    print("=" * 70)
+    # Print results
+    print("\n" + "="*70)
+    print("TOP 15 CONFIGURATIONS (by guaranteed coverage)")
+    print("="*70)
 
-    for i, result in enumerate(results_sorted[:15]):
-        print(f"\n{i+1}. {result['config']['name']}")
-        print(f"   Score: {result['score']:.4f} | Coverage: {result['coverage']:.4f} | MMD: {result['mmd']:.4f} | CovDist: {result['cov_distance']:.4f}")
+    for i, r in enumerate(results_sorted[:15]):
+        print(f"\n{i+1}. {r['config']['name']}")
+        print(f"   MIN Coverage: {r['min_coverage']:.4f} | Mean: {r['mean_coverage']:.4f} | Std: {r['coverage_std']:.4f}")
+        print(f"   MMD: {r['mmd']:.4f} | Score: {r['score']:.2f}")
+        if r['per_session_coverage']:
+            cov_str = ', '.join([f"{k}:{v:.2f}" for k,v in r['per_session_coverage'].items()])
+            print(f"   Per-session: {cov_str}")
 
-    # Save results
+    # Save
     print("\n4. Saving results...")
-    with open(output_dir / 'augmentation_results.json', 'w') as f:
-        json.dump(results_sorted, f, indent=2)
+    with open(output_dir / 'guaranteed_coverage_results.json', 'w') as f:
+        json.dump(results_sorted, f, indent=2, default=str)
 
     # Plot
     print("\n5. Generating visualizations...")
@@ -722,16 +813,23 @@ def main():
     best = results_sorted[0]
     baseline = next((r for r in results if r['config']['name'] == 'baseline'), results_sorted[-1])
 
-    print("\n" + "=" * 70)
-    print("FINAL SUMMARY")
-    print("=" * 70)
-    print(f"\nBaseline: Score={baseline['score']:.4f}, Coverage={baseline['coverage']:.4f}, MMD={baseline['mmd']:.4f}")
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+    print(f"\nBaseline: MIN={baseline['min_coverage']:.4f}, Mean={baseline['mean_coverage']:.4f}")
     print(f"\n🏆 BEST: {best['config']['name']}")
-    print(f"   Score: {best['score']:.4f} (+{best['score'] - baseline['score']:.4f})")
-    print(f"   Coverage: {best['coverage']:.4f} (+{best['coverage'] - baseline['coverage']:.4f})")
-    print(f"   MMD: {best['mmd']:.4f} ({best['mmd'] - baseline['mmd']:+.4f})")
+    print(f"   MIN Coverage: {best['min_coverage']:.4f} (+{best['min_coverage'] - baseline['min_coverage']:.4f})")
+    print(f"   Mean Coverage: {best['mean_coverage']:.4f}")
+    print(f"   Coverage Variance: {best['coverage_std']:.4f}")
 
-    print(f"\n📊 Results saved to: {output_dir}/")
+    if best['min_coverage'] >= 0.95:
+        print("\n✅ GUARANTEE ACHIEVED: Worst-case session coverage >= 95%")
+    elif best['min_coverage'] >= 0.90:
+        print("\n⚠️  CLOSE: Worst-case coverage >= 90% but < 95%")
+    else:
+        print("\n❌ NEEDS WORK: Worst-case coverage < 90%")
+
+    print(f"\nResults saved to: {output_dir}/")
 
 
 if __name__ == '__main__':
