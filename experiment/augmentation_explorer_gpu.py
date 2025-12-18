@@ -56,29 +56,63 @@ if N_GPUS > 0:
 # Data Loading
 # =============================================================================
 
-def load_data(n_val_sessions: int = 4, seed: int = 42) -> Dict[str, Any]:
+def load_data(n_val_sessions: int = 4, seed: int = 42, use_synthetic: bool = False) -> Dict[str, Any]:
     """Load data with session-based splits."""
-    try:
-        from experiment.data import load_signals, load_odor_labels, load_session_ids, DATA_PATH, ODOR_CSV_PATH
-    except ModuleNotFoundError:
-        from data import load_signals, load_odor_labels, load_session_ids, DATA_PATH, ODOR_CSV_PATH
 
-    print("\nLoading neural signals...")
-    signals = load_signals(DATA_PATH)
-    n_trials = signals.shape[0]
-    print(f"  Loaded {n_trials} trials, shape: {signals.shape}")
+    if use_synthetic:
+        print("\nGenerating SYNTHETIC data for testing...")
+        np.random.seed(seed)
+        # Create synthetic data: 500 trials, 2 regions, 32 channels each, 1000 time points
+        n_trials = 500
+        n_channels = 32
+        n_time = 1000
+        n_sessions = 10
 
-    ob = signals[:, 0, :, :]
-    pcx = signals[:, 1, :, :]
+        # Generate session-varying signals (each session has different statistics)
+        ob = np.zeros((n_trials, n_channels, n_time))
+        pcx = np.zeros((n_trials, n_channels, n_time))
+        session_ids = np.zeros(n_trials, dtype=int)
 
-    odors, _ = load_odor_labels(ODOR_CSV_PATH, n_trials)
-    session_ids, session_to_idx, idx_to_session = load_session_ids(ODOR_CSV_PATH, num_trials=n_trials)
+        trials_per_session = n_trials // n_sessions
+        for sess in range(n_sessions):
+            start_idx = sess * trials_per_session
+            end_idx = start_idx + trials_per_session
 
-    unique_sessions = np.unique(session_ids)
-    n_sessions = len(unique_sessions)
-    print(f"  {n_sessions} unique sessions")
+            # Each session has different mean and covariance
+            sess_mean = np.random.randn(n_channels) * 0.5
+            sess_cov = np.eye(n_channels) + np.random.randn(n_channels, n_channels) * 0.1
+            sess_cov = sess_cov @ sess_cov.T  # Make positive definite
+
+            for i in range(start_idx, end_idx):
+                ob[i] = np.random.multivariate_normal(sess_mean, sess_cov, n_time).T
+                pcx[i] = np.random.multivariate_normal(sess_mean * 0.8, sess_cov * 0.9, n_time).T
+                session_ids[i] = sess
+
+        idx_to_session = {i: f"session_{i}" for i in range(n_sessions)}
+        unique_sessions = np.arange(n_sessions)
+        print(f"  Generated {n_trials} synthetic trials, shape: ({n_trials}, {n_channels}, {n_time})")
+        print(f"  {n_sessions} synthetic sessions")
+
+    else:
+        try:
+            from experiment.data import load_signals, load_odor_labels, load_session_ids, DATA_PATH, ODOR_CSV_PATH
+        except ModuleNotFoundError:
+            from data import load_signals, load_odor_labels, load_session_ids, DATA_PATH, ODOR_CSV_PATH
+
+        print("\nLoading neural signals...")
+        signals = load_signals(DATA_PATH)
+        n_trials = signals.shape[0]
+        print(f"  Loaded {n_trials} trials, shape: {signals.shape}")
+
+        ob = signals[:, 0, :, :]
+        pcx = signals[:, 1, :, :]
+
+        odors, _ = load_odor_labels(ODOR_CSV_PATH, n_trials)
+        session_ids, session_to_idx, idx_to_session = load_session_ids(ODOR_CSV_PATH, num_trials=n_trials)
+        unique_sessions = np.unique(session_ids)
 
     np.random.seed(seed)
+    unique_sessions = np.unique(session_ids)
     perm = np.random.permutation(unique_sessions)
     val_session_set = set(perm[:n_val_sessions])
     train_session_set = set(perm[n_val_sessions:])
@@ -1306,6 +1340,7 @@ def main():
     parser.add_argument('--n-val-sessions', type=int, default=4)
     parser.add_argument('--output-dir', type=str, default='figures/augmentation_exploration')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--synthetic', action='store_true', help='Use synthetic data for testing')
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -1317,7 +1352,7 @@ def main():
 
     # Load data
     print("\n1. Loading data...")
-    data = load_data(args.n_val_sessions, args.seed)
+    data = load_data(args.n_val_sessions, args.seed, use_synthetic=args.synthetic)
 
     ob, pcx = data['ob'], data['pcx']
     train_idx, val_idx = data['train_idx'], data['val_idx']
