@@ -5,6 +5,7 @@ __pycache__/
 
 # Artifacts and outputs
 artifacts/
+figures/
 *.db
 *.sqlite
 
