@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Session Analysis Script - Visualize cross-session variability for augmentation planning.
 
-This script generates 10 figures analyzing session differences:
+This script generates 20 figures analyzing session differences:
+
+=== Structural Analysis (Figures 1-10) ===
 1. PCA by Session (train vs held-out)
 2. PCA by Odor (within sessions)
 3. t-SNE by Session
@@ -12,6 +14,18 @@ This script generates 10 figures analyzing session differences:
 8. Odor Separability per Session
 9. Channel Statistics by Session
 10. Session-Odor Interaction (combined view)
+
+=== Probability Distribution Analysis (Figures 11-20) ===
+11. Envelope Magnitude Distribution (Hilbert transform)
+12. Instantaneous Frequency Distribution (Hilbert transform)
+13. Phase Distribution (Hilbert transform)
+14. Raw Signal Amplitude Distribution
+15. Peak Amplitude Distribution
+16. Zero-Crossing Rate Distribution
+17. Signal Gradient Distribution
+18. RMS Energy Distribution
+19. Kurtosis Distribution by Session
+20. Skewness Distribution by Session
 
 IMPORTANT: No data leakage - PCA/scalers fit ONLY on training data!
 
@@ -36,7 +50,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
-from scipy.signal import welch
+from scipy.signal import welch, hilbert, find_peaks
 from scipy.spatial.distance import pdist, squareform
 
 # Add parent directory to path for imports
@@ -918,6 +932,968 @@ def figure_10_session_odor_interaction(
     print(f"  Saved: {output_dir / 'fig10_session_odor_interaction.png'}")
 
 
+# ==============================================================================
+# PROBABILITY DISTRIBUTION FIGURES (11-20)
+# ==============================================================================
+
+def figure_11_envelope_magnitude_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 50,
+):
+    """Figure 11: Envelope magnitude distribution using Hilbert transform."""
+    print("Creating Figure 11: Envelope Magnitude Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Collect envelope magnitudes per session
+    session_envelopes = {}
+    all_envelopes_train = []
+    all_envelopes_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+        sess_name = idx_to_session[sess_id]
+
+        # Subsample for efficiency
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        # Compute envelope using Hilbert transform
+        envelopes = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                analytic = hilbert(trial[ch])
+                envelope = np.abs(analytic)
+                envelopes.extend(envelope)
+
+        session_envelopes[sess_id] = np.array(envelopes)
+
+        if sess_id in train_sessions:
+            all_envelopes_train.extend(envelopes)
+        else:
+            all_envelopes_holdout.extend(envelopes)
+
+    # Left: Per-session envelope distribution (KDE)
+    ax = axes[0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        env = session_envelopes[sess_id]
+
+        # Use KDE for smooth distribution
+        try:
+            kde = stats.gaussian_kde(env)
+            x_range = np.linspace(0, np.percentile(env, 99), 200)
+            ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                   label=sess_name, alpha=0.8)
+        except:
+            ax.hist(env, bins=50, density=True, alpha=0.3, color=colors[i], label=sess_name)
+
+    ax.set_xlabel('Envelope Magnitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Envelope Magnitude Distribution by Session\n(solid=train, dashed=held-out)')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+    ax.set_xlim(left=0)
+
+    # Right: Train vs Held-out comparison
+    ax = axes[1]
+    if all_envelopes_train and all_envelopes_holdout:
+        ax.hist(all_envelopes_train, bins=100, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_envelopes_holdout, bins=100, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        # KS test
+        stat, pval = stats.ks_2samp(
+            np.array(all_envelopes_train)[:10000],
+            np.array(all_envelopes_holdout)[:10000]
+        )
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Envelope Magnitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Envelope Distribution: Train vs Held-out')
+    ax.legend()
+    ax.set_xlim(left=0)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig11_envelope_magnitude_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig11_envelope_magnitude_distribution.png'}")
+
+
+def figure_12_instantaneous_frequency_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 50,
+):
+    """Figure 12: Instantaneous frequency distribution using Hilbert transform."""
+    print("Creating Figure 12: Instantaneous Frequency Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_inst_freqs = {}
+    all_freqs_train = []
+    all_freqs_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+        sess_name = idx_to_session[sess_id]
+
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        inst_freqs = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                analytic = hilbert(trial[ch])
+                phase = np.unwrap(np.angle(analytic))
+                # Instantaneous frequency = d(phase)/dt / (2*pi)
+                inst_freq = np.diff(phase) * SAMPLING_RATE_HZ / (2 * np.pi)
+                # Filter out unreasonable values
+                inst_freq = inst_freq[(inst_freq > 0) & (inst_freq < SAMPLING_RATE_HZ / 2)]
+                inst_freqs.extend(inst_freq)
+
+        session_inst_freqs[sess_id] = np.array(inst_freqs)
+
+        if sess_id in train_sessions:
+            all_freqs_train.extend(inst_freqs)
+        else:
+            all_freqs_holdout.extend(inst_freqs)
+
+    # Left: Per-session distribution
+    ax = axes[0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        freqs = session_inst_freqs[sess_id]
+
+        if len(freqs) > 0:
+            try:
+                kde = stats.gaussian_kde(freqs)
+                x_range = np.linspace(0, min(100, np.percentile(freqs, 99)), 200)
+                ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                       label=sess_name, alpha=0.8)
+            except:
+                ax.hist(freqs, bins=50, density=True, alpha=0.3, color=colors[i])
+
+    ax.set_xlabel('Instantaneous Frequency (Hz)')
+    ax.set_ylabel('Density')
+    ax.set_title('Instantaneous Frequency Distribution by Session\n(solid=train, dashed=held-out)')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+    ax.set_xlim(0, 100)
+
+    # Right: Train vs Held-out
+    ax = axes[1]
+    if all_freqs_train and all_freqs_holdout:
+        bins = np.linspace(0, 100, 100)
+        ax.hist(all_freqs_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_freqs_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        stat, pval = stats.ks_2samp(
+            np.array(all_freqs_train)[:10000],
+            np.array(all_freqs_holdout)[:10000]
+        )
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Instantaneous Frequency (Hz)')
+    ax.set_ylabel('Density')
+    ax.set_title('Instantaneous Frequency: Train vs Held-out')
+    ax.legend()
+    ax.set_xlim(0, 100)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig12_instantaneous_frequency_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig12_instantaneous_frequency_distribution.png'}")
+
+
+def figure_13_phase_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 50,
+):
+    """Figure 13: Phase distribution using Hilbert transform."""
+    print("Creating Figure 13: Phase Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_phases = {}
+    all_phases_train = []
+    all_phases_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+        sess_name = idx_to_session[sess_id]
+
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        phases = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                analytic = hilbert(trial[ch])
+                phase = np.angle(analytic)  # Returns values in [-pi, pi]
+                phases.extend(phase)
+
+        session_phases[sess_id] = np.array(phases)
+
+        if sess_id in train_sessions:
+            all_phases_train.extend(phases)
+        else:
+            all_phases_holdout.extend(phases)
+
+    # Left: Polar histogram per session
+    ax = axes[0]
+    ax.remove()
+    ax = fig.add_subplot(1, 2, 1, projection='polar')
+
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        phases = session_phases[sess_id]
+
+        if len(phases) > 0:
+            # Histogram in polar coordinates
+            bins = np.linspace(-np.pi, np.pi, 37)  # 36 bins
+            hist, bin_edges = np.histogram(phases, bins=bins, density=True)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+            ax.plot(bin_centers, hist, color=colors[i], linestyle=linestyle,
+                   label=sess_name, alpha=0.7)
+
+    ax.set_title('Phase Distribution by Session\n(polar histogram)')
+    ax.legend(bbox_to_anchor=(1.3, 1), loc='upper left', fontsize=7)
+
+    # Right: Train vs Held-out (Cartesian)
+    ax = axes[1]
+    if all_phases_train and all_phases_holdout:
+        bins = np.linspace(-np.pi, np.pi, 100)
+        ax.hist(all_phases_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_phases_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        # Circular mean test (Rayleigh test for uniformity)
+        from scipy.stats import circmean, circstd
+        train_mean = circmean(all_phases_train[:10000])
+        holdout_mean = circmean(all_phases_holdout[:10000])
+        ax.axvline(train_mean, color='C0', linestyle='--', label=f'Train mean: {train_mean:.2f}')
+        ax.axvline(holdout_mean, color='C1', linestyle='--', label=f'Held-out mean: {holdout_mean:.2f}')
+
+    ax.set_xlabel('Phase (radians)')
+    ax.set_ylabel('Density')
+    ax.set_title('Phase Distribution: Train vs Held-out')
+    ax.set_xlim(-np.pi, np.pi)
+    ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+    ax.set_xticklabels(['-π', '-π/2', '0', 'π/2', 'π'])
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig13_phase_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig13_phase_distribution.png'}")
+
+
+def figure_14_amplitude_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 50,
+):
+    """Figure 14: Raw signal amplitude distribution."""
+    print("Creating Figure 14: Raw Amplitude Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_amplitudes = {}
+    all_amps_train = []
+    all_amps_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        # Flatten all amplitude values
+        amps = sess_data.flatten()
+        session_amplitudes[sess_id] = amps
+
+        if sess_id in train_sessions:
+            all_amps_train.extend(amps)
+        else:
+            all_amps_holdout.extend(amps)
+
+    # Left: Per-session distribution
+    ax = axes[0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    # Determine common range
+    all_amps = np.concatenate(list(session_amplitudes.values()))
+    p1, p99 = np.percentile(all_amps, [1, 99])
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        amps = session_amplitudes[sess_id]
+
+        try:
+            kde = stats.gaussian_kde(amps)
+            x_range = np.linspace(p1, p99, 200)
+            ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                   label=sess_name, alpha=0.8)
+        except:
+            ax.hist(amps, bins=50, density=True, alpha=0.3, color=colors[i])
+
+    ax.set_xlabel('Signal Amplitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Raw Amplitude Distribution by Session\n(solid=train, dashed=held-out)')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    # Right: Train vs Held-out with statistics
+    ax = axes[1]
+    all_amps_train = np.array(all_amps_train)
+    all_amps_holdout = np.array(all_amps_holdout)
+
+    if len(all_amps_train) > 0 and len(all_amps_holdout) > 0:
+        bins = np.linspace(p1, p99, 100)
+        ax.hist(all_amps_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_amps_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        # Statistics
+        train_mean = np.mean(all_amps_train)
+        holdout_mean = np.mean(all_amps_holdout)
+        train_std = np.std(all_amps_train)
+        holdout_std = np.std(all_amps_holdout)
+
+        stats_text = f'Train: μ={train_mean:.3f}, σ={train_std:.3f}\n'
+        stats_text += f'Held-out: μ={holdout_mean:.3f}, σ={holdout_std:.3f}'
+        ax.text(0.95, 0.95, stats_text, transform=ax.transAxes,
+               ha='right', va='top', fontsize=10, family='monospace')
+
+    ax.set_xlabel('Signal Amplitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Amplitude Distribution: Train vs Held-out')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig14_amplitude_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig14_amplitude_distribution.png'}")
+
+
+def figure_15_peak_amplitude_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 100,
+):
+    """Figure 15: Peak amplitude distribution (local maxima)."""
+    print("Creating Figure 15: Peak Amplitude Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_peaks = {}
+    all_peaks_train = []
+    all_peaks_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+        sess_name = idx_to_session[sess_id]
+
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        peaks = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                # Find peaks (local maxima)
+                peak_idx, _ = find_peaks(trial[ch], distance=5)
+                if len(peak_idx) > 0:
+                    peaks.extend(trial[ch][peak_idx])
+
+        session_peaks[sess_id] = np.array(peaks) if peaks else np.array([0])
+
+        if sess_id in train_sessions:
+            all_peaks_train.extend(peaks)
+        else:
+            all_peaks_holdout.extend(peaks)
+
+    # Left: Per-session peak distribution
+    ax = axes[0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    # Determine common range
+    all_peaks = np.concatenate(list(session_peaks.values()))
+    p1, p99 = np.percentile(all_peaks, [5, 95])
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        peaks = session_peaks[sess_id]
+
+        if len(peaks) > 10:
+            try:
+                kde = stats.gaussian_kde(peaks)
+                x_range = np.linspace(p1, p99, 200)
+                ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                       label=sess_name, alpha=0.8)
+            except:
+                pass
+
+    ax.set_xlabel('Peak Amplitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Peak Amplitude Distribution by Session\n(solid=train, dashed=held-out)')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    # Right: Train vs Held-out
+    ax = axes[1]
+    if all_peaks_train and all_peaks_holdout:
+        bins = np.linspace(p1, p99, 100)
+        ax.hist(all_peaks_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_peaks_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        stat, pval = stats.ks_2samp(
+            np.array(all_peaks_train)[:10000],
+            np.array(all_peaks_holdout)[:10000]
+        )
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Peak Amplitude')
+    ax.set_ylabel('Density')
+    ax.set_title('Peak Amplitude: Train vs Held-out')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig15_peak_amplitude_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig15_peak_amplitude_distribution.png'}")
+
+
+def figure_16_zero_crossing_rate_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+):
+    """Figure 16: Zero-crossing rate distribution per trial."""
+    print("Creating Figure 16: Zero-Crossing Rate Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    def compute_zcr(signal):
+        """Compute zero-crossing rate."""
+        return np.sum(np.abs(np.diff(np.sign(signal))) > 0) / len(signal)
+
+    session_zcrs = {}
+    all_zcrs_train = []
+    all_zcrs_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        zcrs = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                zcr = compute_zcr(trial[ch])
+                zcrs.append(zcr)
+
+        session_zcrs[sess_id] = np.array(zcrs)
+
+        if sess_id in train_sessions:
+            all_zcrs_train.extend(zcrs)
+        else:
+            all_zcrs_holdout.extend(zcrs)
+
+    # Left: Box plot per session
+    ax = axes[0]
+    data = [session_zcrs[s] for s in unique_sessions]
+    labels = [idx_to_session[s] for s in unique_sessions]
+    colors_list = ['C0' if s in train_sessions else 'C1' for s in unique_sessions]
+
+    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors_list):
+        patch.set_facecolor(color)
+
+    ax.set_xlabel('Session')
+    ax.set_ylabel('Zero-Crossing Rate')
+    ax.set_title('Zero-Crossing Rate by Session\n(blue=train, orange=held-out)')
+    ax.tick_params(axis='x', rotation=45)
+
+    # Right: Distribution comparison
+    ax = axes[1]
+    if all_zcrs_train and all_zcrs_holdout:
+        ax.hist(all_zcrs_train, bins=50, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_zcrs_holdout, bins=50, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        train_mean = np.mean(all_zcrs_train)
+        holdout_mean = np.mean(all_zcrs_holdout)
+        ax.axvline(train_mean, color='C0', linestyle='--')
+        ax.axvline(holdout_mean, color='C1', linestyle='--')
+
+        stat, pval = stats.ks_2samp(all_zcrs_train, all_zcrs_holdout)
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Zero-Crossing Rate')
+    ax.set_ylabel('Density')
+    ax.set_title('Zero-Crossing Rate: Train vs Held-out')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig16_zero_crossing_rate_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig16_zero_crossing_rate_distribution.png'}")
+
+
+def figure_17_gradient_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+    n_samples_per_session: int = 50,
+):
+    """Figure 17: Signal gradient (first derivative) distribution."""
+    print("Creating Figure 17: Signal Gradient Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    rng = np.random.RandomState(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_grads = {}
+    all_grads_train = []
+    all_grads_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        if len(sess_data) > n_samples_per_session:
+            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
+            sess_data = sess_data[idx]
+
+        grads = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                gradient = np.diff(trial[ch]) * SAMPLING_RATE_HZ
+                grads.extend(gradient)
+
+        session_grads[sess_id] = np.array(grads)
+
+        if sess_id in train_sessions:
+            all_grads_train.extend(grads)
+        else:
+            all_grads_holdout.extend(grads)
+
+    # Left: Per-session gradient distribution
+    ax = axes[0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    all_grads = np.concatenate(list(session_grads.values()))
+    p1, p99 = np.percentile(all_grads, [1, 99])
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        grads = session_grads[sess_id]
+
+        try:
+            kde = stats.gaussian_kde(grads)
+            x_range = np.linspace(p1, p99, 200)
+            ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                   label=sess_name, alpha=0.8)
+        except:
+            pass
+
+    ax.set_xlabel('Signal Gradient (dV/dt)')
+    ax.set_ylabel('Density')
+    ax.set_title('Signal Gradient Distribution by Session\n(solid=train, dashed=held-out)')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    # Right: Train vs Held-out
+    ax = axes[1]
+    if all_grads_train and all_grads_holdout:
+        bins = np.linspace(p1, p99, 100)
+        ax.hist(all_grads_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_grads_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        # Statistics
+        train_std = np.std(all_grads_train)
+        holdout_std = np.std(all_grads_holdout)
+        ax.text(0.95, 0.95, f'Train σ: {train_std:.2f}\nHeld-out σ: {holdout_std:.2f}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Signal Gradient (dV/dt)')
+    ax.set_ylabel('Density')
+    ax.set_title('Gradient Distribution: Train vs Held-out')
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig17_gradient_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig17_gradient_distribution.png'}")
+
+
+def figure_18_rms_energy_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+):
+    """Figure 18: RMS energy distribution per trial and channel."""
+    print("Creating Figure 18: RMS Energy Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+    # Compute RMS per trial (average across channels)
+    session_rms_trial = {}
+    # Compute RMS per channel per trial
+    session_rms_channel = {}
+
+    all_rms_train = []
+    all_rms_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        # Per-trial RMS (averaged across channels)
+        rms_trials = np.sqrt(np.mean(sess_data ** 2, axis=(1, 2)))
+        session_rms_trial[sess_id] = rms_trials
+
+        # Per-channel RMS for each trial
+        rms_channels = np.sqrt(np.mean(sess_data ** 2, axis=2))  # (trials, channels)
+        session_rms_channel[sess_id] = rms_channels.flatten()
+
+        if sess_id in train_sessions:
+            all_rms_train.extend(rms_trials)
+        else:
+            all_rms_holdout.extend(rms_trials)
+
+    # Top-left: Trial RMS box plot per session
+    ax = axes[0, 0]
+    data = [session_rms_trial[s] for s in unique_sessions]
+    labels = [idx_to_session[s] for s in unique_sessions]
+    colors_list = ['C0' if s in train_sessions else 'C1' for s in unique_sessions]
+
+    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors_list):
+        patch.set_facecolor(color)
+
+    ax.set_xlabel('Session')
+    ax.set_ylabel('RMS Energy')
+    ax.set_title('Per-Trial RMS Energy by Session\n(blue=train, orange=held-out)')
+    ax.tick_params(axis='x', rotation=45)
+
+    # Top-right: Trial RMS distribution
+    ax = axes[0, 1]
+    if all_rms_train and all_rms_holdout:
+        ax.hist(all_rms_train, bins=50, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_rms_holdout, bins=50, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        stat, pval = stats.ks_2samp(all_rms_train, all_rms_holdout)
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('RMS Energy')
+    ax.set_ylabel('Density')
+    ax.set_title('Trial RMS Distribution: Train vs Held-out')
+    ax.legend()
+
+    # Bottom-left: Per-channel RMS distribution per session (KDE)
+    ax = axes[1, 0]
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    for i, sess_id in enumerate(unique_sessions):
+        sess_name = idx_to_session[sess_id]
+        linestyle = '-' if sess_id in train_sessions else '--'
+        rms = session_rms_channel[sess_id]
+
+        try:
+            kde = stats.gaussian_kde(rms)
+            x_range = np.linspace(0, np.percentile(rms, 99), 200)
+            ax.plot(x_range, kde(x_range), color=colors[i], linestyle=linestyle,
+                   label=sess_name, alpha=0.8)
+        except:
+            pass
+
+    ax.set_xlabel('Channel RMS Energy')
+    ax.set_ylabel('Density')
+    ax.set_title('Per-Channel RMS Distribution by Session')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+    ax.set_xlim(left=0)
+
+    # Bottom-right: RMS statistics summary
+    ax = axes[1, 1]
+
+    sess_names = [idx_to_session[s] for s in unique_sessions]
+    means = [np.mean(session_rms_trial[s]) for s in unique_sessions]
+    stds = [np.std(session_rms_trial[s]) for s in unique_sessions]
+    colors_bars = ['C0' if s in train_sessions else 'C1' for s in unique_sessions]
+
+    x = np.arange(len(unique_sessions))
+    ax.bar(x, means, yerr=stds, color=colors_bars, alpha=0.7, capsize=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(sess_names, rotation=45, ha='right')
+    ax.set_xlabel('Session')
+    ax.set_ylabel('Mean RMS Energy (±std)')
+    ax.set_title('Session RMS Statistics')
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig18_rms_energy_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig18_rms_energy_distribution.png'}")
+
+
+def figure_19_kurtosis_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+):
+    """Figure 19: Kurtosis distribution by session (per-channel)."""
+    print("Creating Figure 19: Kurtosis Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_kurtosis = {}
+    all_kurt_train = []
+    all_kurt_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        kurts = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                k = stats.kurtosis(trial[ch])
+                if not np.isnan(k) and not np.isinf(k):
+                    kurts.append(k)
+
+        session_kurtosis[sess_id] = np.array(kurts)
+
+        if sess_id in train_sessions:
+            all_kurt_train.extend(kurts)
+        else:
+            all_kurt_holdout.extend(kurts)
+
+    # Left: Box plot per session
+    ax = axes[0]
+    data = [session_kurtosis[s] for s in unique_sessions]
+    labels = [idx_to_session[s] for s in unique_sessions]
+    colors_list = ['C0' if s in train_sessions else 'C1' for s in unique_sessions]
+
+    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors_list):
+        patch.set_facecolor(color)
+
+    ax.set_xlabel('Session')
+    ax.set_ylabel('Kurtosis')
+    ax.set_title('Per-Channel Kurtosis by Session\n(blue=train, orange=held-out)')
+    ax.tick_params(axis='x', rotation=45)
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5, label='Gaussian (k=0)')
+
+    # Right: Distribution comparison
+    ax = axes[1]
+    if all_kurt_train and all_kurt_holdout:
+        # Clip extreme values for visualization
+        p1, p99 = np.percentile(all_kurt_train + all_kurt_holdout, [1, 99])
+        bins = np.linspace(p1, p99, 80)
+
+        ax.hist(all_kurt_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_kurt_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        train_mean = np.mean(all_kurt_train)
+        holdout_mean = np.mean(all_kurt_holdout)
+        ax.axvline(train_mean, color='C0', linestyle='--', label=f'Train mean: {train_mean:.2f}')
+        ax.axvline(holdout_mean, color='C1', linestyle='--', label=f'Held-out mean: {holdout_mean:.2f}')
+        ax.axvline(0, color='gray', linestyle='-', alpha=0.5, label='Gaussian')
+
+        stat, pval = stats.ks_2samp(all_kurt_train, all_kurt_holdout)
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Kurtosis')
+    ax.set_ylabel('Density')
+    ax.set_title('Kurtosis Distribution: Train vs Held-out\n(>0: heavy-tailed, <0: light-tailed)')
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig19_kurtosis_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig19_kurtosis_distribution.png'}")
+
+
+def figure_20_skewness_distribution(
+    ob: np.ndarray,
+    session_ids: np.ndarray,
+    idx_to_session: Dict[int, str],
+    train_idx: np.ndarray,
+    output_dir: Path,
+):
+    """Figure 20: Skewness distribution by session (per-channel)."""
+    print("Creating Figure 20: Skewness Distribution...")
+
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    session_skewness = {}
+    all_skew_train = []
+    all_skew_holdout = []
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = ob[mask]
+
+        skews = []
+        for trial in sess_data:
+            for ch in range(trial.shape[0]):
+                s = stats.skew(trial[ch])
+                if not np.isnan(s) and not np.isinf(s):
+                    skews.append(s)
+
+        session_skewness[sess_id] = np.array(skews)
+
+        if sess_id in train_sessions:
+            all_skew_train.extend(skews)
+        else:
+            all_skew_holdout.extend(skews)
+
+    # Left: Box plot per session
+    ax = axes[0]
+    data = [session_skewness[s] for s in unique_sessions]
+    labels = [idx_to_session[s] for s in unique_sessions]
+    colors_list = ['C0' if s in train_sessions else 'C1' for s in unique_sessions]
+
+    bp = ax.boxplot(data, labels=labels, patch_artist=True)
+    for patch, color in zip(bp['boxes'], colors_list):
+        patch.set_facecolor(color)
+
+    ax.set_xlabel('Session')
+    ax.set_ylabel('Skewness')
+    ax.set_title('Per-Channel Skewness by Session\n(blue=train, orange=held-out)')
+    ax.tick_params(axis='x', rotation=45)
+    ax.axhline(0, color='gray', linestyle='--', alpha=0.5, label='Symmetric (s=0)')
+
+    # Right: Distribution comparison
+    ax = axes[1]
+    if all_skew_train and all_skew_holdout:
+        p1, p99 = np.percentile(all_skew_train + all_skew_holdout, [1, 99])
+        bins = np.linspace(p1, p99, 80)
+
+        ax.hist(all_skew_train, bins=bins, density=True, alpha=0.5,
+               label='Train sessions', color='C0')
+        ax.hist(all_skew_holdout, bins=bins, density=True, alpha=0.5,
+               label='Held-out sessions', color='C1')
+
+        train_mean = np.mean(all_skew_train)
+        holdout_mean = np.mean(all_skew_holdout)
+        ax.axvline(train_mean, color='C0', linestyle='--', label=f'Train mean: {train_mean:.2f}')
+        ax.axvline(holdout_mean, color='C1', linestyle='--', label=f'Held-out mean: {holdout_mean:.2f}')
+        ax.axvline(0, color='gray', linestyle='-', alpha=0.5, label='Symmetric')
+
+        stat, pval = stats.ks_2samp(all_skew_train, all_skew_holdout)
+        ax.text(0.95, 0.95, f'KS test p-value: {pval:.2e}',
+               transform=ax.transAxes, ha='right', va='top', fontsize=10)
+
+    ax.set_xlabel('Skewness')
+    ax.set_ylabel('Density')
+    ax.set_title('Skewness Distribution: Train vs Held-out\n(>0: right-skewed, <0: left-skewed)')
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'fig20_skewness_distribution.png')
+    plt.close()
+    print(f"  Saved: {output_dir / 'fig20_skewness_distribution.png'}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze session differences for augmentation planning')
     parser.add_argument('--output-dir', type=str, default='figures/session_analysis',
@@ -991,6 +1967,21 @@ def main():
     figure_8_odor_separability_per_session(ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)
     figure_9_channel_statistics(ob, session_ids, idx_to_session, train_idx, output_dir)
     figure_10_session_odor_interaction(ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)
+
+    # Probability Distribution Figures (11-20)
+    print()
+    print("Generating probability distribution figures...")
+    print()
+    figure_11_envelope_magnitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_12_instantaneous_frequency_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_13_phase_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_14_amplitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_15_peak_amplitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_16_zero_crossing_rate_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_17_gradient_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_18_rms_energy_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_19_kurtosis_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    figure_20_skewness_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
 
     print()
     print("=" * 60)
