@@ -1360,6 +1360,7 @@ class PairedConditionalDataset(Dataset):
         filter_odor_id: If provided, only keep samples with this odor ID
         temporal_ablation: TemporalAblation instance to apply masking
         data_fraction: Fraction of data to use (for data scaling experiments)
+        session_ids: Optional session IDs for each sample (for session-aware augmentation)
     """
     def __init__(
         self,
@@ -1370,6 +1371,7 @@ class PairedConditionalDataset(Dataset):
         filter_odor_id: Optional[int] = None,
         temporal_ablation: Optional[TemporalAblation] = None,
         data_fraction: float = 1.0,
+        session_ids: Optional[np.ndarray] = None,
     ):
         # Apply odor filtering first if requested
         if filter_odor_id is not None:
@@ -1390,6 +1392,12 @@ class PairedConditionalDataset(Dataset):
         self.odors = torch.from_numpy(odors[indices]).long()
         self.temporal_ablation = temporal_ablation
 
+        # Session IDs for session-aware augmentation
+        if session_ids is not None:
+            self.session_ids = torch.from_numpy(session_ids[indices]).long()
+        else:
+            self.session_ids = None
+
     def __len__(self) -> int:
         return self.ob.shape[0]
 
@@ -1402,6 +1410,9 @@ class PairedConditionalDataset(Dataset):
             ob = self.temporal_ablation.apply_mask(ob)
             pcx = self.temporal_ablation.apply_mask(pcx)
 
+        # Return session_id if available (for session-aware augmentation)
+        if self.session_ids is not None:
+            return ob, pcx, odor, self.session_ids[idx]
         return ob, pcx, odor
 
 
@@ -1995,22 +2006,28 @@ def create_dataloaders(
     # Create temporal ablation if specified
     temp_ablation = TemporalAblation(temporal_ablation) if temporal_ablation else None
 
+    # Get session_ids if available (for session-aware augmentation)
+    session_ids = data.get("session_ids", None)
+
     # Create datasets
     train_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["train_idx"],
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
         data_fraction=data_fraction,
+        session_ids=session_ids,
     )
     val_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["val_idx"],
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
+        session_ids=session_ids,
     )
     test_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["test_idx"],
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
+        session_ids=session_ids,
     )
 
     # Create samplers for distributed training (seed=42 for reproducibility)

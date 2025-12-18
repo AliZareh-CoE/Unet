@@ -217,6 +217,8 @@ DEFAULT_CONFIG = {
     "aug_time_mask_ratio": 0.15,    # Fraction of time to mask
     "aug_mixup": True,              # Mixup: blend random sample pairs
     "aug_mixup_alpha": 0.4,         # Beta distribution alpha
+    "aug_session_mixup": True,      # Session-aware mixup: blend samples from DIFFERENT sessions
+    "aug_session_mixup_alpha": 0.4, # Beta distribution alpha for session mixup
     "aug_freq_mask": True,          # Frequency masking: zero out random freq bands
     "aug_freq_mask_max_bands": 3,   # Max number of frequency bands to mask
     "aug_freq_mask_max_width": 20,  # Max width of each masked band (in freq bins)
@@ -632,6 +634,64 @@ def aug_mixup(
     return ob_mixed, pcx_mixed
 
 
+def aug_session_mixup(
+    ob: torch.Tensor,
+    pcx: torch.Tensor,
+    session_ids: torch.Tensor,
+    alpha: float = 0.4
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply session-aware mixup: blend samples from DIFFERENT sessions.
+
+    Unlike standard mixup which pairs randomly, this specifically pairs
+    samples from different sessions to encourage cross-session invariance.
+
+    Args:
+        ob: Input tensor (batch, channels, time)
+        pcx: Target tensor (batch, channels, time)
+        session_ids: Session ID for each sample (batch,)
+        alpha: Beta distribution parameter (higher = more mixing)
+
+    Returns:
+        Tuple of (mixed_ob, mixed_pcx)
+    """
+    batch_size = ob.shape[0]
+    if batch_size < 2:
+        return ob, pcx
+
+    device = ob.device
+    unique_sessions = torch.unique(session_ids)
+
+    # If only one session in batch, fall back to regular mixup
+    if len(unique_sessions) < 2:
+        return aug_mixup(ob, pcx, alpha)
+
+    # Sample mixing coefficients from Beta distribution
+    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size,)).to(device)
+    lam = lam.view(-1, 1, 1)
+
+    # For each sample, find a partner from a DIFFERENT session
+    perm = torch.zeros(batch_size, dtype=torch.long, device=device)
+    for i in range(batch_size):
+        my_session = session_ids[i]
+        # Find indices of samples from different sessions
+        diff_session_mask = session_ids != my_session
+        diff_session_indices = torch.where(diff_session_mask)[0]
+
+        if len(diff_session_indices) > 0:
+            # Randomly pick one from different session
+            rand_idx = torch.randint(0, len(diff_session_indices), (1,), device=device)
+            perm[i] = diff_session_indices[rand_idx]
+        else:
+            # Fallback: if no different session available, use random
+            perm[i] = torch.randint(0, batch_size, (1,), device=device)
+
+    # Mix samples
+    ob_mixed = lam * ob + (1 - lam) * ob[perm]
+    pcx_mixed = lam * pcx + (1 - lam) * pcx[perm]
+
+    return ob_mixed, pcx_mixed
+
+
 def aug_freq_mask(
     x: torch.Tensor,
     max_bands: int = 2,
@@ -731,7 +791,8 @@ def aug_dc_offset(
 def apply_augmentations(
     ob: torch.Tensor,
     pcx: torch.Tensor,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
+    session_ids: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply configured augmentations to input/target pairs.
 
@@ -743,6 +804,7 @@ def apply_augmentations(
         ob: Input (OB) tensor (batch, channels, time)
         pcx: Target (PCx) tensor (batch, channels, time)
         config: Config dict with aug_* keys
+        session_ids: Optional session IDs for session-aware augmentation (batch,)
 
     Returns:
         Tuple of (augmented_ob, augmented_pcx)
@@ -804,6 +866,11 @@ def apply_augmentations(
     if config.get("aug_mixup", False):
         alpha = config.get("aug_mixup_alpha", 0.4)
         ob, pcx = aug_mixup(ob, pcx, alpha)
+
+    # Session-aware mixup: blend samples from DIFFERENT sessions
+    if config.get("aug_session_mixup", False) and session_ids is not None:
+        alpha = config.get("aug_session_mixup_alpha", 0.4)
+        ob, pcx = aug_session_mixup(ob, pcx, session_ids, alpha)
 
     # Frequency masking: zero out random freq bands (same bands for both)
     if config.get("aug_freq_mask", False):
@@ -1535,7 +1602,15 @@ def train_epoch(
     use_bf16 = config.get("fsdp_bf16", False)
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    for batch_idx, (ob, pcx, odor) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        # Handle both 3-tuple (ob, pcx, odor) and 4-tuple (ob, pcx, odor, session_id)
+        if len(batch_data) == 4:
+            ob, pcx, odor, session_ids = batch_data
+            session_ids = session_ids.to(device, non_blocking=True)
+        else:
+            ob, pcx, odor = batch_data
+            session_ids = None
+
         # non_blocking=True enables async CPU->GPU transfer (overlaps with compute)
         ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
@@ -1546,8 +1621,8 @@ def train_epoch(
             ob = per_channel_normalize(ob)
             pcx = per_channel_normalize(pcx)
 
-        # Apply data augmentation (training only)
-        ob, pcx = apply_augmentations(ob, pcx, config)
+        # Apply data augmentation (training only, with optional session info)
+        ob, pcx = apply_augmentations(ob, pcx, config, session_ids=session_ids)
 
         # Compute conditioning embedding
         cond_emb = None
@@ -3016,6 +3091,12 @@ def parse_args():
                         help="Disable Mixup augmentation")
     parser.add_argument("--aug-mixup-alpha", type=float, default=None,
                         help="Mixup Beta distribution alpha (default: 0.4, higher=more mixing)")
+    parser.add_argument("--aug-session-mixup", action="store_true", default=None,
+                        help="Enable session-aware Mixup (blend samples from DIFFERENT sessions)")
+    parser.add_argument("--no-aug-session-mixup", action="store_false", dest="aug_session_mixup",
+                        help="Disable session-aware Mixup")
+    parser.add_argument("--aug-session-mixup-alpha", type=float, default=None,
+                        help="Session Mixup Beta distribution alpha (default: 0.4)")
     parser.add_argument("--aug-freq-mask", action="store_true", default=None,
                         help="Enable frequency masking augmentation")
     parser.add_argument("--no-aug-freq-mask", action="store_false", dest="aug_freq_mask",
@@ -3252,6 +3333,10 @@ def main():
         config["aug_mixup"] = args.aug_mixup
     if args.aug_mixup_alpha is not None:
         config["aug_mixup_alpha"] = args.aug_mixup_alpha
+    if args.aug_session_mixup is not None:
+        config["aug_session_mixup"] = args.aug_session_mixup
+    if args.aug_session_mixup_alpha is not None:
+        config["aug_session_mixup_alpha"] = args.aug_session_mixup_alpha
     if args.aug_freq_mask is not None:
         config["aug_freq_mask"] = args.aug_freq_mask
     if args.aug_freq_mask_max_bands is not None:
