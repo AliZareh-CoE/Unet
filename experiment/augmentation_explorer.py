@@ -29,6 +29,11 @@ Author: Claude (Anthropic)
 from __future__ import annotations
 
 import os
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Limit threads BEFORE importing numpy/scipy
 os.environ['OMP_NUM_THREADS'] = '16'
 os.environ['MKL_NUM_THREADS'] = '16'
@@ -69,10 +74,16 @@ def load_data(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """Load data with session-based splits."""
-    from experiment.data import (
-        load_signals, load_odor_labels, load_session_ids,
-        load_or_create_session_splits, DATA_PATH, ODOR_CSV_PATH
-    )
+    try:
+        from experiment.data import (
+            load_signals, load_odor_labels, load_session_ids,
+            load_or_create_session_splits, DATA_PATH, ODOR_CSV_PATH
+        )
+    except ModuleNotFoundError:
+        from data import (
+            load_signals, load_odor_labels, load_session_ids,
+            load_or_create_session_splits, DATA_PATH, ODOR_CSV_PATH
+        )
 
     print("Loading neural signals...")
     signals = load_signals(DATA_PATH)
