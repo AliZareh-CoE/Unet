@@ -39,6 +39,9 @@ import os
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 
 import numpy as np
 import matplotlib
@@ -52,9 +55,95 @@ from sklearn.preprocessing import StandardScaler
 from scipy import stats
 from scipy.signal import welch, hilbert, find_peaks
 from scipy.spatial.distance import pdist, squareform
+from joblib import Parallel, delayed
+
+# Use all available cores
+N_JOBS = mp.cpu_count()
+print(f"Using {N_JOBS} CPU cores for parallel processing")
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+# ==============================================================================
+# PARALLEL PROCESSING HELPERS
+# ==============================================================================
+
+def _compute_envelope_for_trial(trial):
+    """Compute envelope for all channels in a trial."""
+    envelopes = []
+    for ch in range(trial.shape[0]):
+        analytic = hilbert(trial[ch])
+        envelopes.append(np.abs(analytic))
+    return np.concatenate(envelopes)
+
+
+def _compute_inst_freq_for_trial(trial, fs):
+    """Compute instantaneous frequency for all channels in a trial."""
+    inst_freqs = []
+    for ch in range(trial.shape[0]):
+        analytic = hilbert(trial[ch])
+        phase = np.unwrap(np.angle(analytic))
+        inst_freq = np.diff(phase) * fs / (2 * np.pi)
+        inst_freq = inst_freq[(inst_freq > 0) & (inst_freq < fs / 2)]
+        inst_freqs.append(inst_freq)
+    return np.concatenate(inst_freqs) if inst_freqs else np.array([])
+
+
+def _compute_phase_for_trial(trial):
+    """Compute phase for all channels in a trial."""
+    phases = []
+    for ch in range(trial.shape[0]):
+        analytic = hilbert(trial[ch])
+        phases.append(np.angle(analytic))
+    return np.concatenate(phases)
+
+
+def _compute_peaks_for_trial(trial):
+    """Compute peaks for all channels in a trial."""
+    peaks = []
+    for ch in range(trial.shape[0]):
+        peak_idx, _ = find_peaks(trial[ch], distance=5)
+        if len(peak_idx) > 0:
+            peaks.append(trial[ch][peak_idx])
+    return np.concatenate(peaks) if peaks else np.array([])
+
+
+def _compute_zcr_for_trial(trial):
+    """Compute zero-crossing rate for all channels in a trial."""
+    zcrs = []
+    for ch in range(trial.shape[0]):
+        zcr = np.sum(np.abs(np.diff(np.sign(trial[ch]))) > 0) / len(trial[ch])
+        zcrs.append(zcr)
+    return np.array(zcrs)
+
+
+def _compute_gradient_for_trial(trial, fs):
+    """Compute gradient for all channels in a trial."""
+    grads = []
+    for ch in range(trial.shape[0]):
+        grads.append(np.diff(trial[ch]) * fs)
+    return np.concatenate(grads)
+
+
+def _compute_kurtosis_for_trial(trial):
+    """Compute kurtosis for all channels in a trial."""
+    kurts = []
+    for ch in range(trial.shape[0]):
+        k = stats.kurtosis(trial[ch])
+        if not np.isnan(k) and not np.isinf(k):
+            kurts.append(k)
+    return np.array(kurts)
+
+
+def _compute_skewness_for_trial(trial):
+    """Compute skewness for all channels in a trial."""
+    skews = []
+    for ch in range(trial.shape[0]):
+        s = stats.skew(trial[ch])
+        if not np.isnan(s) and not np.isinf(s):
+            skews.append(s)
+    return np.array(skews)
 
 from data import (
     prepare_data,
@@ -942,18 +1031,16 @@ def figure_11_envelope_magnitude_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 50,
 ):
     """Figure 11: Envelope magnitude distribution using Hilbert transform."""
     print("Creating Figure 11: Envelope Magnitude Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Collect envelope magnitudes per session
+    # Collect envelope magnitudes per session - PARALLEL
     session_envelopes = {}
     all_envelopes_train = []
     all_envelopes_holdout = []
@@ -961,27 +1048,22 @@ def figure_11_envelope_magnitude_distribution(
     for sess_id in unique_sessions:
         mask = session_ids == sess_id
         sess_data = ob[mask]
-        sess_name = idx_to_session[sess_id]
 
-        # Subsample for efficiency
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
+        # Parallel computation across all trials - NO SUBSAMPLING
+        envelopes_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_envelope_for_trial)(trial) for trial in sess_data
+        )
+        envelopes = np.concatenate(envelopes_list) if envelopes_list else np.array([])
 
-        # Compute envelope using Hilbert transform
-        envelopes = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                analytic = hilbert(trial[ch])
-                envelope = np.abs(analytic)
-                envelopes.extend(envelope)
-
-        session_envelopes[sess_id] = np.array(envelopes)
+        session_envelopes[sess_id] = envelopes
 
         if sess_id in train_sessions:
-            all_envelopes_train.extend(envelopes)
+            all_envelopes_train.append(envelopes)
         else:
-            all_envelopes_holdout.extend(envelopes)
+            all_envelopes_holdout.append(envelopes)
+
+    all_envelopes_train = np.concatenate(all_envelopes_train) if all_envelopes_train else np.array([])
+    all_envelopes_holdout = np.concatenate(all_envelopes_holdout) if all_envelopes_holdout else np.array([])
 
     # Left: Per-session envelope distribution (KDE)
     ax = axes[0]
@@ -1041,14 +1123,12 @@ def figure_12_instantaneous_frequency_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 50,
 ):
     """Figure 12: Instantaneous frequency distribution using Hilbert transform."""
     print("Creating Figure 12: Instantaneous Frequency Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1059,29 +1139,22 @@ def figure_12_instantaneous_frequency_distribution(
     for sess_id in unique_sessions:
         mask = session_ids == sess_id
         sess_data = ob[mask]
-        sess_name = idx_to_session[sess_id]
 
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
+        # Parallel computation - NO SUBSAMPLING
+        inst_freqs_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_inst_freq_for_trial)(trial, SAMPLING_RATE_HZ) for trial in sess_data
+        )
+        inst_freqs = np.concatenate([f for f in inst_freqs_list if len(f) > 0]) if inst_freqs_list else np.array([])
 
-        inst_freqs = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                analytic = hilbert(trial[ch])
-                phase = np.unwrap(np.angle(analytic))
-                # Instantaneous frequency = d(phase)/dt / (2*pi)
-                inst_freq = np.diff(phase) * SAMPLING_RATE_HZ / (2 * np.pi)
-                # Filter out unreasonable values
-                inst_freq = inst_freq[(inst_freq > 0) & (inst_freq < SAMPLING_RATE_HZ / 2)]
-                inst_freqs.extend(inst_freq)
-
-        session_inst_freqs[sess_id] = np.array(inst_freqs)
+        session_inst_freqs[sess_id] = inst_freqs
 
         if sess_id in train_sessions:
-            all_freqs_train.extend(inst_freqs)
+            all_freqs_train.append(inst_freqs)
         else:
-            all_freqs_holdout.extend(inst_freqs)
+            all_freqs_holdout.append(inst_freqs)
+
+    all_freqs_train = np.concatenate(all_freqs_train) if all_freqs_train else np.array([])
+    all_freqs_holdout = np.concatenate(all_freqs_holdout) if all_freqs_holdout else np.array([])
 
     # Left: Per-session distribution
     ax = axes[0]
@@ -1141,14 +1214,12 @@ def figure_13_phase_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 50,
 ):
     """Figure 13: Phase distribution using Hilbert transform."""
     print("Creating Figure 13: Phase Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1159,25 +1230,22 @@ def figure_13_phase_distribution(
     for sess_id in unique_sessions:
         mask = session_ids == sess_id
         sess_data = ob[mask]
-        sess_name = idx_to_session[sess_id]
 
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
+        # Parallel computation - NO SUBSAMPLING
+        phases_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_phase_for_trial)(trial) for trial in sess_data
+        )
+        phases = np.concatenate(phases_list) if phases_list else np.array([])
 
-        phases = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                analytic = hilbert(trial[ch])
-                phase = np.angle(analytic)  # Returns values in [-pi, pi]
-                phases.extend(phase)
-
-        session_phases[sess_id] = np.array(phases)
+        session_phases[sess_id] = phases
 
         if sess_id in train_sessions:
-            all_phases_train.extend(phases)
+            all_phases_train.append(phases)
         else:
-            all_phases_holdout.extend(phases)
+            all_phases_holdout.append(phases)
+
+    all_phases_train = np.concatenate(all_phases_train) if all_phases_train else np.array([])
+    all_phases_holdout = np.concatenate(all_phases_holdout) if all_phases_holdout else np.array([])
 
     # Left: Polar histogram per session
     ax = axes[0]
@@ -1239,14 +1307,12 @@ def figure_14_amplitude_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 50,
 ):
     """Figure 14: Raw signal amplitude distribution."""
     print("Creating Figure 14: Raw Amplitude Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1258,18 +1324,17 @@ def figure_14_amplitude_distribution(
         mask = session_ids == sess_id
         sess_data = ob[mask]
 
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
-
-        # Flatten all amplitude values
+        # NO SUBSAMPLING - use all data
         amps = sess_data.flatten()
         session_amplitudes[sess_id] = amps
 
         if sess_id in train_sessions:
-            all_amps_train.extend(amps)
+            all_amps_train.append(amps)
         else:
-            all_amps_holdout.extend(amps)
+            all_amps_holdout.append(amps)
+
+    all_amps_train = np.concatenate(all_amps_train) if all_amps_train else np.array([])
+    all_amps_holdout = np.concatenate(all_amps_holdout) if all_amps_holdout else np.array([])
 
     # Left: Per-session distribution
     ax = axes[0]
@@ -1337,14 +1402,12 @@ def figure_15_peak_amplitude_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 100,
 ):
     """Figure 15: Peak amplitude distribution (local maxima)."""
     print("Creating Figure 15: Peak Amplitude Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1355,26 +1418,22 @@ def figure_15_peak_amplitude_distribution(
     for sess_id in unique_sessions:
         mask = session_ids == sess_id
         sess_data = ob[mask]
-        sess_name = idx_to_session[sess_id]
 
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
+        # Parallel computation - NO SUBSAMPLING
+        peaks_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_peaks_for_trial)(trial) for trial in sess_data
+        )
+        peaks = np.concatenate([p for p in peaks_list if len(p) > 0]) if peaks_list else np.array([0])
 
-        peaks = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                # Find peaks (local maxima)
-                peak_idx, _ = find_peaks(trial[ch], distance=5)
-                if len(peak_idx) > 0:
-                    peaks.extend(trial[ch][peak_idx])
-
-        session_peaks[sess_id] = np.array(peaks) if peaks else np.array([0])
+        session_peaks[sess_id] = peaks
 
         if sess_id in train_sessions:
-            all_peaks_train.extend(peaks)
+            all_peaks_train.append(peaks)
         else:
-            all_peaks_holdout.extend(peaks)
+            all_peaks_holdout.append(peaks)
+
+    all_peaks_train = np.concatenate(all_peaks_train) if all_peaks_train else np.array([])
+    all_peaks_holdout = np.concatenate(all_peaks_holdout) if all_peaks_holdout else np.array([])
 
     # Left: Per-session peak distribution
     ax = axes[0]
@@ -1445,10 +1504,6 @@ def figure_16_zero_crossing_rate_distribution(
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    def compute_zcr(signal):
-        """Compute zero-crossing rate."""
-        return np.sum(np.abs(np.diff(np.sign(signal))) > 0) / len(signal)
-
     session_zcrs = {}
     all_zcrs_train = []
     all_zcrs_holdout = []
@@ -1457,18 +1512,21 @@ def figure_16_zero_crossing_rate_distribution(
         mask = session_ids == sess_id
         sess_data = ob[mask]
 
-        zcrs = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                zcr = compute_zcr(trial[ch])
-                zcrs.append(zcr)
+        # Parallel computation
+        zcrs_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_zcr_for_trial)(trial) for trial in sess_data
+        )
+        zcrs = np.concatenate(zcrs_list) if zcrs_list else np.array([])
 
-        session_zcrs[sess_id] = np.array(zcrs)
+        session_zcrs[sess_id] = zcrs
 
         if sess_id in train_sessions:
-            all_zcrs_train.extend(zcrs)
+            all_zcrs_train.append(zcrs)
         else:
-            all_zcrs_holdout.extend(zcrs)
+            all_zcrs_holdout.append(zcrs)
+
+    all_zcrs_train = np.concatenate(all_zcrs_train) if all_zcrs_train else np.array([])
+    all_zcrs_holdout = np.concatenate(all_zcrs_holdout) if all_zcrs_holdout else np.array([])
 
     # Left: Box plot per session
     ax = axes[0]
@@ -1487,7 +1545,7 @@ def figure_16_zero_crossing_rate_distribution(
 
     # Right: Distribution comparison
     ax = axes[1]
-    if all_zcrs_train and all_zcrs_holdout:
+    if len(all_zcrs_train) > 0 and len(all_zcrs_holdout) > 0:
         ax.hist(all_zcrs_train, bins=50, density=True, alpha=0.5,
                label='Train sessions', color='C0')
         ax.hist(all_zcrs_holdout, bins=50, density=True, alpha=0.5,
@@ -1519,14 +1577,12 @@ def figure_17_gradient_distribution(
     idx_to_session: Dict[int, str],
     train_idx: np.ndarray,
     output_dir: Path,
-    n_samples_per_session: int = 50,
 ):
     """Figure 17: Signal gradient (first derivative) distribution."""
     print("Creating Figure 17: Signal Gradient Distribution...")
 
     unique_sessions = np.unique(session_ids)
     train_sessions = set(session_ids[train_idx])
-    rng = np.random.RandomState(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1538,22 +1594,21 @@ def figure_17_gradient_distribution(
         mask = session_ids == sess_id
         sess_data = ob[mask]
 
-        if len(sess_data) > n_samples_per_session:
-            idx = rng.choice(len(sess_data), n_samples_per_session, replace=False)
-            sess_data = sess_data[idx]
+        # Parallel computation - NO SUBSAMPLING
+        grads_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_gradient_for_trial)(trial, SAMPLING_RATE_HZ) for trial in sess_data
+        )
+        grads = np.concatenate(grads_list) if grads_list else np.array([])
 
-        grads = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                gradient = np.diff(trial[ch]) * SAMPLING_RATE_HZ
-                grads.extend(gradient)
-
-        session_grads[sess_id] = np.array(grads)
+        session_grads[sess_id] = grads
 
         if sess_id in train_sessions:
-            all_grads_train.extend(grads)
+            all_grads_train.append(grads)
         else:
-            all_grads_holdout.extend(grads)
+            all_grads_holdout.append(grads)
+
+    all_grads_train = np.concatenate(all_grads_train) if all_grads_train else np.array([])
+    all_grads_holdout = np.concatenate(all_grads_holdout) if all_grads_holdout else np.array([])
 
     # Left: Per-session gradient distribution
     ax = axes[0]
@@ -1746,19 +1801,21 @@ def figure_19_kurtosis_distribution(
         mask = session_ids == sess_id
         sess_data = ob[mask]
 
-        kurts = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                k = stats.kurtosis(trial[ch])
-                if not np.isnan(k) and not np.isinf(k):
-                    kurts.append(k)
+        # Parallel computation
+        kurts_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_kurtosis_for_trial)(trial) for trial in sess_data
+        )
+        kurts = np.concatenate([k for k in kurts_list if len(k) > 0]) if kurts_list else np.array([])
 
-        session_kurtosis[sess_id] = np.array(kurts)
+        session_kurtosis[sess_id] = kurts
 
         if sess_id in train_sessions:
-            all_kurt_train.extend(kurts)
+            all_kurt_train.append(kurts)
         else:
-            all_kurt_holdout.extend(kurts)
+            all_kurt_holdout.append(kurts)
+
+    all_kurt_train = np.concatenate(all_kurt_train) if all_kurt_train else np.array([])
+    all_kurt_holdout = np.concatenate(all_kurt_holdout) if all_kurt_holdout else np.array([])
 
     # Left: Box plot per session
     ax = axes[0]
@@ -1832,19 +1889,21 @@ def figure_20_skewness_distribution(
         mask = session_ids == sess_id
         sess_data = ob[mask]
 
-        skews = []
-        for trial in sess_data:
-            for ch in range(trial.shape[0]):
-                s = stats.skew(trial[ch])
-                if not np.isnan(s) and not np.isinf(s):
-                    skews.append(s)
+        # Parallel computation
+        skews_list = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(_compute_skewness_for_trial)(trial) for trial in sess_data
+        )
+        skews = np.concatenate([s for s in skews_list if len(s) > 0]) if skews_list else np.array([])
 
-        session_skewness[sess_id] = np.array(skews)
+        session_skewness[sess_id] = skews
 
         if sess_id in train_sessions:
-            all_skew_train.extend(skews)
+            all_skew_train.append(skews)
         else:
-            all_skew_holdout.extend(skews)
+            all_skew_holdout.append(skews)
+
+    all_skew_train = np.concatenate(all_skew_train) if all_skew_train else np.array([])
+    all_skew_holdout = np.concatenate(all_skew_holdout) if all_skew_holdout else np.array([])
 
     # Left: Box plot per session
     ax = axes[0]
@@ -1953,35 +2012,50 @@ def main():
     print(f"Test samples: {len(test_idx)}")
     print()
 
-    # Generate all figures
-    print("Generating figures...")
+    # Generate all figures IN PARALLEL
+    print("Generating ALL 20 figures in PARALLEL...")
+    print(f"Using {N_JOBS} CPU cores")
     print()
 
-    figure_1_pca_by_session(ob, session_ids, idx_to_session, train_idx, val_idx, test_idx, output_dir)
-    figure_2_pca_by_odor(ob, odors, vocab, train_idx, output_dir)
-    figure_3_tsne_by_session(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_4_session_covariances(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_5_session_psd(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_6_session_similarity(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_7_within_between_distances(ob, session_ids, idx_to_session, output_dir)
-    figure_8_odor_separability_per_session(ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)
-    figure_9_channel_statistics(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_10_session_odor_interaction(ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)
+    # Define all figure functions with their arguments
+    figure_tasks = [
+        # Structural Analysis (1-10)
+        (figure_1_pca_by_session, (ob, session_ids, idx_to_session, train_idx, val_idx, test_idx, output_dir)),
+        (figure_2_pca_by_odor, (ob, odors, vocab, train_idx, output_dir)),
+        (figure_3_tsne_by_session, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_4_session_covariances, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_5_session_psd, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_6_session_similarity, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_7_within_between_distances, (ob, session_ids, idx_to_session, output_dir)),
+        (figure_8_odor_separability_per_session, (ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)),
+        (figure_9_channel_statistics, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_10_session_odor_interaction, (ob, odors, session_ids, idx_to_session, vocab, train_idx, output_dir)),
+        # Probability Distribution Figures (11-20)
+        (figure_11_envelope_magnitude_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_12_instantaneous_frequency_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_13_phase_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_14_amplitude_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_15_peak_amplitude_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_16_zero_crossing_rate_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_17_gradient_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_18_rms_energy_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_19_kurtosis_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+        (figure_20_skewness_distribution, (ob, session_ids, idx_to_session, train_idx, output_dir)),
+    ]
 
-    # Probability Distribution Figures (11-20)
-    print()
-    print("Generating probability distribution figures...")
-    print()
-    figure_11_envelope_magnitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_12_instantaneous_frequency_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_13_phase_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_14_amplitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_15_peak_amplitude_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_16_zero_crossing_rate_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_17_gradient_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_18_rms_energy_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_19_kurtosis_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
-    figure_20_skewness_distribution(ob, session_ids, idx_to_session, train_idx, output_dir)
+    # Run all figures in parallel using ThreadPoolExecutor
+    # (matplotlib is not process-safe, but thread-safe with Agg backend)
+    with ThreadPoolExecutor(max_workers=min(20, N_JOBS)) as executor:
+        futures = []
+        for func, args in figure_tasks:
+            futures.append(executor.submit(func, *args))
+
+        # Wait for all to complete
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error generating figure: {e}")
 
     print()
     print("=" * 60)
