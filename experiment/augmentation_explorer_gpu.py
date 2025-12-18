@@ -362,6 +362,186 @@ def aug_dc_shift(ob, pcx, max_shift=0.3):
 
 
 # =============================================================================
+# LITERATURE-BACKED AUGMENTATIONS (from BCI research papers)
+# =============================================================================
+
+def aug_segment_recombination(ob, pcx, n_segments=4):
+    """Segment & Recombination (S&R) - proven in BCI-DA literature.
+    Split signal into segments, shuffle, recombine. Creates synthetic trials.
+    Reference: DCGANs vs VAE vs S&R comparison (BioMed Central)
+    """
+    n_trials, n_ch, n_time = ob.shape
+    segment_length = n_time // n_segments
+    ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
+
+    for i in range(n_trials):
+        # Split into segments
+        ob_segs = [ob[i, :, j*segment_length:(j+1)*segment_length] for j in range(n_segments)]
+        pcx_segs = [pcx[i, :, j*segment_length:(j+1)*segment_length] for j in range(n_segments)]
+
+        # Shuffle segment order
+        perm = np.random.permutation(n_segments)
+        ob_shuffled = [ob_segs[p] for p in perm]
+        pcx_shuffled = [pcx_segs[p] for p in perm]
+
+        # Recombine
+        ob_aug[i, :, :segment_length*n_segments] = np.concatenate(ob_shuffled, axis=-1)
+        pcx_aug[i, :, :segment_length*n_segments] = np.concatenate(pcx_shuffled, axis=-1)
+
+        # Handle remaining samples if any
+        if n_time > segment_length * n_segments:
+            ob_aug[i, :, segment_length*n_segments:] = ob[i, :, segment_length*n_segments:]
+            pcx_aug[i, :, segment_length*n_segments:] = pcx[i, :, segment_length*n_segments:]
+
+    return ob_aug, pcx_aug
+
+
+def aug_time_warp(ob, pcx, sigma=0.2):
+    """Non-linear time warping - stretch/compress different parts differently.
+    Simulates natural variability in neural timing.
+    Reference: DTW similarity (Frontiers)
+    """
+    from scipy.interpolate import interp1d
+
+    n_trials, n_ch, n_time = ob.shape
+    ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
+
+    for i in range(n_trials):
+        # Create smooth random warping path
+        orig_steps = np.arange(n_time)
+        warp_steps = orig_steps + np.cumsum(np.random.randn(n_time) * sigma)
+        warp_steps = np.clip(warp_steps, 0, n_time - 1)
+        # Normalize to original range
+        warp_steps = (warp_steps - warp_steps.min()) / (warp_steps.max() - warp_steps.min() + 1e-10) * (n_time - 1)
+
+        for ch in range(n_ch):
+            f_ob = interp1d(orig_steps, ob[i, ch, :], kind='linear', fill_value='extrapolate')
+            f_pcx = interp1d(orig_steps, pcx[i, ch, :], kind='linear', fill_value='extrapolate')
+            ob_aug[i, ch, :] = f_ob(warp_steps)
+            pcx_aug[i, ch, :] = f_pcx(warp_steps)
+
+    return ob_aug, pcx_aug
+
+
+def aug_fourier(ob, pcx, phase_noise=0.1, amp_noise=0.1):
+    """Fourier transform augmentation - perturb phase and/or amplitude.
+    Preserves spectral structure while adding variability.
+    Reference: DA techniques survey (ScienceDirect)
+    """
+    n_trials, n_ch, n_time = ob.shape
+    ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
+
+    for i in range(n_trials):
+        for ch in range(n_ch):
+            # OB
+            fft_ob = np.fft.rfft(ob[i, ch, :])
+            amp_ob = np.abs(fft_ob)
+            phase_ob = np.angle(fft_ob)
+            amp_ob = amp_ob * (1 + np.random.randn(*amp_ob.shape) * amp_noise)
+            phase_ob = phase_ob + np.random.randn(*phase_ob.shape) * phase_noise
+            fft_new_ob = amp_ob * np.exp(1j * phase_ob)
+            ob_aug[i, ch, :] = np.fft.irfft(fft_new_ob, n=n_time)
+
+            # PCX
+            fft_pcx = np.fft.rfft(pcx[i, ch, :])
+            amp_pcx = np.abs(fft_pcx)
+            phase_pcx = np.angle(fft_pcx)
+            amp_pcx = amp_pcx * (1 + np.random.randn(*amp_pcx.shape) * amp_noise)
+            phase_pcx = phase_pcx + np.random.randn(*phase_pcx.shape) * phase_noise
+            fft_new_pcx = amp_pcx * np.exp(1j * phase_pcx)
+            pcx_aug[i, ch, :] = np.fft.irfft(fft_new_pcx, n=n_time)
+
+    return ob_aug, pcx_aug
+
+
+def aug_geodesic_interpolation(ob, pcx, t_range=(0.3, 0.7)):
+    """Geodesic interpolation on SPD manifold between covariance matrices.
+    Creates synthetic "intermediate" sessions using Riemannian geometry.
+    Reference: HAL paper on covariance interpolation
+    """
+    from scipy.linalg import sqrtm, fractional_matrix_power
+
+    n_trials, n_ch, n_time = ob.shape
+    ob_aug, pcx_aug = np.zeros_like(ob), np.zeros_like(pcx)
+
+    for i in range(n_trials):
+        # Pick a random partner trial
+        partner = np.random.randint(n_trials)
+        t = np.random.uniform(t_range[0], t_range[1])
+
+        try:
+            # OB geodesic
+            cov1_ob = np.cov(ob[i])
+            cov2_ob = np.cov(ob[partner])
+            cov1_sqrt = sqrtm(cov1_ob + 1e-6 * np.eye(n_ch))
+            cov1_inv_sqrt = np.linalg.inv(cov1_sqrt)
+            inner = cov1_inv_sqrt @ cov2_ob @ cov1_inv_sqrt
+            inner_t = np.real(fractional_matrix_power(inner + 1e-6 * np.eye(n_ch), t))
+            cov_interp_ob = np.real(cov1_sqrt @ inner_t @ cov1_sqrt)
+
+            # Transform ob[i] to have interpolated covariance
+            ob_centered = ob[i] - ob[i].mean(axis=-1, keepdims=True)
+            T_ob = np.real(sqrtm(cov_interp_ob + 1e-6 * np.eye(n_ch))) @ np.linalg.inv(sqrtm(cov1_ob + 1e-6 * np.eye(n_ch)))
+            ob_aug[i] = T_ob @ ob_centered + ob[i].mean(axis=-1, keepdims=True)
+
+            # PCX geodesic
+            cov1_pcx = np.cov(pcx[i])
+            cov2_pcx = np.cov(pcx[partner])
+            cov1_sqrt_pcx = sqrtm(cov1_pcx + 1e-6 * np.eye(n_ch))
+            cov1_inv_sqrt_pcx = np.linalg.inv(cov1_sqrt_pcx)
+            inner_pcx = cov1_inv_sqrt_pcx @ cov2_pcx @ cov1_inv_sqrt_pcx
+            inner_t_pcx = np.real(fractional_matrix_power(inner_pcx + 1e-6 * np.eye(n_ch), t))
+            cov_interp_pcx = np.real(cov1_sqrt_pcx @ inner_t_pcx @ cov1_sqrt_pcx)
+
+            pcx_centered = pcx[i] - pcx[i].mean(axis=-1, keepdims=True)
+            T_pcx = np.real(sqrtm(cov_interp_pcx + 1e-6 * np.eye(n_ch))) @ np.linalg.inv(sqrtm(cov1_pcx + 1e-6 * np.eye(n_ch)))
+            pcx_aug[i] = T_pcx @ pcx_centered + pcx[i].mean(axis=-1, keepdims=True)
+        except:
+            ob_aug[i] = ob[i]
+            pcx_aug[i] = pcx[i]
+
+    return ob_aug, pcx_aug
+
+
+def aug_freq_band_swap(ob, pcx, band=(30, 80), swap_prob=0.5):
+    """Swap a specific frequency band between two trials.
+    E.g., keep theta from one trial, gamma from another.
+    """
+    from scipy.signal import butter, filtfilt
+
+    n_trials, n_ch, n_time = ob.shape
+    fs = 1000  # Sampling rate
+    ob_aug, pcx_aug = ob.copy(), pcx.copy()
+
+    # Design bandpass and bandstop filters
+    try:
+        b_band, a_band = butter(4, [band[0]/(fs/2), band[1]/(fs/2)], btype='band')
+        b_stop, a_stop = butter(4, [band[0]/(fs/2), band[1]/(fs/2)], btype='bandstop')
+    except:
+        return ob, pcx  # Filter design failed
+
+    for i in range(n_trials):
+        if np.random.rand() < swap_prob:
+            # Pick a random partner
+            partner = np.random.randint(n_trials)
+
+            try:
+                # Extract band from partner, notch from self, combine
+                for ch in range(n_ch):
+                    band_partner_ob = filtfilt(b_band, a_band, ob[partner, ch, :])
+                    notch_self_ob = filtfilt(b_stop, a_stop, ob[i, ch, :])
+                    ob_aug[i, ch, :] = notch_self_ob + band_partner_ob
+
+                    band_partner_pcx = filtfilt(b_band, a_band, pcx[partner, ch, :])
+                    notch_self_pcx = filtfilt(b_stop, a_stop, pcx[i, ch, :])
+                    pcx_aug[i, ch, :] = notch_self_pcx + band_partner_pcx
+            except:
+                pass  # Keep original on filter error
+
+    return ob_aug, pcx_aug
+
+
+# =============================================================================
 # Augmentation Config
 # =============================================================================
 
@@ -385,6 +565,18 @@ class AugConfig:
     use_freq_mask: bool = False
     use_dc_shift: bool = False
     dc_max: float = 0.3
+    # Literature-backed augmentations
+    use_segment_recomb: bool = False
+    n_segments: int = 4
+    use_time_warp: bool = False
+    warp_sigma: float = 0.2
+    use_fourier: bool = False
+    fourier_phase: float = 0.1
+    fourier_amp: float = 0.1
+    use_geodesic: bool = False
+    geodesic_t: Tuple[float, float] = (0.3, 0.7)
+    use_band_swap: bool = False
+    swap_band: Tuple[int, int] = (30, 80)
     n_passes: int = 3  # More passes for stability
 
     def to_dict(self):
@@ -413,6 +605,17 @@ def apply_augmentation(ob, pcx, session_ids, config: AugConfig):
         ob_aug, pcx_aug = aug_freq_mask(ob_aug, pcx_aug)
     if config.use_dc_shift:
         ob_aug, pcx_aug = aug_dc_shift(ob_aug, pcx_aug, config.dc_max)
+    # Literature-backed augmentations
+    if config.use_segment_recomb:
+        ob_aug, pcx_aug = aug_segment_recombination(ob_aug, pcx_aug, config.n_segments)
+    if config.use_time_warp:
+        ob_aug, pcx_aug = aug_time_warp(ob_aug, pcx_aug, config.warp_sigma)
+    if config.use_fourier:
+        ob_aug, pcx_aug = aug_fourier(ob_aug, pcx_aug, config.fourier_phase, config.fourier_amp)
+    if config.use_geodesic:
+        ob_aug, pcx_aug = aug_geodesic_interpolation(ob_aug, pcx_aug, config.geodesic_t)
+    if config.use_band_swap:
+        ob_aug, pcx_aug = aug_freq_band_swap(ob_aug, pcx_aug, config.swap_band)
 
     return ob_aug, pcx_aug
 
@@ -729,7 +932,171 @@ def generate_search_space() -> List[AugConfig]:
                     use_amp=True, amp_range=(0.7, 1.3)
                 ))
 
-    print(f"\n  🔥🔥🔥 GENERATED {len(configs)} CONFIGURATIONS - ABSOLUTELY INSANE! 🔥🔥🔥")
+    # ==========================================================================
+    # LITERATURE-BACKED AUGMENTATIONS (NEW - from BCI papers!)
+    # ==========================================================================
+
+    # Segment Recombination - S&R (proven in BCI-DA, gave 36% boost!)
+    for n_seg in [2, 3, 4, 6, 8]:
+        configs.append(AugConfig(name=f'sr_{n_seg}', use_segment_recomb=True, n_segments=n_seg))
+
+    # Time Warp (non-linear stretching)
+    for sigma in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]:
+        configs.append(AugConfig(name=f'twarp_{sigma}', use_time_warp=True, warp_sigma=sigma))
+
+    # Fourier augmentation (phase/amplitude perturbation)
+    for phase in [0.05, 0.1, 0.15, 0.2]:
+        for amp in [0.05, 0.1, 0.15, 0.2]:
+            configs.append(AugConfig(name=f'fourier_p{phase}_a{amp}', use_fourier=True, fourier_phase=phase, fourier_amp=amp))
+
+    # Geodesic interpolation (Riemannian)
+    for t_lo in [0.2, 0.3, 0.4]:
+        for t_hi in [0.6, 0.7, 0.8]:
+            configs.append(AugConfig(name=f'geodesic_{t_lo}_{t_hi}', use_geodesic=True, geodesic_t=(t_lo, t_hi)))
+
+    # Frequency band swap
+    for band in [(4, 12), (12, 30), (30, 60), (60, 100)]:
+        configs.append(AugConfig(name=f'bandswap_{band[0]}_{band[1]}', use_band_swap=True, swap_band=band))
+
+    # ==========================================================================
+    # LITERATURE + NOISE COMBOS (noise gave 36% boost!)
+    # ==========================================================================
+
+    # S&R + Noise (noise is king!)
+    for n_seg in [3, 4, 6]:
+        for n in [0.1, 0.15, 0.2, 0.25]:
+            configs.append(AugConfig(
+                name=f'sr{n_seg}_n{n}',
+                use_segment_recomb=True, n_segments=n_seg,
+                use_noise=True, noise_std=n
+            ))
+
+    # Fourier + Noise
+    for phase in [0.1, 0.15]:
+        for n in [0.1, 0.15, 0.2]:
+            configs.append(AugConfig(
+                name=f'fourier_p{phase}_n{n}',
+                use_fourier=True, fourier_phase=phase, fourier_amp=0.1,
+                use_noise=True, noise_std=n
+            ))
+
+    # Time Warp + Noise
+    for sigma in [0.1, 0.15, 0.2]:
+        for n in [0.1, 0.15, 0.2]:
+            configs.append(AugConfig(
+                name=f'twarp{sigma}_n{n}',
+                use_time_warp=True, warp_sigma=sigma,
+                use_noise=True, noise_std=n
+            ))
+
+    # Geodesic + Noise
+    for t_lo, t_hi in [(0.3, 0.7), (0.2, 0.8)]:
+        for n in [0.1, 0.15, 0.2]:
+            configs.append(AugConfig(
+                name=f'geo_{t_lo}_{t_hi}_n{n}',
+                use_geodesic=True, geodesic_t=(t_lo, t_hi),
+                use_noise=True, noise_std=n
+            ))
+
+    # ==========================================================================
+    # LITERATURE + EA + COV + CSM COMBOS (the power stack!)
+    # ==========================================================================
+
+    # EA + Cov + S&R
+    for s in [0.2, 0.3, 0.4]:
+        for n_seg in [3, 4, 6]:
+            configs.append(AugConfig(
+                name=f'ea_cov{s}_sr{n_seg}',
+                use_ea=True, use_cov=True, cov_strength=s,
+                use_segment_recomb=True, n_segments=n_seg
+            ))
+
+    # EA + Cov + CSM + S&R + Noise (full literature stack!)
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3, 0.4]:
+            for n_seg in [3, 4]:
+                for n in [0.1, 0.15]:
+                    configs.append(AugConfig(
+                        name=f'litstack_{s}_{a}_{n_seg}_{n}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_segment_recomb=True, n_segments=n_seg,
+                        use_noise=True, noise_std=n
+                    ))
+
+    # EA + Cov + CSM + Fourier + Noise
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for phase in [0.1, 0.15]:
+                for n in [0.1, 0.15]:
+                    configs.append(AugConfig(
+                        name=f'fourstack_{s}_{a}_{phase}_{n}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_fourier=True, fourier_phase=phase, fourier_amp=0.1,
+                        use_noise=True, noise_std=n
+                    ))
+
+    # EA + Cov + CSM + TimeWarp + Noise
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for sigma in [0.1, 0.15]:
+                for n in [0.1, 0.15]:
+                    configs.append(AugConfig(
+                        name=f'warpstack_{s}_{a}_{sigma}_{n}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_time_warp=True, warp_sigma=sigma,
+                        use_noise=True, noise_std=n
+                    ))
+
+    # EA + Cov + CSM + Geodesic + Noise (Riemannian power!)
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for n in [0.1, 0.15]:
+                configs.append(AugConfig(
+                    name=f'geostack_{s}_{a}_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_geodesic=True, geodesic_t=(0.3, 0.7),
+                    use_noise=True, noise_std=n
+                ))
+
+    # ==========================================================================
+    # ULTIMATE COMBOS - ALL LITERATURE AUGS TOGETHER
+    # ==========================================================================
+
+    # Full literature stack: EA + Cov + CSM + S&R + Fourier + Noise
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for n in [0.1, 0.15]:
+                configs.append(AugConfig(
+                    name=f'ultimate_{s}_{a}_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_segment_recomb=True, n_segments=4,
+                    use_fourier=True, fourier_phase=0.1, fourier_amp=0.1,
+                    use_noise=True, noise_std=n,
+                    use_amp=True, amp_range=(0.7, 1.3)
+                ))
+
+    # SUPREME: All augmentations at once
+    for s in [0.2, 0.3]:
+        for a in [0.2, 0.3]:
+            for n in [0.1, 0.15]:
+                configs.append(AugConfig(
+                    name=f'supreme_{s}_{a}_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_noise=True, noise_std=n,
+                    use_amp=True, amp_range=(0.7, 1.3),
+                    use_segment_recomb=True, n_segments=4,
+                    use_time_warp=True, warp_sigma=0.1,
+                    use_fourier=True, fourier_phase=0.1, fourier_amp=0.1,
+                    use_geodesic=True, geodesic_t=(0.3, 0.7)
+                ))
+
+    print(f"\n  GENERATED {len(configs)} CONFIGURATIONS - LITERATURE-BACKED INSANITY!")
     return configs
 
 
