@@ -422,69 +422,172 @@ def apply_augmentation(ob, pcx, session_ids, config: AugConfig):
 # =============================================================================
 
 def generate_search_space() -> List[AugConfig]:
-    """Generate search space focused on GUARANTEED coverage."""
+    """INSANE 1024+ CONFIGURATION SPACE - RAPE THIS DATA LIKE A HORNY HORSE."""
     configs = []
 
-    # Baseline
+    # ==========================================================================
+    # BASELINE (2)
+    # ==========================================================================
     configs.append(AugConfig(name='baseline'))
     configs.append(AugConfig(name='ea_only', use_ea=True))
 
-    # Single augmentations - comprehensive sweep
-    for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
+    # ==========================================================================
+    # SINGLE AUGMENTATIONS - FINE GRAINED (100+)
+    # ==========================================================================
+
+    # Covariance: 12 strengths × 3 modes = 36
+    for s in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
         for m in ['expand', 'shrink', 'random']:
             configs.append(AugConfig(name=f'cov_{m}_{s}', use_cov=True, cov_strength=s, cov_mode=m))
 
-    for a in [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+    # Cross-session mixing: 12 alphas
+    for a in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]:
         configs.append(AugConfig(name=f'csm_{a}', use_csm=True, csm_alpha=a))
 
-    for n in [0.05, 0.1, 0.15, 0.2, 0.25]:
+    # Noise: 10 levels
+    for n in [0.02, 0.05, 0.08, 0.1, 0.12, 0.15, 0.18, 0.2, 0.25, 0.3]:
         configs.append(AugConfig(name=f'noise_{n}', use_noise=True, noise_std=n))
 
-    # EA + Cov - key combination
-    for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
+    # Amplitude: 8 ranges
+    for lo in [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]:
+        hi = 2.0 - lo
+        configs.append(AugConfig(name=f'amp_{lo}', use_amp=True, amp_range=(lo, hi)))
+
+    # Time shift: 6 levels
+    for ts in [0.02, 0.05, 0.08, 0.1, 0.15, 0.2]:
+        configs.append(AugConfig(name=f'tshift_{ts}', use_time_shift=True, shift_max=ts))
+
+    # Dropout: 6 levels
+    for dp in [0.02, 0.05, 0.08, 0.1, 0.15, 0.2]:
+        configs.append(AugConfig(name=f'dropout_{dp}', use_dropout=True, dropout_p=dp))
+
+    # DC shift: 6 levels
+    for dc in [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]:
+        configs.append(AugConfig(name=f'dc_{dc}', use_dc_shift=True, dc_max=dc))
+
+    # Freq mask
+    configs.append(AugConfig(name='freqmask', use_freq_mask=True))
+
+    # ==========================================================================
+    # DOUBLE COMBINATIONS (200+)
+    # ==========================================================================
+
+    # EA + Cov: 8 strengths × 3 modes = 24
+    for s in [0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7]:
         for m in ['expand', 'shrink', 'random']:
             configs.append(AugConfig(name=f'ea_cov_{m}_{s}', use_ea=True, use_cov=True, cov_strength=s, cov_mode=m))
 
-    # EA + CSM
-    for a in [0.1, 0.2, 0.3, 0.4, 0.5]:
+    # EA + CSM: 10 alphas
+    for a in [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55]:
         configs.append(AugConfig(name=f'ea_csm_{a}', use_ea=True, use_csm=True, csm_alpha=a))
 
-    # Cov + CSM (no EA)
-    for s in [0.2, 0.3, 0.4, 0.5]:
-        for a in [0.2, 0.3, 0.4]:
+    # Cov + CSM: 6 × 6 = 36
+    for s in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for a in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
             configs.append(AugConfig(name=f'cov_{s}_csm_{a}', use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a))
 
-    # EA + Cov + CSM - triple combo
-    for s in [0.2, 0.3, 0.4, 0.5]:
-        for a in [0.2, 0.3, 0.4]:
-            configs.append(AugConfig(name=f'ea_cov_{s}_csm_{a}', use_ea=True, use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a))
+    # Cov + Noise: 6 × 5 = 30
+    for s in [0.2, 0.25, 0.3, 0.4, 0.5, 0.6]:
+        for n in [0.05, 0.08, 0.1, 0.15, 0.2]:
+            configs.append(AugConfig(name=f'cov_{s}_n_{n}', use_cov=True, cov_strength=s, use_noise=True, noise_std=n))
 
-    # With noise
-    for s in [0.2, 0.3, 0.4]:
-        for a in [0.2, 0.3]:
-            for n in [0.05, 0.1, 0.15]:
+    # CSM + Noise: 6 × 5 = 30
+    for a in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for n in [0.05, 0.08, 0.1, 0.15, 0.2]:
+            configs.append(AugConfig(name=f'csm_{a}_n_{n}', use_csm=True, csm_alpha=a, use_noise=True, noise_std=n))
+
+    # CSM + Amp: 6 × 4 = 24
+    for a in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for lo in [0.6, 0.7, 0.8, 0.9]:
+            configs.append(AugConfig(name=f'csm_{a}_amp_{lo}', use_csm=True, csm_alpha=a, use_amp=True, amp_range=(lo, 2-lo)))
+
+    # ==========================================================================
+    # TRIPLE COMBINATIONS - EA + COV + CSM (100+)
+    # ==========================================================================
+
+    # EA + Cov + CSM: 6 × 6 = 36
+    for s in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for a in [0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+            configs.append(AugConfig(
+                name=f'ea_cov_{s}_csm_{a}',
+                use_ea=True, use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a
+            ))
+
+    # EA + Cov + Noise: 5 × 5 = 25
+    for s in [0.2, 0.25, 0.3, 0.4, 0.5]:
+        for n in [0.05, 0.08, 0.1, 0.15, 0.2]:
+            configs.append(AugConfig(
+                name=f'ea_cov_{s}_n_{n}',
+                use_ea=True, use_cov=True, cov_strength=s, use_noise=True, noise_std=n
+            ))
+
+    # EA + CSM + Noise: 5 × 5 = 25
+    for a in [0.2, 0.25, 0.3, 0.4, 0.5]:
+        for n in [0.05, 0.08, 0.1, 0.15, 0.2]:
+            configs.append(AugConfig(
+                name=f'ea_csm_{a}_n_{n}',
+                use_ea=True, use_csm=True, csm_alpha=a, use_noise=True, noise_std=n
+            ))
+
+    # Cov + CSM + Noise: 4 × 4 × 4 = 64
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15, 0.2]:
+                configs.append(AugConfig(
+                    name=f'cov_{s}_csm_{a}_n_{n}',
+                    use_cov=True, cov_strength=s, use_csm=True, csm_alpha=a, use_noise=True, noise_std=n
+                ))
+
+    # ==========================================================================
+    # QUAD COMBINATIONS - EA + COV + CSM + NOISE (150+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise: 5 × 5 × 4 = 100
+    for s in [0.15, 0.2, 0.3, 0.4, 0.5]:
+        for a in [0.15, 0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15, 0.2]:
                 configs.append(AugConfig(
                     name=f'ea_cov_{s}_csm_{a}_n_{n}',
                     use_ea=True, use_cov=True, cov_strength=s,
                     use_csm=True, csm_alpha=a, use_noise=True, noise_std=n
                 ))
 
-    # With amplitude
-    for s in [0.2, 0.3, 0.4]:
-        for a in [0.2, 0.3]:
-            for amp_lo in [0.6, 0.7, 0.8]:
-                amp_hi = 2.0 - amp_lo
+    # EA + Cov + CSM + Amp: 4 × 4 × 4 = 64
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for lo in [0.6, 0.7, 0.8, 0.9]:
                 configs.append(AugConfig(
-                    name=f'ea_cov_{s}_csm_{a}_amp_{amp_lo}',
+                    name=f'ea_cov_{s}_csm_{a}_amp_{lo}',
                     use_ea=True, use_cov=True, cov_strength=s,
-                    use_csm=True, csm_alpha=a, use_amp=True, amp_range=(amp_lo, amp_hi)
+                    use_csm=True, csm_alpha=a, use_amp=True, amp_range=(lo, 2-lo)
                 ))
 
-    # Full combo with time shift
+    # ==========================================================================
+    # QUINT COMBINATIONS - 5 AUGMENTATIONS (150+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise + Amp: 4 × 4 × 3 × 3 = 144
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15]:
+                for lo in [0.7, 0.8, 0.9]:
+                    configs.append(AugConfig(
+                        name=f'q5_{s}_{a}_{n}_{lo}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_noise=True, noise_std=n,
+                        use_amp=True, amp_range=(lo, 2-lo)
+                    ))
+
+    # ==========================================================================
+    # FULL COMBOS WITH TIME SHIFT (100+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise + Amp + TimeShift: 3 × 3 × 3 × 3 = 81
     for s in [0.2, 0.3, 0.4]:
-        for a in [0.2, 0.3]:
-            for n in [0.05, 0.1]:
-                for ts in [0.05, 0.1]:
+        for a in [0.2, 0.3, 0.4]:
+            for n in [0.05, 0.1, 0.15]:
+                for ts in [0.05, 0.1, 0.15]:
                     configs.append(AugConfig(
                         name=f'full_{s}_{a}_{n}_{ts}',
                         use_ea=True, use_cov=True, cov_strength=s,
@@ -494,47 +597,139 @@ def generate_search_space() -> List[AugConfig]:
                         use_time_shift=True, shift_max=ts
                     ))
 
-    # Ultra with DC shift
+    # ==========================================================================
+    # ULTRA COMBOS WITH DC SHIFT (50+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise + Amp + DC: 3 × 3 × 3 × 3 = 81
     for s in [0.2, 0.3, 0.4]:
-        for a in [0.2, 0.3]:
-            for dc in [0.1, 0.2, 0.3]:
+        for a in [0.2, 0.3, 0.4]:
+            for n in [0.05, 0.1, 0.15]:
+                for dc in [0.1, 0.2, 0.3]:
+                    configs.append(AugConfig(
+                        name=f'ultra_{s}_{a}_{n}_{dc}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_noise=True, noise_std=n,
+                        use_amp=True, amp_range=(0.7, 1.3),
+                        use_dc_shift=True, dc_max=dc
+                    ))
+
+    # ==========================================================================
+    # MEGA COMBOS WITH DROPOUT (50+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise + Dropout: 3 × 3 × 3 × 3 = 81
+    for s in [0.2, 0.3, 0.4]:
+        for a in [0.2, 0.3, 0.4]:
+            for n in [0.05, 0.1, 0.15]:
+                for dp in [0.05, 0.1, 0.15]:
+                    configs.append(AugConfig(
+                        name=f'mega_{s}_{a}_{n}_{dp}',
+                        use_ea=True, use_cov=True, cov_strength=s,
+                        use_csm=True, csm_alpha=a,
+                        use_noise=True, noise_std=n,
+                        use_dropout=True, dropout_p=dp
+                    ))
+
+    # ==========================================================================
+    # HYPER COMBOS WITH FREQ MASK (50+)
+    # ==========================================================================
+
+    # EA + Cov + CSM + Noise + FreqMask: 4 × 4 × 3 = 48
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15]:
                 configs.append(AugConfig(
-                    name=f'ultra_{s}_{a}_dc_{dc}',
+                    name=f'hyper_{s}_{a}_{n}',
                     use_ea=True, use_cov=True, cov_strength=s,
                     use_csm=True, csm_alpha=a,
-                    use_noise=True, noise_std=0.1,
+                    use_noise=True, noise_std=n,
                     use_amp=True, amp_range=(0.7, 1.3),
-                    use_dc_shift=True, dc_max=dc
+                    use_freq_mask=True
                 ))
 
-    # Mega with dropout
-    for s in [0.2, 0.3]:
-        for a in [0.2, 0.3]:
-            for dp in [0.05, 0.1, 0.15]:
+    # ==========================================================================
+    # INSANE - ALL THE FUCKING THINGS (50+)
+    # ==========================================================================
+
+    # Everything combined: 4 × 4 × 3 = 48
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15]:
                 configs.append(AugConfig(
-                    name=f'mega_{s}_{a}_dp_{dp}',
-                    use_ea=True, use_cov=True, cov_strength=s,
+                    name=f'insane_{s}_{a}_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s, cov_mode='random',
                     use_csm=True, csm_alpha=a,
-                    use_noise=True, noise_std=0.1,
-                    use_dropout=True, dropout_p=dp
+                    use_noise=True, noise_std=n,
+                    use_amp=True, amp_range=(0.6, 1.4),
+                    use_time_shift=True, shift_max=0.1,
+                    use_dropout=True, dropout_p=0.1,
+                    use_freq_mask=True,
+                    use_dc_shift=True, dc_max=0.2
                 ))
 
-    # INSANE: everything
-    for s in [0.2, 0.3, 0.4]:
-        for a in [0.2, 0.3]:
+    # ==========================================================================
+    # GODMODE - EXTREME VARIATIONS (30+)
+    # ==========================================================================
+
+    # High covariance + high CSM
+    for s in [0.6, 0.7, 0.8]:
+        for a in [0.5, 0.55, 0.6]:
             configs.append(AugConfig(
-                name=f'insane_{s}_{a}',
+                name=f'god_high_{s}_{a}',
                 use_ea=True, use_cov=True, cov_strength=s, cov_mode='random',
                 use_csm=True, csm_alpha=a,
-                use_noise=True, noise_std=0.1,
-                use_amp=True, amp_range=(0.6, 1.4),
-                use_time_shift=True, shift_max=0.1,
-                use_dropout=True, dropout_p=0.1,
-                use_freq_mask=True,
-                use_dc_shift=True, dc_max=0.2
+                use_noise=True, noise_std=0.15,
+                use_amp=True, amp_range=(0.5, 1.5)
             ))
 
-    print(f"\n  Generated {len(configs)} configurations")
+    # Low covariance + high everything else
+    for s in [0.1, 0.15]:
+        for a in [0.4, 0.5, 0.6]:
+            for n in [0.15, 0.2, 0.25]:
+                configs.append(AugConfig(
+                    name=f'god_low_{s}_{a}_{n}',
+                    use_ea=True, use_cov=True, cov_strength=s, cov_mode='expand',
+                    use_csm=True, csm_alpha=a,
+                    use_noise=True, noise_std=n,
+                    use_amp=True, amp_range=(0.5, 1.5),
+                    use_time_shift=True, shift_max=0.15
+                ))
+
+    # Shrink-only covariance variations
+    for s in [0.3, 0.4, 0.5, 0.6]:
+        for a in [0.3, 0.4, 0.5]:
+            configs.append(AugConfig(
+                name=f'shrink_{s}_{a}',
+                use_ea=True, use_cov=True, cov_strength=s, cov_mode='shrink',
+                use_csm=True, csm_alpha=a,
+                use_noise=True, noise_std=0.1
+            ))
+
+    # Expand-only covariance variations
+    for s in [0.3, 0.4, 0.5, 0.6]:
+        for a in [0.3, 0.4, 0.5]:
+            configs.append(AugConfig(
+                name=f'expand_{s}_{a}',
+                use_ea=True, use_cov=True, cov_strength=s, cov_mode='expand',
+                use_csm=True, csm_alpha=a,
+                use_noise=True, noise_std=0.1
+            ))
+
+    # No EA variations (test if EA helps or hurts)
+    for s in [0.2, 0.3, 0.4, 0.5]:
+        for a in [0.2, 0.3, 0.4, 0.5]:
+            for n in [0.05, 0.1, 0.15]:
+                configs.append(AugConfig(
+                    name=f'noea_{s}_{a}_{n}',
+                    use_ea=False, use_cov=True, cov_strength=s,
+                    use_csm=True, csm_alpha=a,
+                    use_noise=True, noise_std=n,
+                    use_amp=True, amp_range=(0.7, 1.3)
+                ))
+
+    print(f"\n  🔥🔥🔥 GENERATED {len(configs)} CONFIGURATIONS - ABSOLUTELY INSANE! 🔥🔥🔥")
     return configs
 
 
