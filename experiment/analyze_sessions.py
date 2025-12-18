@@ -335,7 +335,7 @@ def figure_3_tsne_by_session(
     scaler = StandardScaler()
     features_scaled = scaler.fit_transform(features)
 
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, max_iter=1000)
     features_tsne = tsne.fit_transform(features_scaled)
 
     # Plot
@@ -928,6 +928,8 @@ def main():
                         help='Number of test sessions (0 for no test set)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--force-recreate-splits', action='store_true',
+                        help='Force recreate splits (ignore cached splits)')
     args = parser.parse_args()
 
     # Create output directory
@@ -947,12 +949,15 @@ def main():
 
     # Load data with session splits
     print("Loading data...")
+    if args.force_recreate_splits:
+        print("  (forcing recreation of splits)")
     data = prepare_data(
         split_by_session=True,
         n_val_sessions=args.n_val_sessions,
         n_test_sessions=args.n_test_sessions,
         no_test_set=(args.n_test_sessions == 0),
         seed=args.seed,
+        force_recreate_splits=args.force_recreate_splits,
     )
 
     ob = data['ob']
