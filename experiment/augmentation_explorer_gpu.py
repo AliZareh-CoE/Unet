@@ -62,12 +62,12 @@ def load_data(n_val_sessions: int = 4, force_recreate_splits: bool = False, seed
     try:
         from experiment.data import (
             load_signals, load_odor_labels, load_session_ids,
-            load_or_create_session_splits, DATA_PATH, ODOR_CSV_PATH
+            DATA_PATH, ODOR_CSV_PATH
         )
     except ModuleNotFoundError:
         from data import (
             load_signals, load_odor_labels, load_session_ids,
-            load_or_create_session_splits, DATA_PATH, ODOR_CSV_PATH
+            DATA_PATH, ODOR_CSV_PATH
         )
 
     print("Loading neural signals...")
@@ -81,12 +81,26 @@ def load_data(n_val_sessions: int = 4, force_recreate_splits: bool = False, seed
     odors, odor_vocab = load_odor_labels(ODOR_CSV_PATH, n_trials)
     session_ids, session_to_idx, idx_to_session = load_session_ids(ODOR_CSV_PATH, num_trials=n_trials)
 
-    train_idx, val_idx, test_idx, split_info = load_or_create_session_splits(
-        session_ids=session_ids, odors=odors, n_test_sessions=0, n_val_sessions=n_val_sessions,
-        seed=seed, force_recreate=force_recreate_splits, idx_to_session=idx_to_session, no_test_set=True,
-    )
+    # Simple session-based split - no caching nonsense
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+    print(f"  {n_sessions} unique sessions")
 
-    print(f"  Train: {len(train_idx)} trials, Val: {len(val_idx)} trials")
+    np.random.seed(seed)
+    perm = np.random.permutation(unique_sessions)
+    val_sessions = set(perm[:n_val_sessions])
+    train_sessions = set(perm[n_val_sessions:])
+
+    train_idx = np.where([s not in val_sessions for s in session_ids])[0]
+    val_idx = np.where([s in val_sessions for s in session_ids])[0]
+
+    split_info = {
+        'train_sessions': [idx_to_session[s] for s in train_sessions],
+        'val_sessions': [idx_to_session[s] for s in val_sessions],
+    }
+
+    print(f"  Train: {len(train_idx)} trials ({len(train_sessions)} sessions)")
+    print(f"  Val: {len(val_idx)} trials ({len(val_sessions)} sessions)")
 
     return {
         'ob': ob, 'pcx': pcx, 'odors': odors, 'session_ids': session_ids,
