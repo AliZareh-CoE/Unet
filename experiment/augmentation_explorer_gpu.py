@@ -1341,6 +1341,8 @@ def main():
     parser.add_argument('--output-dir', type=str, default='figures/augmentation_exploration')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--synthetic', action='store_true', help='Use synthetic data for testing')
+    parser.add_argument('--dry-run', action='store_true', help='Quick test with only 10 configs')
+    parser.add_argument('--resume', action='store_true', help='Resume from previous run (loads existing results)')
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -1367,11 +1369,30 @@ def main():
     print("\n2. Generating search space...")
     configs = generate_search_space()
 
-    # Evaluate
-    print(f"\n3. Evaluating {len(configs)} configurations...")
-    results = []
+    if args.dry_run:
+        print(f"  DRY RUN: Limiting to 10 configs (from {len(configs)})")
+        configs = configs[:10]
 
-    for config in tqdm(configs, desc="Evaluating"):
+    # Resume from previous run if requested
+    results = []
+    completed_configs = set()
+    results_file = output_dir / 'guaranteed_coverage_results.json'
+
+    if args.resume and results_file.exists():
+        print(f"\n  RESUMING from {results_file}")
+        with open(results_file, 'r') as f:
+            prev_results = json.load(f)
+        results = prev_results
+        completed_configs = {r['config']['name'] for r in prev_results}
+        print(f"  Loaded {len(completed_configs)} previously evaluated configs")
+
+    # Filter out already completed configs
+    configs_to_run = [c for c in configs if c.name not in completed_configs]
+
+    # Evaluate
+    print(f"\n3. Evaluating {len(configs_to_run)} configurations ({len(completed_configs)} already done)...")
+
+    for i, config in enumerate(tqdm(configs_to_run, desc="Evaluating")):
         result = evaluate_config(
             config, ob_train, pcx_train, ob_val, pcx_val,
             session_ids_train, val_session_indices, device
@@ -1380,6 +1401,12 @@ def main():
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # Periodic save every 50 configs (so we can resume if interrupted)
+        if (i + 1) % 50 == 0:
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"\n  [Checkpoint] Saved {len(results)} results to {results_file}")
 
     # Sort by score
     results_sorted = sorted(results, key=lambda r: r['score'], reverse=True)
