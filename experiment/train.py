@@ -273,6 +273,16 @@ DEFAULT_CONFIG = {
     "use_covariance_augmentation": True,  # Enable covariance augmentation
     "cov_aug_strength": 0.3,              # How much to perturb covariance
     "cov_aug_n_synthetic": 3,             # How many synthetic sessions per real session
+
+    # =========================================================================
+    # Geodesic Warp Augmentation (Riemannian geometry on SPD manifold)
+    # =========================================================================
+    # Interpolates between covariance matrices along geodesic paths
+    # Creates synthetic "intermediate" sessions - proven effective in BCI literature
+    "aug_geodesic_warp": True,            # Enable geodesic warp augmentation
+    "aug_geodesic_warp_range": (0.3, 0.7),  # Interpolation range on geodesic path
+    "aug_geodesic_warp_prob": 0.7,        # Probability of applying to each sample
+    "aug_geodesic_noise": 0.2,            # Additional noise level after warp
 }
 
 
@@ -788,6 +798,88 @@ def aug_dc_offset(
     return x + offsets
 
 
+def aug_geodesic_warp(
+    ob: torch.Tensor,
+    pcx: torch.Tensor,
+    t_range: tuple = (0.3, 0.7),
+    prob: float = 0.7,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Geodesic interpolation on SPD manifold between covariance matrices.
+
+    Creates synthetic "intermediate" sessions using Riemannian geometry.
+    Proven effective in BCI literature for cross-session generalization.
+
+    Args:
+        ob: OB signals (batch, channels, time)
+        pcx: PCx signals (batch, channels, time)
+        t_range: Interpolation range on geodesic path (e.g., (0.3, 0.7))
+        prob: Probability of applying to each sample
+
+    Returns:
+        Tuple of (warped_ob, warped_pcx)
+    """
+    import numpy as np
+    from scipy.linalg import sqrtm, fractional_matrix_power
+
+    batch_size, n_ch, n_time = ob.shape
+    device = ob.device
+    dtype = ob.dtype
+
+    # Convert to numpy for scipy operations
+    ob_np = ob.cpu().numpy()
+    pcx_np = pcx.cpu().numpy()
+    ob_aug = ob_np.copy()
+    pcx_aug = pcx_np.copy()
+
+    for i in range(batch_size):
+        if np.random.rand() > prob:
+            continue  # Skip with probability (1 - prob)
+
+        # Pick a random partner trial
+        partner = np.random.randint(batch_size)
+        t = np.random.uniform(t_range[0], t_range[1])
+
+        try:
+            # OB geodesic interpolation
+            cov1_ob = np.cov(ob_np[i])
+            cov2_ob = np.cov(ob_np[partner])
+            cov1_sqrt = sqrtm(cov1_ob + 1e-6 * np.eye(n_ch))
+            cov1_inv_sqrt = np.linalg.inv(cov1_sqrt)
+            inner = cov1_inv_sqrt @ cov2_ob @ cov1_inv_sqrt
+            inner_t = np.real(fractional_matrix_power(inner + 1e-6 * np.eye(n_ch), t))
+            cov_interp_ob = np.real(cov1_sqrt @ inner_t @ cov1_sqrt)
+
+            # Transform to have interpolated covariance
+            ob_centered = ob_np[i] - ob_np[i].mean(axis=-1, keepdims=True)
+            T_ob = np.real(sqrtm(cov_interp_ob + 1e-6 * np.eye(n_ch))) @ np.linalg.inv(
+                sqrtm(cov1_ob + 1e-6 * np.eye(n_ch))
+            )
+            ob_aug[i] = T_ob @ ob_centered + ob_np[i].mean(axis=-1, keepdims=True)
+
+            # PCX geodesic interpolation
+            cov1_pcx = np.cov(pcx_np[i])
+            cov2_pcx = np.cov(pcx_np[partner])
+            cov1_sqrt_pcx = sqrtm(cov1_pcx + 1e-6 * np.eye(n_ch))
+            cov1_inv_sqrt_pcx = np.linalg.inv(cov1_sqrt_pcx)
+            inner_pcx = cov1_inv_sqrt_pcx @ cov2_pcx @ cov1_inv_sqrt_pcx
+            inner_t_pcx = np.real(fractional_matrix_power(inner_pcx + 1e-6 * np.eye(n_ch), t))
+            cov_interp_pcx = np.real(cov1_sqrt_pcx @ inner_t_pcx @ cov1_sqrt_pcx)
+
+            pcx_centered = pcx_np[i] - pcx_np[i].mean(axis=-1, keepdims=True)
+            T_pcx = np.real(sqrtm(cov_interp_pcx + 1e-6 * np.eye(n_ch))) @ np.linalg.inv(
+                sqrtm(cov1_pcx + 1e-6 * np.eye(n_ch))
+            )
+            pcx_aug[i] = T_pcx @ pcx_centered + pcx_np[i].mean(axis=-1, keepdims=True)
+        except Exception:
+            # Keep original on any numerical error
+            pass
+
+    return (
+        torch.from_numpy(ob_aug.astype(np.float32)).to(device),
+        torch.from_numpy(pcx_aug.astype(np.float32)).to(device),
+    )
+
+
 def apply_augmentations(
     ob: torch.Tensor,
     pcx: torch.Tensor,
@@ -915,6 +1007,17 @@ def apply_augmentations(
         offset_range = config.get("aug_dc_offset_range", (-0.3, 0.3))
         ob = aug_dc_offset(ob, offset_range)
         pcx = aug_dc_offset(pcx, offset_range)
+
+    # Geodesic warp: Riemannian interpolation on SPD manifold (cross-session)
+    if config.get("aug_geodesic_warp", False):
+        t_range = config.get("aug_geodesic_warp_range", (0.3, 0.7))
+        prob = config.get("aug_geodesic_warp_prob", 0.7)
+        ob, pcx = aug_geodesic_warp(ob, pcx, t_range=t_range, prob=prob)
+        # Apply additional noise after geodesic warp
+        geo_noise = config.get("aug_geodesic_noise", 0.2)
+        if geo_noise > 0:
+            ob = aug_gaussian_noise(ob, geo_noise)
+            pcx = aug_gaussian_noise(pcx, geo_noise)
 
     return ob, pcx
 
@@ -3106,6 +3209,16 @@ def parse_args():
     parser.add_argument("--aug-freq-mask-max-width", type=int, default=None,
                         help="Max width of each masked band in freq bins (default: 10)")
 
+    # Geodesic warp augmentation (Riemannian geometry)
+    parser.add_argument("--aug-geodesic-warp", action="store_true", default=None,
+                        help="Enable geodesic warp augmentation (Riemannian SPD manifold)")
+    parser.add_argument("--no-aug-geodesic-warp", action="store_false", dest="aug_geodesic_warp",
+                        help="Disable geodesic warp augmentation")
+    parser.add_argument("--aug-geodesic-warp-prob", type=float, default=None,
+                        help="Probability of applying geodesic warp (default: 0.7)")
+    parser.add_argument("--aug-geodesic-noise", type=float, default=None,
+                        help="Noise level after geodesic warp (default: 0.2)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3344,6 +3457,14 @@ def main():
     if args.aug_freq_mask_max_width is not None:
         config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
 
+    # Geodesic warp config
+    if args.aug_geodesic_warp is not None:
+        config["aug_geodesic_warp"] = args.aug_geodesic_warp
+    if args.aug_geodesic_warp_prob is not None:
+        config["aug_geodesic_warp_prob"] = args.aug_geodesic_warp_prob
+    if args.aug_geodesic_noise is not None:
+        config["aug_geodesic_noise"] = args.aug_geodesic_noise
+
     # Plot generation config
     if args.generate_plots is not None:
         config["generate_plots"] = args.generate_plots
@@ -3359,7 +3480,8 @@ def main():
                 k for k in [
                     "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
                     "aug_time_mask", "aug_mixup", "aug_freq_mask",
-                    "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
+                    "aug_channel_scale", "aug_dc_offset",  # Session-specific augmentations
+                    "aug_geodesic_warp"  # Riemannian geometry augmentation
                 ]
                 if config.get(k, False)
             ]
@@ -3367,6 +3489,11 @@ def main():
                 print(f"Data augmentation ENABLED: {', '.join(aug_active)}")
                 if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
                     print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
+                if config.get("aug_geodesic_warp", False):
+                    t_range = config.get("aug_geodesic_warp_range", (0.3, 0.7))
+                    prob = config.get("aug_geodesic_warp_prob", 0.7)
+                    noise = config.get("aug_geodesic_noise", 0.2)
+                    print(f"  [Geodesic warp: range={t_range}, prob={prob}, noise={noise}]")
             else:
                 print("Data augmentation: all individual augmentations disabled")
 
