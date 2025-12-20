@@ -1603,7 +1603,8 @@ def apply_covariance_augmentation(
     n_synthetic: int = 3,
     seed: int = 42,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    session_ids: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Apply covariance augmentation to generate synthetic training sessions.
 
     For each training sample, generates n_synthetic augmented versions by
@@ -1618,9 +1619,10 @@ def apply_covariance_augmentation(
         n_synthetic: Number of synthetic sessions per real session
         seed: Random seed
         verbose: Print progress
+        session_ids: Optional session ID array [trials] to expand alongside data
 
     Returns:
-        Tuple of (aug_source, aug_target, aug_labels, aug_train_idx)
+        Tuple of (aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids)
         Arrays are expanded with synthetic samples appended
     """
     rng = np.random.default_rng(seed)
@@ -1636,6 +1638,7 @@ def apply_covariance_augmentation(
     train_source = source[train_idx]
     train_target = target[train_idx]
     train_labels = labels[train_idx]
+    train_session_ids = session_ids[train_idx] if session_ids is not None else None
 
     # Compute original covariances from training data
     cov_source = compute_covariance(train_source)
@@ -1649,6 +1652,7 @@ def apply_covariance_augmentation(
     synthetic_sources = []
     synthetic_targets = []
     synthetic_labels = []
+    synthetic_session_ids = []
 
     for i in range(n_synthetic):
         # Perturb covariances
@@ -1662,6 +1666,8 @@ def apply_covariance_augmentation(
         synthetic_sources.append(syn_source)
         synthetic_targets.append(syn_target)
         synthetic_labels.append(train_labels.copy())
+        if train_session_ids is not None:
+            synthetic_session_ids.append(train_session_ids.copy())
 
         if verbose and _is_primary_rank():
             print(f"  Generated synthetic session {i+1}/{n_synthetic}")
@@ -1670,6 +1676,12 @@ def apply_covariance_augmentation(
     aug_source = np.concatenate([source] + synthetic_sources, axis=0)
     aug_target = np.concatenate([target] + synthetic_targets, axis=0)
     aug_labels = np.concatenate([labels] + synthetic_labels, axis=0)
+
+    # Concatenate session_ids if provided
+    if session_ids is not None and len(synthetic_session_ids) > 0:
+        aug_session_ids = np.concatenate([session_ids] + synthetic_session_ids, axis=0)
+    else:
+        aug_session_ids = session_ids
 
     # Update train indices to include synthetic samples
     n_original = len(source)
@@ -1688,7 +1700,7 @@ def apply_covariance_augmentation(
         print(f"  Total training samples: {len(aug_train_idx)} ({n_synthetic + 1}x)")
         print(f"{'='*60}\n")
 
-    return aug_source, aug_target, aug_labels, aug_train_idx
+    return aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids
 
 
 # =============================================================================
@@ -1787,7 +1799,7 @@ def prepare_data(
 
     # Apply covariance augmentation if enabled
     if use_covariance_augmentation:
-        ob, pcx, odors, train_idx = apply_covariance_augmentation(
+        ob, pcx, odors, train_idx, session_ids = apply_covariance_augmentation(
             source=ob,
             target=pcx,
             labels=odors,
@@ -1796,6 +1808,7 @@ def prepare_data(
             n_synthetic=cov_aug_n_synthetic,
             seed=seed,
             verbose=True,
+            session_ids=session_ids if split_by_session else None,
         )
 
     result = {

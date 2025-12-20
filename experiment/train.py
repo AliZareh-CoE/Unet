@@ -203,30 +203,33 @@ DEFAULT_CONFIG = {
 
     # Data augmentation (applied during training only)
     # Master toggle - set to False to disable ALL augmentations at once
-    "aug_enabled": False,            # Master switch for all augmentations
-    # HEAVY augmentation for cross-session generalization
-    "aug_time_shift": True,         # Random circular time shift
-    "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
-    "aug_noise": True,              # Add Gaussian noise
-    "aug_noise_std": 0.1,           # Noise std relative to signal std (heavy)
-    "aug_channel_dropout": True,    # Randomly zero out channels
-    "aug_channel_dropout_p": 0.2,   # Probability of dropping each channel (heavy)
-    "aug_amplitude_scale": True,    # Random amplitude scaling
-    "aug_amplitude_scale_range": (0.5, 1.5),  # Scale factor range (heavy - simulates gain drift)
-    "aug_time_mask": True,          # Randomly mask time segments
-    "aug_time_mask_ratio": 0.15,    # Fraction of time to mask
-    "aug_mixup": True,              # Mixup: blend random sample pairs
-    "aug_mixup_alpha": 0.4,         # Beta distribution alpha
-    "aug_session_mixup": True,      # Session-aware mixup: blend samples from DIFFERENT sessions
-    "aug_session_mixup_alpha": 0.4, # Beta distribution alpha for session mixup
-    "aug_freq_mask": True,          # Frequency masking: zero out random freq bands
-    "aug_freq_mask_max_bands": 3,   # Max number of frequency bands to mask
-    "aug_freq_mask_max_width": 20,  # Max width of each masked band (in freq bins)
+    "aug_enabled": True,             # Master switch for all augmentations
+    # =========================================================================
+    # WINNING CONFIG: csm_0.5_n_0.05 (93.3% MIN coverage, +29% over baseline!)
+    # Cross-Session Mixup (alpha=0.5) + Noise (std=0.05)
+    # =========================================================================
+    "aug_time_shift": False,         # Random circular time shift
+    "aug_time_shift_max": 0.2,       # Max shift as fraction of signal length (20%)
+    "aug_noise": True,               # Add Gaussian noise - WINNER USES THIS
+    "aug_noise_std": 0.05,           # Noise std=0.05 from winning config
+    "aug_channel_dropout": False,    # Randomly zero out channels
+    "aug_channel_dropout_p": 0.2,    # Probability of dropping each channel
+    "aug_amplitude_scale": False,    # Random amplitude scaling
+    "aug_amplitude_scale_range": (0.5, 1.5),  # Scale factor range
+    "aug_time_mask": False,          # Randomly mask time segments
+    "aug_time_mask_ratio": 0.15,     # Fraction of time to mask
+    "aug_mixup": False,              # Mixup: blend random sample pairs
+    "aug_mixup_alpha": 0.4,          # Beta distribution alpha
+    "aug_session_mixup": True,       # Session-aware mixup - WINNER USES THIS (alpha=0.5)
+    "aug_session_mixup_alpha": 0.5,  # Beta distribution alpha=0.5 from winning config
+    "aug_freq_mask": False,          # Frequency masking: zero out random freq bands
+    "aug_freq_mask_max_bands": 3,    # Max number of frequency bands to mask
+    "aug_freq_mask_max_width": 20,   # Max width of each masked band (in freq bins)
 
-    # Session-specific augmentation (simulates cross-session variability)
-    "aug_channel_scale": True,      # Per-channel random scaling (simulates electrode drift)
+    # Session-specific augmentation (disable - not in winning config)
+    "aug_channel_scale": False,      # Per-channel random scaling (simulates electrode drift)
     "aug_channel_scale_range": (0.7, 1.4),  # Per-channel scale range
-    "aug_dc_offset": True,          # Random DC offset per channel
+    "aug_dc_offset": False,          # Random DC offset per channel
     "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
 
     # Bidirectional training
@@ -270,19 +273,20 @@ DEFAULT_CONFIG = {
     # Covariance Augmentation for Cross-Session Robustness
     # =========================================================================
     # Generates synthetic sessions by perturbing covariance structure
-    "use_covariance_augmentation": True,  # Enable covariance augmentation
-    "cov_aug_strength": 0.3,              # How much to perturb covariance
-    "cov_aug_n_synthetic": 3,             # How many synthetic sessions per real session
+    # NOTE: Disabled - csm_0.5_n_0.05 winner doesn't use this
+    "use_covariance_augmentation": False,  # Enable covariance augmentation
+    "cov_aug_strength": 0.3,               # How much to perturb covariance
+    "cov_aug_n_synthetic": 3,              # How many synthetic sessions per real session
 
     # =========================================================================
     # Geodesic Warp Augmentation (Riemannian geometry on SPD manifold)
     # =========================================================================
     # Interpolates between covariance matrices along geodesic paths
-    # Creates synthetic "intermediate" sessions - proven effective in BCI literature
-    "aug_geodesic_warp": True,            # Enable geodesic warp augmentation
-    "aug_geodesic_warp_range": (0.3, 0.7),  # Interpolation range on geodesic path
-    "aug_geodesic_warp_prob": 0.7,        # Probability of applying to each sample
-    "aug_geodesic_noise": 0.2,            # Additional noise level after warp
+    # NOTE: 3rd place (geo_0.3_0.7_n0.2), disabled in favor of winner csm_0.5_n_0.05
+    "aug_geodesic_warp": False,            # Enable geodesic warp augmentation
+    "aug_geodesic_warp_range": (0.3, 0.7), # Interpolation range on geodesic path
+    "aug_geodesic_warp_prob": 0.7,         # Probability of applying to each sample
+    "aug_geodesic_noise": 0.2,             # Additional noise level after warp
 }
 
 
