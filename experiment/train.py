@@ -1404,7 +1404,12 @@ def evaluate(
     raw_corrs = []
 
     with torch.inference_mode():  # Faster than no_grad() - disables view tracking
-        for ob, pcx, odor, _ in loader:  # Ignore session_ids (4th value)
+        for batch_data in loader:
+            # Handle both 3-tuple (ob, pcx, odor) and 4-tuple (ob, pcx, odor, session_id)
+            if len(batch_data) == 4:
+                ob, pcx, odor, _ = batch_data
+            else:
+                ob, pcx, odor = batch_data
             ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
