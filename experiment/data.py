@@ -513,6 +513,23 @@ def load_or_create_session_splits(
                 if _is_primary_rank():
                     print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
                           f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+
+                # Regenerate per-session validation indices if requested
+                if separate_val_sessions and "val_idx_per_session" not in split_info:
+                    val_idx_per_session = {}
+                    for val_i in val_idx:
+                        sess_id = session_ids[val_i]
+                        sess_name = idx_to_session[sess_id] if idx_to_session else str(sess_id)
+                        if sess_name not in val_idx_per_session:
+                            val_idx_per_session[sess_name] = []
+                        val_idx_per_session[sess_name].append(val_i)
+                    # Convert lists to numpy arrays
+                    for sess_name in val_idx_per_session:
+                        val_idx_per_session[sess_name] = np.array(val_idx_per_session[sess_name])
+                    split_info["val_idx_per_session"] = val_idx_per_session
+                    if _is_primary_rank():
+                        print(f"  Regenerated per-session validation indices for {len(val_idx_per_session)} sessions")
+
                 return train_idx, val_idx, test_idx, split_info
 
     rng = np.random.default_rng(seed)
