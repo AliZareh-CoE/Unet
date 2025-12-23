@@ -137,7 +137,10 @@ LOGS_DIR = OUTPUT_DIR / "logs"
 # Default hyperparameters
 DEFAULT_CONFIG = {
     # Training
-    "batch_size": 8,
+    "batch_size": 32,                # Per-GPU batch size (increased from 8)
+    "gradient_accumulation": 8,      # Accumulate gradients for larger effective batch
+    # Effective batch = batch_size × gradient_accumulation × n_gpus
+    # Example: 32 × 8 × 8 = 2048 effective batch size
     "num_epochs": 80,
     "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
@@ -287,6 +290,18 @@ DEFAULT_CONFIG = {
     "aug_geodesic_warp_range": (0.3, 0.7), # Interpolation range on geodesic path
     "aug_geodesic_warp_prob": 0.7,         # Probability of applying to each sample
     "aug_geodesic_noise": 0.2,             # Additional noise level after warp
+
+    # =========================================================================
+    # Dataset Expansion Augmentations (pre-generate synthetic samples)
+    # =========================================================================
+    # These augmentations EXPAND the dataset before training (not on-the-fly)
+    # This helps with curse of dimensionality by adding real synthetic data
+    "aug_expand_session_mixup": False,     # Pre-generate cross-session blends
+    "aug_expand_session_mixup_n": 2,       # Samples per session pair
+    "aug_expand_session_mixup_alpha": 0.5, # Beta distribution alpha
+    "aug_expand_geodesic": False,          # Pre-generate geodesic warps
+    "aug_expand_geodesic_n": 2,            # Samples per source sample
+    "aug_expand_geodesic_range": (0.3, 0.7),  # Interpolation range
 }
 
 
@@ -1701,6 +1716,9 @@ def train_epoch(
     loss_components = defaultdict(lambda: torch.tensor(0.0, device=device))
     optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
 
+    # Gradient accumulation for larger effective batch size
+    accumulation_steps = config.get("gradient_accumulation", 1)
+
     pbar = tqdm(
         loader,
         desc=f"Epoch {epoch}/{num_epochs}",
@@ -1899,22 +1917,38 @@ def train_epoch(
                 loss = loss + cycle_loss_pcx
                 loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
-        loss.backward()
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / accumulation_steps
+        scaled_loss.backward()
+
+        # Accumulate loss as tensor - NO .item() call to avoid GPU sync
+        total_loss = total_loss + loss.detach()
+
+        # Only step optimizer every accumulation_steps batches
+        if (batch_idx + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            if reverse_model is not None:
+                torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
+            if cond_encoder is not None:
+                torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
+                # Manual gradient sync for cond_encoder (not wrapped in DDP)
+                sync_gradients_manual(cond_encoder)
+            # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
+            # They have only 32 params each with high lr (0.1), clipping would prevent convergence.
+            # The spectral loss gradient is naturally bounded by log PSD differences.
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+    # Handle final incomplete accumulation batch
+    if len(loader) % accumulation_steps != 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
-            # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
-        # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
-        # They have only 32 params each with high lr (0.1), clipping would prevent convergence.
-        # The spectral loss gradient is naturally bounded by log PSD differences.
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
-        # Accumulate loss as tensor - NO .item() call to avoid GPU sync
-        total_loss = total_loss + loss.detach()
 
     pbar.close()
     sys.stdout.flush()
@@ -3041,7 +3075,9 @@ def parse_args():
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
     
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
-    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size per GPU (default: 32)")
+    parser.add_argument("--gradient-accumulation", type=int, default=None,
+                        help="Gradient accumulation steps (default: 8). Effective batch = batch_size × accum × n_gpus")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: from config)")
     parser.add_argument("--weight-decay", type=float, default=None,
                         help="Weight decay / L2 regularization (default: 0.0, try 0.01-0.1)")
@@ -3228,6 +3264,20 @@ def parse_args():
     parser.add_argument("--aug-geodesic-noise", type=float, default=None,
                         help="Noise level after geodesic warp (default: 0.2)")
 
+    # Dataset expansion augmentations (pre-generate synthetic samples)
+    parser.add_argument("--aug-expand-session-mixup", action="store_true", default=None,
+                        help="Pre-generate cross-session blend samples (dataset expansion)")
+    parser.add_argument("--no-aug-expand-session-mixup", action="store_false", dest="aug_expand_session_mixup",
+                        help="Disable session mixup expansion")
+    parser.add_argument("--aug-expand-session-mixup-n", type=int, default=None,
+                        help="Samples per session pair for expansion (default: 2)")
+    parser.add_argument("--aug-expand-geodesic", action="store_true", default=None,
+                        help="Pre-generate geodesic warp samples (dataset expansion)")
+    parser.add_argument("--no-aug-expand-geodesic", action="store_false", dest="aug_expand_geodesic",
+                        help="Disable geodesic expansion")
+    parser.add_argument("--aug-expand-geodesic-n", type=int, default=None,
+                        help="Geodesic samples per source sample (default: 2)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3286,6 +3336,8 @@ def main():
         config["num_epochs"] = args.epochs
     if args.batch_size is not None:
         config["batch_size"] = args.batch_size
+    if args.gradient_accumulation is not None:
+        config["gradient_accumulation"] = args.gradient_accumulation
     if args.lr is not None:
         config["learning_rate"] = args.lr
     if args.weight_decay is not None:
@@ -3375,6 +3427,13 @@ def main():
             use_covariance_augmentation=config.get("use_covariance_augmentation", False),
             cov_aug_strength=config.get("cov_aug_strength", 0.3),
             cov_aug_n_synthetic=config.get("cov_aug_n_synthetic", 3),
+            # Dataset expansion augmentations
+            aug_expand_session_mixup=config.get("aug_expand_session_mixup", False),
+            aug_expand_session_mixup_n=config.get("aug_expand_session_mixup_n", 2),
+            aug_expand_session_mixup_alpha=config.get("aug_expand_session_mixup_alpha", 0.5),
+            aug_expand_geodesic=config.get("aug_expand_geodesic", False),
+            aug_expand_geodesic_n=config.get("aug_expand_geodesic_n", 2),
+            aug_expand_geodesic_range=config.get("aug_expand_geodesic_range", (0.3, 0.7)),
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels
@@ -3474,6 +3533,16 @@ def main():
     if args.aug_geodesic_noise is not None:
         config["aug_geodesic_noise"] = args.aug_geodesic_noise
 
+    # Dataset expansion augmentations (pre-generate synthetic samples)
+    if args.aug_expand_session_mixup is not None:
+        config["aug_expand_session_mixup"] = args.aug_expand_session_mixup
+    if args.aug_expand_session_mixup_n is not None:
+        config["aug_expand_session_mixup_n"] = args.aug_expand_session_mixup_n
+    if args.aug_expand_geodesic is not None:
+        config["aug_expand_geodesic"] = args.aug_expand_geodesic
+    if args.aug_expand_geodesic_n is not None:
+        config["aug_expand_geodesic_n"] = args.aug_expand_geodesic_n
+
     # Plot generation config
     if args.generate_plots is not None:
         config["generate_plots"] = args.generate_plots
@@ -3554,6 +3623,12 @@ def main():
 
     if is_primary():
         print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
+        # Calculate and display effective batch size
+        n_gpus = get_world_size()
+        batch_size = config['batch_size']
+        grad_accum = config.get('gradient_accumulation', 1)
+        effective_batch = batch_size * grad_accum * n_gpus
+        print(f"Batch size: {batch_size} per GPU × {grad_accum} accum × {n_gpus} GPUs = {effective_batch} effective")
         print(f"Attention type: {config['attention_type']}")
         print(f"Convolution type: {config['conv_type']}")
         if config['conv_type'] == 'modern':
