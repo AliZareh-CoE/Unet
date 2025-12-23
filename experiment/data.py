@@ -1704,6 +1704,316 @@ def apply_covariance_augmentation(
 
 
 # =============================================================================
+# Dataset Expansion Augmentations
+# =============================================================================
+
+def expand_session_mixup(
+    source: np.ndarray,
+    target: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    session_ids: np.ndarray,
+    n_samples_per_pair: int = 2,
+    alpha: float = 0.5,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pre-generate cross-session mixup samples to expand the dataset.
+
+    For each pair of different sessions, generates interpolated samples.
+    This expands the training set with synthetic cross-session data.
+
+    Args:
+        source: Source signal array [trials, channels, samples]
+        target: Target signal array [trials, channels, samples]
+        labels: Label array [trials]
+        train_idx: Indices of training samples
+        session_ids: Session ID array [trials]
+        n_samples_per_pair: Number of samples to generate per session pair
+        alpha: Beta distribution alpha for mixup weights
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        Tuple of (aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids)
+    """
+    rng = np.random.default_rng(seed)
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Applying Session Mixup Dataset Expansion")
+        print(f"{'='*60}")
+        print(f"  Samples per session pair: {n_samples_per_pair}")
+        print(f"  Mixup alpha: {alpha}")
+
+    # Get unique sessions in training data
+    train_source = source[train_idx]
+    train_target = target[train_idx]
+    train_labels = labels[train_idx]
+    train_sessions = session_ids[train_idx]
+
+    unique_sessions = np.unique(train_sessions)
+    n_sessions = len(unique_sessions)
+
+    if verbose and _is_primary_rank():
+        print(f"  Unique training sessions: {n_sessions}")
+
+    # Generate cross-session mixup samples
+    synthetic_sources = []
+    synthetic_targets = []
+    synthetic_labels = []
+    synthetic_session_ids = []
+
+    # For each pair of different sessions
+    session_pairs = [(i, j) for i in range(n_sessions) for j in range(i+1, n_sessions)]
+
+    for sess_i, sess_j in session_pairs:
+        sess_id_i = unique_sessions[sess_i]
+        sess_id_j = unique_sessions[sess_j]
+
+        # Get samples from each session
+        mask_i = train_sessions == sess_id_i
+        mask_j = train_sessions == sess_id_j
+
+        samples_i = train_source[mask_i]
+        samples_j = train_source[mask_j]
+        targets_i = train_target[mask_i]
+        targets_j = train_target[mask_j]
+        labels_i = train_labels[mask_i]
+        labels_j = train_labels[mask_j]
+
+        # Generate n_samples_per_pair mixup samples
+        for _ in range(n_samples_per_pair):
+            # Random sample from each session
+            idx_i = rng.integers(0, len(samples_i))
+            idx_j = rng.integers(0, len(samples_j))
+
+            # Mixup weight from beta distribution
+            lam = rng.beta(alpha, alpha)
+
+            # Create mixed sample
+            mixed_source = lam * samples_i[idx_i] + (1 - lam) * samples_j[idx_j]
+            mixed_target = lam * targets_i[idx_i] + (1 - lam) * targets_j[idx_j]
+
+            # Use label from dominant sample
+            mixed_label = labels_i[idx_i] if lam > 0.5 else labels_j[idx_j]
+
+            # Assign to new synthetic session ID (use max + pair index)
+            max_session_id = np.max(session_ids)
+            synthetic_session_id = max_session_id + sess_i * n_sessions + sess_j + 1
+
+            synthetic_sources.append(mixed_source)
+            synthetic_targets.append(mixed_target)
+            synthetic_labels.append(mixed_label)
+            synthetic_session_ids.append(synthetic_session_id)
+
+    n_synthetic = len(synthetic_sources)
+
+    if n_synthetic > 0:
+        # Stack synthetic samples
+        syn_source = np.stack(synthetic_sources, axis=0)
+        syn_target = np.stack(synthetic_targets, axis=0)
+        syn_labels = np.array(synthetic_labels)
+        syn_session_ids = np.array(synthetic_session_ids)
+
+        # Concatenate with original
+        aug_source = np.concatenate([source, syn_source], axis=0)
+        aug_target = np.concatenate([target, syn_target], axis=0)
+        aug_labels = np.concatenate([labels, syn_labels], axis=0)
+        aug_session_ids = np.concatenate([session_ids, syn_session_ids], axis=0)
+
+        # Update train indices
+        n_original = len(source)
+        new_indices = np.arange(n_original, n_original + n_synthetic)
+        aug_train_idx = np.concatenate([train_idx, new_indices])
+    else:
+        aug_source = source
+        aug_target = target
+        aug_labels = labels
+        aug_session_ids = session_ids
+        aug_train_idx = train_idx
+
+    if verbose and _is_primary_rank():
+        print(f"  Session pairs: {len(session_pairs)}")
+        print(f"  Generated synthetic samples: {n_synthetic}")
+        print(f"  Original training samples: {len(train_idx)}")
+        print(f"  Total training samples: {len(aug_train_idx)}")
+        print(f"{'='*60}\n")
+
+    return aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids
+
+
+def expand_geodesic_warp(
+    source: np.ndarray,
+    target: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    session_ids: np.ndarray,
+    n_samples_per_source: int = 2,
+    t_range: Tuple[float, float] = (0.3, 0.7),
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pre-generate geodesic warp samples to expand the dataset.
+
+    Generates samples along geodesic paths on the SPD manifold between
+    different session covariance structures.
+
+    Args:
+        source: Source signal array [trials, channels, samples]
+        target: Target signal array [trials, channels, samples]
+        labels: Label array [trials]
+        train_idx: Indices of training samples
+        session_ids: Session ID array [trials]
+        n_samples_per_source: Number of geodesic samples per source sample
+        t_range: Range of interpolation parameter (0=source, 1=target session)
+        seed: Random seed
+        verbose: Print progress
+
+    Returns:
+        Tuple of (aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids)
+    """
+    rng = np.random.default_rng(seed)
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Applying Geodesic Warp Dataset Expansion")
+        print(f"{'='*60}")
+        print(f"  Samples per source: {n_samples_per_source}")
+        print(f"  Interpolation range: {t_range}")
+
+    # Get training data
+    train_source = source[train_idx]
+    train_target = target[train_idx]
+    train_labels = labels[train_idx]
+    train_sessions = session_ids[train_idx]
+
+    unique_sessions = np.unique(train_sessions)
+    n_sessions = len(unique_sessions)
+
+    if n_sessions < 2:
+        if verbose and _is_primary_rank():
+            print("  WARNING: Need at least 2 sessions for geodesic warp, skipping")
+            print(f"{'='*60}\n")
+        return source, target, labels, train_idx, session_ids
+
+    if verbose and _is_primary_rank():
+        print(f"  Unique training sessions: {n_sessions}")
+
+    # Compute per-session covariances
+    session_covs_source = {}
+    session_covs_target = {}
+
+    for sess_id in unique_sessions:
+        mask = train_sessions == sess_id
+        session_covs_source[sess_id] = compute_covariance(train_source[mask])
+        session_covs_target[sess_id] = compute_covariance(train_target[mask])
+
+    # Generate geodesic warp samples
+    synthetic_sources = []
+    synthetic_targets = []
+    synthetic_labels = []
+    synthetic_session_ids = []
+
+    for i, idx in enumerate(train_idx):
+        sess_id = session_ids[idx]
+        src = source[idx]
+        tgt = target[idx]
+        lbl = labels[idx]
+
+        # Pick a random different session
+        other_sessions = [s for s in unique_sessions if s != sess_id]
+        if len(other_sessions) == 0:
+            continue
+
+        for _ in range(n_samples_per_source):
+            other_sess = rng.choice(other_sessions)
+
+            # Interpolation parameter
+            t = rng.uniform(t_range[0], t_range[1])
+
+            # Compute geodesic interpolation of covariances
+            cov_src_source = session_covs_source[sess_id]
+            cov_src_target = session_covs_target[sess_id]
+            cov_other_source = session_covs_source[other_sess]
+            cov_other_target = session_covs_target[other_sess]
+
+            # Interpolate covariance (simple linear for now - proper geodesic is complex)
+            # A full geodesic would use SPD manifold exponential/log maps
+            interp_cov_source = (1 - t) * cov_src_source + t * cov_other_source
+            interp_cov_target = (1 - t) * cov_src_target + t * cov_other_target
+
+            # Apply whitening-coloring transform
+            # whiten with source session, color with interpolated covariance
+            try:
+                # Regularize covariances for numerical stability
+                eps = 1e-6
+                cov_src_source_reg = cov_src_source + eps * np.eye(cov_src_source.shape[0])
+                cov_src_target_reg = cov_src_target + eps * np.eye(cov_src_target.shape[0])
+                interp_cov_source_reg = interp_cov_source + eps * np.eye(interp_cov_source.shape[0])
+                interp_cov_target_reg = interp_cov_target + eps * np.eye(interp_cov_target.shape[0])
+
+                # Whitening transform (inverse sqrt of source cov)
+                L_src = np.linalg.cholesky(cov_src_source_reg)
+                L_interp_source = np.linalg.cholesky(interp_cov_source_reg)
+                L_tgt = np.linalg.cholesky(cov_src_target_reg)
+                L_interp_target = np.linalg.cholesky(interp_cov_target_reg)
+
+                # Transform: L_interp @ L_src^-1 @ data
+                transform_source = L_interp_source @ np.linalg.inv(L_src)
+                transform_target = L_interp_target @ np.linalg.inv(L_tgt)
+
+                warped_src = np.einsum('ij,jt->it', transform_source, src)
+                warped_tgt = np.einsum('ij,jt->it', transform_target, tgt)
+
+                synthetic_sources.append(warped_src)
+                synthetic_targets.append(warped_tgt)
+                synthetic_labels.append(lbl)
+
+                # Assign to synthetic session ID
+                max_session_id = np.max(session_ids)
+                synthetic_session_ids.append(max_session_id + i * n_samples_per_source + 1)
+
+            except np.linalg.LinAlgError:
+                # Skip if Cholesky fails (non-PSD matrix)
+                continue
+
+    n_synthetic = len(synthetic_sources)
+
+    if n_synthetic > 0:
+        # Stack synthetic samples
+        syn_source = np.stack(synthetic_sources, axis=0)
+        syn_target = np.stack(synthetic_targets, axis=0)
+        syn_labels = np.array(synthetic_labels)
+        syn_session_ids = np.array(synthetic_session_ids)
+
+        # Concatenate with original
+        aug_source = np.concatenate([source, syn_source], axis=0)
+        aug_target = np.concatenate([target, syn_target], axis=0)
+        aug_labels = np.concatenate([labels, syn_labels], axis=0)
+        aug_session_ids = np.concatenate([session_ids, syn_session_ids], axis=0)
+
+        # Update train indices
+        n_original = len(source)
+        new_indices = np.arange(n_original, n_original + n_synthetic)
+        aug_train_idx = np.concatenate([train_idx, new_indices])
+    else:
+        aug_source = source
+        aug_target = target
+        aug_labels = labels
+        aug_session_ids = session_ids
+        aug_train_idx = train_idx
+
+    if verbose and _is_primary_rank():
+        print(f"  Generated geodesic warp samples: {n_synthetic}")
+        print(f"  Original training samples: {len(train_idx)}")
+        print(f"  Total training samples: {len(aug_train_idx)}")
+        print(f"{'='*60}\n")
+
+    return aug_source, aug_target, aug_labels, aug_train_idx, aug_session_ids
+
+
+# =============================================================================
 # Data Preparation Pipeline
 # =============================================================================
 
@@ -1724,6 +2034,13 @@ def prepare_data(
     use_covariance_augmentation: bool = False,
     cov_aug_strength: float = 0.3,
     cov_aug_n_synthetic: int = 3,
+    # Dataset expansion augmentations
+    aug_expand_session_mixup: bool = False,
+    aug_expand_session_mixup_n: int = 2,
+    aug_expand_session_mixup_alpha: float = 0.5,
+    aug_expand_geodesic: bool = False,
+    aug_expand_geodesic_n: int = 2,
+    aug_expand_geodesic_range: Tuple[float, float] = (0.3, 0.7),
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1810,6 +2127,36 @@ def prepare_data(
             verbose=True,
             session_ids=session_ids if split_by_session else None,
         )
+
+    # Apply dataset expansion augmentations (only if session info available)
+    if split_by_session and session_ids is not None:
+        # Session mixup expansion
+        if aug_expand_session_mixup:
+            ob, pcx, odors, train_idx, session_ids = expand_session_mixup(
+                source=ob,
+                target=pcx,
+                labels=odors,
+                train_idx=train_idx,
+                session_ids=session_ids,
+                n_samples_per_pair=aug_expand_session_mixup_n,
+                alpha=aug_expand_session_mixup_alpha,
+                seed=seed,
+                verbose=True,
+            )
+
+        # Geodesic warp expansion
+        if aug_expand_geodesic:
+            ob, pcx, odors, train_idx, session_ids = expand_geodesic_warp(
+                source=ob,
+                target=pcx,
+                labels=odors,
+                train_idx=train_idx,
+                session_ids=session_ids,
+                n_samples_per_source=aug_expand_geodesic_n,
+                t_range=aug_expand_geodesic_range,
+                seed=seed,
+                verbose=True,
+            )
 
     result = {
         "ob": ob,
