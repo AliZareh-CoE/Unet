@@ -271,6 +271,7 @@ DEFAULT_CONFIG = {
     "session_column": "recording_id",  # CSV column containing session/recording IDs
     "no_test_set": True,        # If True, no test set - all held-out sessions for validation
     "separate_val_sessions": True,  # If True, evaluate each val session separately
+    "per_session_normalize": True,  # Per-session z-score normalization for cross-session generalization
 
     # =========================================================================
     # Covariance Augmentation for Cross-Session Robustness
@@ -3124,6 +3125,10 @@ def parse_args():
                         help="Evaluate each validation session separately (per-session metrics)")
     parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
                         help="Combine all validation sessions (default)")
+    parser.add_argument("--per-session-normalize", action="store_true", default=None,
+                        help="Apply per-session z-score normalization (aligns distributions across sessions)")
+    parser.add_argument("--no-per-session-normalize", action="store_false", dest="per_session_normalize",
+                        help="Disable per-session normalization")
 
     # Covariance augmentation for cross-session robustness
     parser.add_argument("--cov-aug", action="store_true", default=None,
@@ -3369,6 +3374,8 @@ def main():
         config["no_test_set"] = args.no_test_set
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
+    if args.per_session_normalize is not None:
+        config["per_session_normalize"] = args.per_session_normalize
 
     # Covariance augmentation config (CLI overrides config)
     if args.cov_aug is not None:
@@ -3392,6 +3399,8 @@ def main():
         print(f"Session column: {config['session_column']}")
         if config.get("separate_val_sessions", False):
             print("  Per-session validation ENABLED (metrics reported per session)")
+        if config.get("per_session_normalize", False):
+            print("  Per-session normalization ENABLED (aligns distributions across sessions)")
 
     # Load data based on dataset choice
     if args.dataset == "pfc":
@@ -3434,6 +3443,8 @@ def main():
             aug_expand_geodesic=config.get("aug_expand_geodesic", False),
             aug_expand_geodesic_n=config.get("aug_expand_geodesic_n", 2),
             aug_expand_geodesic_range=config.get("aug_expand_geodesic_range", (0.3, 0.7)),
+            # Per-session normalization for cross-session generalization
+            per_session_normalize=config.get("per_session_normalize", False),
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels

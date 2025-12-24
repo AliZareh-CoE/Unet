@@ -513,6 +513,23 @@ def load_or_create_session_splits(
                 if _is_primary_rank():
                     print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
                           f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+
+                # Regenerate per-session validation indices if requested
+                if separate_val_sessions and "val_idx_per_session" not in split_info:
+                    val_idx_per_session = {}
+                    for val_i in val_idx:
+                        sess_id = session_ids[val_i]
+                        sess_name = idx_to_session[sess_id] if idx_to_session else str(sess_id)
+                        if sess_name not in val_idx_per_session:
+                            val_idx_per_session[sess_name] = []
+                        val_idx_per_session[sess_name].append(val_i)
+                    # Convert lists to numpy arrays
+                    for sess_name in val_idx_per_session:
+                        val_idx_per_session[sess_name] = np.array(val_idx_per_session[sess_name])
+                    split_info["val_idx_per_session"] = val_idx_per_session
+                    if _is_primary_rank():
+                        print(f"  Regenerated per-session validation indices for {len(val_idx_per_session)} sessions")
+
                 return train_idx, val_idx, test_idx, split_info
 
     rng = np.random.default_rng(seed)
@@ -1039,6 +1056,428 @@ def normalize(windowed: np.ndarray, stats: NormalizationStats) -> np.ndarray:
 def denormalize(normalized: np.ndarray, stats: NormalizationStats) -> np.ndarray:
     """Reverse z-score normalization."""
     return normalized * stats.std + stats.mean
+
+
+# =============================================================================
+# Per-Session Normalization (for cross-session generalization)
+# =============================================================================
+
+@dataclass
+class PerSessionNormStats:
+    """Per-session normalization statistics for cross-session generalization.
+
+    This addresses the cross-session distribution shift problem where different
+    recording sessions have different DC offsets, gains, and spectral profiles.
+
+    Each session is normalized independently to zero mean and unit variance
+    per channel, aligning distributions before global normalization.
+    """
+    # Dict mapping session_id -> {'mean': [channels], 'std': [channels]}
+    session_stats: Dict[int, Dict[str, np.ndarray]]
+
+    def save(self, path: Path) -> None:
+        """Save per-session stats to JSON."""
+        # Convert numpy arrays to lists for JSON serialization
+        payload = {}
+        for sess_id, stats in self.session_stats.items():
+            payload[str(sess_id)] = {
+                'mean': stats['mean'].tolist(),
+                'std': stats['std'].tolist(),
+            }
+        path.write_text(json.dumps(payload), encoding='utf-8')
+
+    @staticmethod
+    def load(path: Path) -> "PerSessionNormStats":
+        """Load per-session stats from JSON."""
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        session_stats = {}
+        for sess_id_str, stats in payload.items():
+            session_stats[int(sess_id_str)] = {
+                'mean': np.asarray(stats['mean'], dtype=np.float32),
+                'std': np.asarray(stats['std'], dtype=np.float32),
+            }
+        return PerSessionNormStats(session_stats=session_stats)
+
+
+def compute_per_session_normalization(
+    windowed: np.ndarray,
+    session_ids: np.ndarray,
+    verbose: bool = True,
+) -> PerSessionNormStats:
+    """Compute per-session normalization statistics.
+
+    For each session, compute mean and std per channel across all trials and time.
+    This allows each session to be independently z-score normalized, removing
+    session-specific DC offsets and gain differences.
+
+    Args:
+        windowed: Signal array. Shape depends on format:
+            - Olfactory: (trials, 2, channels, time)
+            - PFC: (trials, channels, time)
+        session_ids: Session ID per trial [trials]
+        verbose: Print progress
+
+    Returns:
+        PerSessionNormStats with per-session mean/std per channel
+    """
+    unique_sessions = np.unique(session_ids)
+    session_stats = {}
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Computing Per-Session Normalization Statistics")
+        print(f"{'='*60}")
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = windowed[mask]
+        n_trials = sess_data.shape[0]
+
+        if sess_data.ndim == 4:
+            # Olfactory format: (trials, 2, channels, time)
+            # Compute mean/std per region (OB/PCx) and channel
+            # Shape: (2, channels)
+            mean_per_channel = sess_data.mean(axis=(0, 3))  # Mean over trials and time
+            std_per_channel = sess_data.std(axis=(0, 3))    # Std over trials and time
+        elif sess_data.ndim == 3:
+            # PFC format: (trials, channels, time)
+            # Shape: (channels,)
+            mean_per_channel = sess_data.mean(axis=(0, 2))
+            std_per_channel = sess_data.std(axis=(0, 2))
+        else:
+            raise ValueError(f"Unexpected array shape: {sess_data.shape}")
+
+        # Avoid division by zero
+        std_per_channel = np.maximum(std_per_channel, 1e-8)
+
+        session_stats[int(sess_id)] = {
+            'mean': mean_per_channel.astype(np.float32),
+            'std': std_per_channel.astype(np.float32),
+            'n_trials': n_trials,
+        }
+
+        if verbose and _is_primary_rank():
+            mean_range = (mean_per_channel.min(), mean_per_channel.max())
+            std_range = (std_per_channel.min(), std_per_channel.max())
+            print(f"  Session {sess_id}: {n_trials} trials, "
+                  f"mean range [{mean_range[0]:.4f}, {mean_range[1]:.4f}], "
+                  f"std range [{std_range[0]:.4f}, {std_range[1]:.4f}]")
+
+    if verbose and _is_primary_rank():
+        print(f"{'='*60}\n")
+
+    return PerSessionNormStats(session_stats=session_stats)
+
+
+def normalize_per_session(
+    windowed: np.ndarray,
+    session_ids: np.ndarray,
+    stats: Optional[PerSessionNormStats] = None,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, PerSessionNormStats]:
+    """Apply per-session z-score normalization.
+
+    Each session is normalized independently, removing session-specific
+    DC offsets and gain differences. This aligns distributions across sessions
+    before any global normalization.
+
+    Args:
+        windowed: Signal array. Shape:
+            - Olfactory: (trials, 2, channels, time)
+            - PFC: (trials, channels, time)
+        session_ids: Session ID per trial [trials]
+        stats: Pre-computed stats. If None, computed from data.
+        verbose: Print progress
+
+    Returns:
+        normalized: Per-session normalized data
+        stats: PerSessionNormStats used for normalization
+    """
+    if stats is None:
+        stats = compute_per_session_normalization(windowed, session_ids, verbose)
+
+    normalized = windowed.copy()
+
+    if verbose and _is_primary_rank():
+        print("Applying per-session normalization...")
+
+    for sess_id, sess_stats in stats.session_stats.items():
+        mask = session_ids == sess_id
+        sess_data = windowed[mask]
+        mean = sess_stats['mean']
+        std = sess_stats['std']
+
+        if sess_data.ndim == 4:
+            # Olfactory: (trials, 2, channels, time)
+            # mean/std shape: (2, channels) -> need (1, 2, channels, 1)
+            normalized[mask] = (sess_data - mean[None, :, :, None]) / std[None, :, :, None]
+        elif sess_data.ndim == 3:
+            # PFC: (trials, channels, time)
+            # mean/std shape: (channels,) -> need (1, channels, 1)
+            normalized[mask] = (sess_data - mean[None, :, None]) / std[None, :, None]
+
+    if verbose and _is_primary_rank():
+        print("  Per-session normalization complete.")
+
+    return normalized.astype(np.float32), stats
+
+
+def denormalize_per_session(
+    normalized: np.ndarray,
+    session_ids: np.ndarray,
+    stats: PerSessionNormStats,
+) -> np.ndarray:
+    """Reverse per-session z-score normalization."""
+    denormalized = normalized.copy()
+
+    for sess_id, sess_stats in stats.session_stats.items():
+        mask = session_ids == sess_id
+        sess_data = normalized[mask]
+        mean = sess_stats['mean']
+        std = sess_stats['std']
+
+        if sess_data.ndim == 4:
+            denormalized[mask] = sess_data * std[None, :, :, None] + mean[None, :, :, None]
+        elif sess_data.ndim == 3:
+            denormalized[mask] = sess_data * std[None, :, None] + mean[None, :, None]
+
+    return denormalized.astype(np.float32)
+
+
+# =============================================================================
+# Spectral (PSD) Normalization for Cross-Session Generalization
+# =============================================================================
+
+def compute_session_psd(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    fs: int = 1000,
+    nperseg: int = 256,
+) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+    """
+    Compute average PSD for each session.
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        fs: Sampling frequency
+        nperseg: Segment length for Welch method
+
+    Returns:
+        freqs: Frequency bins
+        session_psds: Dict mapping session_id -> average PSD [channels, freqs]
+    """
+    from scipy.signal import welch
+
+    unique_sessions = np.unique(session_ids)
+    session_psds = {}
+
+    # Handle different array shapes
+    if data.ndim == 4:
+        # Olfactory: (trials, 2, channels, time) - use first region (OB)
+        data_3d = data[:, 0]  # [trials, channels, time]
+    else:
+        data_3d = data  # Already [trials, channels, time]
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = data_3d[mask]  # [n_trials, channels, time]
+
+        # Compute PSD for each trial, then average
+        psds = []
+        for trial in sess_data:
+            freqs, psd = welch(trial, fs=fs, nperseg=nperseg, axis=1)
+            psds.append(psd)
+
+        session_psds[int(sess_id)] = np.mean(psds, axis=0)  # [channels, freqs]
+
+    return freqs, session_psds
+
+
+def normalize_spectral_per_session(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    reference_psd: Optional[np.ndarray] = None,
+    train_session_ids: Optional[np.ndarray] = None,
+    fs: int = 1000,
+    nperseg: int = 256,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Normalize each session's PSD to match a reference.
+
+    This corrects for different amplifier gains and frequency responses
+    across recording sessions by applying a frequency-domain correction filter.
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        reference_psd: Target PSD to match [channels, freqs]. If None, use median of train sessions.
+        train_session_ids: Session IDs to use for computing reference (if reference_psd is None)
+        fs: Sampling frequency
+        nperseg: Segment length for Welch method
+        verbose: Print progress
+
+    Returns:
+        normalized: Spectrally normalized data
+        info: Dict with reference PSD and correction filters
+    """
+    from scipy.interpolate import interp1d
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Applying Spectral (PSD) Normalization")
+        print(f"{'='*60}")
+
+    # Handle different array shapes
+    is_4d = data.ndim == 4
+    if is_4d:
+        # Process each region separately for olfactory data
+        data_ob = data[:, 0]  # [trials, channels, time]
+        data_pcx = data[:, 1]
+    else:
+        data_ob = data
+
+    # Compute session PSDs
+    freqs, session_psds = compute_session_psd(data_ob, session_ids, fs, nperseg)
+
+    # Compute reference PSD if not provided
+    if reference_psd is None:
+        if train_session_ids is not None:
+            # Use median of training sessions
+            train_sess_unique = np.unique(train_session_ids)
+            train_psds = [session_psds[int(sid)] for sid in train_sess_unique if int(sid) in session_psds]
+        else:
+            # Use median of all sessions
+            train_psds = list(session_psds.values())
+
+        reference_psd = np.median(train_psds, axis=0)  # [channels, freqs]
+        if verbose and _is_primary_rank():
+            print(f"  Reference PSD: median of {len(train_psds)} sessions")
+
+    # Normalize each session
+    normalized_ob = data_ob.copy()
+    if is_4d:
+        normalized_pcx = data_pcx.copy()
+    correction_filters = {}
+
+    unique_sessions = np.unique(session_ids)
+    n_time = data_ob.shape[2]
+    n_channels = data_ob.shape[1]
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_psd = session_psds[int(sess_id)]  # [channels, freqs]
+
+        # Compute correction filter: sqrt(reference / session)
+        # This scales the amplitude spectrum to match reference
+        with np.errstate(divide='ignore', invalid='ignore'):
+            correction = np.sqrt(reference_psd / (sess_psd + 1e-10))
+        correction = np.nan_to_num(correction, nan=1.0, posinf=1.0, neginf=1.0)
+
+        # Clip extreme corrections to avoid amplifying noise
+        correction = np.clip(correction, 0.1, 10.0)
+
+        # Interpolate correction filter to match FFT bins
+        n_fft = n_time // 2 + 1
+        fft_freqs = np.fft.rfftfreq(n_time, 1/fs)
+
+        correction_interp = np.zeros((n_channels, n_fft))
+        for ch in range(n_channels):
+            interp_func = interp1d(freqs, correction[ch], kind='linear',
+                                   fill_value='extrapolate', bounds_error=False)
+            correction_interp[ch] = np.clip(interp_func(fft_freqs), 0.1, 10.0)
+
+        correction_filters[int(sess_id)] = correction_interp
+
+        # Apply correction in frequency domain
+        sess_data_ob = data_ob[mask]
+        for i in range(sess_data_ob.shape[0]):
+            fft = np.fft.rfft(sess_data_ob[i], axis=1)
+            fft_corrected = fft * correction_interp
+            normalized_ob[mask][i] = np.fft.irfft(fft_corrected, n=n_time, axis=1)
+
+        # Also apply to PCx if 4D data (using same correction as OB)
+        if is_4d:
+            sess_data_pcx = data_pcx[mask]
+            for i in range(sess_data_pcx.shape[0]):
+                fft = np.fft.rfft(sess_data_pcx[i], axis=1)
+                fft_corrected = fft * correction_interp
+                normalized_pcx[mask][i] = np.fft.irfft(fft_corrected, n=n_time, axis=1)
+
+        if verbose and _is_primary_rank():
+            avg_correction = np.mean(correction)
+            print(f"  Session {sess_id}: avg correction factor {avg_correction:.2f}")
+
+    # Reconstruct output
+    if is_4d:
+        normalized = np.stack([normalized_ob, normalized_pcx], axis=1)
+    else:
+        normalized = normalized_ob
+
+    info = {
+        'reference_psd': reference_psd,
+        'freqs': freqs,
+        'correction_filters': correction_filters,
+        'session_psds': session_psds,
+    }
+
+    if verbose and _is_primary_rank():
+        print(f"{'='*60}\n")
+
+    return normalized.astype(np.float32), info
+
+
+def normalize_combined_per_session(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    train_session_ids: Optional[np.ndarray] = None,
+    apply_zscore: bool = True,
+    apply_spectral: bool = True,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Apply both z-score and spectral normalization.
+
+    Order: Z-score first (removes DC/gain), then spectral (fixes frequency response)
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        train_session_ids: Session IDs for reference computation
+        apply_zscore: Apply per-session z-score normalization
+        apply_spectral: Apply spectral normalization
+        verbose: Print progress
+
+    Returns:
+        normalized: Fully normalized data
+        info: Dict with all normalization parameters
+    """
+    if verbose and _is_primary_rank():
+        print("\n" + "="*70)
+        print("COMBINED PER-SESSION NORMALIZATION PIPELINE")
+        print("="*70)
+
+    info = {}
+    normalized = data
+
+    # Step 1: Z-score normalization
+    if apply_zscore:
+        normalized, zscore_stats = normalize_per_session(
+            normalized, session_ids, verbose=verbose
+        )
+        info['zscore_stats'] = zscore_stats
+
+    # Step 2: Spectral normalization
+    if apply_spectral:
+        normalized, spectral_info = normalize_spectral_per_session(
+            normalized, session_ids,
+            train_session_ids=train_session_ids,
+            verbose=verbose
+        )
+        info['spectral_info'] = spectral_info
+
+    return normalized, info
 
 
 # =============================================================================
@@ -2050,6 +2489,8 @@ def prepare_data(
     aug_expand_geodesic: bool = False,
     aug_expand_geodesic_n: int = 2,
     aug_expand_geodesic_range: Tuple[float, float] = (0.3, 0.7),
+    # Per-session normalization for cross-session generalization
+    per_session_normalize: bool = False,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -2069,6 +2510,9 @@ def prepare_data(
         use_covariance_augmentation: If True, generate synthetic sessions via cov perturbation
         cov_aug_strength: Perturbation strength (0-1)
         cov_aug_n_synthetic: Number of synthetic sessions per real session
+        per_session_normalize: If True, apply per-session z-score normalization BEFORE
+            global normalization. This aligns distributions across sessions by removing
+            session-specific DC offsets and gain differences. Requires split_by_session=True.
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays (augmented if use_covariance_augmentation)
@@ -2078,6 +2522,7 @@ def prepare_data(
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
     - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
+    - per_session_norm_stats: (only if per_session_normalize) PerSessionNormStats
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -2112,6 +2557,19 @@ def prepare_data(
     else:
         # Random stratified splits (original behavior)
         train_idx, val_idx, test_idx = load_or_create_stratified_splits(odors, seed)
+        session_ids = None  # No session info for random splits
+
+    # Apply per-session normalization if enabled (BEFORE global normalization)
+    # This aligns distributions across sessions by removing session-specific offsets/gains
+    per_session_norm_stats = None
+    if per_session_normalize:
+        if session_ids is None:
+            raise ValueError(
+                "per_session_normalize=True requires split_by_session=True to have session IDs"
+            )
+        windowed, per_session_norm_stats = normalize_per_session(
+            windowed, session_ids, verbose=True
+        )
 
     # Compute normalization from training set ONLY
     norm_stats = compute_normalization(windowed, train_idx)
@@ -2189,6 +2647,10 @@ def prepare_data(
     if split_by_session:
         result["session_ids"] = session_ids  # Integer session ID per trial
         result["idx_to_session"] = idx_to_session  # Map from int ID to session name
+
+    # Include per-session normalization stats if used
+    if per_session_norm_stats is not None:
+        result["per_session_norm_stats"] = per_session_norm_stats
 
     return result
 

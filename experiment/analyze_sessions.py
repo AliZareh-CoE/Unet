@@ -35,7 +35,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from data import prepare_data, SAMPLING_RATE_HZ
+from data import (
+    prepare_data, SAMPLING_RATE_HZ,
+    normalize_per_session, normalize_spectral_per_session, normalize_combined_per_session
+)
 
 
 def set_style():
@@ -643,6 +646,319 @@ def figures_11_20_distributions(features, idx_to_session, train_sess, output_dir
 
 
 # ==============================================================================
+# NORMALIZATION COMPARISON FIGURES
+# ==============================================================================
+
+def figure_norm_channel_means(ob_before: np.ndarray, ob_after: np.ndarray,
+                               session_ids: np.ndarray, idx_to_session: Dict,
+                               train_idx: np.ndarray, output_dir: Path, suffix: str = ""):
+    """Compare per-channel means before/after normalization."""
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    for i, sess_id in enumerate(unique_sessions):
+        mask = session_ids == sess_id
+        linestyle = '-' if sess_id in train_sessions else '--'
+        linewidth = 1.5 if sess_id in train_sessions else 2.5
+
+        # Before
+        means_before = ob_before[mask].mean(axis=(0, 2))
+        axes[0].plot(means_before, color=colors[i], linestyle=linestyle,
+                    linewidth=linewidth, label=idx_to_session[sess_id], alpha=0.8)
+
+        # After
+        means_after = ob_after[mask].mean(axis=(0, 2))
+        axes[1].plot(means_after, color=colors[i], linestyle=linestyle,
+                    linewidth=linewidth, label=idx_to_session[sess_id], alpha=0.8)
+
+    axes[0].set_title('Per-Channel Mean by Session (BEFORE)', fontsize=14)
+    axes[0].set_xlabel('Channel')
+    axes[0].set_ylabel('Mean')
+    axes[0].axhline(y=0, color='k', linestyle=':', alpha=0.5)
+    axes[0].legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    axes[1].set_title('Per-Channel Mean by Session (AFTER)', fontsize=14)
+    axes[1].set_xlabel('Channel')
+    axes[1].set_ylabel('Mean')
+    axes[1].axhline(y=0, color='k', linestyle=':', alpha=0.5)
+
+    # Compute variance reduction
+    all_means_before = np.array([ob_before[session_ids == s].mean(axis=(0, 2)) for s in unique_sessions])
+    all_means_after = np.array([ob_after[session_ids == s].mean(axis=(0, 2)) for s in unique_sessions])
+    var_before = np.var(all_means_before, axis=0).mean()
+    var_after = np.var(all_means_after, axis=0).mean()
+    reduction = (1 - var_after / var_before) * 100 if var_before > 0 else 0
+
+    fig.suptitle(f'Per-Channel Mean Comparison{suffix}\n'
+                 f'Cross-session variance: {var_before:.6f} → {var_after:.6f} ({reduction:.1f}% reduction)',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / f'norm_comparison_channel_means{suffix.replace(" ", "_").lower()}.png',
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Channel means variance reduction: {reduction:.1f}%")
+
+
+def figure_norm_psd(ob_before: np.ndarray, ob_after: np.ndarray,
+                    session_ids: np.ndarray, idx_to_session: Dict,
+                    train_idx: np.ndarray, output_dir: Path, suffix: str = ""):
+    """Compare PSD before/after normalization."""
+    unique_sessions = np.unique(session_ids)
+    train_sessions = set(session_ids[train_idx])
+    colors = plt.cm.tab20(np.linspace(0, 1, len(unique_sessions)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    psd_spread_before = []
+    psd_spread_after = []
+
+    for i, sess_id in enumerate(unique_sessions):
+        mask = session_ids == sess_id
+        linestyle = '-' if sess_id in train_sessions else '--'
+        linewidth = 1.5 if sess_id in train_sessions else 2.5
+
+        # Sample trials for speed
+        sess_before = ob_before[mask][:20]
+        sess_after = ob_after[mask][:20]
+
+        # Compute average PSD
+        psds_before = []
+        psds_after = []
+        for trial_b, trial_a in zip(sess_before, sess_after):
+            freqs, psd_b = welch(trial_b, fs=SAMPLING_RATE_HZ, nperseg=256, axis=1)
+            _, psd_a = welch(trial_a, fs=SAMPLING_RATE_HZ, nperseg=256, axis=1)
+            psds_before.append(psd_b.mean(axis=0))
+            psds_after.append(psd_a.mean(axis=0))
+
+        avg_psd_before = np.mean(psds_before, axis=0)
+        avg_psd_after = np.mean(psds_after, axis=0)
+
+        psd_spread_before.append(avg_psd_before)
+        psd_spread_after.append(avg_psd_after)
+
+        axes[0].semilogy(freqs, avg_psd_before, color=colors[i], linestyle=linestyle,
+                        linewidth=linewidth, label=idx_to_session[sess_id], alpha=0.8)
+        axes[1].semilogy(freqs, avg_psd_after, color=colors[i], linestyle=linestyle,
+                        linewidth=linewidth, label=idx_to_session[sess_id], alpha=0.8)
+
+    axes[0].set_title('PSD by Session (BEFORE)', fontsize=14)
+    axes[0].set_xlabel('Frequency (Hz)')
+    axes[0].set_ylabel('PSD')
+    axes[0].set_xlim([0, 100])
+    axes[0].legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    axes[1].set_title('PSD by Session (AFTER)', fontsize=14)
+    axes[1].set_xlabel('Frequency (Hz)')
+    axes[1].set_ylabel('PSD')
+    axes[1].set_xlim([0, 100])
+
+    # Compute PSD alignment improvement
+    psd_spread_before = np.array(psd_spread_before)
+    psd_spread_after = np.array(psd_spread_after)
+    spread_before = np.std(psd_spread_before, axis=0).mean()
+    spread_after = np.std(psd_spread_after, axis=0).mean()
+    reduction = (1 - spread_after / spread_before) * 100 if spread_before > 0 else 0
+
+    fig.suptitle(f'PSD Comparison{suffix}\n'
+                 f'Cross-session PSD std: {spread_before:.4f} → {spread_after:.4f} ({reduction:.1f}% reduction)',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / f'norm_comparison_psd{suffix.replace(" ", "_").lower()}.png',
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  PSD spread reduction: {reduction:.1f}%")
+
+
+def figure_norm_ks_test(ob_before: np.ndarray, ob_after: np.ndarray,
+                        session_ids: np.ndarray, train_idx: np.ndarray,
+                        output_dir: Path, suffix: str = ""):
+    """Compare train vs held-out distributions with KS test."""
+    train_sessions = set(session_ids[train_idx])
+    train_mask = np.isin(session_ids, list(train_sessions))
+    holdout_mask = ~train_mask
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    n_sample = 50000
+
+    # Amplitude comparison
+    train_before = ob_before[train_mask].flatten()
+    holdout_before = ob_before[holdout_mask].flatten()
+    train_after = ob_after[train_mask].flatten()
+    holdout_after = ob_after[holdout_mask].flatten()
+
+    axes[0, 0].hist(np.random.choice(train_before, min(n_sample, len(train_before)), replace=False),
+                    bins=100, alpha=0.5, label='Train', density=True)
+    axes[0, 0].hist(np.random.choice(holdout_before, min(n_sample, len(holdout_before)), replace=False),
+                    bins=100, alpha=0.5, label='Held-out', density=True)
+    ks_before = stats.ks_2samp(train_before[:n_sample], holdout_before[:n_sample])
+    axes[0, 0].set_title(f'Amplitude Distribution (BEFORE)\nKS p={ks_before.pvalue:.2e}', fontsize=12)
+    axes[0, 0].legend()
+    axes[0, 0].set_xlabel('Amplitude')
+    axes[0, 0].set_ylabel('Density')
+
+    axes[0, 1].hist(np.random.choice(train_after, min(n_sample, len(train_after)), replace=False),
+                    bins=100, alpha=0.5, label='Train', density=True)
+    axes[0, 1].hist(np.random.choice(holdout_after, min(n_sample, len(holdout_after)), replace=False),
+                    bins=100, alpha=0.5, label='Held-out', density=True)
+    ks_after = stats.ks_2samp(train_after[:n_sample], holdout_after[:n_sample])
+    axes[0, 1].set_title(f'Amplitude Distribution (AFTER)\nKS p={ks_after.pvalue:.2e}', fontsize=12)
+    axes[0, 1].legend()
+    axes[0, 1].set_xlabel('Amplitude')
+    axes[0, 1].set_ylabel('Density')
+
+    # Gradient comparison
+    train_grad_before = np.diff(ob_before[train_mask], axis=2).flatten()
+    holdout_grad_before = np.diff(ob_before[holdout_mask], axis=2).flatten()
+    train_grad_after = np.diff(ob_after[train_mask], axis=2).flatten()
+    holdout_grad_after = np.diff(ob_after[holdout_mask], axis=2).flatten()
+
+    axes[1, 0].hist(np.random.choice(train_grad_before, min(n_sample, len(train_grad_before)), replace=False),
+                    bins=100, alpha=0.5, label='Train', density=True)
+    axes[1, 0].hist(np.random.choice(holdout_grad_before, min(n_sample, len(holdout_grad_before)), replace=False),
+                    bins=100, alpha=0.5, label='Held-out', density=True)
+    ks_grad_before = stats.ks_2samp(train_grad_before[:n_sample], holdout_grad_before[:n_sample])
+    axes[1, 0].set_title(f'Gradient Distribution (BEFORE)\nKS p={ks_grad_before.pvalue:.2e}', fontsize=12)
+    axes[1, 0].legend()
+    axes[1, 0].set_xlabel('Gradient')
+    axes[1, 0].set_ylabel('Density')
+
+    axes[1, 1].hist(np.random.choice(train_grad_after, min(n_sample, len(train_grad_after)), replace=False),
+                    bins=100, alpha=0.5, label='Train', density=True)
+    axes[1, 1].hist(np.random.choice(holdout_grad_after, min(n_sample, len(holdout_grad_after)), replace=False),
+                    bins=100, alpha=0.5, label='Held-out', density=True)
+    ks_grad_after = stats.ks_2samp(train_grad_after[:n_sample], holdout_grad_after[:n_sample])
+    axes[1, 1].set_title(f'Gradient Distribution (AFTER)\nKS p={ks_grad_after.pvalue:.2e}', fontsize=12)
+    axes[1, 1].legend()
+    axes[1, 1].set_xlabel('Gradient')
+    axes[1, 1].set_ylabel('Density')
+
+    fig.suptitle(f'Train vs Held-out Distribution Comparison{suffix}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / f'norm_comparison_ks_test{suffix.replace(" ", "_").lower()}.png',
+                dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"  KS test amplitude: p={ks_before.pvalue:.2e} → p={ks_after.pvalue:.2e}")
+    print(f"  KS test gradient: p={ks_grad_before.pvalue:.2e} → p={ks_grad_after.pvalue:.2e}")
+
+    return {
+        'ks_amplitude_before': ks_before.pvalue,
+        'ks_amplitude_after': ks_after.pvalue,
+        'ks_gradient_before': ks_grad_before.pvalue,
+        'ks_gradient_after': ks_grad_after.pvalue,
+    }
+
+
+def figure_norm_summary(results: Dict, output_dir: Path, suffix: str = ""):
+    """Create summary figure with all normalization metrics."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Bar chart for variance reduction
+    if 'mean_var_before' in results and 'mean_var_after' in results:
+        x = ['Before', 'After']
+        y = [results['mean_var_before'], results['mean_var_after']]
+        bars = axes[0].bar(x, y, color=['#ff6b6b', '#4ecdc4'])
+        axes[0].set_title('Channel Mean Variance')
+        axes[0].set_ylabel('Variance')
+        for bar, val in zip(bars, y):
+            axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{val:.4f}', ha='center', va='bottom', fontsize=10)
+
+    # Bar chart for PSD spread reduction
+    if 'psd_spread_before' in results and 'psd_spread_after' in results:
+        x = ['Before', 'After']
+        y = [results['psd_spread_before'], results['psd_spread_after']]
+        bars = axes[1].bar(x, y, color=['#ff6b6b', '#4ecdc4'])
+        axes[1].set_title('PSD Cross-Session Spread')
+        axes[1].set_ylabel('Std')
+        for bar, val in zip(bars, y):
+            axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f'{val:.4f}', ha='center', va='bottom', fontsize=10)
+
+    # KS test p-values (log scale)
+    if 'ks_amplitude_before' in results:
+        x = ['Amp Before', 'Amp After', 'Grad Before', 'Grad After']
+        y = [results['ks_amplitude_before'], results['ks_amplitude_after'],
+             results['ks_gradient_before'], results['ks_gradient_after']]
+        colors = ['#ff6b6b', '#4ecdc4', '#ff6b6b', '#4ecdc4']
+        bars = axes[2].bar(x, y, color=colors)
+        axes[2].set_yscale('log')
+        axes[2].set_title('KS Test p-values (Train vs Held-out)')
+        axes[2].set_ylabel('p-value (log scale)')
+        axes[2].axhline(y=0.05, color='r', linestyle='--', label='p=0.05')
+        axes[2].legend()
+        axes[2].tick_params(axis='x', rotation=45)
+
+    fig.suptitle(f'Normalization Impact Summary{suffix}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / f'norm_summary{suffix.replace(" ", "_").lower()}.png',
+                dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def run_normalization_comparison(ob: np.ndarray, session_ids: np.ndarray,
+                                  idx_to_session: Dict, train_idx: np.ndarray,
+                                  output_dir: Path, method: str = 'combined'):
+    """Run full normalization comparison analysis."""
+    print(f"\n{'='*60}")
+    print(f"NORMALIZATION COMPARISON: {method.upper()}")
+    print(f"{'='*60}")
+
+    train_session_ids = session_ids[train_idx]
+    ob_before = ob.copy()
+
+    # Apply normalization based on method
+    if method == 'zscore':
+        ob_after, _ = normalize_per_session(ob_before, session_ids, verbose=True)
+        suffix = " (Z-Score)"
+    elif method == 'spectral':
+        ob_after, _ = normalize_spectral_per_session(
+            ob_before, session_ids, train_session_ids=train_session_ids, verbose=True
+        )
+        suffix = " (Spectral)"
+    else:  # combined
+        ob_after, _ = normalize_combined_per_session(
+            ob_before, session_ids, train_session_ids=train_session_ids, verbose=True
+        )
+        suffix = " (Combined)"
+
+    # Generate comparison figures
+    print("\nGenerating comparison figures...")
+
+    print("  Figure: Channel means comparison")
+    figure_norm_channel_means(ob_before, ob_after, session_ids, idx_to_session, train_idx, output_dir, suffix)
+
+    print("  Figure: PSD comparison")
+    figure_norm_psd(ob_before, ob_after, session_ids, idx_to_session, train_idx, output_dir, suffix)
+
+    print("  Figure: KS test comparison")
+    ks_results = figure_norm_ks_test(ob_before, ob_after, session_ids, train_idx, output_dir, suffix)
+
+    # Compute additional metrics for summary
+    unique_sessions = np.unique(session_ids)
+    all_means_before = np.array([ob_before[session_ids == s].mean(axis=(0, 2)) for s in unique_sessions])
+    all_means_after = np.array([ob_after[session_ids == s].mean(axis=(0, 2)) for s in unique_sessions])
+
+    results = {
+        'mean_var_before': np.var(all_means_before, axis=0).mean(),
+        'mean_var_after': np.var(all_means_after, axis=0).mean(),
+        **ks_results
+    }
+
+    print("  Figure: Summary")
+    figure_norm_summary(results, output_dir, suffix)
+
+    print(f"\n{'='*60}")
+    print("NORMALIZATION COMPARISON COMPLETE")
+    print(f"{'='*60}")
+
+    return ob_after, results
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
 
@@ -653,6 +969,11 @@ def main():
     parser.add_argument('--n-test-sessions', type=int, default=0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--force-recreate-splits', action='store_true')
+    # Normalization comparison options
+    parser.add_argument('--normalize', type=str, choices=['zscore', 'spectral', 'combined', 'all'],
+                        help='Test normalization method and generate before/after comparison')
+    parser.add_argument('--skip-standard-analysis', action='store_true',
+                        help='Skip standard 20 figures, only run normalization comparison')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -685,6 +1006,28 @@ def main():
 
     print(f"\nData: {ob.shape}, {len(np.unique(session_ids))} sessions")
     print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    # Run normalization comparison if requested
+    if args.normalize:
+        norm_output_dir = output_dir / 'normalization'
+        norm_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.normalize == 'all':
+            # Run all normalization methods
+            for method in ['zscore', 'spectral', 'combined']:
+                run_normalization_comparison(ob, session_ids, idx_to_session, train_idx,
+                                            norm_output_dir, method=method)
+        else:
+            run_normalization_comparison(ob, session_ids, idx_to_session, train_idx,
+                                        norm_output_dir, method=args.normalize)
+
+        print(f"\nNormalization comparison figures saved to: {norm_output_dir}")
+
+    # Skip standard analysis if requested
+    if args.skip_standard_analysis:
+        print("\nSkipping standard 20 figures (--skip-standard-analysis)")
+        print("=" * 60)
+        return
 
     # Precompute all features ONCE
     features = precompute_features(ob, session_ids)
