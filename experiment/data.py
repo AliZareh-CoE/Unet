@@ -1245,6 +1245,242 @@ def denormalize_per_session(
 
 
 # =============================================================================
+# Spectral (PSD) Normalization for Cross-Session Generalization
+# =============================================================================
+
+def compute_session_psd(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    fs: int = 1000,
+    nperseg: int = 256,
+) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+    """
+    Compute average PSD for each session.
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        fs: Sampling frequency
+        nperseg: Segment length for Welch method
+
+    Returns:
+        freqs: Frequency bins
+        session_psds: Dict mapping session_id -> average PSD [channels, freqs]
+    """
+    from scipy.signal import welch
+
+    unique_sessions = np.unique(session_ids)
+    session_psds = {}
+
+    # Handle different array shapes
+    if data.ndim == 4:
+        # Olfactory: (trials, 2, channels, time) - use first region (OB)
+        data_3d = data[:, 0]  # [trials, channels, time]
+    else:
+        data_3d = data  # Already [trials, channels, time]
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = data_3d[mask]  # [n_trials, channels, time]
+
+        # Compute PSD for each trial, then average
+        psds = []
+        for trial in sess_data:
+            freqs, psd = welch(trial, fs=fs, nperseg=nperseg, axis=1)
+            psds.append(psd)
+
+        session_psds[int(sess_id)] = np.mean(psds, axis=0)  # [channels, freqs]
+
+    return freqs, session_psds
+
+
+def normalize_spectral_per_session(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    reference_psd: Optional[np.ndarray] = None,
+    train_session_ids: Optional[np.ndarray] = None,
+    fs: int = 1000,
+    nperseg: int = 256,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Normalize each session's PSD to match a reference.
+
+    This corrects for different amplifier gains and frequency responses
+    across recording sessions by applying a frequency-domain correction filter.
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        reference_psd: Target PSD to match [channels, freqs]. If None, use median of train sessions.
+        train_session_ids: Session IDs to use for computing reference (if reference_psd is None)
+        fs: Sampling frequency
+        nperseg: Segment length for Welch method
+        verbose: Print progress
+
+    Returns:
+        normalized: Spectrally normalized data
+        info: Dict with reference PSD and correction filters
+    """
+    from scipy.interpolate import interp1d
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Applying Spectral (PSD) Normalization")
+        print(f"{'='*60}")
+
+    # Handle different array shapes
+    is_4d = data.ndim == 4
+    if is_4d:
+        # Process each region separately for olfactory data
+        data_ob = data[:, 0]  # [trials, channels, time]
+        data_pcx = data[:, 1]
+    else:
+        data_ob = data
+
+    # Compute session PSDs
+    freqs, session_psds = compute_session_psd(data_ob, session_ids, fs, nperseg)
+
+    # Compute reference PSD if not provided
+    if reference_psd is None:
+        if train_session_ids is not None:
+            # Use median of training sessions
+            train_sess_unique = np.unique(train_session_ids)
+            train_psds = [session_psds[int(sid)] for sid in train_sess_unique if int(sid) in session_psds]
+        else:
+            # Use median of all sessions
+            train_psds = list(session_psds.values())
+
+        reference_psd = np.median(train_psds, axis=0)  # [channels, freqs]
+        if verbose and _is_primary_rank():
+            print(f"  Reference PSD: median of {len(train_psds)} sessions")
+
+    # Normalize each session
+    normalized_ob = data_ob.copy()
+    if is_4d:
+        normalized_pcx = data_pcx.copy()
+    correction_filters = {}
+
+    unique_sessions = np.unique(session_ids)
+    n_time = data_ob.shape[2]
+    n_channels = data_ob.shape[1]
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_psd = session_psds[int(sess_id)]  # [channels, freqs]
+
+        # Compute correction filter: sqrt(reference / session)
+        # This scales the amplitude spectrum to match reference
+        with np.errstate(divide='ignore', invalid='ignore'):
+            correction = np.sqrt(reference_psd / (sess_psd + 1e-10))
+        correction = np.nan_to_num(correction, nan=1.0, posinf=1.0, neginf=1.0)
+
+        # Clip extreme corrections to avoid amplifying noise
+        correction = np.clip(correction, 0.1, 10.0)
+
+        # Interpolate correction filter to match FFT bins
+        n_fft = n_time // 2 + 1
+        fft_freqs = np.fft.rfftfreq(n_time, 1/fs)
+
+        correction_interp = np.zeros((n_channels, n_fft))
+        for ch in range(n_channels):
+            interp_func = interp1d(freqs, correction[ch], kind='linear',
+                                   fill_value='extrapolate', bounds_error=False)
+            correction_interp[ch] = np.clip(interp_func(fft_freqs), 0.1, 10.0)
+
+        correction_filters[int(sess_id)] = correction_interp
+
+        # Apply correction in frequency domain
+        sess_data_ob = data_ob[mask]
+        for i in range(sess_data_ob.shape[0]):
+            fft = np.fft.rfft(sess_data_ob[i], axis=1)
+            fft_corrected = fft * correction_interp
+            normalized_ob[mask][i] = np.fft.irfft(fft_corrected, n=n_time, axis=1)
+
+        # Also apply to PCx if 4D data (using same correction as OB)
+        if is_4d:
+            sess_data_pcx = data_pcx[mask]
+            for i in range(sess_data_pcx.shape[0]):
+                fft = np.fft.rfft(sess_data_pcx[i], axis=1)
+                fft_corrected = fft * correction_interp
+                normalized_pcx[mask][i] = np.fft.irfft(fft_corrected, n=n_time, axis=1)
+
+        if verbose and _is_primary_rank():
+            avg_correction = np.mean(correction)
+            print(f"  Session {sess_id}: avg correction factor {avg_correction:.2f}")
+
+    # Reconstruct output
+    if is_4d:
+        normalized = np.stack([normalized_ob, normalized_pcx], axis=1)
+    else:
+        normalized = normalized_ob
+
+    info = {
+        'reference_psd': reference_psd,
+        'freqs': freqs,
+        'correction_filters': correction_filters,
+        'session_psds': session_psds,
+    }
+
+    if verbose and _is_primary_rank():
+        print(f"{'='*60}\n")
+
+    return normalized.astype(np.float32), info
+
+
+def normalize_combined_per_session(
+    data: np.ndarray,
+    session_ids: np.ndarray,
+    train_session_ids: Optional[np.ndarray] = None,
+    apply_zscore: bool = True,
+    apply_spectral: bool = True,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Apply both z-score and spectral normalization.
+
+    Order: Z-score first (removes DC/gain), then spectral (fixes frequency response)
+
+    Args:
+        data: Signal array [trials, channels, time] or [trials, 2, channels, time]
+        session_ids: Session ID per trial
+        train_session_ids: Session IDs for reference computation
+        apply_zscore: Apply per-session z-score normalization
+        apply_spectral: Apply spectral normalization
+        verbose: Print progress
+
+    Returns:
+        normalized: Fully normalized data
+        info: Dict with all normalization parameters
+    """
+    if verbose and _is_primary_rank():
+        print("\n" + "="*70)
+        print("COMBINED PER-SESSION NORMALIZATION PIPELINE")
+        print("="*70)
+
+    info = {}
+    normalized = data
+
+    # Step 1: Z-score normalization
+    if apply_zscore:
+        normalized, zscore_stats = normalize_per_session(
+            normalized, session_ids, verbose=verbose
+        )
+        info['zscore_stats'] = zscore_stats
+
+    # Step 2: Spectral normalization
+    if apply_spectral:
+        normalized, spectral_info = normalize_spectral_per_session(
+            normalized, session_ids,
+            train_session_ids=train_session_ids,
+            verbose=verbose
+        )
+        info['spectral_info'] = spectral_info
+
+    return normalized, info
+
+
+# =============================================================================
 # Per-Segment Normalization (for temporal ablation validation)
 # =============================================================================
 
