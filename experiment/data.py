@@ -1059,6 +1059,192 @@ def denormalize(normalized: np.ndarray, stats: NormalizationStats) -> np.ndarray
 
 
 # =============================================================================
+# Per-Session Normalization (for cross-session generalization)
+# =============================================================================
+
+@dataclass
+class PerSessionNormStats:
+    """Per-session normalization statistics for cross-session generalization.
+
+    This addresses the cross-session distribution shift problem where different
+    recording sessions have different DC offsets, gains, and spectral profiles.
+
+    Each session is normalized independently to zero mean and unit variance
+    per channel, aligning distributions before global normalization.
+    """
+    # Dict mapping session_id -> {'mean': [channels], 'std': [channels]}
+    session_stats: Dict[int, Dict[str, np.ndarray]]
+
+    def save(self, path: Path) -> None:
+        """Save per-session stats to JSON."""
+        # Convert numpy arrays to lists for JSON serialization
+        payload = {}
+        for sess_id, stats in self.session_stats.items():
+            payload[str(sess_id)] = {
+                'mean': stats['mean'].tolist(),
+                'std': stats['std'].tolist(),
+            }
+        path.write_text(json.dumps(payload), encoding='utf-8')
+
+    @staticmethod
+    def load(path: Path) -> "PerSessionNormStats":
+        """Load per-session stats from JSON."""
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        session_stats = {}
+        for sess_id_str, stats in payload.items():
+            session_stats[int(sess_id_str)] = {
+                'mean': np.asarray(stats['mean'], dtype=np.float32),
+                'std': np.asarray(stats['std'], dtype=np.float32),
+            }
+        return PerSessionNormStats(session_stats=session_stats)
+
+
+def compute_per_session_normalization(
+    windowed: np.ndarray,
+    session_ids: np.ndarray,
+    verbose: bool = True,
+) -> PerSessionNormStats:
+    """Compute per-session normalization statistics.
+
+    For each session, compute mean and std per channel across all trials and time.
+    This allows each session to be independently z-score normalized, removing
+    session-specific DC offsets and gain differences.
+
+    Args:
+        windowed: Signal array. Shape depends on format:
+            - Olfactory: (trials, 2, channels, time)
+            - PFC: (trials, channels, time)
+        session_ids: Session ID per trial [trials]
+        verbose: Print progress
+
+    Returns:
+        PerSessionNormStats with per-session mean/std per channel
+    """
+    unique_sessions = np.unique(session_ids)
+    session_stats = {}
+
+    if verbose and _is_primary_rank():
+        print(f"\n{'='*60}")
+        print("Computing Per-Session Normalization Statistics")
+        print(f"{'='*60}")
+
+    for sess_id in unique_sessions:
+        mask = session_ids == sess_id
+        sess_data = windowed[mask]
+        n_trials = sess_data.shape[0]
+
+        if sess_data.ndim == 4:
+            # Olfactory format: (trials, 2, channels, time)
+            # Compute mean/std per region (OB/PCx) and channel
+            # Shape: (2, channels)
+            mean_per_channel = sess_data.mean(axis=(0, 3))  # Mean over trials and time
+            std_per_channel = sess_data.std(axis=(0, 3))    # Std over trials and time
+        elif sess_data.ndim == 3:
+            # PFC format: (trials, channels, time)
+            # Shape: (channels,)
+            mean_per_channel = sess_data.mean(axis=(0, 2))
+            std_per_channel = sess_data.std(axis=(0, 2))
+        else:
+            raise ValueError(f"Unexpected array shape: {sess_data.shape}")
+
+        # Avoid division by zero
+        std_per_channel = np.maximum(std_per_channel, 1e-8)
+
+        session_stats[int(sess_id)] = {
+            'mean': mean_per_channel.astype(np.float32),
+            'std': std_per_channel.astype(np.float32),
+            'n_trials': n_trials,
+        }
+
+        if verbose and _is_primary_rank():
+            mean_range = (mean_per_channel.min(), mean_per_channel.max())
+            std_range = (std_per_channel.min(), std_per_channel.max())
+            print(f"  Session {sess_id}: {n_trials} trials, "
+                  f"mean range [{mean_range[0]:.4f}, {mean_range[1]:.4f}], "
+                  f"std range [{std_range[0]:.4f}, {std_range[1]:.4f}]")
+
+    if verbose and _is_primary_rank():
+        print(f"{'='*60}\n")
+
+    return PerSessionNormStats(session_stats=session_stats)
+
+
+def normalize_per_session(
+    windowed: np.ndarray,
+    session_ids: np.ndarray,
+    stats: Optional[PerSessionNormStats] = None,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, PerSessionNormStats]:
+    """Apply per-session z-score normalization.
+
+    Each session is normalized independently, removing session-specific
+    DC offsets and gain differences. This aligns distributions across sessions
+    before any global normalization.
+
+    Args:
+        windowed: Signal array. Shape:
+            - Olfactory: (trials, 2, channels, time)
+            - PFC: (trials, channels, time)
+        session_ids: Session ID per trial [trials]
+        stats: Pre-computed stats. If None, computed from data.
+        verbose: Print progress
+
+    Returns:
+        normalized: Per-session normalized data
+        stats: PerSessionNormStats used for normalization
+    """
+    if stats is None:
+        stats = compute_per_session_normalization(windowed, session_ids, verbose)
+
+    normalized = windowed.copy()
+
+    if verbose and _is_primary_rank():
+        print("Applying per-session normalization...")
+
+    for sess_id, sess_stats in stats.session_stats.items():
+        mask = session_ids == sess_id
+        sess_data = windowed[mask]
+        mean = sess_stats['mean']
+        std = sess_stats['std']
+
+        if sess_data.ndim == 4:
+            # Olfactory: (trials, 2, channels, time)
+            # mean/std shape: (2, channels) -> need (1, 2, channels, 1)
+            normalized[mask] = (sess_data - mean[None, :, :, None]) / std[None, :, :, None]
+        elif sess_data.ndim == 3:
+            # PFC: (trials, channels, time)
+            # mean/std shape: (channels,) -> need (1, channels, 1)
+            normalized[mask] = (sess_data - mean[None, :, None]) / std[None, :, None]
+
+    if verbose and _is_primary_rank():
+        print("  Per-session normalization complete.")
+
+    return normalized.astype(np.float32), stats
+
+
+def denormalize_per_session(
+    normalized: np.ndarray,
+    session_ids: np.ndarray,
+    stats: PerSessionNormStats,
+) -> np.ndarray:
+    """Reverse per-session z-score normalization."""
+    denormalized = normalized.copy()
+
+    for sess_id, sess_stats in stats.session_stats.items():
+        mask = session_ids == sess_id
+        sess_data = normalized[mask]
+        mean = sess_stats['mean']
+        std = sess_stats['std']
+
+        if sess_data.ndim == 4:
+            denormalized[mask] = sess_data * std[None, :, :, None] + mean[None, :, :, None]
+        elif sess_data.ndim == 3:
+            denormalized[mask] = sess_data * std[None, :, None] + mean[None, :, None]
+
+    return denormalized.astype(np.float32)
+
+
+# =============================================================================
 # Per-Segment Normalization (for temporal ablation validation)
 # =============================================================================
 
@@ -2067,6 +2253,8 @@ def prepare_data(
     aug_expand_geodesic: bool = False,
     aug_expand_geodesic_n: int = 2,
     aug_expand_geodesic_range: Tuple[float, float] = (0.3, 0.7),
+    # Per-session normalization for cross-session generalization
+    per_session_normalize: bool = False,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -2086,6 +2274,9 @@ def prepare_data(
         use_covariance_augmentation: If True, generate synthetic sessions via cov perturbation
         cov_aug_strength: Perturbation strength (0-1)
         cov_aug_n_synthetic: Number of synthetic sessions per real session
+        per_session_normalize: If True, apply per-session z-score normalization BEFORE
+            global normalization. This aligns distributions across sessions by removing
+            session-specific DC offsets and gain differences. Requires split_by_session=True.
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays (augmented if use_covariance_augmentation)
@@ -2095,6 +2286,7 @@ def prepare_data(
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
     - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
+    - per_session_norm_stats: (only if per_session_normalize) PerSessionNormStats
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -2129,6 +2321,19 @@ def prepare_data(
     else:
         # Random stratified splits (original behavior)
         train_idx, val_idx, test_idx = load_or_create_stratified_splits(odors, seed)
+        session_ids = None  # No session info for random splits
+
+    # Apply per-session normalization if enabled (BEFORE global normalization)
+    # This aligns distributions across sessions by removing session-specific offsets/gains
+    per_session_norm_stats = None
+    if per_session_normalize:
+        if session_ids is None:
+            raise ValueError(
+                "per_session_normalize=True requires split_by_session=True to have session IDs"
+            )
+        windowed, per_session_norm_stats = normalize_per_session(
+            windowed, session_ids, verbose=True
+        )
 
     # Compute normalization from training set ONLY
     norm_stats = compute_normalization(windowed, train_idx)
@@ -2206,6 +2411,10 @@ def prepare_data(
     if split_by_session:
         result["session_ids"] = session_ids  # Integer session ID per trial
         result["idx_to_session"] = idx_to_session  # Map from int ID to session name
+
+    # Include per-session normalization stats if used
+    if per_session_norm_stats is not None:
+        result["per_session_norm_stats"] = per_session_norm_stats
 
     return result
 
