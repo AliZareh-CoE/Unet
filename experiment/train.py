@@ -2251,7 +2251,10 @@ def train(
             dist.barrier()
         else:
             model = model.to(device)
-            model = DDP(model, device_ids=[local_rank])
+            # Use find_unused_parameters=True when DANN is enabled because
+            # return_bottleneck changes which outputs are used in the loss
+            use_dann = config.get("use_dann", False) and config.get("split_by_session", False)
+            model = DDP(model, device_ids=[local_rank], find_unused_parameters=use_dann)
             if reverse_model is not None:
                 reverse_model = reverse_model.to(device)
                 reverse_model = DDP(reverse_model, device_ids=[local_rank])
