@@ -91,6 +91,9 @@ from models import (
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
     hilbert_torch,
+    # DANN components for cross-session generalization
+    SessionDiscriminator,
+    compute_dann_alpha,
 )
 from data import (
     prepare_data,
@@ -272,6 +275,19 @@ DEFAULT_CONFIG = {
     "no_test_set": True,        # If True, no test set - all held-out sessions for validation
     "separate_val_sessions": True,  # If True, evaluate each val session separately
     "per_session_normalize": True,  # Per-session z-score normalization for cross-session generalization
+
+    # =========================================================================
+    # Domain Adversarial Neural Network (DANN) for Cross-Session Generalization
+    # =========================================================================
+    # Forces the encoder to learn session-invariant features via adversarial training.
+    # A session discriminator tries to predict which session a sample came from,
+    # while the encoder (via gradient reversal) tries to fool it.
+    # Reference: Ganin et al. "Domain-Adversarial Training of Neural Networks" (JMLR 2016)
+    "use_dann": True,                    # Enable DANN adversarial training
+    "dann_lambda": 0.1,                  # Weight of adversarial loss (start small)
+    "dann_hidden_dim": 256,              # Hidden dimension of session discriminator
+    "dann_dropout": 0.3,                 # Dropout in session discriminator
+    "dann_alpha_gamma": 10.0,            # Gamma for alpha schedule (higher = faster ramp)
 
     # =========================================================================
     # Covariance Augmentation for Cross-Session Robustness
@@ -1693,6 +1709,7 @@ def train_epoch(
     stage2_spectral_only: bool = False,
     disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
+    session_discriminator: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1700,6 +1717,7 @@ def train_epoch(
         stage2_spectral_only: If True, Stage 2 mode (UNet frozen, SpectralShift active)
         disable_spectral: If True, disable SpectralShift application (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
+        session_discriminator: Optional DANN discriminator for cross-session generalization
     """
     model.train()
     if reverse_model is not None:
@@ -1710,6 +1728,13 @@ def train_epoch(
         spectral_shift_fwd.train()
     if spectral_shift_rev is not None:
         spectral_shift_rev.train()
+    if session_discriminator is not None:
+        session_discriminator.train()
+
+    # Compute DANN alpha for gradient reversal scheduling
+    dann_alpha = 0.0
+    if session_discriminator is not None:
+        dann_alpha = compute_dann_alpha(epoch, num_epochs, gamma=config.get("dann_alpha_gamma", 10.0))
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1796,10 +1821,18 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
+        # If DANN is enabled, also extract bottleneck features
+        use_dann = session_discriminator is not None and session_id is not None
         if cond_emb is not None:
-            pred_raw = model(ob, cond_emb=cond_emb)
+            if use_dann:
+                pred_raw, bottleneck_features = model(ob, cond_emb=cond_emb, return_bottleneck=True)
+            else:
+                pred_raw = model(ob, cond_emb=cond_emb)
         else:
-            pred_raw = model(ob, odor)
+            if use_dann:
+                pred_raw, bottleneck_features = model(ob, odor, return_bottleneck=True)
+            else:
+                pred_raw = model(ob, odor)
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -1851,6 +1884,25 @@ def train_epoch(
         if cond_loss != 0.0:
             loss = loss + cond_loss
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
+
+        # DANN adversarial loss for session-invariant features
+        if use_dann:
+            # Session discriminator tries to predict session from bottleneck features
+            # Gradient reversal makes encoder worse at this task = session-invariant
+            session_logits = session_discriminator(bottleneck_features, alpha=dann_alpha)
+            dann_loss = F.cross_entropy(session_logits, session_id)
+
+            # Weighted adversarial loss (negative because we want to MAXIMIZE discriminator confusion)
+            # The GRL already handles the sign reversal for the encoder
+            dann_lambda = config.get("dann_lambda", 0.1)
+            loss = loss + dann_lambda * dann_loss
+            loss_components["dann_loss"] = loss_components["dann_loss"] + dann_loss.detach()
+
+            # Track session discriminator accuracy (for monitoring)
+            with torch.no_grad():
+                session_pred = session_logits.argmax(dim=1)
+                session_acc = (session_pred == session_id).float().mean()
+                loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
 
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
@@ -2267,6 +2319,39 @@ def train(
             ddp_str = " (DDP-wrapped)" if is_distributed else ""
             print(f"SpectralShift created{ddp_str} mode={mode_str}")
 
+    # Create DANN SessionDiscriminator for cross-session generalization
+    session_discriminator = None
+    if config.get("use_dann", False) and config.get("split_by_session", False):
+        # Get number of sessions from data
+        n_sessions = len(data.get("idx_to_session", {}))
+        if n_sessions > 0:
+            # Get bottleneck channels from model
+            # For standard UNet with base=128, n_downsample=2: bottleneck = 512
+            base_ch = config.get("base_channels", 128)
+            n_downsample = config.get("n_downsample", 2)
+            bottleneck_ch = min(base_ch * (2 ** n_downsample), base_ch * 8)
+
+            session_discriminator = SessionDiscriminator(
+                feature_dim=bottleneck_ch,
+                n_sessions=n_sessions,
+                hidden_dim=config.get("dann_hidden_dim", 256),
+                dropout=config.get("dann_dropout", 0.3),
+            ).to(device)
+
+            # Wrap with DDP for distributed training
+            if is_distributed and not use_fsdp:
+                session_discriminator = DDP(session_discriminator, device_ids=[local_rank])
+
+            if is_primary():
+                dann_params = sum(p.numel() for p in session_discriminator.parameters())
+                print(f"DANN SessionDiscriminator created: {n_sessions} sessions, "
+                      f"bottleneck={bottleneck_ch}, hidden={config.get('dann_hidden_dim', 256)}, "
+                      f"params={dann_params:,}, lambda={config.get('dann_lambda', 0.1)}")
+        else:
+            if is_primary():
+                print("WARNING: DANN enabled but no session info available. Disabling DANN.")
+            config["use_dann"] = False
+
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
@@ -2297,6 +2382,9 @@ def train(
         param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
     if spectral_shift_rev is not None:
         param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
+    if session_discriminator is not None:
+        # DANN discriminator uses same lr as model
+        param_groups.append({"params": list(session_discriminator.parameters()), "lr": lr, "name": "session_discriminator"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
 
@@ -2456,6 +2544,7 @@ def train(
                 spectral_shift_fwd, spectral_shift_rev,
                 disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
                 cond_encoder=cond_encoder,
+                session_discriminator=session_discriminator,
             )
 
             barrier()
@@ -3130,6 +3219,16 @@ def parse_args():
     parser.add_argument("--no-per-session-normalize", action="store_false", dest="per_session_normalize",
                         help="Disable per-session normalization")
 
+    # DANN (Domain Adversarial Neural Network) for cross-session generalization
+    parser.add_argument("--dann", action="store_true", default=None,
+                        help="Enable DANN adversarial training for session-invariant features")
+    parser.add_argument("--no-dann", action="store_false", dest="dann",
+                        help="Disable DANN")
+    parser.add_argument("--dann-lambda", type=float, default=None,
+                        help="Weight of DANN adversarial loss (default: 0.1)")
+    parser.add_argument("--dann-hidden-dim", type=int, default=None,
+                        help="Hidden dimension of session discriminator (default: 256)")
+
     # Covariance augmentation for cross-session robustness
     parser.add_argument("--cov-aug", action="store_true", default=None,
                         help="Enable covariance augmentation (generates synthetic sessions)")
@@ -3376,6 +3475,14 @@ def main():
         config["separate_val_sessions"] = args.separate_val_sessions
     if args.per_session_normalize is not None:
         config["per_session_normalize"] = args.per_session_normalize
+
+    # DANN config (CLI overrides config)
+    if args.dann is not None:
+        config["use_dann"] = args.dann
+    if args.dann_lambda is not None:
+        config["dann_lambda"] = args.dann_lambda
+    if args.dann_hidden_dim is not None:
+        config["dann_hidden_dim"] = args.dann_hidden_dim
 
     # Covariance augmentation config (CLI overrides config)
     if args.cov_aug is not None:

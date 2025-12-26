@@ -43,6 +43,135 @@ NEURAL_FREQ_BANDS = [
 
 
 # =============================================================================
+# Domain Adversarial Neural Network (DANN) Components
+# =============================================================================
+# For cross-session generalization via adversarial training.
+# Reference: Ganin et al. "Domain-Adversarial Training of Neural Networks" (JMLR 2016)
+
+class GradientReversalFunction(torch.autograd.Function):
+    """Gradient Reversal Layer for adversarial domain adaptation.
+
+    During forward pass: identity function (x -> x)
+    During backward pass: reverses gradients (grad -> -alpha * grad)
+
+    This forces the encoder to learn domain-invariant features that
+    cannot be used to distinguish between sessions.
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Wrapper module for gradient reversal."""
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return GradientReversalFunction.apply(x, self.alpha)
+
+    def set_alpha(self, alpha: float):
+        """Update alpha (useful for scheduling)."""
+        self.alpha = alpha
+
+
+class SessionDiscriminator(nn.Module):
+    """Session discriminator for adversarial domain adaptation.
+
+    Takes bottleneck features and predicts which session they came from.
+    Used with GradientReversalLayer to learn session-invariant representations.
+
+    Architecture:
+        Global Average Pool -> FC -> ReLU -> Dropout -> FC -> Session logits
+
+    Args:
+        feature_dim: Number of channels in bottleneck features
+        n_sessions: Number of sessions to discriminate between
+        hidden_dim: Hidden layer dimension
+        dropout: Dropout rate
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        n_sessions: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.grl = GradientReversalLayer(alpha=1.0)
+
+        self.classifier = nn.Sequential(
+            # Global average pooling happens in forward()
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, n_sessions),
+        )
+
+        # Initialize weights
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        alpha: float = 1.0,
+        apply_grl: bool = True,
+    ) -> torch.Tensor:
+        """
+        Args:
+            features: Bottleneck features [B, C, T]
+            alpha: Gradient reversal strength (schedule from 0 to 1)
+            apply_grl: Whether to apply gradient reversal
+
+        Returns:
+            Session logits [B, n_sessions]
+        """
+        # Global average pooling: [B, C, T] -> [B, C]
+        pooled = features.mean(dim=-1)
+
+        # Apply gradient reversal
+        if apply_grl:
+            self.grl.set_alpha(alpha)
+            pooled = self.grl(pooled)
+
+        # Classify
+        return self.classifier(pooled)
+
+
+def compute_dann_alpha(epoch: int, max_epochs: int, gamma: float = 10.0) -> float:
+    """Compute DANN alpha schedule (gradual increase).
+
+    From the original DANN paper, alpha increases from 0 to 1 following:
+        alpha = 2 / (1 + exp(-gamma * p)) - 1
+    where p = epoch / max_epochs
+
+    Args:
+        epoch: Current epoch (0-indexed)
+        max_epochs: Total number of epochs
+        gamma: Steepness of the schedule (default 10)
+
+    Returns:
+        alpha value in [0, 1]
+    """
+    p = epoch / max_epochs
+    return float(2.0 / (1.0 + np.exp(-gamma * p)) - 1.0)
+
+
+# =============================================================================
 # Core Building Blocks
 # =============================================================================
 
@@ -2208,12 +2337,20 @@ class CondUNet1D(nn.Module):
 
         raise ValueError(f"Unknown attention_type: {attention_type}. Available: none, basic, cross_freq, cross_freq_v2")
 
+    @property
+    def bottleneck_channels(self) -> int:
+        """Return the number of channels in the bottleneck (for SessionDiscriminator)."""
+        # channels[n_downsample] is the bottleneck channel count
+        base = self.inc.conv[0].out_channels if hasattr(self.inc, 'conv') else 128
+        return min(base * (2 ** self.n_downsample), base * 8)
+
     def forward(
         self,
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_bottleneck: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass.
 
         Args:
@@ -2221,9 +2358,11 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
+            return_bottleneck: If True, also return bottleneck features for DANN
 
         Returns:
-            Predicted signal [B, C, T]
+            If return_bottleneck=False: Predicted signal [B, C, T]
+            If return_bottleneck=True: (Predicted signal [B, C, T], bottleneck features [B, C_b, T_b])
         """
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2262,6 +2401,8 @@ class CondUNet1D(nn.Module):
             out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
+        if return_bottleneck:
+            return out, bottleneck
         return out
 
     # =========================================================================
