@@ -2620,9 +2620,15 @@ def train(
                 if "corr_rev" in val_metrics:
                     rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
+                # DANN metrics string
+                dann_str = ""
+                if "dann_loss" in train_metrics:
+                    dann_acc_pct = train_metrics.get('dann_acc', 0) * 100
+                    dann_str = f" | DANN: acc={dann_acc_pct:.1f}%, loss={train_metrics['dann_loss']:.3f}"
+
                 print(f"Epoch {epoch}/{num_epochs} | "
                       f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
+                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{dann_str} | "
                       f"Best: {best_val_loss:.3f}")
 
                 # Print per-session metrics if available
