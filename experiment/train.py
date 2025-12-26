@@ -1822,7 +1822,7 @@ def train_epoch(
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
         # If DANN is enabled, also extract bottleneck features
-        use_dann = session_discriminator is not None and session_id is not None
+        use_dann = session_discriminator is not None and session_ids is not None
         if cond_emb is not None:
             if use_dann:
                 pred_raw, bottleneck_features = model(ob, cond_emb=cond_emb, return_bottleneck=True)
@@ -1890,7 +1890,7 @@ def train_epoch(
             # Session discriminator tries to predict session from bottleneck features
             # Gradient reversal makes encoder worse at this task = session-invariant
             session_logits = session_discriminator(bottleneck_features, alpha=dann_alpha)
-            dann_loss = F.cross_entropy(session_logits, session_id)
+            dann_loss = F.cross_entropy(session_logits, session_ids)
 
             # Weighted adversarial loss (negative because we want to MAXIMIZE discriminator confusion)
             # The GRL already handles the sign reversal for the encoder
@@ -1901,7 +1901,7 @@ def train_epoch(
             # Track session discriminator accuracy (for monitoring)
             with torch.no_grad():
                 session_pred = session_logits.argmax(dim=1)
-                session_acc = (session_pred == session_id).float().mean()
+                session_acc = (session_pred == session_ids).float().mean()
                 loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
 
         # Bidirectional training with cycle consistency
