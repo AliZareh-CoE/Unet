@@ -2213,7 +2213,8 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass.
 
         Args:
@@ -2221,9 +2222,11 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
+            return_features: If True, also return bottleneck features for DANN
 
         Returns:
-            Predicted signal [B, C, T]
+            If return_features=False: Predicted signal [B, C, T]
+            If return_features=True: Tuple of (predicted signal, bottleneck features)
         """
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2262,6 +2265,8 @@ class CondUNet1D(nn.Module):
             out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
+        if return_features:
+            return out, bottleneck
         return out
 
     # =========================================================================
@@ -2557,6 +2562,215 @@ def feature_matching_loss(
     for real_feat, fake_feat in zip(real_features, fake_features):
         loss += F.l1_loss(fake_feat, real_feat.detach())
     return loss / len(real_features)
+
+
+# =============================================================================
+# DANN: Domain-Adversarial Neural Networks (Gradient Reversal)
+# =============================================================================
+
+class GradientReversalFunction(torch.autograd.Function):
+    """Gradient Reversal Layer for Domain-Adversarial Training.
+
+    Forward pass: identity (y = x)
+    Backward pass: negates and scales gradients (dy/dx = -lambda * grad)
+
+    This enables learning domain-invariant features by making the feature
+    extractor adversarial to a domain discriminator.
+
+    Reference:
+        Ganin et al. "Domain-Adversarial Training of Neural Networks" (2016)
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        """Forward pass is identity.
+
+        Args:
+            ctx: Autograd context
+            x: Input tensor
+            alpha: Gradient reversal scaling factor (lambda in paper)
+
+        Returns:
+            x unchanged
+        """
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass reverses and scales gradients.
+
+        Args:
+            ctx: Autograd context
+            grad_output: Gradient from upstream
+
+        Returns:
+            Tuple of (negated scaled gradient, None for alpha)
+        """
+        return -ctx.alpha * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    """Gradient Reversal Layer module wrapper.
+
+    Wraps GradientReversalFunction for easy use in nn.Sequential.
+    The alpha parameter controls the magnitude of gradient reversal:
+    - alpha=0: no gradient flows back (discriminator has no effect on encoder)
+    - alpha=1: full gradient reversal (standard DANN)
+    - alpha>1: amplified gradient reversal (stronger domain adaptation)
+
+    Typically, alpha is scheduled to increase during training (curriculum):
+        alpha = 2 / (1 + exp(-10 * p)) - 1
+    where p = epoch / total_epochs goes from 0 to 1.
+
+    Args:
+        alpha: Initial gradient reversal scaling factor (default: 1.0)
+    """
+
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply gradient reversal.
+
+        Args:
+            x: Input tensor
+
+        Returns:
+            x unchanged (gradients are reversed during backward)
+        """
+        return GradientReversalFunction.apply(x, self.alpha)
+
+    def set_alpha(self, alpha: float) -> None:
+        """Update the gradient reversal strength.
+
+        Args:
+            alpha: New scaling factor
+        """
+        self.alpha = alpha
+
+
+def dann_alpha_schedule(epoch: int, total_epochs: int, gamma: float = 10.0) -> float:
+    """Compute DANN alpha schedule (gradually increases from 0 to 1).
+
+    Uses the schedule from Ganin et al.:
+        alpha = 2 / (1 + exp(-gamma * p)) - 1
+    where p = epoch / total_epochs
+
+    This creates a smooth curriculum where domain adaptation strength
+    increases as training progresses.
+
+    Args:
+        epoch: Current epoch (0-indexed)
+        total_epochs: Total number of training epochs
+        gamma: Schedule steepness (default: 10.0)
+
+    Returns:
+        Alpha value in range [0, 1]
+    """
+    p = epoch / max(1, total_epochs - 1)  # Progress ratio
+    alpha = 2.0 / (1.0 + math.exp(-gamma * p)) - 1.0
+    return alpha
+
+
+class SessionDiscriminator(nn.Module):
+    """Session discriminator for DANN-based domain adaptation.
+
+    Predicts which recording session a signal feature comes from.
+    Used with gradient reversal to learn session-invariant representations.
+
+    Architecture:
+        - Takes bottleneck features from UNet encoder
+        - Global average pooling over time
+        - MLP classifier: Linear -> ReLU -> Dropout -> Linear -> ReLU -> Dropout -> Linear
+
+    The discriminator operates on the bottleneck (latent) features of the UNet,
+    encouraging the encoder to produce features that are invariant across sessions.
+
+    Args:
+        feature_dim: Dimension of input features (UNet bottleneck channels)
+        n_sessions: Number of recording sessions to classify
+        hidden_dim: Hidden layer dimension (default: 256)
+        dropout: Dropout rate (default: 0.3)
+        use_spectral_norm: Apply spectral normalization for stability (default: True)
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        n_sessions: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+        use_spectral_norm: bool = True,
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.n_sessions = n_sessions
+
+        # Spectral norm wrapper for stable training
+        norm_layer = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
+
+        # MLP classifier
+        self.classifier = nn.Sequential(
+            # First hidden layer
+            norm_layer(nn.Linear(feature_dim, hidden_dim)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            # Second hidden layer
+            norm_layer(nn.Linear(hidden_dim, hidden_dim // 2)),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            # Output layer (no spectral norm on final layer)
+            nn.Linear(hidden_dim // 2, n_sessions),
+        )
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with small values for stable training."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            features: Bottleneck features [B, C, T] from UNet encoder
+
+        Returns:
+            Session logits [B, n_sessions]
+        """
+        # Global average pooling over time dimension
+        # [B, C, T] -> [B, C]
+        pooled = features.mean(dim=-1)
+
+        # Classify session
+        logits = self.classifier(pooled)
+
+        return logits
+
+
+def dann_loss(
+    logits: torch.Tensor,
+    session_ids: torch.Tensor,
+    label_smoothing: float = 0.1,
+) -> torch.Tensor:
+    """Compute DANN discriminator loss (cross-entropy for session classification).
+
+    Args:
+        logits: Session prediction logits [B, n_sessions]
+        session_ids: Ground truth session indices [B]
+        label_smoothing: Label smoothing factor for regularization (default: 0.1)
+
+    Returns:
+        Cross-entropy loss scalar
+    """
+    return F.cross_entropy(logits, session_ids, label_smoothing=label_smoothing)
 
 
 # =============================================================================
