@@ -1821,15 +1821,18 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-        # If DANN is enabled, also extract bottleneck features
-        use_dann = session_discriminator is not None and session_ids is not None
+        # If DANN is enabled, ALWAYS extract bottleneck features for consistent FSDP forward
+        # We'll only use them when session_ids is available
+        dann_enabled = session_discriminator is not None
+        use_dann_this_batch = dann_enabled and session_ids is not None
+
         if cond_emb is not None:
-            if use_dann:
+            if dann_enabled:
                 pred_raw, bottleneck_features = model(ob, cond_emb=cond_emb, return_bottleneck=True)
             else:
                 pred_raw = model(ob, cond_emb=cond_emb)
         else:
-            if use_dann:
+            if dann_enabled:
                 pred_raw, bottleneck_features = model(ob, odor, return_bottleneck=True)
             else:
                 pred_raw = model(ob, odor)
@@ -1886,23 +1889,28 @@ def train_epoch(
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
 
         # DANN adversarial loss for session-invariant features
-        if use_dann:
-            # Session discriminator tries to predict session from bottleneck features
-            # Gradient reversal makes encoder worse at this task = session-invariant
-            session_logits = session_discriminator(bottleneck_features, alpha=dann_alpha)
-            dann_loss = F.cross_entropy(session_logits, session_ids)
+        if dann_enabled:
+            if use_dann_this_batch:
+                # Session discriminator tries to predict session from bottleneck features
+                # Gradient reversal makes encoder worse at this task = session-invariant
+                session_logits = session_discriminator(bottleneck_features, alpha=dann_alpha)
+                dann_loss = F.cross_entropy(session_logits, session_ids)
 
-            # Weighted adversarial loss (negative because we want to MAXIMIZE discriminator confusion)
-            # The GRL already handles the sign reversal for the encoder
-            dann_lambda = config.get("dann_lambda", 0.1)
-            loss = loss + dann_lambda * dann_loss
-            loss_components["dann_loss"] = loss_components["dann_loss"] + dann_loss.detach()
+                # Weighted adversarial loss (negative because we want to MAXIMIZE discriminator confusion)
+                # The GRL already handles the sign reversal for the encoder
+                dann_lambda = config.get("dann_lambda", 0.1)
+                loss = loss + dann_lambda * dann_loss
+                loss_components["dann_loss"] = loss_components["dann_loss"] + dann_loss.detach()
 
-            # Track session discriminator accuracy (for monitoring)
-            with torch.no_grad():
-                session_pred = session_logits.argmax(dim=1)
-                session_acc = (session_pred == session_ids).float().mean()
-                loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
+                # Track session discriminator accuracy (for monitoring)
+                with torch.no_grad():
+                    session_pred = session_logits.argmax(dim=1)
+                    session_acc = (session_pred == session_ids).float().mean()
+                    loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
+            else:
+                # Dummy usage of bottleneck_features to make FSDP happy
+                # (adds 0 to loss but ensures gradients flow through)
+                loss = loss + 0.0 * bottleneck_features.sum()
 
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
