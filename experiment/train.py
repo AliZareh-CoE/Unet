@@ -1909,13 +1909,9 @@ def train_epoch(
 
                 # Track per-level accuracies (for monitoring)
                 with torch.no_grad():
-                    # Average accuracy across all levels
+                    # Average accuracy across all levels (keep as tensor for consistency)
                     avg_acc = sum(level_metrics.get(f"dann_L{i}_acc", 0) for i in range(disc_module.n_levels)) / disc_module.n_levels
-                    loss_components["dann_acc"] = loss_components["dann_acc"] + avg_acc
-                    # Store per-level metrics for detailed logging
-                    for key, val in level_metrics.items():
-                        if "acc" in key:
-                            loss_components[key] = loss_components.get(key, 0.0) + val
+                    loss_components["dann_acc"] = loss_components["dann_acc"] + torch.tensor(avg_acc, device=device)
             else:
                 # Single-level DANN: bottleneck only
                 # encoder_features is just the bottleneck tensor
