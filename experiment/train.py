@@ -3319,6 +3319,8 @@ def parse_args():
                         help="Explicit session names for test set (e.g., --test-sessions 141208-1 170614)")
     parser.add_argument("--val-sessions", type=str, nargs="+", default=None,
                         help="Explicit session names for val set (e.g., --val-sessions 170609 170619)")
+    parser.add_argument("--exclude-sessions", type=str, nargs="+", default=None,
+                        help="Session name prefixes to exclude from ALL data (e.g., --exclude-sessions 14 to exclude 141208-1, 141208-2, etc.)")
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
     parser.add_argument("--no-test-set", action="store_true", default=None,
@@ -3646,6 +3648,7 @@ def main():
             val_sessions=args.val_sessions,
             no_test_set=config.get("no_test_set", False),
             separate_val_sessions=config.get("separate_val_sessions", False),
+            exclude_sessions=args.exclude_sessions,
             # Covariance augmentation
             use_covariance_augmentation=config.get("use_covariance_augmentation", False),
             cov_aug_strength=config.get("cov_aug_strength", 0.3),

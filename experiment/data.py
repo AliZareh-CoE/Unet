@@ -2039,6 +2039,7 @@ def prepare_data(
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
     no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
     separate_val_sessions: bool = False,  # If True, return per-session val indices
+    exclude_sessions: Optional[List[str]] = None,  # Session prefixes to exclude from ALL data
     # Covariance augmentation
     use_covariance_augmentation: bool = False,
     cov_aug_strength: float = 0.3,
@@ -2066,6 +2067,7 @@ def prepare_data(
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
         no_test_set: If True, no test set - all held-out sessions are for validation only
         separate_val_sessions: If True, return per-session validation indices
+        exclude_sessions: List of session name prefixes to exclude from ALL data
         use_covariance_augmentation: If True, generate synthetic sessions via cov perturbation
         cov_aug_strength: Perturbation strength (0-1)
         cov_aug_n_synthetic: Number of synthetic sessions per real session
@@ -2091,11 +2093,58 @@ def prepare_data(
 
     # Create splits
     split_info = None
-    if split_by_session:
-        # Session-based holdout: entire sessions held out for test/val
+    session_ids = None
+
+    # If excluding sessions, we need session info even for non-session-based splits
+    if exclude_sessions and split_by_session:
+        # Load session IDs first to filter
         session_ids, session_to_idx, idx_to_session = load_session_ids(
             odor_csv_path, session_column, num_trials
         )
+
+        # Find indices to KEEP (sessions that don't match any exclusion prefix)
+        keep_mask = np.ones(num_trials, dtype=bool)
+        excluded_sessions = []
+        for sess_name in idx_to_session.values():
+            for prefix in exclude_sessions:
+                if sess_name.startswith(prefix):
+                    # Mark all trials from this session for exclusion
+                    sess_idx = session_to_idx[sess_name]
+                    trial_mask = (session_ids == sess_idx)
+                    keep_mask[trial_mask] = False
+                    if sess_name not in excluded_sessions:
+                        excluded_sessions.append(sess_name)
+                    break
+
+        if excluded_sessions:
+            print(f"\n[Session Exclusion] Excluding {len(excluded_sessions)} sessions matching prefixes {exclude_sessions}:")
+            for s in sorted(excluded_sessions):
+                n_trials = np.sum(session_ids == session_to_idx[s])
+                print(f"  - {s}: {n_trials} trials")
+
+            # Filter all arrays
+            keep_indices = np.where(keep_mask)[0]
+            windowed = windowed[keep_indices]
+            odors = odors[keep_indices]
+            num_trials = len(keep_indices)
+
+            # Rebuild session mappings for remaining sessions
+            old_session_ids = session_ids[keep_indices]
+            remaining_sessions = sorted(set(idx_to_session[sid] for sid in np.unique(old_session_ids)))
+            session_to_idx = {name: i for i, name in enumerate(remaining_sessions)}
+            idx_to_session = {i: name for i, name in enumerate(remaining_sessions)}
+            session_ids = np.array([session_to_idx[idx_to_session[old_id]] for old_id in old_session_ids])
+
+            print(f"  Remaining: {len(remaining_sessions)} sessions, {num_trials} trials")
+            print(f"  Sessions: {remaining_sessions}\n")
+
+    if split_by_session:
+        # Session-based holdout: entire sessions held out for test/val
+        if session_ids is None:
+            # Load session IDs if not already loaded (no exclusion case)
+            session_ids, session_to_idx, idx_to_session = load_session_ids(
+                odor_csv_path, session_column, num_trials
+            )
         train_idx, val_idx, test_idx, split_info = load_or_create_session_splits(
             session_ids=session_ids,
             odors=odors,
