@@ -94,6 +94,7 @@ from models import (
     # DANN (Domain-Adversarial Neural Networks)
     GradientReversalLayer,
     SessionDiscriminator,
+    MultiLevelSessionDiscriminator,
     dann_loss,
     dann_alpha_schedule,
 )
@@ -249,6 +250,7 @@ DEFAULT_CONFIG = {
     # Uses gradient reversal to learn session-invariant representations
     # Reference: Ganin et al. "Domain-Adversarial Training of Neural Networks" (2016)
     "use_dann": False,           # Enable DANN session discriminator
+    "dann_multi_level": True,    # Use multi-level DANN (discriminator at all encoder levels)
     "dann_weight": 0.1,          # Weight for DANN loss (lambda_d in paper)
     "dann_hidden_dim": 256,      # Hidden dimension for session discriminator
     "dann_dropout": 0.3,         # Dropout rate for session discriminator
@@ -1817,16 +1819,24 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-        # If DANN is enabled, also get bottleneck features for session discrimination
+        # If DANN is enabled, also get encoder features for session discrimination
         use_dann = session_discriminator is not None and grl is not None and session_ids is not None
+        # Check if multi-level DANN (discriminator has multiple levels)
+        disc_module = None
+        is_multi_level_dann = False
+        if use_dann:
+            disc_module = session_discriminator.module if hasattr(session_discriminator, 'module') else session_discriminator
+            is_multi_level_dann = hasattr(disc_module, 'n_levels')
+        return_mode = "multi_level" if is_multi_level_dann else (True if use_dann else False)
+
         if cond_emb is not None:
             if use_dann:
-                pred_raw, bottleneck_features = model(ob, cond_emb=cond_emb, return_features=True)
+                pred_raw, encoder_features = model(ob, cond_emb=cond_emb, return_features=return_mode)
             else:
                 pred_raw = model(ob, cond_emb=cond_emb)
         else:
             if use_dann:
-                pred_raw, bottleneck_features = model(ob, odor, return_features=True)
+                pred_raw, encoder_features = model(ob, odor, return_features=return_mode)
             else:
                 pred_raw = model(ob, odor)
 
@@ -1882,24 +1892,47 @@ def train_epoch(
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
 
         # DANN: Domain-Adversarial loss for session-invariant features
-        # Apply gradient reversal to bottleneck features, then classify sessions
+        # Apply gradient reversal to encoder features, then classify sessions
         # The encoder learns to confuse the discriminator (session-invariant representations)
         if use_dann and not stage2_spectral_only:
-            # Apply gradient reversal layer (negates gradients during backward)
-            reversed_features = grl(bottleneck_features)
-            # Classify session from (reversed) bottleneck features
-            session_logits = session_discriminator(reversed_features)
-            # Compute DANN loss (cross-entropy for session classification)
             dann_weight = config.get("dann_weight", 0.1)
-            d_loss = dann_weight * dann_loss(session_logits, session_ids)
-            loss = loss + d_loss
-            loss_components["dann"] = loss_components["dann"] + d_loss.detach()
 
-            # Track session discriminator accuracy (for monitoring)
-            with torch.no_grad():
-                session_preds = session_logits.argmax(dim=-1)
-                session_acc = (session_preds == session_ids).float().mean()
-                loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
+            if is_multi_level_dann:
+                # Multi-level DANN: discriminators at all encoder levels
+                # encoder_features is a list: [inc_out, enc0_out, ..., bottleneck]
+                all_logits = session_discriminator(encoder_features, grl=grl)
+                # Compute weighted multi-level loss
+                d_loss_raw, level_metrics = disc_module.compute_loss(all_logits, session_ids)
+                d_loss = dann_weight * d_loss_raw
+                loss = loss + d_loss
+                loss_components["dann"] = loss_components["dann"] + d_loss.detach()
+
+                # Track per-level accuracies (for monitoring)
+                with torch.no_grad():
+                    # Average accuracy across all levels
+                    avg_acc = sum(level_metrics.get(f"dann_L{i}_acc", 0) for i in range(disc_module.n_levels)) / disc_module.n_levels
+                    loss_components["dann_acc"] = loss_components["dann_acc"] + avg_acc
+                    # Store per-level metrics for detailed logging
+                    for key, val in level_metrics.items():
+                        if "acc" in key:
+                            loss_components[key] = loss_components.get(key, 0.0) + val
+            else:
+                # Single-level DANN: bottleneck only
+                # encoder_features is just the bottleneck tensor
+                # Apply gradient reversal layer (negates gradients during backward)
+                reversed_features = grl(encoder_features)
+                # Classify session from (reversed) bottleneck features
+                session_logits = session_discriminator(reversed_features)
+                # Compute DANN loss (cross-entropy for session classification)
+                d_loss = dann_weight * dann_loss(session_logits, session_ids)
+                loss = loss + d_loss
+                loss_components["dann"] = loss_components["dann"] + d_loss.detach()
+
+                # Track session discriminator accuracy (for monitoring)
+                with torch.no_grad():
+                    session_preds = session_logits.argmax(dim=-1)
+                    session_acc = (session_preds == session_ids).float().mean()
+                    loss_components["dann_acc"] = loss_components["dann_acc"] + session_acc
 
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
@@ -2339,7 +2372,7 @@ def train(
                 print("         Make sure to use --split-by-session to enable session-based splitting.")
             config["use_dann"] = False
         else:
-            # Calculate bottleneck channels based on model config
+            # Calculate channel dimensions for encoder levels
             # channels = [base, base*2, base*4, ..., base*8 max] for n_downsample levels
             base_ch = config.get("base_channels", 128)
             n_downsample = config.get("n_downsample", 2)
@@ -2348,14 +2381,35 @@ def train(
             # Create Gradient Reversal Layer
             grl = GradientReversalLayer(alpha=0.0)  # Start with alpha=0, will schedule it
 
-            # Create Session Discriminator
-            session_discriminator = SessionDiscriminator(
-                feature_dim=bottleneck_ch,
-                n_sessions=n_sessions,
-                hidden_dim=config.get("dann_hidden_dim", 256),
-                dropout=config.get("dann_dropout", 0.3),
-                use_spectral_norm=True,
-            )
+            # Check if multi-level DANN is requested (default: True)
+            use_multi_level = config.get("dann_multi_level", True)
+
+            if use_multi_level:
+                # Calculate feature dims for all encoder levels:
+                # Level 0: inc output = base_ch
+                # Level 1..n_downsample: encoder outputs = base * 2^level (capped at base*8)
+                # Level n_downsample+1: bottleneck = base * 2^n_downsample (capped at base*8)
+                feature_dims = [base_ch]  # inc output
+                for i in range(n_downsample):
+                    feature_dims.append(min(base_ch * (2 ** (i + 1)), base_ch * 8))
+                feature_dims.append(bottleneck_ch)  # bottleneck
+
+                # Create Multi-Level Session Discriminator
+                session_discriminator = MultiLevelSessionDiscriminator(
+                    feature_dims=feature_dims,
+                    n_sessions=n_sessions,
+                    hidden_dim=config.get("dann_hidden_dim", 256),
+                    dropout=config.get("dann_dropout", 0.3),
+                )
+            else:
+                # Create single-level Session Discriminator (bottleneck only)
+                session_discriminator = SessionDiscriminator(
+                    feature_dim=bottleneck_ch,
+                    n_sessions=n_sessions,
+                    hidden_dim=config.get("dann_hidden_dim", 256),
+                    dropout=config.get("dann_dropout", 0.3),
+                    use_spectral_norm=True,
+                )
 
             # Move to device and handle precision
             if check_bf16_support():
@@ -2377,10 +2431,18 @@ def train(
             disc_params = sum(p.numel() for p in session_discriminator.parameters())
             if is_primary():
                 print(f"\n{'='*60}")
-                print("DANN (Domain-Adversarial Neural Networks) ENABLED")
+                if use_multi_level:
+                    print("DANN (Multi-Level Domain-Adversarial Neural Networks) ENABLED")
+                else:
+                    print("DANN (Domain-Adversarial Neural Networks) ENABLED")
                 print(f"{'='*60}")
                 print(f"  Sessions to discriminate: {n_sessions}")
-                print(f"  Bottleneck feature dim:   {bottleneck_ch}")
+                if use_multi_level:
+                    # Get level info from discriminator (handles DDP wrapper)
+                    disc_module = session_discriminator.module if hasattr(session_discriminator, 'module') else session_discriminator
+                    print(f"  Multi-level:              {disc_module.get_level_info()}")
+                else:
+                    print(f"  Bottleneck feature dim:   {bottleneck_ch}")
                 print(f"  Discriminator hidden dim: {config.get('dann_hidden_dim', 256)}")
                 print(f"  Discriminator dropout:    {config.get('dann_dropout', 0.3)}")
                 print(f"  Discriminator params:     {disc_params:,}")
@@ -3348,6 +3410,10 @@ def parse_args():
                         help="Dropout rate for session discriminator (default: 0.3)")
     parser.add_argument("--dann-schedule-gamma", type=float, default=None,
                         help="Gamma for DANN alpha schedule (default: 10.0)")
+    parser.add_argument("--dann-multi-level", action="store_true", default=None,
+                        help="Use multi-level DANN (discriminators at all encoder levels, default: True)")
+    parser.add_argument("--no-dann-multi-level", action="store_false", dest="dann_multi_level",
+                        help="Use single-level DANN (bottleneck only)")
 
     # Per-channel normalization (applied during training)
     parser.add_argument("--per-channel-norm", action="store_true", default=True,
@@ -3654,8 +3720,11 @@ def main():
         config["dann_dropout"] = args.dann_dropout
     if args.dann_schedule_gamma is not None:
         config["dann_schedule_gamma"] = args.dann_schedule_gamma
+    if args.dann_multi_level is not None:
+        config["dann_multi_level"] = args.dann_multi_level
     if config.get("use_dann", False) and is_primary():
-        print(f"DANN ENABLED: weight={config['dann_weight']}, hidden_dim={config['dann_hidden_dim']}")
+        ml_str = "(multi-level)" if config.get("dann_multi_level", True) else "(bottleneck only)"
+        print(f"DANN ENABLED {ml_str}: weight={config['dann_weight']}, hidden_dim={config['dann_hidden_dim']}")
 
     # Data augmentation config from CLI (only override if explicitly set, not None)
     # Master toggle first

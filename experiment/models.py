@@ -2213,8 +2213,8 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-        return_features: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return_features: Union[bool, str] = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
         """Forward pass.
 
         Args:
@@ -2222,11 +2222,16 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
-            return_features: If True, also return bottleneck features for DANN
+            return_features: Feature return mode:
+                - False: Only return predicted signal
+                - True or "bottleneck": Return (signal, bottleneck_features)
+                - "multi_level": Return (signal, [enc0, enc1, ..., bottleneck])
+                  for multi-level DANN
 
         Returns:
             If return_features=False: Predicted signal [B, C, T]
-            If return_features=True: Tuple of (predicted signal, bottleneck features)
+            If return_features=True/"bottleneck": Tuple of (signal, bottleneck [B, C, T'])
+            If return_features="multi_level": Tuple of (signal, list of encoder features)
         """
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2265,7 +2270,12 @@ class CondUNet1D(nn.Module):
             out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
-        if return_features:
+        if return_features == "multi_level":
+            # Return all encoder features + bottleneck for multi-level DANN
+            # skips = [inc_out, enc0_out, enc1_out, ...] + bottleneck
+            encoder_features = skips + [bottleneck]
+            return out, encoder_features
+        elif return_features:
             return out, bottleneck
         return out
 
@@ -2771,6 +2781,167 @@ def dann_loss(
         Cross-entropy loss scalar
     """
     return F.cross_entropy(logits, session_ids, label_smoothing=label_smoothing)
+
+
+class MultiLevelSessionDiscriminator(nn.Module):
+    """Multi-level session discriminator for hierarchical DANN.
+
+    Applies session discrimination at multiple encoder levels to enforce
+    session-invariance throughout the entire encoder hierarchy, not just
+    at the bottleneck.
+
+    This is more effective than single-level DANN because:
+    1. Early layers learn low-level session-invariant features
+    2. Deeper layers learn high-level session-invariant abstractions
+    3. Gradients flow to all encoder levels, not just through bottleneck
+
+    Architecture:
+        Level 0 (inc output):       [B, base, T]     -> Discriminator_0 -> [B, n_sessions]
+        Level 1 (encoder_0 output): [B, base*2, T/2] -> Discriminator_1 -> [B, n_sessions]
+        Level 2 (encoder_1 output): [B, base*4, T/4] -> Discriminator_2 -> [B, n_sessions]
+        ...
+        Bottleneck:                 [B, base*8, T/N] -> Discriminator_N -> [B, n_sessions]
+
+    Each discriminator has its own parameters but shares the classification target.
+    The total DANN loss is the weighted sum across all levels.
+
+    Args:
+        feature_dims: List of feature dimensions at each level [base, base*2, ..., bottleneck]
+        n_sessions: Number of recording sessions to classify
+        hidden_dim: Hidden layer dimension for each discriminator (default: 256)
+        dropout: Dropout rate (default: 0.3)
+        level_weights: Optional weights for each level's loss (default: equal weights)
+                       Higher weights on deeper levels often work better.
+    """
+
+    def __init__(
+        self,
+        feature_dims: List[int],
+        n_sessions: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+        level_weights: Optional[List[float]] = None,
+    ):
+        super().__init__()
+        self.n_levels = len(feature_dims)
+        self.n_sessions = n_sessions
+        self.feature_dims = feature_dims
+
+        # Default weights: linearly increasing (deeper levels get more weight)
+        if level_weights is None:
+            # [0.5, 0.75, 1.0, 1.25, ...] normalized
+            weights = [0.5 + 0.5 * i / max(1, self.n_levels - 1) for i in range(self.n_levels)]
+            total = sum(weights)
+            self.level_weights = [w / total for w in weights]
+        else:
+            total = sum(level_weights)
+            self.level_weights = [w / total for w in level_weights]
+
+        # Create a discriminator for each level
+        self.discriminators = nn.ModuleList()
+        for i, feat_dim in enumerate(feature_dims):
+            # Scale hidden dim based on feature dim (smaller for early layers)
+            level_hidden = max(64, hidden_dim * feat_dim // feature_dims[-1])
+            self.discriminators.append(
+                self._make_discriminator(feat_dim, n_sessions, level_hidden, dropout)
+            )
+
+        # Store for logging
+        self.register_buffer('_level_weights_tensor', torch.tensor(self.level_weights))
+
+    def _make_discriminator(
+        self,
+        feature_dim: int,
+        n_sessions: int,
+        hidden_dim: int,
+        dropout: float,
+    ) -> nn.Module:
+        """Create a single-level discriminator."""
+        return nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, n_sessions),
+        )
+
+    def forward(
+        self,
+        features: List[torch.Tensor],
+        grl: Optional[nn.Module] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        """Forward pass through all level discriminators.
+
+        Args:
+            features: List of encoder features at each level
+                      [inc_out, enc0_out, enc1_out, ..., bottleneck]
+                      Each tensor is [B, C_level, T_level]
+            grl: Optional GradientReversalLayer to apply before each discriminator
+
+        Returns:
+            Tuple of:
+                - List of logits at each level [[B, n_sessions], ...]
+                - Weighted average accuracy across levels (for monitoring)
+        """
+        all_logits = []
+        all_correct = []
+
+        for i, (feat, disc) in enumerate(zip(features, self.discriminators)):
+            # Global average pooling over time
+            pooled = feat.mean(dim=-1)  # [B, C]
+
+            # Apply gradient reversal if provided
+            if grl is not None:
+                pooled = grl(pooled)
+
+            # Classify
+            logits = disc(pooled)  # [B, n_sessions]
+            all_logits.append(logits)
+
+        return all_logits
+
+    def compute_loss(
+        self,
+        all_logits: List[torch.Tensor],
+        session_ids: torch.Tensor,
+        label_smoothing: float = 0.1,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute weighted multi-level DANN loss.
+
+        Args:
+            all_logits: List of logits from forward pass
+            session_ids: Ground truth session indices [B]
+            label_smoothing: Label smoothing factor
+
+        Returns:
+            Tuple of:
+                - Total weighted loss (scalar)
+                - Dict of per-level metrics for logging
+        """
+        total_loss = 0.0
+        metrics = {}
+
+        for i, (logits, weight) in enumerate(zip(all_logits, self.level_weights)):
+            level_loss = F.cross_entropy(logits, session_ids, label_smoothing=label_smoothing)
+            total_loss = total_loss + weight * level_loss
+
+            # Track per-level accuracy
+            with torch.no_grad():
+                preds = logits.argmax(dim=-1)
+                acc = (preds == session_ids).float().mean().item()
+                metrics[f"dann_L{i}_loss"] = level_loss.item()
+                metrics[f"dann_L{i}_acc"] = acc
+
+        return total_loss, metrics
+
+    def get_level_info(self) -> str:
+        """Get string describing the multi-level architecture."""
+        info_parts = []
+        for i, (dim, weight) in enumerate(zip(self.feature_dims, self.level_weights)):
+            info_parts.append(f"L{i}:{dim}ch(w={weight:.2f})")
+        return " | ".join(info_parts)
 
 
 # =============================================================================
