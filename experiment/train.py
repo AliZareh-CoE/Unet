@@ -102,6 +102,12 @@ from data import (
     SAMPLING_RATE_HZ,
     PFC_SAMPLING_RATE_HZ,
     DatasetType,
+    # PCx1 continuous data
+    list_pcx1_sessions,
+    load_pcx1_session,
+    create_pcx1_dataloaders,
+    get_pcx1_session_splits,
+    PCX1_SAMPLING_RATE,
 )
 
 # Recording system imports (for comprehensive analysis)
@@ -2159,7 +2165,16 @@ def train(
     num_workers = min(8, num_cpus // max(1, get_world_size()))  # Per-GPU workers
 
     # Create dataloaders based on dataset type
-    if config.get("dataset_type") == "pfc":
+    if config.get("dataset_type") == "pcx1":
+        # PCx1 already has loaders created
+        loaders = {
+            "train": data["train_loader"],
+            "val": data["val_loader"],
+        }
+        if is_primary():
+            print(f"PCx1 DataLoaders: {len(loaders['train'].dataset)} train windows, "
+                  f"{len(loaders['val'].dataset)} val windows")
+    elif config.get("dataset_type") == "pfc":
         loaders = create_pfc_dataloaders(
             data,
             batch_size=config.get("batch_size", 16),
@@ -3279,10 +3294,23 @@ def parse_args():
     
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc"],
-                        help="Dataset to train on: 'olfactory' (OB→PCx) or 'pfc' (PFC→CA1)")
+                        choices=["olfactory", "pfc", "pcx1"],
+                        help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
+                             "'pfc' (PFC→CA1), or 'pcx1' (continuous 1kHz LFP with sliding windows)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
+
+    # PCx1 continuous dataset options
+    parser.add_argument("--pcx1-window-size", type=int, default=5000,
+                        help="Window size in samples for PCx1 continuous data (default: 5000 = 5 seconds)")
+    parser.add_argument("--pcx1-stride", type=int, default=None,
+                        help="Stride between windows for PCx1 (default: window_size // 2 for 50%% overlap)")
+    parser.add_argument("--pcx1-train-sessions", type=str, nargs="+", default=None,
+                        help="Explicit training sessions for PCx1 (e.g., --pcx1-train-sessions 141208-1 141208-2)")
+    parser.add_argument("--pcx1-val-sessions", type=str, nargs="+", default=None,
+                        help="Explicit validation sessions for PCx1 (default: 4 random sessions)")
+    parser.add_argument("--pcx1-n-val", type=int, default=4,
+                        help="Number of validation sessions for PCx1 if not explicitly specified (default: 4)")
     
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3589,7 +3617,70 @@ def main():
             print("  Per-session validation ENABLED (metrics reported per session)")
 
     # Load data based on dataset choice
-    if args.dataset == "pfc":
+    if args.dataset == "pcx1":
+        # PCx1 continuous LFP dataset with sliding windows
+        if is_primary():
+            print("Loading PCx1 continuous data with sliding windows...")
+
+        # Get session splits
+        all_sessions = list_pcx1_sessions()
+        if is_primary():
+            print(f"Available sessions: {all_sessions}")
+
+        if args.pcx1_train_sessions and args.pcx1_val_sessions:
+            # Use explicitly specified sessions
+            train_sessions = args.pcx1_train_sessions
+            val_sessions = args.pcx1_val_sessions
+        else:
+            # Random split: use pcx1_n_val for validation, rest for training
+            train_sessions, val_sessions, _ = get_pcx1_session_splits(
+                seed=config["seed"],
+                n_val=args.pcx1_n_val,
+                n_test=0,  # No test set for now
+            )
+            # Allow CLI override of val sessions
+            if args.pcx1_val_sessions:
+                val_sessions = args.pcx1_val_sessions
+                train_sessions = [s for s in all_sessions if s not in val_sessions]
+
+        if is_primary():
+            print(f"Train sessions ({len(train_sessions)}): {train_sessions}")
+            print(f"Val sessions ({len(val_sessions)}): {val_sessions}")
+            print(f"Window size: {args.pcx1_window_size} samples ({args.pcx1_window_size / PCX1_SAMPLING_RATE:.1f} sec)")
+            stride = args.pcx1_stride or args.pcx1_window_size // 2
+            print(f"Stride: {stride} samples ({stride / PCX1_SAMPLING_RATE:.1f} sec, {100 * (1 - stride / args.pcx1_window_size):.0f}% overlap)")
+
+        # Create dataloaders
+        loaders = create_pcx1_dataloaders(
+            train_sessions=train_sessions,
+            val_sessions=val_sessions,
+            test_sessions=None,
+            window_size=args.pcx1_window_size,
+            stride=args.pcx1_stride,
+            batch_size=config["batch_size"],
+            zscore_per_window=True,
+            num_workers=4,
+        )
+
+        # Build a minimal data dict for compatibility with rest of training loop
+        data = {
+            "train_loader": loaders["train"],
+            "val_loader": loaders["val"],
+            "train_sessions": train_sessions,
+            "val_sessions": val_sessions,
+            "n_odors": 1,  # No odor conditioning for continuous data
+            "vocab": {"none": 0},
+        }
+
+        config["dataset_type"] = "pcx1"
+        config["in_channels"] = 32   # OB channels
+        config["out_channels"] = 32  # PCx channels
+        config["sampling_rate"] = PCX1_SAMPLING_RATE
+        config["pcx1_window_size"] = args.pcx1_window_size
+        config["pcx1_stride"] = args.pcx1_stride or args.pcx1_window_size // 2
+        config["split_by_session"] = True  # Always session-based for PCx1
+
+    elif args.dataset == "pfc":
         # PFC/Hippocampus dataset
         data = prepare_pfc_data(
             split_by_session=config["split_by_session"],
