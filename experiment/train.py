@@ -3329,6 +3329,12 @@ def parse_args():
                         help="Window size in samples for PCx1 continuous data (default: 5000 = 5 seconds)")
     parser.add_argument("--pcx1-stride", type=int, default=None,
                         help="Stride between windows for PCx1 (default: window_size // 2 for 50%% overlap)")
+    parser.add_argument("--pcx1-stride-ratio", type=float, default=None,
+                        help="Stride as ratio of window size (0.5 = 50%% overlap, 1.0 = no overlap). "
+                             "Overrides --pcx1-stride if both specified. Higher = faster training.")
+    parser.add_argument("--val-stride-multiplier", type=float, default=1.0,
+                        help="Multiply validation stride by this factor for faster eval (default: 1.0). "
+                             "Use 2.0-4.0 for faster validation without affecting training.")
     parser.add_argument("--pcx1-train-sessions", type=str, nargs="+", default=None,
                         help="Explicit training sessions for PCx1 (e.g., --pcx1-train-sessions 141208-1 141208-2)")
     parser.add_argument("--pcx1-val-sessions", type=str, nargs="+", default=None,
@@ -3683,12 +3689,31 @@ def main():
                 val_sessions = args.pcx1_val_sessions
                 train_sessions = [s for s in all_sessions if s not in val_sessions]
 
+        # Calculate stride: --pcx1-stride-ratio overrides --pcx1-stride
+        window_size = args.pcx1_window_size
+        if args.pcx1_stride_ratio is not None:
+            train_stride = int(window_size * args.pcx1_stride_ratio)
+        elif args.pcx1_stride is not None:
+            train_stride = args.pcx1_stride
+        else:
+            train_stride = window_size // 2  # Default: 50% overlap
+
+        # Validation stride can be larger for faster eval
+        val_stride_mult = args.val_stride_multiplier
+        val_stride = int(train_stride * val_stride_mult)
+
+        # Calculate data multiplication factor (how many times each sample is seen)
+        overlap_ratio = 1.0 - (train_stride / window_size)
+        data_mult = window_size / train_stride if train_stride > 0 else float('inf')
+
         if is_primary():
             print(f"Train sessions ({len(train_sessions)}): {train_sessions}")
             print(f"Val sessions ({len(val_sessions)}): {val_sessions}")
-            print(f"Window size: {args.pcx1_window_size} samples ({args.pcx1_window_size / PCX1_SAMPLING_RATE:.1f} sec)")
-            stride = args.pcx1_stride or args.pcx1_window_size // 2
-            print(f"Stride: {stride} samples ({stride / PCX1_SAMPLING_RATE:.1f} sec, {100 * (1 - stride / args.pcx1_window_size):.0f}% overlap)")
+            print(f"Window size: {window_size} samples ({window_size / PCX1_SAMPLING_RATE:.1f} sec)")
+            print(f"Train stride: {train_stride} samples ({train_stride / PCX1_SAMPLING_RATE:.2f} sec, {overlap_ratio*100:.0f}% overlap)")
+            print(f"  -> Each time point seen in ~{data_mult:.1f}x windows (data multiplication)")
+            if val_stride_mult > 1.0:
+                print(f"Val stride: {val_stride} samples ({val_stride_mult:.1f}x train stride for faster eval)")
 
         # Auto-detect num_workers if not specified
         num_workers = config["num_workers"]
@@ -3702,8 +3727,9 @@ def main():
             train_sessions=train_sessions,
             val_sessions=val_sessions,
             test_sessions=None,
-            window_size=args.pcx1_window_size,
-            stride=args.pcx1_stride,
+            window_size=window_size,
+            stride=train_stride,
+            val_stride=val_stride,
             batch_size=config["batch_size"],
             zscore_per_window=True,
             num_workers=num_workers,
@@ -3727,8 +3753,9 @@ def main():
         config["in_channels"] = 32   # OB channels
         config["out_channels"] = 32  # PCx channels
         config["sampling_rate"] = PCX1_SAMPLING_RATE
-        config["pcx1_window_size"] = args.pcx1_window_size
-        config["pcx1_stride"] = args.pcx1_stride or args.pcx1_window_size // 2
+        config["pcx1_window_size"] = window_size
+        config["pcx1_stride"] = train_stride
+        config["pcx1_val_stride"] = val_stride
         config["split_by_session"] = True  # Always session-based for PCx1
 
     elif args.dataset == "pfc":

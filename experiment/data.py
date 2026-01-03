@@ -2507,6 +2507,7 @@ def create_pcx1_dataloaders(
     test_sessions: Optional[List[str]] = None,
     window_size: int = 5000,
     stride: Optional[int] = None,
+    val_stride: Optional[int] = None,
     batch_size: int = 32,
     zscore_per_window: bool = True,
     num_workers: int = 4,
@@ -2522,7 +2523,8 @@ def create_pcx1_dataloaders(
         val_sessions: List of session names for validation
         test_sessions: List of session names for testing (optional)
         window_size: Window size in samples (5000 = 5 seconds)
-        stride: Stride between windows (default: window_size // 2)
+        stride: Stride between windows for training (default: window_size // 2)
+        val_stride: Stride for validation (default: same as stride). Use larger for faster eval.
         batch_size: Batch size for DataLoader
         zscore_per_window: Whether to z-score each window
         num_workers: Number of DataLoader workers
@@ -2534,6 +2536,12 @@ def create_pcx1_dataloaders(
     Returns:
         Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
     """
+    # Default strides
+    if stride is None:
+        stride = window_size // 2
+    if val_stride is None:
+        val_stride = stride
+
     # persistent_workers requires num_workers > 0
     use_persistent = persistent_workers and num_workers > 0
     # Load sessions
@@ -2542,12 +2550,12 @@ def create_pcx1_dataloaders(
     print("Loading validation sessions...")
     val_data = [load_pcx1_session(s, path) for s in val_sessions]
 
-    # Create datasets
+    # Create datasets (val can use larger stride for faster eval)
     train_dataset = MultiSessionContinuousDataset(
         train_data, window_size, stride, zscore_per_window
     )
     val_dataset = MultiSessionContinuousDataset(
-        val_data, window_size, stride, zscore_per_window
+        val_data, window_size, val_stride, zscore_per_window
     )
 
     # Common DataLoader kwargs for speed
@@ -2582,7 +2590,7 @@ def create_pcx1_dataloaders(
                 ob=sess_data['ob'],
                 pcx=sess_data['pcx'],
                 window_size=window_size,
-                stride=stride,
+                stride=val_stride,  # Use val_stride for faster eval
                 zscore_per_window=zscore_per_window,
             )
             val_sessions_loaders[sess_name] = DataLoader(
@@ -2597,7 +2605,7 @@ def create_pcx1_dataloaders(
         print("Loading test sessions...")
         test_data = [load_pcx1_session(s, path) for s in test_sessions]
         test_dataset = MultiSessionContinuousDataset(
-            test_data, window_size, stride, zscore_per_window
+            test_data, window_size, val_stride, zscore_per_window  # Use val_stride for test too
         )
         dataloaders['test'] = DataLoader(
             test_dataset,
