@@ -2187,6 +2187,17 @@ class CondUNet1D(nn.Module):
             self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
             self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
 
+        # Gradient checkpointing: trade compute for memory
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable/disable gradient checkpointing for memory efficiency.
+
+        When enabled, encoder/decoder blocks are checkpointed to reduce memory
+        at the cost of ~30% more compute (recomputes activations during backward).
+        """
+        self.gradient_checkpointing = enable
+
     def _build_attention(self, channels: int, attention_type: str) -> nn.Module:
         """Build attention module based on type.
 
@@ -2243,9 +2254,16 @@ class CondUNet1D(nn.Module):
             emb = None
 
         # Encoder path with skip connections
-        skips = [self.inc(ob, emb)]
-        for encoder in self.encoders:
-            skips.append(encoder(skips[-1], emb))
+        # Use gradient checkpointing if enabled (saves memory, costs ~30% more compute)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            skips = [checkpoint(self.inc, ob, emb, use_reentrant=False)]
+            for encoder in self.encoders:
+                skips.append(checkpoint(encoder, skips[-1], emb, use_reentrant=False))
+        else:
+            skips = [self.inc(ob, emb)]
+            for encoder in self.encoders:
+                skips.append(encoder(skips[-1], emb))
 
         # Bottleneck
         bottleneck = self.mid(skips[-1])
@@ -2264,9 +2282,15 @@ class CondUNet1D(nn.Module):
 
         # Decoder path with skip connections (reverse order)
         x = bottleneck
-        for i, decoder in enumerate(self.decoders):
-            skip_idx = self.n_downsample - i - 1
-            x = decoder(x, skips[skip_idx], emb)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for i, decoder in enumerate(self.decoders):
+                skip_idx = self.n_downsample - i - 1
+                x = checkpoint(decoder, x, skips[skip_idx], emb, use_reentrant=False)
+        else:
+            for i, decoder in enumerate(self.decoders):
+                skip_idx = self.n_downsample - i - 1
+                x = decoder(x, skips[skip_idx], emb)
 
         delta = self.outc(x)
 

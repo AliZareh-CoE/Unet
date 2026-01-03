@@ -2512,6 +2512,8 @@ def create_pcx1_dataloaders(
     num_workers: int = 4,
     path: Path = PCX1_CONTINUOUS_PATH,
     separate_val_sessions: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
 ) -> Dict[str, Any]:
     """Create DataLoaders for PCx1 continuous data with session-based splits.
 
@@ -2526,10 +2528,14 @@ def create_pcx1_dataloaders(
         num_workers: Number of DataLoader workers
         path: Base path to continuous_1khz folder
         separate_val_sessions: If True, also create per-session val loaders
+        persistent_workers: Keep workers alive between epochs (faster)
+        prefetch_factor: Number of batches to prefetch per worker
 
     Returns:
         Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
     """
+    # persistent_workers requires num_workers > 0
+    use_persistent = persistent_workers and num_workers > 0
     # Load sessions
     print("Loading training sessions...")
     train_data = [load_pcx1_session(s, path) for s in train_sessions]
@@ -2544,20 +2550,26 @@ def create_pcx1_dataloaders(
         val_data, window_size, stride, zscore_per_window
     )
 
+    # Common DataLoader kwargs for speed
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
     dataloaders = {
         'train': DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,
+            **loader_kwargs,
         ),
         'val': DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+            **loader_kwargs,
         ),
     }
 
@@ -2577,8 +2589,7 @@ def create_pcx1_dataloaders(
                 sess_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=num_workers,
-                pin_memory=True,
+                **loader_kwargs,
             )
         dataloaders['val_sessions'] = val_sessions_loaders
 
@@ -2592,8 +2603,7 @@ def create_pcx1_dataloaders(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+            **loader_kwargs,
         )
 
     return dataloaders

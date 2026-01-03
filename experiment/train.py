@@ -2321,6 +2321,14 @@ def train(
         print(f"Channel progression: {' → '.join(map(str, channels))} (bottleneck={channels[-1]})")
         print(f"Model parameters: {model_params:,} (forward) + {rev_params:,} (reverse) = {model_params + rev_params:,} total")
 
+    # Enable gradient checkpointing if requested (reduces memory, allows larger batches)
+    if config.get("gradient_checkpointing", False):
+        model.set_gradient_checkpointing(True)
+        if reverse_model is not None:
+            reverse_model.set_gradient_checkpointing(True)
+        if is_primary():
+            print("Gradient checkpointing ENABLED (saves ~40% memory, costs ~30% more compute)")
+
     # Wrap for distributed training
     is_fsdp_wrapped = False
     if is_distributed:
@@ -2684,30 +2692,40 @@ def train(
 
             barrier()
 
-            val_metrics = evaluate(
-                model, loaders["val"], device, wavelet_loss,
-                compute_phase=False, reverse_model=reverse_model, config=config,
-                spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
-                fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
-                sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                cond_encoder=cond_encoder,
-            )
+            # Validation (skip some epochs if val_every > 1 for faster training)
+            val_every = config.get("val_every", 1)
+            should_validate = (epoch % val_every == 0) or (epoch == num_epochs) or (epoch == 1)
 
-            # Per-session validation (if separate_val_sessions is enabled)
-            per_session_metrics = {}
-            if "val_sessions" in loaders and config.get("separate_val_sessions", False):
-                for sess_name, sess_loader in loaders["val_sessions"].items():
-                    sess_metrics = evaluate(
-                        model, sess_loader, device, wavelet_loss,
-                        compute_phase=False, reverse_model=reverse_model, config=config,
-                        spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                        disable_spectral=use_two_stage,
-                        fast_mode=True,
-                        sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                        cond_encoder=cond_encoder,
-                    )
-                    per_session_metrics[sess_name] = sess_metrics
+            if should_validate:
+                val_metrics = evaluate(
+                    model, loaders["val"], device, wavelet_loss,
+                    compute_phase=False, reverse_model=reverse_model, config=config,
+                    spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+                    disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
+                    fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
+                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    cond_encoder=cond_encoder,
+                )
+                last_val_metrics = val_metrics  # Cache for non-validation epochs
+
+                # Per-session validation (if separate_val_sessions is enabled)
+                per_session_metrics = {}
+                if "val_sessions" in loaders and config.get("separate_val_sessions", False):
+                    for sess_name, sess_loader in loaders["val_sessions"].items():
+                        sess_metrics = evaluate(
+                            model, sess_loader, device, wavelet_loss,
+                            compute_phase=False, reverse_model=reverse_model, config=config,
+                            spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
+                            disable_spectral=use_two_stage,
+                            fast_mode=True,
+                            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                            cond_encoder=cond_encoder,
+                        )
+                        per_session_metrics[sess_name] = sess_metrics
+            else:
+                # Skip validation this epoch - use cached metrics
+                val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
+                per_session_metrics = {}
 
             # Sync val_loss across ranks (for early stopping)
             val_loss = val_metrics.get("loss", val_metrics["mae"])  # fallback to mae if no composite
@@ -3339,6 +3357,16 @@ def parse_args():
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (slower startup but faster training)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (default: from config)")
 
+    # Training speed optimizations
+    parser.add_argument("--val-every", type=int, default=1,
+                        help="Validate every N epochs (default: 1). Use 5-10 for faster training.")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce memory and allow larger batches")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Number of DataLoader workers (default: auto based on CPU count)")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="DataLoader prefetch factor (default: 4)")
+
     # Session-based split arguments (for held-out session evaluation)
     # Use default=None so CLI doesn't override config file values
     parser.add_argument("--split-by-session", action="store_true", default=None,
@@ -3572,6 +3600,12 @@ def main():
     if args.seed is not None:
         config["seed"] = args.seed
 
+    # Training speed optimizations
+    config["val_every"] = args.val_every  # Validate every N epochs
+    config["gradient_checkpointing"] = args.gradient_checkpointing
+    config["num_workers"] = args.num_workers  # None = auto
+    config["prefetch_factor"] = args.prefetch_factor
+
     # Session-based split config (CLI overrides config if explicitly provided)
     if args.split_by_session:
         config["split_by_session"] = True
@@ -3656,6 +3690,13 @@ def main():
             stride = args.pcx1_stride or args.pcx1_window_size // 2
             print(f"Stride: {stride} samples ({stride / PCX1_SAMPLING_RATE:.1f} sec, {100 * (1 - stride / args.pcx1_window_size):.0f}% overlap)")
 
+        # Auto-detect num_workers if not specified
+        num_workers = config["num_workers"]
+        if num_workers is None:
+            import os
+            num_workers = min(8, os.cpu_count() or 4)
+        prefetch_factor = config["prefetch_factor"]
+
         # Create dataloaders
         loaders = create_pcx1_dataloaders(
             train_sessions=train_sessions,
@@ -3665,8 +3706,10 @@ def main():
             stride=args.pcx1_stride,
             batch_size=config["batch_size"],
             zscore_per_window=True,
-            num_workers=4,
+            num_workers=num_workers,
             separate_val_sessions=config.get("separate_val_sessions", True),
+            persistent_workers=True,
+            prefetch_factor=prefetch_factor,
         )
 
         # Build a minimal data dict for compatibility with rest of training loop
