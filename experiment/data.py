@@ -2130,10 +2130,12 @@ def prepare_data(
 
             # Rebuild session mappings for remaining sessions
             old_session_ids = session_ids[keep_indices]
-            remaining_sessions = sorted(set(idx_to_session[sid] for sid in np.unique(old_session_ids)))
+            old_idx_to_session = idx_to_session  # Save old mapping before overwriting
+            remaining_sessions = sorted(set(old_idx_to_session[sid] for sid in np.unique(old_session_ids)))
             session_to_idx = {name: i for i, name in enumerate(remaining_sessions)}
             idx_to_session = {i: name for i, name in enumerate(remaining_sessions)}
-            session_ids = np.array([session_to_idx[idx_to_session[old_id]] for old_id in old_session_ids])
+            # Map old session IDs to new IDs via session names
+            session_ids = np.array([session_to_idx[old_idx_to_session[old_id]] for old_id in old_session_ids])
 
             print(f"  Remaining: {len(remaining_sessions)} sessions, {num_trials} trials")
             print(f"  Sessions: {remaining_sessions}\n")
