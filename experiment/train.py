@@ -1358,10 +1358,9 @@ def evaluate(
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
 
-            # Apply per-channel normalization if enabled (default: True)
-            if config is not None and config.get("per_channel_norm", True):
-                ob = per_channel_normalize(ob)
-                pcx = per_channel_normalize(pcx)
+            # Normalize target (PCx) for loss computation
+            # NOTE: Input (OB) is normalized inside the model's forward()
+            pcx = per_channel_normalize(pcx)
 
             # Compute conditioning embedding if using auto-conditioning
             cond_emb = None
@@ -1642,10 +1641,9 @@ def train_epoch(
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
 
-        # Apply per-channel normalization if enabled (default: True)
-        if config.get("per_channel_norm", True):
-            ob = per_channel_normalize(ob)
-            pcx = per_channel_normalize(pcx)
+        # Normalize target (PCx) for loss computation
+        # NOTE: Input (OB) is normalized inside the model's forward()
+        pcx = per_channel_normalize(pcx)
 
         # Apply data augmentation (training only)
         ob, pcx = apply_augmentations(ob, pcx, config)
@@ -3130,12 +3128,6 @@ def parse_args():
     parser.add_argument("--no-bidirectional", action="store_true",
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
-    # Per-channel normalization (applied during training)
-    parser.add_argument("--per-channel-norm", action="store_true", default=True,
-                        help="Apply per-channel z-score normalization to each batch (default: True)")
-    parser.add_argument("--no-per-channel-norm", action="store_false", dest="per_channel_norm",
-                        help="Disable per-channel normalization")
-
     # Data augmentation (default=None means use config value, not override)
     # Master toggle for all augmentations
     parser.add_argument("--aug-enabled", action="store_true", default=None,
@@ -3576,11 +3568,6 @@ def main():
         loss_type = config.get("loss_type", "huber_wavelet")
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
-
-    # Per-channel normalization (default: enabled)
-    config["per_channel_norm"] = args.per_channel_norm if hasattr(args, 'per_channel_norm') else True
-    if is_primary():
-        print(f"Per-channel normalization: {'ENABLED' if config['per_channel_norm'] else 'DISABLED'}")
 
     # Output scaling correction in model (default: enabled)
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True

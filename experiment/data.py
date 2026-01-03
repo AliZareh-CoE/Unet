@@ -2509,7 +2509,7 @@ def create_pcx1_dataloaders(
     stride: Optional[int] = None,
     val_stride: Optional[int] = None,
     batch_size: int = 32,
-    zscore_per_window: bool = True,
+    zscore_per_window: bool = False,  # Model handles input normalization internally
     num_workers: int = 4,
     path: Path = PCX1_CONTINUOUS_PATH,
     separate_val_sessions: bool = True,
@@ -2795,7 +2795,7 @@ class AllenContinuousDataset(Dataset):
         target: np.ndarray,
         window_size: int = 5000,
         stride: Optional[int] = None,
-        zscore_per_window: bool = True,
+        zscore_per_window: bool = False,  # Model handles input normalization internally
     ):
         self.source = source.astype(np.float32)
         self.target = target.astype(np.float32)
@@ -2830,7 +2830,7 @@ def create_allen_dataloaders(
     window_size: int = 5000,
     stride: Optional[int] = None,
     batch_size: int = 32,
-    zscore_per_window: bool = True,
+    zscore_per_window: bool = False,  # Model handles input normalization internally
     num_workers: int = 4,
     path: Path = ALLEN_NEUROPIXELS_PATH,
     separate_val_sessions: bool = True,

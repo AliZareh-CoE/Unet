@@ -1973,6 +1973,18 @@ class CondUNet1D(nn.Module):
             If return_bottleneck=True: (predicted signal, pooled bottleneck features [B, bottleneck_ch])
             If return_bottleneck_temporal=True: (predicted signal, unpooled bottleneck features [B, bottleneck_ch, T'])
         """
+        # =================================================================
+        # INPUT NORMALIZATION - The key to session-agnostic generalization
+        # =================================================================
+        # Per-channel, per-sample z-score: each channel gets mean=0, std=1
+        # This makes the model see the same range regardless of:
+        #   - Which session (different electrode impedance, animal, etc.)
+        #   - Which channel (different baseline activity)
+        #   - Absolute amplitude (only PATTERN matters)
+        # The model learns SHAPE transformation, not SCALE transformation.
+        # =================================================================
+        ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
+
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
             emb = cond_emb
