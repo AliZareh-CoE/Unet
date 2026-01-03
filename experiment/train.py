@@ -2228,19 +2228,18 @@ def train(
     n_downsample = config.get("n_downsample", 2)
     base_ch = config.get("base_channels", 128)
     downsample_factor = 2 ** n_downsample
-    nyquist_hz = 1000 / (2 * downsample_factor)  # 1000 Hz sample rate
-    
+
     # Calculate channel progression for logging
     channels = [base_ch]
     for i in range(n_downsample):
         channels.append(min(base_ch * (2 ** (i + 1)), base_ch * 8))
-    
+
     # Count actual parameters
     model_params = sum(p.numel() for p in model.parameters())
     rev_params = sum(p.numel() for p in reverse_model.parameters()) if reverse_model else 0
-    
+
     if is_primary():
-        print(f"U-Net depth: {n_downsample} levels → {downsample_factor}x downsample → bottleneck Nyquist = {nyquist_hz:.0f} Hz")
+        print(f"U-Net depth: {n_downsample} levels → {downsample_factor}x downsample")
         print(f"Channel progression: {' → '.join(map(str, channels))} (bottleneck={channels[-1]})")
         print(f"Model parameters: {model_params:,} (forward) + {rev_params:,} (reverse) = {model_params + rev_params:,} total")
 
