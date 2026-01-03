@@ -216,8 +216,12 @@ def extract_session_lfp(cache, session_id: int, output_path: Path) -> Optional[D
         }
 
         for structure, lfp_list in region_data.items():
+            # Different probes may have different lengths - truncate to minimum
+            min_len = min(lfp.shape[1] for lfp in lfp_list)
+            lfp_list_truncated = [lfp[:, :min_len] for lfp in lfp_list]
+
             # Concatenate all channels for this structure
-            combined = np.concatenate(lfp_list, axis=0)
+            combined = np.concatenate(lfp_list_truncated, axis=0)
 
             # Downsample to 1kHz
             downsampled = downsample_lfp(combined, ORIGINAL_FS, TARGET_FS)
