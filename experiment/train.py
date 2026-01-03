@@ -2365,11 +2365,18 @@ def train(
                 print(f"Using FSDP with {get_world_size()} GPUs")
             dist.barrier()
         else:
+            # When using gradient checkpointing, we need find_unused_parameters=True
+            # because checkpointing recomputes activations and some params may not
+            # receive gradients until the recomputation happens
+            ddp_kwargs = {"device_ids": [local_rank]}
+            if config.get("gradient_checkpointing", False):
+                ddp_kwargs["find_unused_parameters"] = True
+
             model = model.to(device)
-            model = DDP(model, device_ids=[local_rank])
+            model = DDP(model, **ddp_kwargs)
             if reverse_model is not None:
                 reverse_model = reverse_model.to(device)
-                reverse_model = DDP(reverse_model, device_ids=[local_rank])
+                reverse_model = DDP(reverse_model, **ddp_kwargs)
             if cond_encoder is not None:
                 cond_encoder = cond_encoder.to(device)
                 # NOTE: We intentionally do NOT wrap cond_encoder in DDP.
@@ -2379,6 +2386,8 @@ def train(
                 # using sync_gradients_manual() after backward() but before optimizer.step().
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs")
+                if config.get("gradient_checkpointing", False):
+                    print("  (find_unused_parameters=True for gradient checkpointing)")
             dist.barrier()
     else:
         model = wrap_model_fsdp(model, local_rank, use_fsdp=False, compile_model=compile_model)
