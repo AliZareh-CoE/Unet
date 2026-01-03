@@ -171,14 +171,6 @@ DEFAULT_CONFIG = {
     #   - "huber_wavelet": Huber + Wavelet combined
     "loss_type": "l1_wavelet",
 
-    # Multi-stage training:
-    # Stage 1: Train UNet (L1 + wavelet)
-    # Stage 2: Post-hoc calibration (OptimalSpectralBias + EnvelopeHistogramMatching)
-    "use_two_stage": True,        # Enable multi-stage training
-    "spectral_finetune_epochs": 20,  # Epochs for Stage 2 (post-hoc calibration)
-    "stage2_only": False,         # Skip Stage 1, load checkpoint and run Stage 2 only
-    "stage1_checkpoint": "best_model.pt",    # Path to Stage 1 checkpoint
-
     # Model
     "base_channels": 64,
     "dropout": 0.0,
@@ -243,17 +235,6 @@ DEFAULT_CONFIG = {
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
-
-    # Spectral shift block
-    "use_spectral_shift": True,  # Per-channel amplitude scaling for PSD correction
-    "spectral_shift_mode": "adaptive",  # "flat", "frequency_band", or "adaptive" (signal-adaptive)
-    "spectral_shift_conditional": True,  # If True, use odor-specific spectral bias
-    "spectral_shift_per_channel": False,  # Not used by OptimalSpectralBias (global bias per band)
-    "spectral_shift_init_fwd": 0.0,  # Not used by OptimalSpectralBias (bias computed from data)
-    "spectral_shift_lr": 0.001,  # Not used by OptimalSpectralBias (no training)
-    "spectral_shift_lr_decay": 0.95,  # Not used by OptimalSpectralBias (no training)
-    "spectral_shift_band_width_hz": 2,  # None=use predefined neuro bands, or float (e.g., 2.0 for 2Hz uniform bands)
-    "spectral_shift_compute_bias": True,  # Compute optimal bias directly from UNet output vs target PSD
 
     # Output scaling correction (learnable per-channel scale and bias)
     # Helps match target distribution, especially important for probabilistic losses
@@ -1082,19 +1063,13 @@ def load_checkpoint(
     path: Path,
     model: nn.Module,
     reverse_model: Optional[nn.Module] = None,
-    spectral_shift_fwd: Optional[nn.Module] = None,
-    spectral_shift_rev: Optional[nn.Module] = None,
-    load_spectral_only: bool = False,
-    skip_spectral: bool = False,
     expected_cond_mode: Optional[str] = None,
 ) -> str:
-    """Load checkpoint (with option to load only SpectralShift for fine-tuning).
+    """Load checkpoint.
 
     Args:
-        skip_spectral: If True, skip loading SpectralShift (use fresh init instead).
-                       Useful when SpectralShift architecture changed (e.g., different band_width_hz).
         expected_cond_mode: If provided, validate checkpoint cond_mode matches.
-        
+
     Returns:
         cond_mode from checkpoint (for verification)
     """
@@ -1122,51 +1097,35 @@ def load_checkpoint(
                 f"    2. Use a different checkpoint (set BEST_CHECKPOINT=/path/to/matching/checkpoint.pt)"
             )
 
-    if not load_spectral_only:
-        # Load UNet (forward) - handle FSDP
-        if isinstance(model, FSDP):
+    # Load UNet (forward) - handle FSDP
+    if isinstance(model, FSDP):
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+        ):
+            model.load_state_dict(checkpoint["model"])
+    else:
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(checkpoint["model"])
+        else:
+            model.load_state_dict(checkpoint["model"])
+
+    # Load reverse UNet - handle FSDP
+    if reverse_model is not None and "reverse_model" in checkpoint:
+        if isinstance(reverse_model, FSDP):
             with FSDP.state_dict_type(
-                model,
+                reverse_model,
                 StateDictType.FULL_STATE_DICT,
                 FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
             ):
-                model.load_state_dict(checkpoint["model"])
+                reverse_model.load_state_dict(checkpoint["reverse_model"])
         else:
-            if hasattr(model, 'module'):
-                model.module.load_state_dict(checkpoint["model"])
+            if hasattr(reverse_model, 'module'):
+                reverse_model.module.load_state_dict(checkpoint["reverse_model"])
             else:
-                model.load_state_dict(checkpoint["model"])
+                reverse_model.load_state_dict(checkpoint["reverse_model"])
 
-        # Load reverse UNet - handle FSDP
-        if reverse_model is not None and "reverse_model" in checkpoint:
-            if isinstance(reverse_model, FSDP):
-                with FSDP.state_dict_type(
-                    reverse_model,
-                    StateDictType.FULL_STATE_DICT,
-                    FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-                ):
-                    reverse_model.load_state_dict(checkpoint["reverse_model"])
-            else:
-                if hasattr(reverse_model, 'module'):
-                    reverse_model.module.load_state_dict(checkpoint["reverse_model"])
-                else:
-                    reverse_model.load_state_dict(checkpoint["reverse_model"])
-
-    # Load SpectralShift (DDP-wrapped, not FSDP)
-    # Skip if skip_spectral=True (allows using fresh init with different architecture)
-    if not skip_spectral:
-        if spectral_shift_fwd is not None and "spectral_shift_fwd" in checkpoint:
-            if hasattr(spectral_shift_fwd, 'module'):
-                spectral_shift_fwd.module.load_state_dict(checkpoint["spectral_shift_fwd"])
-            else:
-                spectral_shift_fwd.load_state_dict(checkpoint["spectral_shift_fwd"])
-
-        if spectral_shift_rev is not None and "spectral_shift_rev" in checkpoint:
-            if hasattr(spectral_shift_rev, 'module'):
-                spectral_shift_rev.module.load_state_dict(checkpoint["spectral_shift_rev"])
-            else:
-                spectral_shift_rev.load_state_dict(checkpoint["spectral_shift_rev"])
-    
     return checkpoint_cond_mode
 
 
@@ -1177,8 +1136,6 @@ def save_checkpoint(
     path: Path,
     is_fsdp: bool = False,
     reverse_model: Optional[nn.Module] = None,
-    spectral_shift_fwd: Optional[nn.Module] = None,
-    spectral_shift_rev: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
     data: Optional[Dict[str, Any]] = None,  # Add data dict for split info
 ) -> None:
@@ -1226,15 +1183,7 @@ def save_checkpoint(
             ):
                 checkpoint["reverse_model"] = reverse_model.state_dict()
 
-        # Save spectral shifts (DDP-wrapped, not FSDP)
         if is_primary():
-            if spectral_shift_fwd is not None:
-                shift_fwd_state = spectral_shift_fwd.module.state_dict() if hasattr(spectral_shift_fwd, 'module') else spectral_shift_fwd.state_dict()
-                checkpoint["spectral_shift_fwd"] = shift_fwd_state
-            if spectral_shift_rev is not None:
-                shift_rev_state = spectral_shift_rev.module.state_dict() if hasattr(spectral_shift_rev, 'module') else spectral_shift_rev.state_dict()
-                checkpoint["spectral_shift_rev"] = shift_rev_state
-
             torch.save(checkpoint, path)
     else:
         if is_primary():
@@ -1268,49 +1217,7 @@ def save_checkpoint(
             if reverse_model is not None:
                 rev_state = reverse_model.module.state_dict() if hasattr(reverse_model, 'module') else reverse_model.state_dict()
                 checkpoint["reverse_model"] = rev_state
-            # Save spectral shifts if exist
-            if spectral_shift_fwd is not None:
-                shift_fwd_state = spectral_shift_fwd.module.state_dict() if hasattr(spectral_shift_fwd, 'module') else spectral_shift_fwd.state_dict()
-                checkpoint["spectral_shift_fwd"] = shift_fwd_state
-            if spectral_shift_rev is not None:
-                shift_rev_state = spectral_shift_rev.module.state_dict() if hasattr(spectral_shift_rev, 'module') else spectral_shift_rev.state_dict()
-                checkpoint["spectral_shift_rev"] = shift_rev_state
             torch.save(checkpoint, path)
-
-
-# =============================================================================
-# Spectral Shift Monitoring
-# =============================================================================
-
-def get_spectral_shift_db(spectral_shift_module, detailed: bool = False) -> float | dict | None:
-    """Get dB shift from OptimalSpectralBias (handles DDP wrapping).
-
-    Args:
-        spectral_shift_module: OptimalSpectralBias (may be DDP-wrapped)
-        detailed: If True, return dict with detailed info
-
-    Returns:
-        Mean dB shift (or detailed dict), or None if module is None
-    """
-    if spectral_shift_module is None:
-        return None
-
-    # Handle DDP wrapping - access the underlying module
-    module = spectral_shift_module.module if hasattr(spectral_shift_module, 'module') else spectral_shift_module
-
-    # OptimalSpectralBias stores bias in bias_db parameter [n_odors, n_bands]
-    if hasattr(module, 'bias_db'):
-        bias_db = module.bias_db.detach()
-        mean_shift = bias_db.mean().item()
-        if detailed:
-            return {
-                "mean": mean_shift,
-                "per_odor_mean": bias_db.mean(dim=1).cpu().tolist(),  # Mean per odor
-                "per_band_mean": bias_db.mean(dim=0).cpu().tolist(),  # Mean per band
-                "mode": "optimal_bias",
-            }
-        return mean_shift
-    return None
 
 
 # =============================================================================
@@ -1393,10 +1300,6 @@ def evaluate(
     compute_phase: bool = False,
     reverse_model: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
-    spectral_shift_fwd: Optional[nn.Module] = None,
-    spectral_shift_rev: Optional[nn.Module] = None,
-    spectral_only: bool = False,
-    disable_spectral: bool = False,
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
@@ -1408,8 +1311,6 @@ def evaluate(
     Returns composite validation loss that mirrors training loss.
 
     Args:
-        spectral_only: If True, Stage 2 mode (UNet frozen, only SpectralShift active)
-        disable_spectral: If True, disable SpectralShift (Stage 1 mode)
         fast_mode: If True, skip expensive metrics (PSD, phase, baseline) for faster validation.
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
@@ -1419,10 +1320,6 @@ def evaluate(
         reverse_model.eval()
     if cond_encoder is not None:
         cond_encoder.eval()
-    if spectral_shift_fwd is not None:
-        spectral_shift_fwd.eval()
-    if spectral_shift_rev is not None:
-        spectral_shift_rev.eval()
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -1492,15 +1389,9 @@ def evaluate(
             else:
                 pred = model(ob, odor)
 
-            # Apply spectral shift OUTSIDE the model (FSDP-safe)
-            # Pass odor_ids for conditional spectral shift
-            # NOTE: Skip in Stage 1 (disable_spectral=True)
-            if spectral_shift_fwd is not None and not disable_spectral:
-                pred = spectral_shift_fwd(pred, odor_ids=odor)
-
             # Apply envelope histogram matching (closed-form correction for amplitude dynamics)
-            # This corrects bursty vs smooth characteristics - applied after spectral shift
-            if envelope_matcher_fwd is not None and not disable_spectral:
+            # This corrects bursty vs smooth characteristics
+            if envelope_matcher_fwd is not None:
                 pred = envelope_matcher_fwd(pred, odor_ids=odor)
 
             pred_c = crop_to_target_torch(pred)
@@ -1562,14 +1453,8 @@ def evaluate(
                 else:
                     pred_rev = reverse_model(pcx, odor)
 
-                # Apply spectral shift with SEPARATE reverse module
-                # Each direction learns independently - no inverse constraint
-                # NOTE: Skip in Stage 1 (disable_spectral=True)
-                if spectral_shift_rev is not None and not disable_spectral:
-                    pred_rev = spectral_shift_rev(pred_rev, odor_ids=odor)
-
                 # Apply envelope histogram matching (reverse direction)
-                if envelope_matcher_rev is not None and not disable_spectral:
+                if envelope_matcher_rev is not None:
                     pred_rev = envelope_matcher_rev(pred_rev, odor_ids=odor)
 
                 pred_rev_c = crop_to_target_torch(pred_rev)
@@ -1652,26 +1537,20 @@ def evaluate(
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
     if config is not None:
-        if spectral_only:
-            # Stage 2: Use PSD error for validation (SpectralShift optimization)
-            val_loss = results.get("psd_err_db", results["mae"])
-            if "psd_err_db_rev" in results:
-                val_loss += results["psd_err_db_rev"]
-        else:
-            # Stage 1: L1 + wavelet
-            w_l1 = config.get("weight_l1", 1.0)
-            w_wav = config.get("weight_wavelet", 1.0) if config.get("use_wavelet_loss", True) else 0.0
+        # L1 + wavelet
+        w_l1 = config.get("weight_l1", 1.0)
+        w_wav = config.get("weight_wavelet", 1.0) if config.get("use_wavelet_loss", True) else 0.0
 
-            # Forward loss
-            val_loss = w_l1 * results["mae"]
-            if "wavelet" in results:
-                val_loss += w_wav * results["wavelet"]
+        # Forward loss
+        val_loss = w_l1 * results["mae"]
+        if "wavelet" in results:
+            val_loss += w_wav * results["wavelet"]
 
-            # Reverse loss (if bidirectional)
-            if "mae_rev" in results:
-                val_loss += w_l1 * results["mae_rev"]
-                if "wavelet_rev" in results:
-                    val_loss += w_wav * results["wavelet_rev"]
+        # Reverse loss (if bidirectional)
+        if "mae_rev" in results:
+            val_loss += w_l1 * results["mae_rev"]
+            if "wavelet_rev" in results:
+                val_loss += w_wav * results["wavelet_rev"]
 
         results["loss"] = val_loss
 
@@ -1719,10 +1598,6 @@ def train_epoch(
     reverse_model: Optional[nn.Module] = None,
     epoch: int = 0,
     num_epochs: int = 0,
-    spectral_shift_fwd: Optional[nn.Module] = None,
-    spectral_shift_rev: Optional[nn.Module] = None,
-    stage2_spectral_only: bool = False,
-    disable_spectral: bool = False,
     cond_encoder: Optional[nn.Module] = None,
     projection_head_fwd: Optional[nn.Module] = None,
     projection_head_rev: Optional[nn.Module] = None,
@@ -1730,8 +1605,6 @@ def train_epoch(
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
-        stage2_spectral_only: If True, Stage 2 mode (UNet frozen, SpectralShift active)
-        disable_spectral: If True, disable SpectralShift application (Stage 1 mode)
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
     model.train()
@@ -1739,10 +1612,6 @@ def train_epoch(
         reverse_model.train()
     if cond_encoder is not None:
         cond_encoder.train()
-    if spectral_shift_fwd is not None:
-        spectral_shift_fwd.train()
-    if spectral_shift_rev is not None:
-        spectral_shift_rev.train()
     if projection_head_fwd is not None:
         projection_head_fwd.train()
     if projection_head_rev is not None:
@@ -1853,47 +1722,20 @@ def train_epoch(
         pcx_c = crop_to_target_torch(pcx)
         ob_c = crop_to_target_torch(ob)
 
-        # Apply spectral shift OUTSIDE the model (FSDP-safe)
-        # CRITICAL: Detach pred_raw so UNet does NOT get gradients from spectral loss!
-        # This ensures clean separation of responsibilities:
-        # - UNet handles waveform matching (L1 + wavelet loss)
-        # - SpectralShift ALONE handles PSD correction (spectral loss)
-        # Without detach, UNet and SpectralShift fight each other trying to fix PSD.
-        # NOTE: In Stage 1 (disable_spectral=True), skip SpectralShift entirely
-        if spectral_shift_fwd is not None and not disable_spectral:
-            pred_shifted = spectral_shift_fwd(pred_raw.detach(), odor_ids=odor)
-            pred_shifted_c = crop_to_target_torch(pred_shifted)
+        # L1/Huber + wavelet loss
+        loss_type = config.get("loss_type", "huber_wavelet")
+        if loss_type in ("huber", "huber_wavelet"):
+            recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
         else:
-            pred_shifted = pred_raw
-            pred_shifted_c = pred_raw_c
+            recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
+        loss = recon_loss
+        loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
 
-        # Stage 2 (UNet frozen): OptimalSpectralBias computes bias from statistics (no training needed)
-        # Stage 1 (UNet trainable): L1 + wavelet
-        if stage2_spectral_only:
-            # Stage 2: No loss needed - OptimalSpectralBias uses closed-form solution
-            # Just use wavelet loss if available for validation consistency
-            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-                loss = config["weight_wavelet"] * wavelet_loss(pred_shifted_c, pcx_c)
-                loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + loss.detach()
-            else:
-                loss = torch.tensor(0.0, device=device)
-
-        else:
-            # Stage 1: L1/Huber + wavelet
-            # Reconstruction loss (forward) - uses pred_raw (no SpectralShift gradient)
-            loss_type = config.get("loss_type", "huber_wavelet")
-            if loss_type in ("huber", "huber_wavelet"):
-                recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
-            else:
-                recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
-            loss = recon_loss
-            loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
-
-            # Wavelet loss (forward) - uses pred_raw (no SpectralShift gradient)
-            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-                w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
-                loss = loss + w_loss
-                loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
+        # Wavelet loss (forward)
+        if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+            w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
+            loss = loss + w_loss
+            loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -1925,61 +1767,40 @@ def train_epoch(
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
-            # Apply spectral shift with SEPARATE reverse module
-            # CRITICAL: Detach so reverse UNet doesn't get spectral loss gradients
-            # SpectralShift alone handles PSD correction for reverse direction
-            # NOTE: In Stage 1 (disable_spectral=True), skip SpectralShift entirely
-            if spectral_shift_rev is not None and not disable_spectral:
-                pred_rev_shifted = spectral_shift_rev(pred_rev_raw.detach(), odor_ids=odor)
-                pred_rev_shifted_c = crop_to_target_torch(pred_rev_shifted)
+            # L1/Huber + wavelet (reverse)
+            loss_type = config.get("loss_type", "huber_wavelet")
+            if loss_type in ("huber", "huber_wavelet"):
+                rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
             else:
-                pred_rev_shifted = pred_rev_raw
-                pred_rev_shifted_c = pred_rev_raw_c
+                rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
+            loss = loss + rev_loss
+            loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
 
-            # Stage 2: No training needed for reverse (OptimalSpectralBias uses closed-form)
-            if stage2_spectral_only:
-                # Just use wavelet loss if available for validation consistency
-                if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-                    w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_shifted_c, ob_c)
-                    loss = loss + w_loss_rev
-                    loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
+            # Wavelet loss (reverse)
+            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
+                w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
+                loss = loss + w_loss_rev
+                loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
+
+            # Cycle consistency: OB → PCx → OB
+            if cond_emb is not None:
+                cycle_ob = reverse_model(pred_raw, cond_emb=cond_emb)
             else:
-                # Stage 1: L1/Huber + wavelet
-                # Reconstruction loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
-                loss_type = config.get("loss_type", "huber_wavelet")
-                if loss_type in ("huber", "huber_wavelet"):
-                    rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
-                else:
-                    rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
-                loss = loss + rev_loss
-                loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
+                cycle_ob = reverse_model(pred_raw, odor)
+            cycle_ob_c = crop_to_target_torch(cycle_ob)
+            cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
+            loss = loss + cycle_loss_ob
+            loss_components["cycle_ob"] = loss_components["cycle_ob"] + cycle_loss_ob.detach()
 
-                # Wavelet loss (reverse) - uses pred_rev_raw (no SpectralShift gradient)
-                if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-                    w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
-                    loss = loss + w_loss_rev
-                    loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
-
-                # Cycle consistency: OB → PCx → OB (use raw, no spectral shift in cycle)
-                # Skip in Stage 2 since UNet is frozen
-                if cond_emb is not None:
-                    cycle_ob = reverse_model(pred_raw, cond_emb=cond_emb)
-                else:
-                    cycle_ob = reverse_model(pred_raw, odor)
-                cycle_ob_c = crop_to_target_torch(cycle_ob)
-                cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
-                loss = loss + cycle_loss_ob
-                loss_components["cycle_ob"] = loss_components["cycle_ob"] + cycle_loss_ob.detach()
-
-                # Cycle consistency: PCx → OB → PCx (use raw, no spectral shift in cycle)
-                if cond_emb is not None:
-                    cycle_pcx = model(pred_rev_raw, cond_emb=cond_emb)
-                else:
-                    cycle_pcx = model(pred_rev_raw, odor)
-                cycle_pcx_c = crop_to_target_torch(cycle_pcx)
-                cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
-                loss = loss + cycle_loss_pcx
-                loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
+            # Cycle consistency: PCx → OB → PCx
+            if cond_emb is not None:
+                cycle_pcx = model(pred_rev_raw, cond_emb=cond_emb)
+            else:
+                cycle_pcx = model(pred_rev_raw, odor)
+            cycle_pcx_c = crop_to_target_torch(cycle_pcx)
+            cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
+            loss = loss + cycle_loss_pcx
+            loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
         # Contrastive loss for session-invariant learning (CEBRA-style)
         # Two modes:
@@ -2086,9 +1907,6 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(projection_head_rev.parameters(), GRAD_CLIP)
             # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
-        # NOTE: We intentionally do NOT clip gradients for SpectralShift modules.
-        # They have only 32 params each with high lr (0.1), clipping would prevent convergence.
-        # The spectral loss gradient is naturally bounded by log PSD differences.
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -2218,7 +2036,6 @@ def train(
         attention_type=attention_type,
         norm_type=config.get("norm_type", "batch"),
         cond_mode=config.get("cond_mode", "film"),
-        use_spectral_shift=config.get("use_spectral_shift", True),
         # U-Net depth for frequency resolution
         n_downsample=config.get("n_downsample", 2),
         # Modern convolution options
@@ -2243,7 +2060,6 @@ def train(
             attention_type=attention_type,
             norm_type=config.get("norm_type", "batch"),
             cond_mode=config.get("cond_mode", "film"),
-            use_spectral_shift=config.get("use_spectral_shift", True),
             # U-Net depth (same as forward)
             n_downsample=config.get("n_downsample", 2),
             # Modern convolution options (same as forward)
@@ -2396,52 +2212,8 @@ def train(
         if cond_encoder is not None:
             cond_encoder = cond_encoder.to(device)
 
-    # Create SpectralShift modules OUTSIDE of FSDP (too small for sharding overhead)
-    # but DO wrap with DDP for gradient synchronization in distributed training
-    from models import OptimalSpectralBias, EnvelopeHistogramMatching
-
-    spectral_shift_fwd = None
-    spectral_shift_rev = None
-    if config.get("use_spectral_shift", True):
-        # Fixed per-odor spectral bias correction (no signal-adaptive network!)
-        # Computes optimal bias directly from UNet output vs target PSD difference
-        sampling_rate = config.get("sampling_rate", SAMPLING_RATE_HZ)
-        fwd_out_channels = config.get("out_channels", 32)  # Forward output channels
-        rev_out_channels = config.get("in_channels", 32)   # Reverse output = forward input
-        n_odors = config.get("n_odors", 7)
-        band_width_hz = config.get("spectral_shift_band_width_hz", None)
-
-        spectral_shift_fwd = OptimalSpectralBias(
-            n_channels=fwd_out_channels,
-            n_odors=n_odors,
-            sample_rate=sampling_rate,
-            band_width_hz=band_width_hz,
-        ).to(device)
-        spectral_shift_rev = OptimalSpectralBias(
-            n_channels=rev_out_channels,
-            n_odors=n_odors,
-            sample_rate=sampling_rate,
-            band_width_hz=band_width_hz,
-        ).to(device)
-
-        if band_width_hz is not None:
-            band_str = f", {spectral_shift_fwd.n_bands} bands @ {band_width_hz}Hz"
-        else:
-            band_str = ", 10 neuro bands"
-        mode_str = f"optimal_bias (fixed per-odor, n_odors={n_odors}{band_str})"
-
-        # Wrap with DDP for distributed training (gradient sync across ranks)
-        # Note: NOT using FSDP since these are tiny
-        # CRITICAL: Must use find_unused_parameters=True because in Stage 1 (two-stage training)
-        # SpectralShift modules are created but NOT used in forward pass (disable_spectral=True).
-        # Without this flag, DDP hangs waiting for gradient sync on unused parameters.
-        if is_distributed:
-            spectral_shift_fwd = DDP(spectral_shift_fwd, device_ids=[local_rank], find_unused_parameters=True)
-            spectral_shift_rev = DDP(spectral_shift_rev, device_ids=[local_rank], find_unused_parameters=True)
-
-        if is_primary():
-            ddp_str = " (DDP-wrapped)" if is_distributed else ""
-            print(f"SpectralShift created{ddp_str} mode={mode_str}")
+    # Import EnvelopeHistogramMatching for post-processing
+    from models import EnvelopeHistogramMatching
 
     # Create projection heads for contrastive learning (if enabled)
     projection_head_fwd = None
@@ -2514,9 +2286,7 @@ def train(
         ).to(device)
 
     # Create optimizer with parameter groups
-    # SpectralShift needs MUCH higher lr because it's just 32 scalars trying to make dB-scale changes
     lr = config.get("learning_rate", 1e-4)
-    spectral_shift_lr = config.get("spectral_shift_lr", 0.1)  # 500x higher for fast amplitude adaptation
 
     # Build parameter groups with different learning rates
     param_groups = [
@@ -2527,10 +2297,6 @@ def train(
     if cond_encoder is not None:
         # Conditioning encoder uses same lr as model
         param_groups.append({"params": list(cond_encoder.parameters()), "lr": lr, "name": "cond_encoder"})
-    if spectral_shift_fwd is not None:
-        param_groups.append({"params": list(spectral_shift_fwd.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_fwd"})
-    if spectral_shift_rev is not None:
-        param_groups.append({"params": list(spectral_shift_rev.parameters()), "lr": spectral_shift_lr, "name": "spectral_shift_rev"})
     # Projection heads for contrastive learning (use same lr as model)
     if projection_head_fwd is not None:
         param_groups.append({"params": list(projection_head_fwd.parameters()), "lr": lr, "name": "projection_head_fwd"})
@@ -2543,54 +2309,44 @@ def train(
     weight_decay = config.get("weight_decay", 0.0)
 
     if is_primary():
-        print(f"Optimizer: {total_params} total params | model lr={lr}, spectral_shift lr={spectral_shift_lr}, weight_decay={weight_decay}")
+        print(f"Optimizer: {total_params} total params | lr={lr}, weight_decay={weight_decay}")
 
     optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
 
     # Learning rate scheduler configuration
-    spectral_shift_lr_decay = config.get("spectral_shift_lr_decay", 0.95)
     num_epochs = config.get("num_epochs", 80)
     lr_scheduler_type = config.get("lr_scheduler", "none")
     lr_warmup_epochs = config.get("lr_warmup_epochs", 5)
     lr_min_ratio = config.get("lr_min_ratio", 0.01)
 
-    def make_lr_lambda(is_spectral_shift: bool):
+    def make_lr_lambda():
         """Create lr lambda for a param group."""
         def lr_lambda(epoch):
             # Base multiplier from scheduler type
             if lr_scheduler_type == "none":
-                base_mult = 1.0
+                return 1.0
             elif lr_scheduler_type == "cosine":
                 # Cosine annealing from 1.0 to lr_min_ratio
                 progress = epoch / max(num_epochs - 1, 1)
-                base_mult = lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+                return lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
             elif lr_scheduler_type == "cosine_warmup":
                 # Linear warmup then cosine decay
                 if epoch < lr_warmup_epochs:
-                    base_mult = (epoch + 1) / lr_warmup_epochs
+                    return (epoch + 1) / lr_warmup_epochs
                 else:
                     progress = (epoch - lr_warmup_epochs) / max(num_epochs - lr_warmup_epochs - 1, 1)
-                    base_mult = lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+                    return lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
             else:
-                base_mult = 1.0
-
-            # SpectralShift always gets exponential decay on top
-            if is_spectral_shift:
-                return base_mult * (spectral_shift_lr_decay ** epoch)
-            return base_mult
+                return 1.0
         return lr_lambda
 
     # Build per-group lr lambdas
-    lr_lambdas = []
-    for pg in param_groups:
-        is_spectral = pg.get("name", "").startswith("spectral_shift")
-        lr_lambdas.append(make_lr_lambda(is_spectral))
+    lr_lambdas = [make_lr_lambda() for _ in param_groups]
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambdas)
 
     if is_primary():
         print(f"LR scheduler: {lr_scheduler_type}" + (f" (warmup={lr_warmup_epochs}, min_ratio={lr_min_ratio})" if lr_scheduler_type != "none" else ""))
-        print(f"SpectralShift lr decay: {spectral_shift_lr_decay} per epoch")
 
     # =========================================================================
     # Initialize Recording System (for Nature Methods publication)
@@ -2616,125 +2372,61 @@ def train(
         )
         print(f"Recording system initialized: {recording_session.output_dir}")
 
-    # Two-stage training info: UNet convergence → SpectralShift fine-tuning
-    use_two_stage = config.get("use_two_stage", False)
-    spectral_finetune_epochs = config.get("spectral_finetune_epochs", 10)
-    stage2_only = config.get("stage2_only", False)
-    stage1_checkpoint = config.get("stage1_checkpoint", None)
-
-    # Validate stage2_only requirements
-    if stage2_only:
-        if stage1_checkpoint is None:
-            raise ValueError("stage2_only requires stage1_checkpoint path to be set!")
-
-        # Smart checkpoint path resolution - check multiple locations
-        stage1_checkpoint = Path(stage1_checkpoint)
-        if not stage1_checkpoint.exists():
-            # Try common locations
-            candidates = [
-                CHECKPOINT_DIR / stage1_checkpoint.name,  # artifacts/checkpoints/<filename>
-                CHECKPOINT_DIR / stage1_checkpoint,        # artifacts/checkpoints/<full_path>
-                Path("artifacts/checkpoints") / stage1_checkpoint.name,
-            ]
-            found = False
-            for candidate in candidates:
-                if candidate.exists():
-                    stage1_checkpoint = candidate
-                    found = True
-                    if is_primary():
-                        print(f"[INFO] Resolved checkpoint path: {stage1_checkpoint}")
-                    break
-            if not found:
-                raise FileNotFoundError(
-                    f"Stage 1 checkpoint not found: {stage1_checkpoint}\n"
-                    f"  Also checked: {[str(c) for c in candidates]}"
-                )
-        if is_primary():
-            print(f"\n{'='*70}")
-            print("STAGE 2 ONLY MODE")
-            print(f"{'='*70}")
-            print(f"  Skipping Stage 1 - loading checkpoint from:")
-            print(f"    {stage1_checkpoint}")
-            print(f"  Running Stage 2: Post-hoc calibration")
-            print(f"{'='*70}\n")
-
-    elif is_primary() and use_two_stage:
-        print(f"\n{'='*70}")
-        print("MULTI-STAGE TRAINING ENABLED")
-        print(f"{'='*70}")
-        print(f"  Stage 1: Train UNet + SpectralShift until early stopping")
-        print(f"  Stage 2: Post-hoc calibration (OptimalSpectralBias + EnvelopeHistogramMatching)")
-        print(f"{'='*70}\n")
-
     early_stop_patience = config.get("early_stop_patience", 8)
 
     # =============================================================================
-    # STAGE 1: Train UNet + SpectralShift together until early stopping
-    # (SKIPPED if stage2_only=True)
+    # Training loop
     # =============================================================================
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
     history = []
 
-    skip_stage1 = stage2_only
-    if not skip_stage1:
-        if is_primary() and use_two_stage:
-            print(f"\n{'='*70}")
-            print("STAGE 1: Training UNet + SpectralShift together")
-            print(f"{'='*70}\n")
+    for epoch in range(1, num_epochs + 1):
+        if loaders.get("train_sampler") is not None:
+            loaders["train_sampler"].set_epoch(epoch)
 
-        for epoch in range(1, num_epochs + 1):
-            if loaders.get("train_sampler") is not None:
-                loaders["train_sampler"].set_epoch(epoch)
+        train_metrics = train_epoch(
+            model, loaders["train"], optimizer, device, config,
+            wavelet_loss,
+            reverse_model, epoch, num_epochs,
+            cond_encoder=cond_encoder,
+            projection_head_fwd=projection_head_fwd,
+            projection_head_rev=projection_head_rev,
+        )
 
-            train_metrics = train_epoch(
-                model, loaders["train"], optimizer, device, config,
-                wavelet_loss,
-                reverse_model, epoch, num_epochs,
-                spectral_shift_fwd, spectral_shift_rev,
-                disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet training)
+        barrier()
+
+        # Validation (skip some epochs if val_every > 1 for faster training)
+        val_every = config.get("val_every", 1)
+        should_validate = (epoch % val_every == 0) or (epoch == num_epochs) or (epoch == 1)
+
+        if should_validate:
+            val_metrics = evaluate(
+                model, loaders["val"], device, wavelet_loss,
+                compute_phase=False, reverse_model=reverse_model, config=config,
+                fast_mode=True,
+                sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                projection_head_fwd=projection_head_fwd,
-                projection_head_rev=projection_head_rev,
             )
+            last_val_metrics = val_metrics  # Cache for non-validation epochs
 
-            barrier()
-
-            # Validation (skip some epochs if val_every > 1 for faster training)
-            val_every = config.get("val_every", 1)
-            should_validate = (epoch % val_every == 0) or (epoch == num_epochs) or (epoch == 1)
-
-            if should_validate:
-                val_metrics = evaluate(
-                    model, loaders["val"], device, wavelet_loss,
-                    compute_phase=False, reverse_model=reverse_model, config=config,
-                    spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                    disable_spectral=use_two_stage,  # Stage 1: Disable spectral if two-stage (pure UNet validation)
-                    fast_mode=True,  # Stage 1: Only compute r and r² (skip PSD metrics)
-                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                    cond_encoder=cond_encoder,
-                )
-                last_val_metrics = val_metrics  # Cache for non-validation epochs
-
-                # Per-session validation (if separate_val_sessions is enabled)
-                per_session_metrics = {}
-                if "val_sessions" in loaders and config.get("separate_val_sessions", False):
-                    for sess_name, sess_loader in loaders["val_sessions"].items():
-                        sess_metrics = evaluate(
-                            model, sess_loader, device, wavelet_loss,
-                            compute_phase=False, reverse_model=reverse_model, config=config,
-                            spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                            disable_spectral=use_two_stage,
-                            fast_mode=True,
-                            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                            cond_encoder=cond_encoder,
-                        )
-                        per_session_metrics[sess_name] = sess_metrics
-            else:
-                # Skip validation this epoch - use cached metrics
-                val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
-                per_session_metrics = {}
+            # Per-session validation (if separate_val_sessions is enabled)
+            per_session_metrics = {}
+            if "val_sessions" in loaders and config.get("separate_val_sessions", False):
+                for sess_name, sess_loader in loaders["val_sessions"].items():
+                    sess_metrics = evaluate(
+                        model, sess_loader, device, wavelet_loss,
+                        compute_phase=False, reverse_model=reverse_model, config=config,
+                        fast_mode=True,
+                        sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                        cond_encoder=cond_encoder,
+                    )
+                    per_session_metrics[sess_name] = sess_metrics
+        else:
+            # Skip validation this epoch - use cached metrics
+            val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
+            per_session_metrics = {}
 
             # Sync val_loss across ranks (for early stopping)
             val_loss = val_metrics.get("loss", val_metrics["mae"])  # fallback to mae if no composite
@@ -2756,8 +2448,6 @@ def train(
                     CHECKPOINT_DIR / "best_model.pt",
                     is_fsdp=is_fsdp_wrapped,
                     reverse_model=reverse_model,
-                    spectral_shift_fwd=spectral_shift_fwd,
-                    spectral_shift_rev=spectral_shift_rev,
                     config=config,
                     data=data,  # Save split info for validation
                 )
@@ -2924,7 +2614,7 @@ def train(
                 if epoch % 5 == 0:
                     recording_session.flush()
 
-            # Step the lr scheduler (decays SpectralShift lr)
+            # Step the lr scheduler
             scheduler.step()
 
             if patience_counter >= early_stop_patience:
@@ -2946,8 +2636,6 @@ def train(
             val_metrics_stage1 = evaluate(
                 model, loaders["val"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
-                spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                disable_spectral=use_two_stage,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             )
@@ -2958,8 +2646,6 @@ def train(
             test_metrics_stage1 = evaluate(
                 model, loaders["test"], device, wavelet_loss,
                 compute_phase=True, reverse_model=reverse_model, config=config,
-                spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
-                disable_spectral=use_two_stage,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             )
@@ -3018,7 +2704,6 @@ def train(
         test_metrics = evaluate(
             model, loaders["test"], device, wavelet_loss,
             compute_phase=True, reverse_model=reverse_model, config=config,
-            spectral_shift_fwd=spectral_shift_fwd, spectral_shift_rev=spectral_shift_rev,
             fast_mode=False,  # Full metrics for final evaluation
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             cond_encoder=cond_encoder,
@@ -3145,7 +2830,6 @@ def train(
                 session_metrics = evaluate(
                     model, session_loader, device, wavelet_loss,
                     compute_phase=False, reverse_model=None, config=config,
-                    spectral_shift_fwd=spectral_shift_fwd,
                     fast_mode=False,  # Need full metrics for baseline
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
@@ -3223,8 +2907,6 @@ def train(
             generate_training_plots(
                 model_fwd=base_model,
                 model_rev=base_reverse_model,
-                spectral_shift_fwd=spectral_shift_fwd,
-                spectral_shift_rev=spectral_shift_rev,
                 dataloader=plot_loader,
                 device=device,
                 vocab=data["vocab"],
@@ -3443,40 +3125,6 @@ def parse_args():
                              "'odor_onehot' (uses odor labels), "
                              "'cpc' (contrastive predictive coding), 'vqvae' (vector quantized), "
                              "'freq_disentangled' (per-band encoding), 'cycle_consistent' (cycle loss)")
-
-    # Stage 1 evaluation
-    parser.add_argument("--eval-stage1", action="store_true",
-                        help="Evaluate and save metrics after stage 1 (before spectral fine-tuning)")
-
-    # Spectral finetune epochs override
-    parser.add_argument("--spectral-finetune-epochs", type=int, default=None,
-                        help="Override number of spectral fine-tuning epochs")
-
-    # Spectral shift block configuration
-    parser.add_argument("--spectral-shift-mode", type=str, default=None,
-                        choices=["flat", "frequency_band"],
-                        help="Spectral shift mode: 'flat' (per-channel) or 'frequency_band' (per-band)")
-    parser.add_argument("--spectral-shift-conditional", type=lambda x: x.lower() == 'true',
-                        default=None, metavar="BOOL",
-                        help="Learn odor-specific spectral shifts (True/False)")
-    parser.add_argument("--spectral-shift-band-width", type=float, default=None,
-                        help="Band width in Hz for frequency_band mode (e.g., 2.0, 4.0, 8.0)")
-    parser.add_argument("--spectral-shift-per-channel", type=lambda x: x.lower() == 'true',
-                        default=None, metavar="BOOL",
-                        help="Learn per-channel spectral shifts (True/False)")
-    parser.add_argument("--spectral-shift-init-db", type=float, default=None,
-                        help="Initial dB shift value for spectral shift block")
-    parser.add_argument("--spectral-shift-lr", type=float, default=None,
-                        help="Learning rate for spectral shift parameters")
-    # Note: OptimalSpectralBias always computes bias directly from data (no training needed)
-
-    # Stage control
-    parser.add_argument("--skip-spectral-finetune", action="store_true",
-                        help="Skip Stage 2 (post-hoc calibration)")
-    parser.add_argument("--stage2-only", action="store_true",
-                        help="Skip Stage 1, load checkpoint and run Stage 2 (calibration)")
-    parser.add_argument("--load-checkpoint", type=str, default=None,
-                        help="Path to checkpoint to load for stage2-only mode")
 
     # Training mode control
     parser.add_argument("--no-bidirectional", action="store_true",
@@ -3821,37 +3469,6 @@ def main():
     if args.cond_mode is not None:
         config["cond_mode"] = args.cond_mode
     config["conditioning_source"] = args.conditioning  # odor_onehot, spectro_temporal, etc.
-    if args.spectral_finetune_epochs is not None:
-        config["spectral_finetune_epochs"] = args.spectral_finetune_epochs
-
-    # Spectral shift configuration from CLI
-    if args.spectral_shift_mode is not None:
-        config["spectral_shift_mode"] = args.spectral_shift_mode
-    if args.spectral_shift_conditional is not None:
-        config["spectral_shift_conditional"] = args.spectral_shift_conditional
-    if args.spectral_shift_band_width is not None:
-        config["spectral_shift_band_width_hz"] = args.spectral_shift_band_width
-    if args.spectral_shift_per_channel is not None:
-        config["spectral_shift_per_channel"] = args.spectral_shift_per_channel
-    if args.spectral_shift_init_db is not None:
-        config["spectral_shift_init_fwd"] = args.spectral_shift_init_db
-    if args.spectral_shift_lr is not None:
-        config["spectral_shift_lr"] = args.spectral_shift_lr
-    # Note: OptimalSpectralBias computes bias directly from data (no training config needed)
-
-    # Stage control from CLI
-    if args.skip_spectral_finetune:
-        config["spectral_finetune_epochs"] = 0  # Disables Stage 2 (post-hoc calibration)
-    if args.stage2_only:
-        config["stage2_only"] = True
-        if args.load_checkpoint:
-            config["stage1_checkpoint"] = args.load_checkpoint
-        else:
-            # Default to best_model.pt in artifacts/checkpoints
-            config["stage1_checkpoint"] = str(CHECKPOINT_DIR / "best_model.pt")
-
-    # Stage 1 evaluation flag
-    config["eval_stage1"] = args.eval_stage1
 
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
