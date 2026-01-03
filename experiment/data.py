@@ -2413,7 +2413,7 @@ class ContinuousLFPDataset(Dataset):
     def __len__(self) -> int:
         return self.n_windows
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
         start = idx * self.stride
         end = start + self.window_size
 
@@ -2426,7 +2426,8 @@ class ContinuousLFPDataset(Dataset):
             pcx_window = (pcx_window - pcx_window.mean(axis=1, keepdims=True)) / \
                          (pcx_window.std(axis=1, keepdims=True) + 1e-8)
 
-        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window)
+        # Return dummy label 0 for compatibility with training loop
+        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window), 0
 
 
 class MultiSessionContinuousDataset(Dataset):
@@ -2510,7 +2511,8 @@ def create_pcx1_dataloaders(
     zscore_per_window: bool = True,
     num_workers: int = 4,
     path: Path = PCX1_CONTINUOUS_PATH,
-) -> Dict[str, DataLoader]:
+    separate_val_sessions: bool = True,
+) -> Dict[str, Any]:
     """Create DataLoaders for PCx1 continuous data with session-based splits.
 
     Args:
@@ -2523,9 +2525,10 @@ def create_pcx1_dataloaders(
         zscore_per_window: Whether to z-score each window
         num_workers: Number of DataLoader workers
         path: Base path to continuous_1khz folder
+        separate_val_sessions: If True, also create per-session val loaders
 
     Returns:
-        Dictionary with 'train', 'val', and optionally 'test' DataLoaders
+        Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
     """
     # Load sessions
     print("Loading training sessions...")
@@ -2557,6 +2560,27 @@ def create_pcx1_dataloaders(
             pin_memory=True,
         ),
     }
+
+    # Create per-session validation loaders for separate evaluation
+    if separate_val_sessions:
+        val_sessions_loaders = {}
+        for sess_data in val_data:
+            sess_name = sess_data['session']
+            sess_dataset = ContinuousLFPDataset(
+                ob=sess_data['ob'],
+                pcx=sess_data['pcx'],
+                window_size=window_size,
+                stride=stride,
+                zscore_per_window=zscore_per_window,
+            )
+            val_sessions_loaders[sess_name] = DataLoader(
+                sess_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+        dataloaders['val_sessions'] = val_sessions_loaders
 
     if test_sessions:
         print("Loading test sessions...")

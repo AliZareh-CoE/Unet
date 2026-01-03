@@ -2171,9 +2171,15 @@ def train(
             "train": data["train_loader"],
             "val": data["val_loader"],
         }
+        # Add per-session val loaders if available
+        if data.get("val_sessions_loaders"):
+            loaders["val_sessions"] = data["val_sessions_loaders"]
         if is_primary():
             print(f"PCx1 DataLoaders: {len(loaders['train'].dataset)} train windows, "
                   f"{len(loaders['val'].dataset)} val windows")
+            if "val_sessions" in loaders:
+                for sess_name, sess_loader in loaders["val_sessions"].items():
+                    print(f"  Val session {sess_name}: {len(sess_loader.dataset)} windows")
     elif config.get("dataset_type") == "pfc":
         loaders = create_pfc_dataloaders(
             data,
@@ -3660,12 +3666,14 @@ def main():
             batch_size=config["batch_size"],
             zscore_per_window=True,
             num_workers=4,
+            separate_val_sessions=config.get("separate_val_sessions", True),
         )
 
         # Build a minimal data dict for compatibility with rest of training loop
         data = {
             "train_loader": loaders["train"],
             "val_loader": loaders["val"],
+            "val_sessions_loaders": loaders.get("val_sessions"),  # For per-session eval
             "train_sessions": train_sessions,
             "val_sessions": val_sessions,
             "n_odors": 1,  # No odor conditioning for continuous data
