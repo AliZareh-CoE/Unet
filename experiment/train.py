@@ -3725,11 +3725,26 @@ def main():
                 print(f"Val stride: {val_stride} samples ({val_stride_mult:.1f}x train stride for faster eval)")
 
         # Auto-detect num_workers if not specified
+        # When running multi-GPU, reduce workers per process to avoid shared memory exhaustion
         num_workers = config["num_workers"]
         if num_workers is None:
             import os
-            num_workers = min(8, os.cpu_count() or 4)
+            world_size = get_world_size()
+            cpu_count = os.cpu_count() or 8
+            # With 8 GPUs, use 2 workers per GPU; with 1 GPU, use up to 8
+            num_workers = max(2, min(8, cpu_count // max(1, world_size)))
         prefetch_factor = config["prefetch_factor"]
+
+        # Reduce prefetch and disable persistent_workers when running multi-GPU to save shared memory
+        use_persistent = True
+        if get_world_size() > 1:
+            if prefetch_factor > 2:
+                prefetch_factor = 2
+            # Disable persistent_workers with many GPUs to avoid /dev/shm exhaustion
+            use_persistent = False
+
+        if is_primary():
+            print(f"DataLoader: {num_workers} workers, prefetch={prefetch_factor}, persistent={use_persistent}")
 
         # Create dataloaders
         loaders = create_pcx1_dataloaders(
@@ -3743,7 +3758,7 @@ def main():
             zscore_per_window=True,
             num_workers=num_workers,
             separate_val_sessions=config.get("separate_val_sessions", True),
-            persistent_workers=True,
+            persistent_workers=use_persistent,
             prefetch_factor=prefetch_factor,
         )
 
