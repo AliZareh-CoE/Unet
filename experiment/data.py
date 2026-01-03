@@ -2188,7 +2188,7 @@ def get_label_name(vocab: Dict[str, int], label_id: int) -> str:
 
 def get_data_info(data: Dict[str, Any]) -> Dict[str, Any]:
     """Get summary information about loaded data.
-    
+
     Works for both olfactory and PFC datasets.
     """
     # Determine dataset type
@@ -2223,3 +2223,386 @@ def get_data_info(data: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         raise ValueError("Unknown data format")
+
+
+# =============================================================================
+# PCx1 Continuous LFP Dataset (1kHz)
+# =============================================================================
+
+# Paths for PCx1 continuous dataset
+PCX1_CONTINUOUS_PATH = Path("/data/PCx1/extracted/continuous_1khz")
+PCX1_SAMPLING_RATE = 1000  # Hz
+PCX1_N_CHANNELS = 32  # per region (OB and PCx)
+
+
+def list_pcx1_sessions(path: Path = PCX1_CONTINUOUS_PATH) -> List[str]:
+    """List available PCx1 continuous sessions.
+
+    Returns:
+        List of session names (e.g., ['141208-1', '141208-2', ...])
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"PCx1 continuous data path not found: {path}")
+
+    sessions = sorted([
+        d.name for d in path.iterdir()
+        if d.is_dir() and (d / 'OB.npy').exists()
+    ])
+    return sessions
+
+
+def load_pcx1_session_metadata(
+    session: str,
+    path: Path = PCX1_CONTINUOUS_PATH
+) -> Dict[str, Any]:
+    """Load metadata for a PCx1 session.
+
+    Args:
+        session: Session name (e.g., '141208-1')
+        path: Base path to continuous_1khz folder
+
+    Returns:
+        Dictionary containing session metadata
+    """
+    session_path = path / session
+    metadata_path = session_path / 'metadata.json'
+
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata not found for session {session}: {metadata_path}")
+
+    with open(metadata_path) as f:
+        return json.load(f)
+
+
+def load_pcx1_session(
+    session: str,
+    path: Path = PCX1_CONTINUOUS_PATH,
+    load_resp: bool = True,
+    load_trials: bool = True,
+    zscore: bool = False,
+) -> Dict[str, Any]:
+    """Load a single PCx1 session's continuous data.
+
+    Args:
+        session: Session name (e.g., '141208-1')
+        path: Base path to continuous_1khz folder
+        load_resp: Whether to load respiration signal
+        load_trials: Whether to load trial info CSVs
+        zscore: Whether to z-score normalize the data (per channel)
+
+    Returns:
+        Dictionary containing:
+            - ob: OB signals [32, n_samples]
+            - pcx: PCx signals [32, n_samples]
+            - resp: Respiration signal [n_samples] (if load_resp=True)
+            - breath_times: Array of breath timestamps (if exists)
+            - trials: DataFrame of valid trials (if load_trials=True)
+            - metadata: Session metadata dict
+            - session: Session name
+            - sampling_rate: 1000 Hz
+    """
+    session_path = path / session
+
+    if not session_path.exists():
+        raise FileNotFoundError(f"Session not found: {session_path}")
+
+    # Load neural data
+    ob = np.load(session_path / 'OB.npy').astype(np.float32)
+    pcx = np.load(session_path / 'PCx.npy').astype(np.float32)
+
+    # Optional z-score normalization (per channel)
+    if zscore:
+        ob = (ob - ob.mean(axis=1, keepdims=True)) / (ob.std(axis=1, keepdims=True) + 1e-8)
+        pcx = (pcx - pcx.mean(axis=1, keepdims=True)) / (pcx.std(axis=1, keepdims=True) + 1e-8)
+
+    result = {
+        'ob': ob,
+        'pcx': pcx,
+        'session': session,
+        'sampling_rate': PCX1_SAMPLING_RATE,
+    }
+
+    # Load respiration
+    if load_resp:
+        resp_path = session_path / 'Resp.npy'
+        if resp_path.exists():
+            result['resp'] = np.load(resp_path).astype(np.float32)
+
+        breath_path = session_path / 'breath_times.npy'
+        if breath_path.exists():
+            result['breath_times'] = np.load(breath_path)
+
+    # Load trial info
+    if load_trials:
+        trials_path = session_path / 'valid_trials.csv'
+        if trials_path.exists():
+            result['trials'] = pd.read_csv(trials_path)
+
+    # Load metadata
+    metadata_path = session_path / 'metadata.json'
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            result['metadata'] = json.load(f)
+
+    return result
+
+
+def load_pcx1_all_sessions(
+    path: Path = PCX1_CONTINUOUS_PATH,
+    sessions: Optional[List[str]] = None,
+    zscore: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Load all PCx1 sessions.
+
+    Args:
+        path: Base path to continuous_1khz folder
+        sessions: List of session names to load (None = all)
+        zscore: Whether to z-score normalize
+
+    Returns:
+        Dictionary mapping session name to session data
+    """
+    if sessions is None:
+        sessions = list_pcx1_sessions(path)
+
+    all_data = {}
+    for session in sessions:
+        print(f"Loading session {session}...")
+        all_data[session] = load_pcx1_session(session, path, zscore=zscore)
+
+    return all_data
+
+
+class ContinuousLFPDataset(Dataset):
+    """PyTorch Dataset for continuous LFP data with sliding window.
+
+    Creates windows from continuous recordings for training neural translation models.
+
+    Args:
+        ob: OB signals [n_channels, n_samples] or [n_samples, n_channels]
+        pcx: PCx signals [n_channels, n_samples] or [n_samples, n_channels]
+        window_size: Window size in samples (default: 5000 = 5 seconds at 1kHz)
+        stride: Stride between windows in samples (default: window_size // 2)
+        zscore_per_window: Whether to z-score each window independently
+        channels_first: If True, expect input as [n_channels, n_samples]
+    """
+    def __init__(
+        self,
+        ob: np.ndarray,
+        pcx: np.ndarray,
+        window_size: int = 5000,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        channels_first: bool = True,
+    ):
+        # Ensure channels-first format: [n_channels, n_samples]
+        if not channels_first:
+            ob = ob.T
+            pcx = pcx.T
+
+        self.ob = ob.astype(np.float32)
+        self.pcx = pcx.astype(np.float32)
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+
+        # Calculate number of windows
+        n_samples = self.ob.shape[1]
+        self.n_windows = max(0, (n_samples - window_size) // self.stride + 1)
+
+    def __len__(self) -> int:
+        return self.n_windows
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        start = idx * self.stride
+        end = start + self.window_size
+
+        ob_window = self.ob[:, start:end].copy()
+        pcx_window = self.pcx[:, start:end].copy()
+
+        if self.zscore_per_window:
+            ob_window = (ob_window - ob_window.mean(axis=1, keepdims=True)) / \
+                        (ob_window.std(axis=1, keepdims=True) + 1e-8)
+            pcx_window = (pcx_window - pcx_window.mean(axis=1, keepdims=True)) / \
+                         (pcx_window.std(axis=1, keepdims=True) + 1e-8)
+
+        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window)
+
+
+class MultiSessionContinuousDataset(Dataset):
+    """PyTorch Dataset combining multiple sessions with sliding windows.
+
+    Useful for training on data from multiple recording sessions.
+
+    Args:
+        sessions_data: List of session data dicts (from load_pcx1_session)
+        window_size: Window size in samples
+        stride: Stride between windows
+        zscore_per_window: Whether to z-score each window
+    """
+    def __init__(
+        self,
+        sessions_data: List[Dict[str, Any]],
+        window_size: int = 5000,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+    ):
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+
+        # Build index mapping: global_idx -> (session_idx, local_window_idx)
+        self.sessions = []
+        self.window_mapping = []
+
+        for sess_idx, sess_data in enumerate(sessions_data):
+            ob = sess_data['ob'].astype(np.float32)
+            pcx = sess_data['pcx'].astype(np.float32)
+            n_samples = ob.shape[1]
+            n_windows = max(0, (n_samples - window_size) // self.stride + 1)
+
+            self.sessions.append({
+                'ob': ob,
+                'pcx': pcx,
+                'name': sess_data.get('session', f'session_{sess_idx}'),
+                'n_windows': n_windows,
+            })
+
+            for local_idx in range(n_windows):
+                self.window_mapping.append((sess_idx, local_idx))
+
+        print(f"MultiSessionContinuousDataset: {len(sessions_data)} sessions, "
+              f"{len(self.window_mapping)} total windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        sess_idx, local_idx = self.window_mapping[idx]
+        sess = self.sessions[sess_idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        ob_window = sess['ob'][:, start:end].copy()
+        pcx_window = sess['pcx'][:, start:end].copy()
+
+        if self.zscore_per_window:
+            ob_window = (ob_window - ob_window.mean(axis=1, keepdims=True)) / \
+                        (ob_window.std(axis=1, keepdims=True) + 1e-8)
+            pcx_window = (pcx_window - pcx_window.mean(axis=1, keepdims=True)) / \
+                         (pcx_window.std(axis=1, keepdims=True) + 1e-8)
+
+        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window), sess_idx
+
+    def get_session_name(self, sess_idx: int) -> str:
+        """Get session name by index."""
+        return self.sessions[sess_idx]['name']
+
+
+def create_pcx1_dataloaders(
+    train_sessions: List[str],
+    val_sessions: List[str],
+    test_sessions: Optional[List[str]] = None,
+    window_size: int = 5000,
+    stride: Optional[int] = None,
+    batch_size: int = 32,
+    zscore_per_window: bool = True,
+    num_workers: int = 4,
+    path: Path = PCX1_CONTINUOUS_PATH,
+) -> Dict[str, DataLoader]:
+    """Create DataLoaders for PCx1 continuous data with session-based splits.
+
+    Args:
+        train_sessions: List of session names for training
+        val_sessions: List of session names for validation
+        test_sessions: List of session names for testing (optional)
+        window_size: Window size in samples (5000 = 5 seconds)
+        stride: Stride between windows (default: window_size // 2)
+        batch_size: Batch size for DataLoader
+        zscore_per_window: Whether to z-score each window
+        num_workers: Number of DataLoader workers
+        path: Base path to continuous_1khz folder
+
+    Returns:
+        Dictionary with 'train', 'val', and optionally 'test' DataLoaders
+    """
+    # Load sessions
+    print("Loading training sessions...")
+    train_data = [load_pcx1_session(s, path) for s in train_sessions]
+    print("Loading validation sessions...")
+    val_data = [load_pcx1_session(s, path) for s in val_sessions]
+
+    # Create datasets
+    train_dataset = MultiSessionContinuousDataset(
+        train_data, window_size, stride, zscore_per_window
+    )
+    val_dataset = MultiSessionContinuousDataset(
+        val_data, window_size, stride, zscore_per_window
+    )
+
+    dataloaders = {
+        'train': DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        ),
+        'val': DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        ),
+    }
+
+    if test_sessions:
+        print("Loading test sessions...")
+        test_data = [load_pcx1_session(s, path) for s in test_sessions]
+        test_dataset = MultiSessionContinuousDataset(
+            test_data, window_size, stride, zscore_per_window
+        )
+        dataloaders['test'] = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+    return dataloaders
+
+
+def get_pcx1_session_splits(
+    seed: int = 42,
+    n_val: int = 2,
+    n_test: int = 2,
+    path: Path = PCX1_CONTINUOUS_PATH,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Get random session-based train/val/test splits for PCx1.
+
+    Args:
+        seed: Random seed for reproducibility
+        n_val: Number of validation sessions
+        n_test: Number of test sessions
+        path: Base path to continuous_1khz folder
+
+    Returns:
+        Tuple of (train_sessions, val_sessions, test_sessions)
+    """
+    sessions = list_pcx1_sessions(path)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(sessions)
+
+    test_sessions = sessions[:n_test]
+    val_sessions = sessions[n_test:n_test + n_val]
+    train_sessions = sessions[n_test + n_val:]
+
+    print(f"PCx1 Session Split (seed={seed}):")
+    print(f"  Train: {train_sessions}")
+    print(f"  Val:   {val_sessions}")
+    print(f"  Test:  {test_sessions}")
+
+    return train_sessions, val_sessions, test_sessions
