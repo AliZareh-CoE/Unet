@@ -1985,8 +1985,8 @@ def train(
     num_workers = min(8, num_cpus // max(1, get_world_size()))  # Per-GPU workers
 
     # Create dataloaders based on dataset type
-    if config.get("dataset_type") == "pcx1":
-        # PCx1 already has loaders created
+    if config.get("dataset_type") in ("pcx1", "allen"):
+        # PCx1/Allen already have loaders created
         loaders = {
             "train": data["train_loader"],
             "val": data["val_loader"],
@@ -1995,7 +1995,8 @@ def train(
         if data.get("val_sessions_loaders"):
             loaders["val_sessions"] = data["val_sessions_loaders"]
         if is_primary():
-            print(f"PCx1 DataLoaders: {len(loaders['train'].dataset)} train windows, "
+            dataset_name = config.get("dataset_type", "").upper()
+            print(f"{dataset_name} DataLoaders: {len(loaders['train'].dataset)} train windows, "
                   f"{len(loaders['val'].dataset)} val windows")
             if "val_sessions" in loaders:
                 for sess_name, sess_loader in loaders["val_sessions"].items():
