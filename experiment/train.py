@@ -3514,11 +3514,9 @@ def main():
             separate_val_sessions=config.get("separate_val_sessions", True),
         )
 
-        # Get channel counts from first session metadata
-        from data import load_allen_paired_session
-        meta = load_allen_paired_session(train_sessions[0], paired_name)
-        in_channels = meta["source"].shape[0]
-        out_channels = meta["target"].shape[0]
+        # Get max channel counts from dataloaders (handles varying channels per session)
+        in_channels = loaders['max_source_channels']
+        out_channels = loaders['max_target_channels']
 
         data = {
             "train_loader": loaders["train"],

@@ -2796,12 +2796,16 @@ class AllenContinuousDataset(Dataset):
         window_size: int = 5000,
         stride: Optional[int] = None,
         zscore_per_window: bool = False,  # Model handles input normalization internally
+        max_source_channels: Optional[int] = None,
+        max_target_channels: Optional[int] = None,
     ):
         self.source = source.astype(np.float32)
         self.target = target.astype(np.float32)
         self.window_size = window_size
         self.stride = stride if stride is not None else window_size // 2
         self.zscore_per_window = zscore_per_window
+        self.max_source_channels = max_source_channels or source.shape[0]
+        self.max_target_channels = max_target_channels or target.shape[0]
 
         n_samples = min(source.shape[1], target.shape[1])
         self.n_windows = max(0, (n_samples - window_size) // self.stride + 1)
@@ -2819,6 +2823,16 @@ class AllenContinuousDataset(Dataset):
         if self.zscore_per_window:
             src = (src - src.mean(axis=1, keepdims=True)) / (src.std(axis=1, keepdims=True) + 1e-8)
             tgt = (tgt - tgt.mean(axis=1, keepdims=True)) / (tgt.std(axis=1, keepdims=True) + 1e-8)
+
+        # Pad channels to max size (zero-padding)
+        if src.shape[0] < self.max_source_channels:
+            pad_src = np.zeros((self.max_source_channels, self.window_size), dtype=np.float32)
+            pad_src[:src.shape[0], :] = src
+            src = pad_src
+        if tgt.shape[0] < self.max_target_channels:
+            pad_tgt = np.zeros((self.max_target_channels, self.window_size), dtype=np.float32)
+            pad_tgt[:tgt.shape[0], :] = tgt
+            tgt = pad_tgt
 
         return torch.from_numpy(src), torch.from_numpy(tgt), 0
 
@@ -2863,12 +2877,23 @@ def create_allen_dataloaders(
 
     # Build combined training dataset with session tracking
     class MultiSessionAllenDataset(Dataset):
-        def __init__(self, sessions_data, window_size, stride, zscore):
+        def __init__(self, sessions_data, window_size, stride, zscore,
+                     max_source_channels=None, max_target_channels=None):
             self.window_size = window_size
             self.stride = stride if stride else window_size // 2
             self.zscore = zscore
             self.sessions = []
             self.window_mapping = []
+
+            # First pass: find max channels if not provided
+            if max_source_channels is None or max_target_channels is None:
+                max_src = max(sess['source'].shape[0] for sess in sessions_data)
+                max_tgt = max(sess['target'].shape[0] for sess in sessions_data)
+                self.max_source_channels = max_source_channels or max_src
+                self.max_target_channels = max_target_channels or max_tgt
+            else:
+                self.max_source_channels = max_source_channels
+                self.max_target_channels = max_target_channels
 
             for sess_idx, sess in enumerate(sessions_data):
                 src = sess['source'].astype(np.float32)
@@ -2880,12 +2905,15 @@ def create_allen_dataloaders(
                     'source': src,
                     'target': tgt,
                     'name': sess['session'],
+                    'src_channels': src.shape[0],
+                    'tgt_channels': tgt.shape[0],
                 })
 
                 for local_idx in range(n_windows):
                     self.window_mapping.append((sess_idx, local_idx))
 
             print(f"AllenDataset: {len(sessions_data)} sessions, {len(self.window_mapping)} windows")
+            print(f"  Padded to: {self.max_source_channels} source, {self.max_target_channels} target channels")
 
         def __len__(self):
             return len(self.window_mapping)
@@ -2903,10 +2931,34 @@ def create_allen_dataloaders(
                 src = (src - src.mean(axis=1, keepdims=True)) / (src.std(axis=1, keepdims=True) + 1e-8)
                 tgt = (tgt - tgt.mean(axis=1, keepdims=True)) / (tgt.std(axis=1, keepdims=True) + 1e-8)
 
+            # Pad channels to max size (zero-padding)
+            if src.shape[0] < self.max_source_channels:
+                pad_src = np.zeros((self.max_source_channels, self.window_size), dtype=np.float32)
+                pad_src[:src.shape[0], :] = src
+                src = pad_src
+            if tgt.shape[0] < self.max_target_channels:
+                pad_tgt = np.zeros((self.max_target_channels, self.window_size), dtype=np.float32)
+                pad_tgt[:tgt.shape[0], :] = tgt
+                tgt = pad_tgt
+
             return torch.from_numpy(src), torch.from_numpy(tgt), sess_idx
 
-    train_dataset = MultiSessionAllenDataset(train_data, window_size, stride, zscore_per_window)
-    val_dataset = MultiSessionAllenDataset(val_data, window_size, stride, zscore_per_window)
+    # Find global max channels across ALL sessions (train + val)
+    all_data = train_data + val_data
+    max_source_channels = max(d['source'].shape[0] for d in all_data)
+    max_target_channels = max(d['target'].shape[0] for d in all_data)
+    print(f"Global max channels: {max_source_channels} source, {max_target_channels} target")
+
+    train_dataset = MultiSessionAllenDataset(
+        train_data, window_size, stride, zscore_per_window,
+        max_source_channels=max_source_channels,
+        max_target_channels=max_target_channels
+    )
+    val_dataset = MultiSessionAllenDataset(
+        val_data, window_size, stride, zscore_per_window,
+        max_source_channels=max_source_channels,
+        max_target_channels=max_target_channels
+    )
 
     dataloaders = {
         'train': DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
@@ -2925,12 +2977,18 @@ def create_allen_dataloaders(
                 window_size=window_size,
                 stride=stride,
                 zscore_per_window=zscore_per_window,
+                max_source_channels=max_source_channels,
+                max_target_channels=max_target_channels,
             )
             val_sessions_loaders[sess['session']] = DataLoader(
                 sess_dataset, batch_size=batch_size, shuffle=False,
                 num_workers=num_workers, pin_memory=True,
             )
         dataloaders['val_sessions'] = val_sessions_loaders
+
+    # Add channel info to return dict
+    dataloaders['max_source_channels'] = max_source_channels
+    dataloaders['max_target_channels'] = max_target_channels
 
     return dataloaders
 
