@@ -763,13 +763,15 @@ def apply_augmentations(
         ob = aug_gaussian_noise(ob, noise_std)
         pcx = aug_gaussian_noise(pcx, noise_std)
 
-    # Channel dropout: apply same mask to both (maintains channel correspondence)
+    # Channel dropout: apply independently (channels may differ between input/output)
     if config.get("aug_channel_dropout", False):
         dropout_p = config.get("aug_channel_dropout_p", 0.1)
-        batch_size, n_channels, _ = ob.shape
-        mask = torch.bernoulli(torch.full((batch_size, n_channels, 1), 1 - dropout_p, device=ob.device))
-        ob = ob * mask
-        pcx = pcx * mask
+        batch_size, n_channels_ob, _ = ob.shape
+        _, n_channels_pcx, _ = pcx.shape
+        mask_ob = torch.bernoulli(torch.full((batch_size, n_channels_ob, 1), 1 - dropout_p, device=ob.device))
+        mask_pcx = torch.bernoulli(torch.full((batch_size, n_channels_pcx, 1), 1 - dropout_p, device=pcx.device))
+        ob = ob * mask_ob
+        pcx = pcx * mask_pcx
 
     # Amplitude scale: apply same scale to both (maintains relative amplitude)
     if config.get("aug_amplitude_scale", False):
@@ -820,17 +822,18 @@ def apply_augmentations(
 
     # Session-specific augmentations (simulate cross-session variability)
 
-    # Per-channel scaling: apply same scale pattern to both (simulates electrode drift)
+    # Per-channel scaling: apply independently (simulates electrode drift)
     if config.get("aug_channel_scale", False):
         scale_range = config.get("aug_channel_scale_range", (0.7, 1.4))
-        batch_size, n_channels, _ = ob.shape
+        batch_size, n_channels_ob, _ = ob.shape
+        _, n_channels_pcx, _ = pcx.shape
         min_scale, max_scale = scale_range
-        # Same per-channel scale for both OB and PCx (electrodes drift together in same rig)
-        scales = torch.empty(1, n_channels, 1, device=ob.device).uniform_(min_scale, max_scale)
-        scales = scales.expand(batch_size, -1, -1)
-        ob = ob * scales
-        # Different scale pattern for PCx (different electrodes)
-        scales_pcx = torch.empty(1, n_channels, 1, device=pcx.device).uniform_(min_scale, max_scale)
+        # Per-channel scale for OB
+        scales_ob = torch.empty(1, n_channels_ob, 1, device=ob.device).uniform_(min_scale, max_scale)
+        scales_ob = scales_ob.expand(batch_size, -1, -1)
+        ob = ob * scales_ob
+        # Per-channel scale for PCx (different electrodes, different channel count)
+        scales_pcx = torch.empty(1, n_channels_pcx, 1, device=pcx.device).uniform_(min_scale, max_scale)
         scales_pcx = scales_pcx.expand(batch_size, -1, -1)
         pcx = pcx * scales_pcx
 
