@@ -3484,11 +3484,17 @@ def main():
         if is_primary():
             print(f"Window: {window_size} samples, train stride: {train_stride}, val stride: {val_stride}")
 
-        # DataLoader settings
-        num_workers = config.get("num_workers", 4)
-        prefetch_factor = config.get("prefetch_factor", 2)
-        use_persistent = True
+        # Auto-detect num_workers if not specified
+        num_workers = config["num_workers"]
+        if num_workers is None:
+            import os
+            world_size = get_world_size()
+            cpu_count = os.cpu_count() or 8
+            num_workers = max(2, min(8, cpu_count // max(1, world_size)))
+        prefetch_factor = config["prefetch_factor"]
 
+        # Reduce prefetch and disable persistent_workers when running multi-GPU
+        use_persistent = True
         if get_world_size() > 1:
             if prefetch_factor > 2:
                 prefetch_factor = 2
