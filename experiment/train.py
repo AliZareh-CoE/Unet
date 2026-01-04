@@ -106,10 +106,6 @@ from data import (
     list_pcx1_sessions,
     load_pcx1_session,
     create_pcx1_dataloaders,
-    create_allen_dataloaders,
-    list_allen_paired_datasets,
-    list_allen_paired_sessions,
-    ALLEN_SAMPLING_RATE,
     get_pcx1_session_splits,
     PCX1_SAMPLING_RATE,
 )
@@ -1988,8 +1984,8 @@ def train(
     num_workers = min(8, num_cpus // max(1, get_world_size()))  # Per-GPU workers
 
     # Create dataloaders based on dataset type
-    if config.get("dataset_type") in ("pcx1", "allen"):
-        # PCx1/Allen already have loaders created
+    if config.get("dataset_type") == "pcx1":
+        # PCx1 already has loaders created
         loaders = {
             "train": data["train_loader"],
             "val": data["val_loader"],
@@ -3015,10 +3011,9 @@ def parse_args():
     
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "pcx1", "allen"],
+                        choices=["olfactory", "pfc", "pcx1"],
                         help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
-                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), "
-                             "or 'allen' (Allen Neuropixels paired regions)")
+                             "'pfc' (PFC→CA1), or 'pcx1' (continuous 1kHz LFP)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
@@ -3039,20 +3034,6 @@ def parse_args():
                         help="Explicit validation sessions for PCx1 (default: 4 random sessions)")
     parser.add_argument("--pcx1-n-val", type=int, default=4,
                         help="Number of validation sessions for PCx1 if not explicitly specified (default: 4)")
-
-    # Allen Neuropixels dataset options
-    parser.add_argument("--allen-pair", type=str, default="paired_LGd_VISp",
-                        help="Allen paired dataset name (e.g., 'paired_LGd_VISp', 'paired_VISp_VISl')")
-    parser.add_argument("--allen-train-sessions", type=str, nargs="+", default=None,
-                        help="Explicit training sessions for Allen (default: all except val)")
-    parser.add_argument("--allen-val-sessions", type=str, nargs="+", default=None,
-                        help="Explicit validation sessions for Allen (default: 4 random sessions)")
-    parser.add_argument("--allen-n-val", type=int, default=4,
-                        help="Number of validation sessions for Allen if not explicitly specified (default: 4)")
-    parser.add_argument("--allen-window-size", type=int, default=5000,
-                        help="Window size in samples for Allen data (default: 5000 = 5 seconds at 1kHz)")
-    parser.add_argument("--allen-stride", type=int, default=None,
-                        help="Stride between windows for Allen (default: window_size // 2)")
 
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3444,101 +3425,6 @@ def main():
         config["pcx1_stride"] = train_stride
         config["pcx1_val_stride"] = val_stride
         config["split_by_session"] = True  # Always session-based for PCx1
-
-    elif args.dataset == "allen":
-        # Allen Neuropixels paired regions dataset
-        paired_name = args.allen_pair
-
-        # Get available sessions for this paired dataset
-        try:
-            available_sessions = list_allen_paired_sessions(paired_name)
-        except Exception as e:
-            raise ValueError(f"Could not load Allen paired dataset '{paired_name}': {e}\n"
-                           f"Available pairs: {list_allen_paired_datasets()}")
-
-        if is_primary():
-            print(f"Allen paired dataset: {paired_name}")
-            print(f"Available sessions: {len(available_sessions)}")
-
-        # Determine train/val sessions
-        if args.allen_val_sessions:
-            val_sessions = args.allen_val_sessions
-        else:
-            # Random subset for validation
-            import random
-            n_val = min(args.allen_n_val, len(available_sessions) // 2)
-            random.seed(42)  # Reproducible
-            val_sessions = random.sample(available_sessions, n_val)
-
-        if args.allen_train_sessions:
-            train_sessions = args.allen_train_sessions
-        else:
-            # All sessions not in validation
-            train_sessions = [s for s in available_sessions if s not in val_sessions]
-
-        if is_primary():
-            print(f"Training sessions ({len(train_sessions)}): {train_sessions}")
-            print(f"Validation sessions ({len(val_sessions)}): {val_sessions}")
-
-        # Window settings
-        window_size = args.allen_window_size
-        train_stride = args.allen_stride if args.allen_stride else window_size // 2
-        val_stride = int(train_stride * args.val_stride_multiplier)
-
-        if is_primary():
-            print(f"Window: {window_size} samples, train stride: {train_stride}, val stride: {val_stride}")
-
-        # Auto-detect num_workers if not specified
-        num_workers = config["num_workers"]
-        if num_workers is None:
-            import os
-            world_size = get_world_size()
-            cpu_count = os.cpu_count() or 8
-            num_workers = max(2, min(8, cpu_count // max(1, world_size)))
-        prefetch_factor = config["prefetch_factor"]
-
-        # Reduce prefetch and disable persistent_workers when running multi-GPU
-        use_persistent = True
-        if get_world_size() > 1:
-            if prefetch_factor > 2:
-                prefetch_factor = 2
-            use_persistent = False
-
-        # Create dataloaders
-        loaders = create_allen_dataloaders(
-            train_sessions=train_sessions,
-            val_sessions=val_sessions,
-            paired_name=paired_name,
-            window_size=window_size,
-            stride=train_stride,
-            batch_size=config["batch_size"],
-            zscore_per_window=False,  # Model handles normalization
-            num_workers=num_workers,
-            separate_val_sessions=config.get("separate_val_sessions", True),
-        )
-
-        # Get max channel counts from dataloaders (handles varying channels per session)
-        in_channels = loaders['max_source_channels']
-        out_channels = loaders['max_target_channels']
-
-        data = {
-            "train_loader": loaders["train"],
-            "val_loader": loaders["val"],
-            "val_sessions_loaders": loaders.get("val_sessions"),
-            "train_sessions": train_sessions,
-            "val_sessions": val_sessions,
-            "n_odors": 1,  # No odor conditioning
-            "vocab": {"none": 0},
-        }
-
-        config["dataset_type"] = "allen"
-        config["allen_pair"] = paired_name
-        config["in_channels"] = in_channels
-        config["out_channels"] = out_channels
-        config["sampling_rate"] = ALLEN_SAMPLING_RATE
-        config["allen_window_size"] = window_size
-        config["allen_stride"] = train_stride
-        config["split_by_session"] = True
 
     elif args.dataset == "pfc":
         # PFC/Hippocampus dataset
