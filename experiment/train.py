@@ -798,12 +798,11 @@ def apply_augmentations(
     if config.get("aug_freq_mask", False):
         max_bands = config.get("aug_freq_mask_max_bands", 2)
         max_width = config.get("aug_freq_mask_max_width", 10)
-        # Apply same masking to both by concatenating, masking, and splitting
         batch_size = ob.shape[0]
-        combined = torch.cat([ob, pcx], dim=0)  # (2*batch, channels, time)
-        # Generate mask indices once
-        combined_fft = torch.fft.rfft(combined, dim=-1)
-        n_freqs = combined_fft.shape[-1]
+        # Apply same frequency mask pattern to both tensors independently
+        ob_fft = torch.fft.rfft(ob, dim=-1)
+        pcx_fft = torch.fft.rfft(pcx, dim=-1)
+        n_freqs = ob_fft.shape[-1]
         if n_freqs > max_width:
             for i in range(batch_size):
                 n_bands_to_mask = torch.randint(1, max_bands + 1, (1,)).item()
@@ -811,10 +810,10 @@ def apply_augmentations(
                     width = torch.randint(1, max_width + 1, (1,)).item()
                     start = torch.randint(0, n_freqs - width, (1,)).item()
                     # Apply same mask to both ob[i] and pcx[i]
-                    combined_fft[i, :, start:start + width] = 0
-                    combined_fft[batch_size + i, :, start:start + width] = 0
-            combined = torch.fft.irfft(combined_fft, n=ob.shape[-1], dim=-1)
-            ob, pcx = combined[:batch_size], combined[batch_size:]
+                    ob_fft[i, :, start:start + width] = 0
+                    pcx_fft[i, :, start:start + width] = 0
+            ob = torch.fft.irfft(ob_fft, n=ob.shape[-1], dim=-1)
+            pcx = torch.fft.irfft(pcx_fft, n=pcx.shape[-1], dim=-1)
 
     # Session-specific augmentations (simulate cross-session variability)
 
