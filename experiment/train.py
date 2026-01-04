@@ -2429,59 +2429,59 @@ def train(
             val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
             per_session_metrics = {}
 
-            # Sync val_loss across ranks (for early stopping)
-            val_loss = val_metrics.get("loss", val_metrics["mae"])  # fallback to mae if no composite
-            if dist.is_initialized():
-                val_loss_tensor = torch.tensor(val_loss, device=device)
-                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-                val_loss = val_loss_tensor.item()
-                val_metrics["loss"] = val_loss
+        # Sync val_loss across ranks (for early stopping)
+        val_loss = val_metrics.get("loss", val_metrics.get("mae", float("inf")))  # fallback to mae if no composite
+        if dist.is_initialized():
+            val_loss_tensor = torch.tensor(val_loss, device=device)
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+            val_loss = val_loss_tensor.item()
+            val_metrics["loss"] = val_loss
 
-            # Track best (lower loss is better)
-            is_best = val_loss < best_val_loss
-            if is_best:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                patience_counter = 0
-                CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-                save_checkpoint(
-                    model, optimizer, epoch,
-                    CHECKPOINT_DIR / "best_model.pt",
-                    is_fsdp=is_fsdp_wrapped,
-                    reverse_model=reverse_model,
-                    config=config,
-                    data=data,  # Save split info for validation
-                )
-            else:
-                patience_counter += 1
+        # Track best (lower loss is better)
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            patience_counter = 0
+            CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            save_checkpoint(
+                model, optimizer, epoch,
+                CHECKPOINT_DIR / "best_model.pt",
+                is_fsdp=is_fsdp_wrapped,
+                reverse_model=reverse_model,
+                config=config,
+                data=data,  # Save split info for validation
+            )
+        else:
+            patience_counter += 1
 
-            barrier()
+        barrier()
 
-            if is_primary():
-                rev_str = ""
-                if "corr_rev" in val_metrics:
-                    rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
+        if is_primary():
+            rev_str = ""
+            if "corr_rev" in val_metrics:
+                rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
-                # Add contrastive loss if present
-                contr_str = ""
-                if "contrastive_fwd" in train_metrics:
-                    contr_str = f" | Contr: {train_metrics['contrastive_fwd']:.3f}"
-                    if "contrastive_rev" in train_metrics:
-                        contr_str += f"/{train_metrics['contrastive_rev']:.3f}"
+            # Add contrastive loss if present
+            contr_str = ""
+            if "contrastive_fwd" in train_metrics:
+                contr_str = f" | Contr: {train_metrics['contrastive_fwd']:.3f}"
+                if "contrastive_rev" in train_metrics:
+                    contr_str += f"/{train_metrics['contrastive_rev']:.3f}"
 
-                print(f"Epoch {epoch}/{num_epochs} | "
-                      f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                      f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
-                      f"Best: {best_val_loss:.3f}")
+            print(f"Epoch {epoch}/{num_epochs} | "
+                  f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
+                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
+                  f"Best: {best_val_loss:.3f}")
 
-                # Print per-session metrics if available
-                if per_session_metrics:
-                    sess_strs = []
-                    for sess_name, sess_m in per_session_metrics.items():
-                        sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
-                    print("  Per-session: " + " | ".join(sess_strs))
+            # Print per-session metrics if available
+            if per_session_metrics:
+                sess_strs = []
+                for sess_name, sess_m in per_session_metrics.items():
+                    sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
+                print("  Per-session: " + " | ".join(sess_strs))
 
-                sys.stdout.flush()
+            sys.stdout.flush()
 
             # Build history entry with per-session metrics if available
             history_entry = {"epoch": epoch, **train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
