@@ -45,6 +45,7 @@ class DatasetType(Enum):
     """Supported dataset types."""
     OLFACTORY = "olfactory"      # OB/PCx dataset
     PFC_HPC = "pfc_hpc"          # PFC/Hippocampus (CA1) dataset
+    DANDI_MOVIE = "dandi_movie"  # DANDI 000623: Human iEEG movie watching
 
 
 # =============================================================================
@@ -106,6 +107,39 @@ CA1_CHANNEL_END = 96
 
 # Trial type labels for PFC dataset
 NUM_TRIAL_TYPES = 2  # Right, Left
+
+
+# =============================================================================
+# Constants - DANDI 000623 Movie Dataset (Human iEEG)
+# =============================================================================
+# Reference: Keles et al., 2024, Scientific Data
+# "Multimodal single-neuron, intracranial EEG, and fMRI brain responses
+# during movie watching in human patients"
+# DANDI Archive: https://dandiarchive.org/dandiset/000623
+# GitHub: https://github.com/rutishauserlab/bmovie-release-NWB-BIDS
+
+_DANDI_DATA_DIR = Path("/data/dandi/000623")
+DANDI_DANDISET_ID = "000623"
+DANDI_SAMPLING_RATE_HZ = 1000  # LFP/iEEG downsampled to 1000 Hz
+DANDI_MOVIE_DURATION_S = 480.0  # ~8 minutes movie clip
+
+# Brain regions in the dataset
+DANDI_BRAIN_REGIONS = ["amygdala", "hippocampus", "medial_frontal_cortex"]
+DANDI_REGION_ABBREVIATIONS = {"amygdala": "AMY", "hippocampus": "HPC", "medial_frontal_cortex": "MFC"}
+
+# Data paths (NWB files will be downloaded here)
+DANDI_RAW_PATH = _DANDI_DATA_DIR / "raw"
+DANDI_PROCESSED_PATH = _DANDI_DATA_DIR / "processed"
+DANDI_CACHE_PATH = _DANDI_DATA_DIR / "cache"
+
+# Subject info (18 subjects in the dataset)
+DANDI_N_SUBJECTS = 18
+DANDI_SUBJECT_IDS = [f"sub-CS{i}" for i in range(41, 63) if i not in [43, 44, 48, 50]]
+
+# Train/val/test split paths
+DANDI_TRAIN_SPLIT_PATH = _DANDI_DATA_DIR / "train_indices.npy"
+DANDI_VAL_SPLIT_PATH = _DANDI_DATA_DIR / "val_indices.npy"
+DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
 
 
 # =============================================================================
@@ -2971,3 +3005,638 @@ def get_pcx1_session_splits(
     print(f"  Test:  {test_sessions}")
 
     return train_sessions, val_sessions, test_sessions
+
+
+# =============================================================================
+# DANDI 000623 Movie Dataset (Human iEEG during movie watching)
+# =============================================================================
+# Reference: Keles et al., 2024, Scientific Data
+# "Multimodal single-neuron, intracranial EEG, and fMRI brain responses
+# during movie watching in human patients"
+
+def check_dandi_dependencies() -> bool:
+    """Check if DANDI/NWB dependencies are available."""
+    try:
+        import pynwb
+        import h5py
+        return True
+    except ImportError:
+        return False
+
+
+def download_dandi_dataset(
+    dandiset_id: str = DANDI_DANDISET_ID,
+    output_dir: Path = DANDI_RAW_PATH,
+    version: str = "draft",
+) -> Path:
+    """Download DANDI dataset using dandi-cli.
+
+    Args:
+        dandiset_id: DANDI dataset ID (default: "000623")
+        output_dir: Directory to save downloaded files
+        version: Dataset version ("draft" or specific version)
+
+    Returns:
+        Path to downloaded dataset directory
+    """
+    import subprocess
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use dandi CLI to download
+    cmd = [
+        "dandi", "download",
+        f"https://dandiarchive.org/dandiset/{dandiset_id}/{version}",
+        "-o", str(output_dir),
+    ]
+
+    print(f"Downloading DANDI dataset {dandiset_id}...")
+    print(f"Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Download failed: {result.stderr}")
+        raise RuntimeError(f"Failed to download DANDI dataset: {result.stderr}")
+
+    print(f"Dataset downloaded to: {output_dir}")
+    return output_dir / dandiset_id
+
+
+def list_dandi_nwb_files(
+    data_dir: Path = DANDI_RAW_PATH,
+    dandiset_id: str = DANDI_DANDISET_ID,
+) -> List[Path]:
+    """List all NWB files in the DANDI dataset directory.
+
+    Args:
+        data_dir: Base directory containing the dataset
+        dandiset_id: DANDI dataset ID
+
+    Returns:
+        List of paths to NWB files
+    """
+    dataset_path = data_dir / dandiset_id
+    if not dataset_path.exists():
+        dataset_path = data_dir  # Try direct path
+
+    nwb_files = sorted(dataset_path.glob("**/*.nwb"))
+
+    if not nwb_files:
+        raise FileNotFoundError(f"No NWB files found in {dataset_path}")
+
+    return nwb_files
+
+
+def load_dandi_nwb_file(
+    nwb_path: Path,
+    load_lfp: bool = True,
+    load_ieeg: bool = True,
+    load_spikes: bool = False,
+    load_behavior: bool = False,
+) -> Dict[str, Any]:
+    """Load data from a single DANDI 000623 NWB file.
+
+    Args:
+        nwb_path: Path to the NWB file
+        load_lfp: Whether to load LFP data (microwires)
+        load_ieeg: Whether to load iEEG data (macroelectrodes)
+        load_spikes: Whether to load spike times
+        load_behavior: Whether to load behavioral data (eye tracking, etc.)
+
+    Returns:
+        Dictionary containing loaded data with keys:
+            - subject_id: Subject identifier
+            - lfp: LFP data array [n_channels, n_samples] (if load_lfp=True)
+            - lfp_electrodes: Electrode info for LFP channels
+            - ieeg: iEEG data array [n_channels, n_samples] (if load_ieeg=True)
+            - ieeg_electrodes: Electrode info for iEEG channels
+            - spikes: Dict of unit_id -> spike_times (if load_spikes=True)
+            - behavior: Behavioral data dict (if load_behavior=True)
+            - sampling_rate: Sampling rate in Hz
+            - metadata: Session/subject metadata
+    """
+    if not check_dandi_dependencies():
+        raise ImportError("pynwb and h5py required. Install with: pip install pynwb h5py")
+
+    from pynwb import NWBHDF5IO
+
+    nwb_path = Path(nwb_path)
+    if not nwb_path.exists():
+        raise FileNotFoundError(f"NWB file not found: {nwb_path}")
+
+    result = {
+        "file_path": str(nwb_path),
+        "sampling_rate": DANDI_SAMPLING_RATE_HZ,
+    }
+
+    with NWBHDF5IO(str(nwb_path), "r") as io:
+        nwbfile = io.read()
+
+        # Extract subject info
+        result["subject_id"] = nwbfile.subject.subject_id if nwbfile.subject else nwb_path.stem
+        result["metadata"] = {
+            "session_id": nwbfile.session_id,
+            "session_description": nwbfile.session_description,
+            "experimenter": list(nwbfile.experimenter) if nwbfile.experimenter else [],
+            "institution": nwbfile.institution,
+        }
+
+        # Load electrode information
+        if nwbfile.electrodes is not None:
+            electrodes_df = nwbfile.electrodes.to_dataframe()
+            result["electrodes"] = electrodes_df
+
+        # Load LFP data (typically from ecephys processing module)
+        if load_lfp:
+            try:
+                if "ecephys" in nwbfile.processing:
+                    ecephys = nwbfile.processing["ecephys"]
+                    if "LFP" in ecephys.data_interfaces:
+                        lfp_module = ecephys.data_interfaces["LFP"]
+                        # Get the electrical series
+                        for name, es in lfp_module.electrical_series.items():
+                            lfp_data = es.data[:]  # Load all data
+                            result["lfp"] = np.array(lfp_data, dtype=np.float32).T  # [channels, samples]
+                            result["lfp_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                            if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                result["lfp_electrodes"] = es.electrodes.to_dataframe()
+                            break
+            except Exception as e:
+                print(f"Warning: Could not load LFP data: {e}")
+
+        # Load iEEG data (macroelectrodes)
+        if load_ieeg:
+            try:
+                if "ecephys" in nwbfile.processing:
+                    ecephys = nwbfile.processing["ecephys"]
+                    if "iEEG" in ecephys.data_interfaces:
+                        ieeg_module = ecephys.data_interfaces["iEEG"]
+                        for name, es in ieeg_module.electrical_series.items():
+                            ieeg_data = es.data[:]
+                            result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T
+                            result["ieeg_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                            if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                result["ieeg_electrodes"] = es.electrodes.to_dataframe()
+                            break
+                # Alternative: check acquisition for raw iEEG
+                elif nwbfile.acquisition:
+                    for name, ts in nwbfile.acquisition.items():
+                        if "eeg" in name.lower() or "ieeg" in name.lower():
+                            ieeg_data = ts.data[:]
+                            result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T
+                            result["ieeg_rate"] = ts.rate if hasattr(ts, 'rate') and ts.rate else DANDI_SAMPLING_RATE_HZ
+                            break
+            except Exception as e:
+                print(f"Warning: Could not load iEEG data: {e}")
+
+        # Load spike data
+        if load_spikes:
+            try:
+                if nwbfile.units is not None:
+                    units_df = nwbfile.units.to_dataframe()
+                    result["spikes"] = {}
+                    for idx, row in units_df.iterrows():
+                        if "spike_times" in row:
+                            result["spikes"][idx] = np.array(row["spike_times"])
+                    result["units_metadata"] = units_df.drop(columns=["spike_times"], errors="ignore")
+            except Exception as e:
+                print(f"Warning: Could not load spike data: {e}")
+
+        # Load behavioral data
+        if load_behavior:
+            try:
+                if "behavior" in nwbfile.processing:
+                    behavior = nwbfile.processing["behavior"]
+                    result["behavior"] = {}
+                    for name, ts in behavior.data_interfaces.items():
+                        if hasattr(ts, 'data'):
+                            result["behavior"][name] = {
+                                "data": np.array(ts.data[:]),
+                                "timestamps": np.array(ts.timestamps[:]) if hasattr(ts, 'timestamps') and ts.timestamps is not None else None,
+                            }
+            except Exception as e:
+                print(f"Warning: Could not load behavioral data: {e}")
+
+    return result
+
+
+def get_electrodes_by_region(
+    electrodes_df: pd.DataFrame,
+    target_regions: Optional[List[str]] = None,
+) -> Dict[str, List[int]]:
+    """Group electrode indices by brain region.
+
+    Args:
+        electrodes_df: DataFrame with electrode information (must have 'location' column)
+        target_regions: List of regions to extract (None = all regions)
+
+    Returns:
+        Dictionary mapping region name to list of electrode indices
+    """
+    if "location" not in electrodes_df.columns:
+        # Try alternative column names
+        location_col = None
+        for col in ["brain_region", "region", "area", "group_name"]:
+            if col in electrodes_df.columns:
+                location_col = col
+                break
+        if location_col is None:
+            raise ValueError("No location/region column found in electrodes DataFrame")
+    else:
+        location_col = "location"
+
+    region_electrodes = {}
+
+    for idx, row in electrodes_df.iterrows():
+        region = str(row[location_col]).lower().strip()
+
+        # Normalize region names
+        if "amygdala" in region or "amy" in region:
+            normalized = "amygdala"
+        elif "hippocampus" in region or "hpc" in region or "hipp" in region:
+            normalized = "hippocampus"
+        elif "frontal" in region or "mfc" in region or "pfc" in region:
+            normalized = "medial_frontal_cortex"
+        else:
+            normalized = region
+
+        if target_regions is None or normalized in target_regions:
+            if normalized not in region_electrodes:
+                region_electrodes[normalized] = []
+            region_electrodes[normalized].append(idx)
+
+    return region_electrodes
+
+
+def extract_region_signals(
+    data: np.ndarray,
+    electrodes_df: pd.DataFrame,
+    source_region: str,
+    target_region: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract signals from source and target brain regions.
+
+    Args:
+        data: Full data array [n_channels, n_samples]
+        electrodes_df: Electrode information DataFrame
+        source_region: Source region name (e.g., "amygdala")
+        target_region: Target region name (e.g., "hippocampus")
+
+    Returns:
+        Tuple of (source_signals, target_signals) arrays
+    """
+    region_indices = get_electrodes_by_region(electrodes_df)
+
+    if source_region not in region_indices:
+        raise ValueError(f"Source region '{source_region}' not found. Available: {list(region_indices.keys())}")
+    if target_region not in region_indices:
+        raise ValueError(f"Target region '{target_region}' not found. Available: {list(region_indices.keys())}")
+
+    source_idx = region_indices[source_region]
+    target_idx = region_indices[target_region]
+
+    source_signals = data[source_idx, :]
+    target_signals = data[target_idx, :]
+
+    return source_signals, target_signals
+
+
+def load_dandi_subject(
+    subject_id: str,
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    zscore: bool = True,
+) -> Dict[str, Any]:
+    """Load and preprocess data for a single DANDI subject.
+
+    Args:
+        subject_id: Subject ID (e.g., "sub-CS41")
+        data_dir: Directory containing NWB files
+        source_region: Source brain region for translation
+        target_region: Target brain region for translation
+        zscore: Whether to z-score normalize the data
+
+    Returns:
+        Dictionary containing preprocessed data
+    """
+    # Find NWB file for this subject
+    nwb_files = list_dandi_nwb_files(data_dir)
+    subject_file = None
+
+    for f in nwb_files:
+        if subject_id in f.stem or subject_id.replace("sub-", "") in f.stem:
+            subject_file = f
+            break
+
+    if subject_file is None:
+        raise FileNotFoundError(f"No NWB file found for subject {subject_id}")
+
+    # Load the NWB file
+    data = load_dandi_nwb_file(subject_file, load_lfp=True, load_ieeg=True)
+
+    # Determine which data to use (prefer LFP, fallback to iEEG)
+    if "lfp" in data and data["lfp"] is not None:
+        neural_data = data["lfp"]
+        electrodes = data.get("lfp_electrodes", data.get("electrodes"))
+    elif "ieeg" in data and data["ieeg"] is not None:
+        neural_data = data["ieeg"]
+        electrodes = data.get("ieeg_electrodes", data.get("electrodes"))
+    else:
+        raise ValueError(f"No LFP or iEEG data found for subject {subject_id}")
+
+    # Extract regions
+    source_signals, target_signals = extract_region_signals(
+        neural_data, electrodes, source_region, target_region
+    )
+
+    # Z-score normalization
+    if zscore:
+        source_signals = (source_signals - source_signals.mean(axis=1, keepdims=True)) / (
+            source_signals.std(axis=1, keepdims=True) + 1e-8
+        )
+        target_signals = (target_signals - target_signals.mean(axis=1, keepdims=True)) / (
+            target_signals.std(axis=1, keepdims=True) + 1e-8
+        )
+
+    return {
+        "subject_id": subject_id,
+        "source": source_signals.astype(np.float32),
+        "target": target_signals.astype(np.float32),
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": data["sampling_rate"],
+        "n_source_channels": source_signals.shape[0],
+        "n_target_channels": target_signals.shape[0],
+        "n_samples": source_signals.shape[1],
+        "metadata": data["metadata"],
+    }
+
+
+class DANDIMovieDataset(Dataset):
+    """PyTorch Dataset for DANDI 000623 movie watching iEEG data.
+
+    Provides sliding window segments for neural signal translation between
+    brain regions during naturalistic movie watching.
+
+    Args:
+        subjects_data: List of subject data dicts from load_dandi_subject()
+        window_size: Size of each window in samples (default: 5000 = 5s at 1kHz)
+        stride: Stride between windows (default: 2500 = 2.5s)
+        zscore_per_window: Whether to z-score each window independently
+    """
+
+    def __init__(
+        self,
+        subjects_data: List[Dict[str, Any]],
+        window_size: int = 5000,
+        stride: int = 2500,
+        zscore_per_window: bool = False,
+    ):
+        self.window_size = window_size
+        self.stride = stride
+        self.zscore_per_window = zscore_per_window
+
+        # Build index of all windows across subjects
+        self.windows = []  # List of (subject_idx, start_sample)
+
+        for subj_idx, subj_data in enumerate(subjects_data):
+            n_samples = subj_data["n_samples"]
+            n_windows = (n_samples - window_size) // stride + 1
+
+            for w in range(n_windows):
+                start = w * stride
+                self.windows.append((subj_idx, start))
+
+        self.subjects_data = subjects_data
+
+        print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
+              f"{len(self.windows)} windows, "
+              f"window_size={window_size}, stride={stride}")
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        subj_idx, start = self.windows[idx]
+        subj_data = self.subjects_data[subj_idx]
+
+        end = start + self.window_size
+
+        # Extract window
+        source = subj_data["source"][:, start:end].copy()
+        target = subj_data["target"][:, start:end].copy()
+
+        # Optional per-window normalization
+        if self.zscore_per_window:
+            source = (source - source.mean(axis=1, keepdims=True)) / (
+                source.std(axis=1, keepdims=True) + 1e-8
+            )
+            target = (target - target.mean(axis=1, keepdims=True)) / (
+                target.std(axis=1, keepdims=True) + 1e-8
+            )
+
+        return {
+            "source": torch.from_numpy(source),
+            "target": torch.from_numpy(target),
+            "subject_idx": torch.tensor(subj_idx),
+            "start_sample": torch.tensor(start),
+        }
+
+
+def prepare_dandi_data(
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    window_size: int = 5000,
+    stride: int = 2500,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+) -> Dict[str, Any]:
+    """Complete data preparation pipeline for DANDI 000623 dataset.
+
+    Args:
+        data_dir: Directory containing NWB files
+        source_region: Source brain region for translation
+        target_region: Target brain region for translation
+        window_size: Window size in samples
+        stride: Stride between windows
+        train_ratio: Fraction of subjects for training
+        val_ratio: Fraction of subjects for validation
+        test_ratio: Fraction of subjects for testing
+        seed: Random seed for reproducibility
+        zscore: Whether to z-score normalize the data
+
+    Returns:
+        Dictionary containing train/val/test datasets and metadata
+    """
+    print(f"Preparing DANDI 000623 dataset...")
+    print(f"  Source region: {source_region}")
+    print(f"  Target region: {target_region}")
+
+    # Get available subjects
+    nwb_files = list_dandi_nwb_files(data_dir)
+    subject_ids = []
+
+    for f in nwb_files:
+        # Extract subject ID from filename
+        stem = f.stem
+        if "sub-" in stem:
+            subj_id = stem.split("_")[0]  # Get sub-CSXX part
+        else:
+            subj_id = stem
+        if subj_id not in subject_ids:
+            subject_ids.append(subj_id)
+
+    print(f"  Found {len(subject_ids)} subjects")
+
+    # Split subjects
+    rng = np.random.default_rng(seed)
+    rng.shuffle(subject_ids)
+
+    n_train = int(len(subject_ids) * train_ratio)
+    n_val = int(len(subject_ids) * val_ratio)
+
+    train_subjects = subject_ids[:n_train]
+    val_subjects = subject_ids[n_train:n_train + n_val]
+    test_subjects = subject_ids[n_train + n_val:]
+
+    print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+    print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
+    print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+
+    # Load data for each split
+    def load_subjects(subject_list):
+        data_list = []
+        for subj_id in subject_list:
+            try:
+                subj_data = load_dandi_subject(
+                    subj_id, data_dir, source_region, target_region, zscore
+                )
+                data_list.append(subj_data)
+                print(f"    Loaded {subj_id}: source={subj_data['n_source_channels']}ch, "
+                      f"target={subj_data['n_target_channels']}ch, "
+                      f"{subj_data['n_samples']} samples")
+            except Exception as e:
+                print(f"    Warning: Could not load {subj_id}: {e}")
+        return data_list
+
+    print("\nLoading training subjects...")
+    train_data = load_subjects(train_subjects)
+
+    print("\nLoading validation subjects...")
+    val_data = load_subjects(val_subjects)
+
+    print("\nLoading test subjects...")
+    test_data = load_subjects(test_subjects)
+
+    # Create datasets
+    train_dataset = DANDIMovieDataset(train_data, window_size, stride)
+    val_dataset = DANDIMovieDataset(val_data, window_size, stride)
+    test_dataset = DANDIMovieDataset(test_data, window_size, stride)
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "train_subjects": train_subjects,
+        "val_subjects": val_subjects,
+        "test_subjects": test_subjects,
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": DANDI_SAMPLING_RATE_HZ,
+        "window_size": window_size,
+        "stride": stride,
+        "dataset_type": DatasetType.DANDI_MOVIE,
+    }
+
+
+def create_dandi_dataloaders(
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    window_size: int = 5000,
+    stride: int = 2500,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    distributed: bool = False,
+    seed: int = 42,
+) -> Dict[str, DataLoader]:
+    """Create DataLoaders for DANDI 000623 dataset.
+
+    Args:
+        data_dir: Directory containing NWB files
+        source_region: Source brain region
+        target_region: Target brain region
+        window_size: Window size in samples
+        stride: Stride between windows
+        batch_size: Batch size for training
+        num_workers: Number of data loading workers
+        distributed: Whether to use distributed samplers
+        seed: Random seed
+
+    Returns:
+        Dictionary with 'train', 'val', 'test' DataLoaders
+    """
+    # Prepare data
+    data = prepare_dandi_data(
+        data_dir=data_dir,
+        source_region=source_region,
+        target_region=target_region,
+        window_size=window_size,
+        stride=stride,
+        seed=seed,
+    )
+
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Create samplers for distributed training
+    train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=seed) if distributed else None
+
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+
+    dataloaders = {
+        "train": DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            drop_last=True,
+            **loader_kwargs,
+        ),
+        "val": DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=test_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+    }
+
+    print(f"\nDANDI DataLoaders created:")
+    print(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
+    print(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
+    print(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
+
+    return dataloaders

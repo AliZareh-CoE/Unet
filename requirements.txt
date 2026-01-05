@@ -42,3 +42,8 @@ pylint>=2.15.0  # Code linting
 # Optional: For advanced visualization
 # plotly>=5.11.0
 # bokeh>=3.0.0
+
+# DANDI Archive support (for NWB neurophysiology data)
+pynwb>=2.5.0
+dandi>=0.55.0
+h5py>=3.8.0
