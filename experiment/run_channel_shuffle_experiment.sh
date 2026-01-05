@@ -22,6 +22,7 @@ torchrun --nproc_per_node=8 train.py \
     --dataset pcx1 \
     --fsdp \
     --epochs 60 \
+    --batch-size 64 \
     --aug-channel-shuffle \
     --aug-channel-shuffle-mode both \
     2>&1 | tee "${LOG_DIR}/with_shuffle.log"
@@ -37,6 +38,7 @@ torchrun --nproc_per_node=8 train.py \
     --dataset pcx1 \
     --fsdp \
     --epochs 60 \
+    --batch-size 64 \
     2>&1 | tee "${LOG_DIR}/no_shuffle_baseline.log"
 
 echo ""
