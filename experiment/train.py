@@ -1666,6 +1666,12 @@ def train_epoch(
         # Apply data augmentation (training only)
         ob, pcx = apply_augmentations(ob, pcx, config)
 
+        # IMPORTANT: Clone tensors after augmentation to avoid autograd inplace errors
+        # This ensures ob/pcx are fresh tensors with no shared memory when used in
+        # both cond_encoder(ob) and model(ob, ...) - prevents version tracking conflicts
+        ob = ob.clone()
+        pcx = pcx.clone()
+
         # Compute conditioning embedding
         cond_emb = None
         cond_loss = 0.0
