@@ -2534,6 +2534,61 @@ def pearson_batch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return corr_channels.mean()
 
 
+def pearson_per_channel(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute per-channel Pearson correlation, averaged over batch.
+
+    Args:
+        pred: Predicted tensor [B, C, T]
+        target: Target tensor [B, C, T]
+
+    Returns:
+        Per-channel correlations [C] - averaged over batch dimension
+    """
+    pred_centered = pred - pred.mean(dim=-1, keepdim=True)
+    target_centered = target - target.mean(dim=-1, keepdim=True)
+    num = (pred_centered * target_centered).sum(dim=-1)  # [B, C]
+    denom = torch.sqrt((pred_centered**2).sum(dim=-1) * (target_centered**2).sum(dim=-1) + 1e-8)
+    corr_channels = num / denom  # [B, C]
+    return corr_channels.mean(dim=0)  # [C] - mean over batch
+
+
+def cross_channel_correlation(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute cross-channel correlation matrix between pred and target.
+
+    Measures how much each predicted channel correlates with each target channel.
+    Useful for understanding if model is mixing/confusing channels.
+
+    Args:
+        pred: Predicted tensor [B, C, T]
+        target: Target tensor [B, C, T]
+
+    Returns:
+        Cross-correlation matrix [C, C] where entry [i,j] is correlation between
+        pred channel i and target channel j, averaged over batch.
+    """
+    B, C, T = pred.shape
+
+    # Center the data
+    pred_centered = pred - pred.mean(dim=-1, keepdim=True)  # [B, C, T]
+    target_centered = target - target.mean(dim=-1, keepdim=True)  # [B, C, T]
+
+    # Compute cross-correlation: for each pred channel i and target channel j
+    # corr[i,j] = sum(pred[i] * target[j]) / sqrt(sum(pred[i]^2) * sum(target[j]^2))
+    cross_corr = torch.zeros(C, C, device=pred.device, dtype=pred.dtype)
+
+    pred_norm = torch.sqrt((pred_centered**2).sum(dim=-1) + 1e-8)  # [B, C]
+    target_norm = torch.sqrt((target_centered**2).sum(dim=-1) + 1e-8)  # [B, C]
+
+    for i in range(C):
+        for j in range(C):
+            # Correlation between pred channel i and target channel j
+            num = (pred_centered[:, i, :] * target_centered[:, j, :]).sum(dim=-1)  # [B]
+            denom = pred_norm[:, i] * target_norm[:, j]  # [B]
+            cross_corr[i, j] = (num / denom).mean()  # scalar, avg over batch
+
+    return cross_corr
+
+
 # =============================================================================
 # GPU-Accelerated Metrics
 # =============================================================================

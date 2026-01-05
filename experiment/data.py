@@ -3400,6 +3400,13 @@ class DANDIMovieDataset(Dataset):
         verbose: Whether to print info messages
         n_source_channels: Fixed number of source channels (None = use min across subjects)
         n_target_channels: Fixed number of target channels (None = use min across subjects)
+        shuffle_channels: Channel shuffle mode for testing channel correspondence assumption
+            - None: no shuffling (default)
+            - "source": shuffle source channels only
+            - "target": shuffle target channels only
+            - "both": shuffle both independently
+            - "consistent": same shuffle applied to both (preserves any real correspondence)
+        shuffle_seed: Seed for channel shuffling (None = random per sample, int = fixed shuffle)
     """
 
     def __init__(
@@ -3411,10 +3418,14 @@ class DANDIMovieDataset(Dataset):
         verbose: bool = True,
         n_source_channels: Optional[int] = None,
         n_target_channels: Optional[int] = None,
+        shuffle_channels: Optional[str] = None,
+        shuffle_seed: Optional[int] = None,
     ):
         self.window_size = window_size
         self.stride = stride
         self.zscore_per_window = zscore_per_window
+        self.shuffle_channels = shuffle_channels
+        self.shuffle_seed = shuffle_seed
 
         # Determine channel counts - use minimum across subjects to ensure consistent shapes
         if n_source_channels is None:
@@ -3426,6 +3437,22 @@ class DANDIMovieDataset(Dataset):
             self.n_target_channels = min(s["n_target_channels"] for s in subjects_data) if subjects_data else 0
         else:
             self.n_target_channels = n_target_channels
+
+        # Pre-compute fixed shuffle permutations if seed is provided
+        self._source_perm = None
+        self._target_perm = None
+        if shuffle_channels and shuffle_seed is not None:
+            rng = np.random.default_rng(shuffle_seed)
+            if shuffle_channels in ("source", "both"):
+                self._source_perm = rng.permutation(self.n_source_channels)
+            if shuffle_channels in ("target", "both"):
+                self._target_perm = rng.permutation(self.n_target_channels)
+            if shuffle_channels == "consistent":
+                # Same permutation for both (only works if same channel count)
+                n_ch = min(self.n_source_channels, self.n_target_channels)
+                perm = rng.permutation(n_ch)
+                self._source_perm = perm
+                self._target_perm = perm
 
         # Build index of all windows across subjects
         self.windows = []  # List of (subject_idx, start_sample)
@@ -3441,10 +3468,12 @@ class DANDIMovieDataset(Dataset):
         self.subjects_data = subjects_data
 
         if verbose:
+            shuffle_str = f", shuffle={shuffle_channels}" if shuffle_channels else ""
             print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
                   f"{len(self.windows)} windows, "
                   f"window_size={window_size}, stride={stride}, "
-                  f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}")
+                  f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}"
+                  f"{shuffle_str}")
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -3459,6 +3488,22 @@ class DANDIMovieDataset(Dataset):
         # This ensures consistent tensor shapes across subjects
         source = subj_data["source"][:self.n_source_channels, start:end].copy()
         target = subj_data["target"][:self.n_target_channels, start:end].copy()
+
+        # Apply channel shuffling if enabled
+        if self.shuffle_channels:
+            if self._source_perm is not None:
+                # Fixed permutation (deterministic)
+                source = source[self._source_perm]
+            elif self.shuffle_channels in ("source", "both"):
+                # Random permutation per sample
+                source = source[np.random.permutation(self.n_source_channels)]
+
+            if self._target_perm is not None:
+                # Fixed permutation (deterministic)
+                target = target[self._target_perm]
+            elif self.shuffle_channels in ("target", "both"):
+                # Random permutation per sample
+                target = target[np.random.permutation(self.n_target_channels)]
 
         # Optional per-window normalization
         if self.zscore_per_window:
@@ -3490,6 +3535,8 @@ def prepare_dandi_data(
     zscore: bool = True,
     verbose: bool = True,
     min_channels: int = 12,
+    shuffle_channels: Optional[str] = None,
+    shuffle_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for DANDI 000623 dataset.
 
@@ -3506,6 +3553,8 @@ def prepare_dandi_data(
         zscore: Whether to z-score normalize the data
         verbose: Whether to print progress messages (set False for non-primary processes)
         min_channels: Minimum channels required in both source and target (subjects with fewer are excluded)
+        shuffle_channels: Channel shuffle mode ("source", "target", "both", "consistent", or None)
+        shuffle_seed: Seed for channel shuffling (None = random per sample)
 
     Returns:
         Dictionary containing train/val/test datasets and metadata
@@ -3596,17 +3645,21 @@ def prepare_dandi_data(
         print(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
 
     # Create datasets with consistent channel counts
+    # Note: shuffle_channels is applied to train set; val/test use same fixed shuffle if seed provided
     train_dataset = DANDIMovieDataset(
         train_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        shuffle_channels=shuffle_channels, shuffle_seed=shuffle_seed
     )
     val_dataset = DANDIMovieDataset(
         val_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        shuffle_channels=shuffle_channels, shuffle_seed=shuffle_seed  # Same shuffle for consistency
     )
     test_dataset = DANDIMovieDataset(
         test_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        shuffle_channels=shuffle_channels, shuffle_seed=shuffle_seed  # Same shuffle for consistency
     )
 
     return {
@@ -3624,6 +3677,8 @@ def prepare_dandi_data(
         "dataset_type": DatasetType.DANDI_MOVIE,
         "n_source_channels": min_source_channels,
         "n_target_channels": min_target_channels,
+        "shuffle_channels": shuffle_channels,
+        "shuffle_seed": shuffle_seed,
     }
 
 

@@ -77,6 +77,8 @@ from models import (
     CondUNet1D,
     build_wavelet_loss,
     pearson_batch,
+    pearson_per_channel,
+    cross_channel_correlation,
     explained_variance_torch,
     normalized_rmse_torch,
     plv_torch,
@@ -1363,6 +1365,11 @@ def evaluate(
     baseline_psd_err_list, baseline_psd_diff_list = [], []
     baseline_plv_list, baseline_pli_list = [], []
 
+    # Per-channel metrics (for channel correspondence analysis)
+    # Only computed in non-fast mode
+    per_channel_corr_list = []  # List of [C] tensors
+    cross_channel_corr_accumulated = None  # [C, C] accumulated cross-channel correlation
+
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -1458,7 +1465,7 @@ def evaluate(
                     # Different channel counts: compare mean signals (reduces to [B, 1, T])
                     ob_baseline = ob_f32.mean(dim=1, keepdim=True)
                     pcx_baseline = pcx_f32.mean(dim=1, keepdim=True)
-                
+
                 baseline_corr_list.append(pearson_batch(ob_baseline, pcx_baseline).item())
                 baseline_r2_list.append(explained_variance_torch(ob_baseline, pcx_baseline).item())
                 baseline_nrmse_list.append(normalized_rmse_torch(ob_baseline, pcx_baseline).item())
@@ -1467,6 +1474,17 @@ def evaluate(
                 if compute_phase:
                     baseline_plv_list.append(plv_torch(ob_baseline, pcx_baseline).item())
                     baseline_pli_list.append(pli_torch(ob_baseline, pcx_baseline).item())
+
+                # Per-channel correlation analysis (for channel correspondence investigation)
+                per_ch_corr = pearson_per_channel(pred_f32, pcx_f32)  # [C]
+                per_channel_corr_list.append(per_ch_corr.cpu())
+
+                # Cross-channel correlation matrix (which pred channels correlate with which target channels)
+                cross_ch_corr = cross_channel_correlation(pred_f32, pcx_f32)  # [C, C]
+                if cross_channel_corr_accumulated is None:
+                    cross_channel_corr_accumulated = cross_ch_corr.cpu()
+                else:
+                    cross_channel_corr_accumulated += cross_ch_corr.cpu()
 
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
@@ -1555,6 +1573,34 @@ def evaluate(
         results["baseline_plv"] = float(np.mean(baseline_plv_list))
     if baseline_pli_list:
         results["baseline_pli"] = float(np.mean(baseline_pli_list))
+
+    # Per-channel correlation metrics (for channel correspondence analysis)
+    if per_channel_corr_list:
+        # Stack and average per-channel correlations across batches
+        per_ch_corr_stacked = torch.stack(per_channel_corr_list)  # [num_batches, C]
+        per_ch_corr_mean = per_ch_corr_stacked.mean(dim=0)  # [C]
+
+        results["per_channel_corr"] = per_ch_corr_mean.tolist()  # List of per-channel correlations
+        results["per_channel_corr_std"] = per_ch_corr_stacked.std(dim=0).tolist()
+        results["per_channel_corr_min"] = float(per_ch_corr_mean.min())
+        results["per_channel_corr_max"] = float(per_ch_corr_mean.max())
+        results["channel_corr_range"] = float(per_ch_corr_mean.max() - per_ch_corr_mean.min())
+
+        # Diagonal dominance: how much does channel i predict channel i vs others?
+        if cross_channel_corr_accumulated is not None:
+            n_batches = len(per_channel_corr_list)
+            cross_corr_mean = cross_channel_corr_accumulated / n_batches  # [C, C]
+            results["cross_channel_corr_matrix"] = cross_corr_mean.tolist()
+
+            # Diagonal = correspondence assumption (ch i -> ch i)
+            diag = torch.diag(cross_corr_mean)
+            # Off-diagonal mean = cross-channel leakage
+            off_diag_mask = ~torch.eye(cross_corr_mean.size(0), dtype=torch.bool)
+            off_diag = cross_corr_mean[off_diag_mask]
+
+            results["diagonal_corr_mean"] = float(diag.mean())
+            results["off_diagonal_corr_mean"] = float(off_diag.mean())
+            results["diagonal_dominance"] = float(diag.mean() - off_diag.mean())
 
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
@@ -3197,6 +3243,13 @@ def parse_args():
                         help="Stride as ratio of window size for DANDI (0.5 = 50%% overlap)")
     parser.add_argument("--dandi-data-dir", type=str, default="/data/movie",
                         help="Directory containing DANDI NWB files (default: /data/movie)")
+    parser.add_argument("--dandi-shuffle-channels", type=str, default=None,
+                        choices=["source", "target", "both", "consistent"],
+                        help="Channel shuffle mode to test channel correspondence assumption: "
+                             "'source' shuffles source channels, 'target' shuffles target, "
+                             "'both' shuffles independently, 'consistent' same shuffle for both")
+    parser.add_argument("--dandi-shuffle-seed", type=int, default=42,
+                        help="Seed for channel shuffling (default: 42 for reproducible fixed shuffle)")
 
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3643,6 +3696,8 @@ def main():
             print(f"  Source region: {args.dandi_source_region}")
             print(f"  Target region: {args.dandi_target_region}")
             print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            if args.dandi_shuffle_channels:
+                print(f"  Channel shuffle: {args.dandi_shuffle_channels} (seed={args.dandi_shuffle_seed})")
 
         # Prepare DANDI data - this returns datasets directly
         dandi_data = prepare_dandi_data(
@@ -3653,6 +3708,8 @@ def main():
             stride=train_stride,
             seed=config["seed"],
             verbose=is_primary(),  # Only print from rank 0 in distributed training
+            shuffle_channels=args.dandi_shuffle_channels,
+            shuffle_seed=args.dandi_shuffle_seed,
         )
 
         # Create a minimal data dict for compatibility with training loop
