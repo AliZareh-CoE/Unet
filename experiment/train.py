@@ -2243,7 +2243,10 @@ def train(
             # When using gradient checkpointing, we need find_unused_parameters=True
             # because checkpointing recomputes activations and some params may not
             # receive gradients until the recomputation happens
-            ddp_kwargs = {"device_ids": [local_rank]}
+            # broadcast_buffers=False prevents DDP from synchronizing BatchNorm
+            # running stats, which can cause inplace modification errors when
+            # the same model is used multiple times per batch (e.g., cycle consistency)
+            ddp_kwargs = {"device_ids": [local_rank], "broadcast_buffers": False}
             if config.get("gradient_checkpointing", False):
                 ddp_kwargs["find_unused_parameters"] = True
 
@@ -2260,7 +2263,7 @@ def train(
                 # even with find_unused_parameters=True. Instead, we manually sync gradients
                 # using sync_gradients_manual() after backward() but before optimizer.step().
             if is_primary():
-                print(f"Using DDP with {get_world_size()} GPUs")
+                print(f"Using DDP with {get_world_size()} GPUs (broadcast_buffers=False)")
                 if config.get("gradient_checkpointing", False):
                     print("  (find_unused_parameters=True for gradient checkpointing)")
             dist.barrier()
