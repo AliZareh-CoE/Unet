@@ -3489,6 +3489,7 @@ def prepare_dandi_data(
     seed: int = 42,
     zscore: bool = True,
     verbose: bool = True,
+    min_channels: int = 12,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for DANDI 000623 dataset.
 
@@ -3504,6 +3505,7 @@ def prepare_dandi_data(
         seed: Random seed for reproducibility
         zscore: Whether to z-score normalize the data
         verbose: Whether to print progress messages (set False for non-primary processes)
+        min_channels: Minimum channels required in both source and target (subjects with fewer are excluded)
 
     Returns:
         Dictionary containing train/val/test datasets and metadata
@@ -3554,10 +3556,16 @@ def prepare_dandi_data(
                 subj_data = load_dandi_subject(
                     subj_id, data_dir, source_region, target_region, zscore
                 )
+                # Filter out subjects with too few channels
+                n_src = subj_data['n_source_channels']
+                n_tgt = subj_data['n_target_channels']
+                if n_src < min_channels or n_tgt < min_channels:
+                    if verbose:
+                        print(f"    Skipping {subj_id}: only {n_src} source / {n_tgt} target channels (min={min_channels})")
+                    continue
                 data_list.append(subj_data)
                 if verbose:
-                    print(f"    Loaded {subj_id}: source={subj_data['n_source_channels']}ch, "
-                          f"target={subj_data['n_target_channels']}ch, "
+                    print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, "
                           f"{subj_data['n_samples']} samples")
             except Exception as e:
                 if verbose:
