@@ -861,6 +861,35 @@ def apply_augmentations(
         ob = aug_dc_offset(ob, offset_range)
         pcx = aug_dc_offset(pcx, offset_range)
 
+    # Channel shuffle: test channel correspondence assumption
+    # This is for experimentation - if performance is similar with shuffle,
+    # model isn't relying on channel position (good for cross-subject generalization)
+    if config.get("aug_channel_shuffle", False):
+        shuffle_mode = config.get("aug_channel_shuffle_mode", "both")
+        batch_size, n_ch_ob, _ = ob.shape
+        _, n_ch_pcx, _ = pcx.shape
+
+        if shuffle_mode in ("source", "both"):
+            # Shuffle source channels (same permutation for entire batch for consistency)
+            perm_ob = torch.randperm(n_ch_ob, device=ob.device)
+            ob = ob[:, perm_ob, :]
+
+        if shuffle_mode in ("target", "both"):
+            # Shuffle target channels
+            perm_pcx = torch.randperm(n_ch_pcx, device=pcx.device)
+            pcx = pcx[:, perm_pcx, :]
+
+        if shuffle_mode == "consistent":
+            # Same permutation for both (only if same channel count)
+            # This preserves any real correspondence while testing position invariance
+            n_ch = min(n_ch_ob, n_ch_pcx)
+            perm = torch.randperm(n_ch, device=ob.device)
+            ob_shuffled = ob.clone()
+            pcx_shuffled = pcx.clone()
+            ob_shuffled[:, :n_ch, :] = ob[:, perm, :]
+            pcx_shuffled[:, :n_ch, :] = pcx[:, perm, :]
+            ob, pcx = ob_shuffled, pcx_shuffled
+
     return ob, pcx
 
 
@@ -3243,13 +3272,6 @@ def parse_args():
                         help="Stride as ratio of window size for DANDI (0.5 = 50%% overlap)")
     parser.add_argument("--dandi-data-dir", type=str, default="/data/movie",
                         help="Directory containing DANDI NWB files (default: /data/movie)")
-    parser.add_argument("--dandi-shuffle-channels", type=str, default=None,
-                        choices=["source", "target", "both", "consistent"],
-                        help="Channel shuffle mode to test channel correspondence assumption: "
-                             "'source' shuffles source channels, 'target' shuffles target, "
-                             "'both' shuffles independently, 'consistent' same shuffle for both")
-    parser.add_argument("--dandi-shuffle-seed", type=int, default=42,
-                        help="Seed for channel shuffling (default: 42 for reproducible fixed shuffle)")
 
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3401,6 +3423,16 @@ def parse_args():
                         help="Max number of frequency bands to mask (default: 2)")
     parser.add_argument("--aug-freq-mask-max-width", type=int, default=None,
                         help="Max width of each masked band in freq bins (default: 10)")
+
+    # Channel shuffle (for testing channel correspondence assumption)
+    parser.add_argument("--aug-channel-shuffle", action="store_true", default=None,
+                        help="Enable channel shuffle augmentation (test if model relies on channel position)")
+    parser.add_argument("--no-aug-channel-shuffle", action="store_false", dest="aug_channel_shuffle",
+                        help="Disable channel shuffle augmentation")
+    parser.add_argument("--aug-channel-shuffle-mode", type=str, default="both",
+                        choices=["source", "target", "both", "consistent"],
+                        help="Channel shuffle mode: 'source' (shuffle input only), 'target' (shuffle output only), "
+                             "'both' (shuffle independently), 'consistent' (same shuffle for both)")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3696,8 +3728,6 @@ def main():
             print(f"  Source region: {args.dandi_source_region}")
             print(f"  Target region: {args.dandi_target_region}")
             print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
-            if args.dandi_shuffle_channels:
-                print(f"  Channel shuffle: {args.dandi_shuffle_channels} (seed={args.dandi_shuffle_seed})")
 
         # Prepare DANDI data - this returns datasets directly
         dandi_data = prepare_dandi_data(
@@ -3708,8 +3738,6 @@ def main():
             stride=train_stride,
             seed=config["seed"],
             verbose=is_primary(),  # Only print from rank 0 in distributed training
-            shuffle_channels=args.dandi_shuffle_channels,
-            shuffle_seed=args.dandi_shuffle_seed,
         )
 
         # Create a minimal data dict for compatibility with training loop
@@ -3815,6 +3843,10 @@ def main():
         config["aug_freq_mask_max_bands"] = args.aug_freq_mask_max_bands
     if args.aug_freq_mask_max_width is not None:
         config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
+    if args.aug_channel_shuffle is not None:
+        config["aug_channel_shuffle"] = args.aug_channel_shuffle
+    if args.aug_channel_shuffle_mode is not None:
+        config["aug_channel_shuffle_mode"] = args.aug_channel_shuffle_mode
 
     # Plot generation config
     if args.generate_plots is not None:
@@ -3831,7 +3863,8 @@ def main():
                 k for k in [
                     "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
                     "aug_time_mask", "aug_mixup", "aug_freq_mask",
-                    "aug_channel_scale", "aug_dc_offset"  # Session-specific augmentations
+                    "aug_channel_scale", "aug_dc_offset",  # Session-specific augmentations
+                    "aug_channel_shuffle"  # Channel correspondence experiment
                 ]
                 if config.get(k, False)
             ]
@@ -3839,6 +3872,9 @@ def main():
                 print(f"Data augmentation ENABLED: {', '.join(aug_active)}")
                 if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
                     print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
+                if config.get("aug_channel_shuffle", False):
+                    mode = config.get("aug_channel_shuffle_mode", "both")
+                    print(f"  [Channel shuffle ENABLED: mode={mode} - testing channel correspondence]")
             else:
                 print("Data augmentation: all individual augmentations disabled")
 
