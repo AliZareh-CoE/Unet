@@ -3665,10 +3665,9 @@ def main():
         config["dandi_data_dir"] = args.dandi_data_dir
         config["sampling_rate"] = DANDI_SAMPLING_RATE_HZ
 
-        # Channel counts depend on which regions are selected (variable per subject)
-        # Use placeholder values - actual counts come from data
-        config["in_channels"] = 8   # Will be determined from data
-        config["out_channels"] = 8  # Will be determined from data
+        # Channel counts from prepared data (normalized across all subjects)
+        config["in_channels"] = dandi_data["n_source_channels"]
+        config["out_channels"] = dandi_data["n_target_channels"]
         config["split_by_session"] = True  # Subject-based splits
 
         # Store the prepared datasets for later use
@@ -3678,6 +3677,7 @@ def main():
             print(f"  Train windows: {len(dandi_data['train_dataset'])}")
             print(f"  Val windows: {len(dandi_data['val_dataset'])}")
             print(f"  Test windows: {len(dandi_data['test_dataset'])}")
+            print(f"  Source channels: {dandi_data['n_source_channels']}, Target channels: {dandi_data['n_target_channels']}")
 
     else:
         # Olfactory dataset (default)

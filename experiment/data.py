@@ -3398,6 +3398,8 @@ class DANDIMovieDataset(Dataset):
         stride: Stride between windows (default: 2500 = 2.5s)
         zscore_per_window: Whether to z-score each window independently
         verbose: Whether to print info messages
+        n_source_channels: Fixed number of source channels (None = use min across subjects)
+        n_target_channels: Fixed number of target channels (None = use min across subjects)
     """
 
     def __init__(
@@ -3407,10 +3409,23 @@ class DANDIMovieDataset(Dataset):
         stride: int = 2500,
         zscore_per_window: bool = False,
         verbose: bool = True,
+        n_source_channels: Optional[int] = None,
+        n_target_channels: Optional[int] = None,
     ):
         self.window_size = window_size
         self.stride = stride
         self.zscore_per_window = zscore_per_window
+
+        # Determine channel counts - use minimum across subjects to ensure consistent shapes
+        if n_source_channels is None:
+            self.n_source_channels = min(s["n_source_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_source_channels = n_source_channels
+
+        if n_target_channels is None:
+            self.n_target_channels = min(s["n_target_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_target_channels = n_target_channels
 
         # Build index of all windows across subjects
         self.windows = []  # List of (subject_idx, start_sample)
@@ -3428,7 +3443,8 @@ class DANDIMovieDataset(Dataset):
         if verbose:
             print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
                   f"{len(self.windows)} windows, "
-                  f"window_size={window_size}, stride={stride}")
+                  f"window_size={window_size}, stride={stride}, "
+                  f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}")
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -3439,9 +3455,10 @@ class DANDIMovieDataset(Dataset):
 
         end = start + self.window_size
 
-        # Extract window
-        source = subj_data["source"][:, start:end].copy()
-        target = subj_data["target"][:, start:end].copy()
+        # Extract window and truncate to normalized channel counts
+        # This ensures consistent tensor shapes across subjects
+        source = subj_data["source"][:self.n_source_channels, start:end].copy()
+        target = subj_data["target"][:self.n_target_channels, start:end].copy()
 
         # Optional per-window normalization
         if self.zscore_per_window:
@@ -3453,8 +3470,8 @@ class DANDIMovieDataset(Dataset):
             )
 
         return {
-            "source": torch.from_numpy(source),
-            "target": torch.from_numpy(target),
+            "source": torch.from_numpy(source).float(),
+            "target": torch.from_numpy(target).float(),
             "subject_idx": torch.tensor(subj_idx),
             "start_sample": torch.tensor(start),
         }
@@ -3559,10 +3576,30 @@ def prepare_dandi_data(
         print("\nLoading test subjects...")
     test_data = load_subjects(test_subjects, "test")
 
-    # Create datasets
-    train_dataset = DANDIMovieDataset(train_data, window_size, stride, verbose=verbose)
-    val_dataset = DANDIMovieDataset(val_data, window_size, stride, verbose=verbose)
-    test_dataset = DANDIMovieDataset(test_data, window_size, stride, verbose=verbose)
+    # Compute minimum channel counts across ALL subjects for consistent batching
+    all_data = train_data + val_data + test_data
+    if not all_data:
+        raise ValueError("No subjects could be loaded from DANDI dataset")
+
+    min_source_channels = min(s["n_source_channels"] for s in all_data)
+    min_target_channels = min(s["n_target_channels"] for s in all_data)
+
+    if verbose:
+        print(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
+
+    # Create datasets with consistent channel counts
+    train_dataset = DANDIMovieDataset(
+        train_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+    )
+    val_dataset = DANDIMovieDataset(
+        val_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+    )
+    test_dataset = DANDIMovieDataset(
+        test_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels
+    )
 
     return {
         "train_dataset": train_dataset,
@@ -3577,6 +3614,8 @@ def prepare_dandi_data(
         "window_size": window_size,
         "stride": stride,
         "dataset_type": DatasetType.DANDI_MOVIE,
+        "n_source_channels": min_source_channels,
+        "n_target_channels": min_target_channels,
     }
 
 
