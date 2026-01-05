@@ -785,10 +785,14 @@ def apply_augmentations(
         batch_size, _, time_len = ob.shape
         mask_len = int(time_len * mask_ratio)
         if mask_len > 0:
+            # Create mask tensor (avoids inplace operation)
+            ob_masked = ob.clone()
+            pcx_masked = pcx.clone()
             for i in range(batch_size):
                 start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
-                ob[i, :, start:start + mask_len] = 0
-                pcx[i, :, start:start + mask_len] = 0
+                ob_masked[i, :, start:start + mask_len] = 0
+                pcx_masked[i, :, start:start + mask_len] = 0
+            ob, pcx = ob_masked, pcx_masked
 
     # Mixup: blend random pairs (applied to both input and target coherently)
     if config.get("aug_mixup", False):
@@ -801,8 +805,8 @@ def apply_augmentations(
         max_width = config.get("aug_freq_mask_max_width", 10)
         batch_size = ob.shape[0]
         # Apply same frequency mask pattern to both tensors independently
-        ob_fft = torch.fft.rfft(ob, dim=-1)
-        pcx_fft = torch.fft.rfft(pcx, dim=-1)
+        ob_fft = torch.fft.rfft(ob, dim=-1).clone()  # Clone to avoid inplace issues
+        pcx_fft = torch.fft.rfft(pcx, dim=-1).clone()
         n_freqs = ob_fft.shape[-1]
         if n_freqs > max_width:
             for i in range(batch_size):
