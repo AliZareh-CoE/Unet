@@ -1264,6 +1264,12 @@ class SpectroTemporalEncoder(nn.Module):
         original_dtype = x.dtype
         param_dtype = self._param_dtype
 
+        # IMPORTANT: Clone input to avoid autograd inplace errors
+        # When x is already float32 and param_dtype is float32, .float() and .to()
+        # return the same tensor (not copies). This can cause gradient computation
+        # issues when the same input tensor is used in both the model and cond_encoder.
+        x = x.clone()
+
         # FFT requires float32, but we need to match param dtype for linear layers
         x_float = x.float()
 
