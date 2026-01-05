@@ -109,6 +109,11 @@ from data import (
     create_pcx1_dataloaders,
     get_pcx1_session_splits,
     PCX1_SAMPLING_RATE,
+    # DANDI 000623 movie dataset
+    prepare_dandi_data,
+    create_dandi_dataloaders,
+    DANDI_SAMPLING_RATE_HZ,
+    DANDI_BRAIN_REGIONS,
 )
 
 # Recording system imports (for comprehensive analysis)
@@ -2064,6 +2069,66 @@ def train(
                 num_workers=num_workers,
                 distributed=is_distributed,
             )
+    elif config.get("dataset_type") == "dandi":
+        # DANDI uses pre-created datasets from prepare_dandi_data
+        from torch.utils.data import DataLoader
+        from torch.utils.data.distributed import DistributedSampler
+
+        dandi_datasets = config.get("_dandi_datasets", {})
+        train_dataset = dandi_datasets.get("train_dataset")
+        val_dataset = dandi_datasets.get("val_dataset")
+        test_dataset = dandi_datasets.get("test_dataset")
+
+        batch_size = config.get("batch_size", 16)
+
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
+
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": True,
+        }
+
+        loaders = {
+            "train": DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
+                drop_last=True,
+                **loader_kwargs,
+            ),
+            "val": DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            ),
+        }
+
+        if test_dataset is not None and len(test_dataset) > 0:
+            test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if is_distributed else None
+            loaders["test"] = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=test_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            )
+
+        # Update in_channels and out_channels from actual data
+        # Get a sample batch to determine shapes
+        sample_batch = next(iter(loaders["train"]))
+        config["in_channels"] = sample_batch["source"].shape[1]  # [B, C, T]
+        config["out_channels"] = sample_batch["target"].shape[1]
+
+        if is_primary():
+            print(f"DANDI DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
+            print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
     else:
         loaders = create_dataloaders(
             data,
@@ -3071,9 +3136,10 @@ def parse_args():
     
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "pcx1"],
+                        choices=["olfactory", "pfc", "pcx1", "dandi"],
                         help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
-                             "'pfc' (PFC→CA1), or 'pcx1' (continuous 1kHz LFP)")
+                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), or "
+                             "'dandi' (DANDI 000623 human iEEG movie watching)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
@@ -3104,6 +3170,22 @@ def parse_args():
                         help="Explicit validation sessions for PCx1 (default: 4 random sessions)")
     parser.add_argument("--pcx1-n-val", type=int, default=4,
                         help="Number of validation sessions for PCx1 if not explicitly specified (default: 4)")
+
+    # DANDI 000623 dataset options
+    parser.add_argument("--dandi-source-region", type=str, default="amygdala",
+                        choices=["amygdala", "hippocampus", "medial_frontal_cortex"],
+                        help="Source brain region for DANDI dataset (default: amygdala)")
+    parser.add_argument("--dandi-target-region", type=str, default="hippocampus",
+                        choices=["amygdala", "hippocampus", "medial_frontal_cortex"],
+                        help="Target brain region for DANDI dataset (default: hippocampus)")
+    parser.add_argument("--dandi-window-size", type=int, default=5000,
+                        help="Window size in samples for DANDI (default: 5000 = 5s at 1kHz)")
+    parser.add_argument("--dandi-stride", type=int, default=None,
+                        help="Stride between windows for DANDI (default: window_size // 2)")
+    parser.add_argument("--dandi-stride-ratio", type=float, default=None,
+                        help="Stride as ratio of window size for DANDI (0.5 = 50%% overlap)")
+    parser.add_argument("--dandi-data-dir", type=str, default="/data/movie",
+                        help="Directory containing DANDI NWB files (default: /data/movie)")
 
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3529,6 +3611,73 @@ def main():
             if is_primary():
                 print(f"PFC sliding window: size={config['pfc_window_size']}, "
                       f"stride={config['pfc_stride']}, val_stride={config['pfc_val_stride']}")
+
+    elif args.dataset == "dandi":
+        # DANDI 000623 human iEEG movie watching dataset
+        from pathlib import Path
+
+        # Calculate stride
+        window_size = args.dandi_window_size
+        if args.dandi_stride_ratio is not None:
+            train_stride = int(window_size * args.dandi_stride_ratio)
+        elif args.dandi_stride is not None:
+            train_stride = args.dandi_stride
+        else:
+            train_stride = window_size // 2  # 50% overlap default
+
+        val_stride = int(window_size * args.val_stride_multiplier)
+
+        if is_primary():
+            print(f"\nLoading DANDI 000623 dataset...")
+            print(f"  Source region: {args.dandi_source_region}")
+            print(f"  Target region: {args.dandi_target_region}")
+            print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+
+        # Prepare DANDI data - this returns datasets directly
+        dandi_data = prepare_dandi_data(
+            data_dir=Path(args.dandi_data_dir),
+            source_region=args.dandi_source_region,
+            target_region=args.dandi_target_region,
+            window_size=window_size,
+            stride=train_stride,
+            seed=config["seed"],
+        )
+
+        # Create a minimal data dict for compatibility with training loop
+        # DANDI uses sliding window so we bypass the standard data loading
+        data = {
+            "train_idx": list(range(len(dandi_data["train_dataset"]))),
+            "val_idx": list(range(len(dandi_data["val_dataset"]))),
+            "test_idx": list(range(len(dandi_data["test_dataset"]))),
+            "n_odors": 1,  # No conditioning labels for DANDI
+            "vocab": {"movie": 0},  # Placeholder
+        }
+
+        # Store DANDI-specific config
+        config["dataset_type"] = "dandi"
+        config["dandi_sliding_window"] = True
+        config["dandi_window_size"] = window_size
+        config["dandi_stride"] = train_stride
+        config["dandi_val_stride"] = val_stride
+        config["dandi_source_region"] = args.dandi_source_region
+        config["dandi_target_region"] = args.dandi_target_region
+        config["dandi_data_dir"] = args.dandi_data_dir
+        config["sampling_rate"] = DANDI_SAMPLING_RATE_HZ
+
+        # Channel counts depend on which regions are selected (variable per subject)
+        # Use placeholder values - actual counts come from data
+        config["in_channels"] = 8   # Will be determined from data
+        config["out_channels"] = 8  # Will be determined from data
+        config["split_by_session"] = True  # Subject-based splits
+
+        # Store the prepared datasets for later use
+        config["_dandi_datasets"] = dandi_data
+
+        if is_primary():
+            print(f"  Train windows: {len(dandi_data['train_dataset'])}")
+            print(f"  Val windows: {len(dandi_data['val_dataset'])}")
+            print(f"  Test windows: {len(dandi_data['test_dataset'])}")
+
     else:
         # Olfactory dataset (default)
         data = prepare_data(
