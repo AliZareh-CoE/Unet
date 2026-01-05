@@ -1672,17 +1672,6 @@ def train_epoch(
         ob = ob.clone()
         pcx = pcx.clone()
 
-        # CRITICAL FIX: Set model and reverse_model to eval mode for the entire batch
-        # to prevent BatchNorm running stats from being updated in-place multiple times.
-        # This causes version tracking conflicts during backward() when the same model
-        # is called multiple times (main forward + cycle consistency).
-        # Gradients still flow for weight/bias training; only running stats are frozen.
-        model_was_training = model.training
-        model.eval()
-        if reverse_model is not None:
-            reverse_model_was_training = reverse_model.training
-            reverse_model.eval()
-
         # Compute conditioning embedding
         # IMPORTANT: Set cond_encoder to eval mode during forward pass to prevent
         # BatchNorm running stats from being updated in-place. This avoids version
@@ -1962,12 +1951,6 @@ def train_epoch(
             sync_gradients_manual(cond_encoder)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-
-        # Restore training mode for models after the batch
-        if model_was_training:
-            model.train()
-        if reverse_model is not None and reverse_model_was_training:
-            reverse_model.train()
 
         # Accumulate loss as tensor - NO .item() call to avoid GPU sync
         total_loss = total_loss + loss.detach()
