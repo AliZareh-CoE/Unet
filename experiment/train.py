@@ -1673,9 +1673,15 @@ def train_epoch(
         pcx = pcx.clone()
 
         # Compute conditioning embedding
+        # IMPORTANT: Set cond_encoder to eval mode during forward pass to prevent
+        # BatchNorm running stats from being updated in-place. This avoids version
+        # tracking conflicts during backward() when cond_emb is used in multiple
+        # model calls. Gradients still flow for weight/bias training.
         cond_emb = None
         cond_loss = 0.0
         if cond_encoder is not None:
+            cond_encoder_training = cond_encoder.training
+            cond_encoder.eval()  # Prevent BatchNorm running stats updates
             cond_source = config.get("conditioning_source", "odor_onehot")
             if cond_source == "spectro_temporal":
                 # SpectroTemporalEncoder: signal -> embedding
@@ -1711,6 +1717,10 @@ def train_epoch(
                     cond_loss = cond_loss + 0.1 * cycle_losses["cycle_loss"]
                 if "recon_loss" in cycle_losses:
                     cond_loss = cond_loss + 0.1 * cycle_losses["recon_loss"]
+
+            # Restore cond_encoder training mode (gradients still flow for training)
+            if cond_encoder_training:
+                cond_encoder.train()
 
         # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
         # If contrastive learning enabled, also get bottleneck features
