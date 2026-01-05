@@ -747,12 +747,14 @@ def apply_augmentations(
         max_shift_samples = int(time_len * max_shift)
         if max_shift_samples > 0:
             shifts = torch.randint(-max_shift_samples, max_shift_samples + 1, (batch_size,), device=ob.device)
-            ob_shifted = torch.zeros_like(ob)
-            pcx_shifted = torch.zeros_like(pcx)
+            # Use list + stack to avoid inplace assignment on autograd-tracked tensors
+            ob_shifted_list = []
+            pcx_shifted_list = []
             for i in range(batch_size):
-                ob_shifted[i] = torch.roll(ob[i], shifts=shifts[i].item(), dims=-1)
-                pcx_shifted[i] = torch.roll(pcx[i], shifts=shifts[i].item(), dims=-1)
-            ob, pcx = ob_shifted, pcx_shifted
+                ob_shifted_list.append(torch.roll(ob[i], shifts=shifts[i].item(), dims=-1))
+                pcx_shifted_list.append(torch.roll(pcx[i], shifts=shifts[i].item(), dims=-1))
+            ob = torch.stack(ob_shifted_list, dim=0)
+            pcx = torch.stack(pcx_shifted_list, dim=0)
 
     # Noise: add independently to both (realistic noise augmentation)
     if config.get("aug_noise", False):
