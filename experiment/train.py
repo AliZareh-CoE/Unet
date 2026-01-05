@@ -2684,6 +2684,9 @@ def train(
                     print(f"Early stopping at epoch {epoch} (Stage 1 complete)")
                 break
 
+        # Synchronize all ranks after training loop exits (critical for early stopping)
+        barrier()
+
         # Stage 1 evaluation (if enabled)
         # NOTE: ALL ranks must participate in evaluate() because model is sharded with FSDP
         if config.get("eval_stage1", False):
@@ -3051,6 +3054,9 @@ def train(
         finally:
             # Always close the recording session
             recording_session.close()
+
+    # Final synchronization before exiting train() to prevent NCCL hangs
+    barrier()
 
     return {
         "best_val_loss": best_val_loss,
@@ -3737,3 +3743,7 @@ if __name__ == "__main__":
         print(f"{'='*70}\n", file=sys.stderr, flush=True)
         sys.stderr.flush()
         raise
+    finally:
+        # Clean up distributed process group to prevent NCCL watchdog hangs
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
