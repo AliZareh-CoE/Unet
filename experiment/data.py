@@ -118,7 +118,7 @@ NUM_TRIAL_TYPES = 2  # Right, Left
 # DANDI Archive: https://dandiarchive.org/dandiset/000623
 # GitHub: https://github.com/rutishauserlab/bmovie-release-NWB-BIDS
 
-_DANDI_DATA_DIR = Path("/data/dandi/000623")
+_DANDI_DATA_DIR = Path("/data/movie")
 DANDI_DANDISET_ID = "000623"
 DANDI_SAMPLING_RATE_HZ = 1000  # LFP/iEEG downsampled to 1000 Hz
 DANDI_MOVIE_DURATION_S = 480.0  # ~8 minutes movie clip
@@ -128,7 +128,7 @@ DANDI_BRAIN_REGIONS = ["amygdala", "hippocampus", "medial_frontal_cortex"]
 DANDI_REGION_ABBREVIATIONS = {"amygdala": "AMY", "hippocampus": "HPC", "medial_frontal_cortex": "MFC"}
 
 # Data paths (NWB files will be downloaded here)
-DANDI_RAW_PATH = _DANDI_DATA_DIR / "raw"
+DANDI_RAW_PATH = _DANDI_DATA_DIR  # NWB files directly in /data/movie
 DANDI_PROCESSED_PATH = _DANDI_DATA_DIR / "processed"
 DANDI_CACHE_PATH = _DANDI_DATA_DIR / "cache"
 
