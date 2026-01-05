@@ -1727,9 +1727,10 @@ def create_dataloaders(
     )
 
     # Create samplers for distributed training (seed=42 for reproducibility)
-    train_sampler = DistributedSampler(train_dataset, seed=42) if distributed else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
+    # drop_last=True ensures all ranks have the same number of samples (critical for FSDP)
+    train_sampler = DistributedSampler(train_dataset, seed=42, drop_last=True) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
 
     # Create dataloaders with optimized settings
     pin_memory = torch.cuda.is_available()
@@ -1852,7 +1853,8 @@ def create_single_session_dataloader(
     )
 
     # Create sampler for distributed training
-    sampler = DistributedSampler(dataset, shuffle=False, seed=seed) if distributed else None
+    # drop_last=True ensures all ranks have the same number of samples (critical for FSDP)
+    sampler = DistributedSampler(dataset, shuffle=False, seed=seed, drop_last=True) if distributed else None
 
     # Handle small datasets
     effective_batch_size = batch_size
@@ -1942,9 +1944,10 @@ def create_pfc_dataloaders(
     )
 
     # Create samplers for distributed training (seed=42 for reproducibility)
-    train_sampler = DistributedSampler(train_dataset, seed=42) if distributed else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
+    # drop_last=True ensures all ranks have the same number of samples (critical for FSDP)
+    train_sampler = DistributedSampler(train_dataset, seed=42, drop_last=True) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
 
     # Create dataloaders with optimized settings
     pin_memory = torch.cuda.is_available()
@@ -2432,9 +2435,10 @@ def create_pfc_sliding_window_dataloaders(
         )
 
     # Create samplers for distributed training
-    train_sampler = DistributedSampler(train_dataset, seed=42) if distributed else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
-    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
+    # drop_last=True ensures all ranks have the same number of samples (critical for FSDP)
+    train_sampler = DistributedSampler(train_dataset, seed=42, drop_last=True) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42, drop_last=True) if distributed else None
 
     # Create DataLoaders
     train_loader = DataLoader(
