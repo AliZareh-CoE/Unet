@@ -97,6 +97,7 @@ from data import (
     prepare_pfc_data,
     create_dataloaders,
     create_pfc_dataloaders,
+    create_pfc_sliding_window_dataloaders,
     create_single_session_dataloader,
     crop_to_target_torch,
     SAMPLING_RATE_HZ,
@@ -2000,12 +2001,28 @@ def train(
                 for sess_name, sess_loader in loaders["val_sessions"].items():
                     print(f"  Val session {sess_name}: {len(sess_loader.dataset)} windows")
     elif config.get("dataset_type") == "pfc":
-        loaders = create_pfc_dataloaders(
-            data,
-            batch_size=config.get("batch_size", 16),
-            num_workers=num_workers,
-            distributed=is_distributed,
-        )
+        if config.get("pfc_sliding_window", False):
+            # Use sliding window dataloaders for more training samples
+            loaders = create_pfc_sliding_window_dataloaders(
+                data,
+                window_size=config.get("pfc_window_size", 2500),
+                stride=config.get("pfc_stride"),
+                val_stride=config.get("pfc_val_stride"),
+                batch_size=config.get("batch_size", 16),
+                num_workers=num_workers,
+                use_sessions=config.get("split_by_session", False),
+                distributed=is_distributed,
+            )
+            if is_primary():
+                print(f"PFC sliding window DataLoaders: {len(loaders['train'].dataset)} train windows, "
+                      f"{len(loaders['val'].dataset)} val windows")
+        else:
+            loaders = create_pfc_dataloaders(
+                data,
+                batch_size=config.get("batch_size", 16),
+                num_workers=num_workers,
+                distributed=is_distributed,
+            )
     else:
         loaders = create_dataloaders(
             data,
@@ -3016,6 +3033,16 @@ def parse_args():
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
+    # PFC sliding window options
+    parser.add_argument("--pfc-sliding-window", action="store_true",
+                        help="Use sliding window training for PFC dataset (more training samples)")
+    parser.add_argument("--pfc-window-size", type=int, default=2500,
+                        help="Window size in samples for PFC sliding window (default: 2500 = 2s at 1250Hz)")
+    parser.add_argument("--pfc-stride", type=int, default=None,
+                        help="Stride between windows for PFC (default: window_size // 2 for 50%% overlap)")
+    parser.add_argument("--pfc-stride-ratio", type=float, default=None,
+                        help="Stride as ratio of window size for PFC (0.5 = 50%% overlap)")
+
     # PCx1 continuous dataset options
     parser.add_argument("--pcx1-window-size", type=int, default=5000,
                         help="Window size in samples for PCx1 continuous data (default: 5000 = 5 seconds)")
@@ -3441,6 +3468,23 @@ def main():
         config["sampling_rate"] = SAMPLING_RATE_HZ if args.resample_pfc else PFC_SAMPLING_RATE_HZ
         # Map PFC data keys to generic names for training loop
         data["n_odors"] = data["n_labels"]  # trial types instead of odors
+
+        # PFC sliding window configuration
+        if args.pfc_sliding_window:
+            config["pfc_sliding_window"] = True
+            config["pfc_window_size"] = args.pfc_window_size
+            # Calculate stride from ratio if specified
+            if args.pfc_stride_ratio is not None:
+                config["pfc_stride"] = int(args.pfc_window_size * args.pfc_stride_ratio)
+            elif args.pfc_stride is not None:
+                config["pfc_stride"] = args.pfc_stride
+            else:
+                config["pfc_stride"] = args.pfc_window_size // 2  # 50% overlap default
+            # Validation stride: use window size for non-overlapping (faster eval)
+            config["pfc_val_stride"] = int(args.pfc_window_size * args.val_stride_multiplier)
+            if is_primary():
+                print(f"PFC sliding window: size={config['pfc_window_size']}, "
+                      f"stride={config['pfc_stride']}, val_stride={config['pfc_val_stride']}")
     else:
         # Olfactory dataset (default)
         data = prepare_data(

@@ -2170,6 +2170,329 @@ class PFCDataModule:
         return self.data["n_labels"]
 
 
+# =============================================================================
+# PFC Sliding Window Dataset (for continuous-style training from trial data)
+# =============================================================================
+
+class SlidingWindowPFCDataset(Dataset):
+    """PyTorch Dataset for PFC data with sliding windows within trials.
+
+    Creates overlapping windows from trial-based recordings for training
+    neural translation models with more data augmentation.
+
+    Args:
+        pfc: PFC signals [n_trials, n_channels, n_samples] = [N, 64, 6250]
+        ca1: CA1 signals [n_trials, n_channels, n_samples] = [N, 32, 6250]
+        trial_indices: Which trials to include (e.g., train_idx)
+        trial_types: Trial type labels for each trial
+        window_size: Window size in samples (default: 2500 = 2 seconds at 1250 Hz)
+        stride: Stride between windows in samples (default: window_size // 2)
+        zscore_per_window: Whether to z-score each window independently
+        session_ids: Optional session IDs for each trial
+    """
+    def __init__(
+        self,
+        pfc: np.ndarray,
+        ca1: np.ndarray,
+        trial_indices: np.ndarray,
+        trial_types: Optional[np.ndarray] = None,
+        window_size: int = 2500,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        session_ids: Optional[np.ndarray] = None,
+    ):
+        self.pfc = pfc.astype(np.float32)
+        self.ca1 = ca1.astype(np.float32)
+        self.trial_indices = trial_indices
+        self.trial_types = trial_types
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+        self.session_ids = session_ids
+
+        # Get trial length
+        self.trial_length = pfc.shape[2]
+
+        # Calculate number of windows per trial
+        self.windows_per_trial = max(0, (self.trial_length - window_size) // self.stride + 1)
+
+        # Build index mapping: global_idx -> (trial_idx, local_window_idx)
+        self.window_mapping = []
+        for trial_idx in trial_indices:
+            for local_idx in range(self.windows_per_trial):
+                self.window_mapping.append((trial_idx, local_idx))
+
+        print(f"SlidingWindowPFCDataset: {len(trial_indices)} trials, "
+              f"{self.windows_per_trial} windows/trial, "
+              f"{len(self.window_mapping)} total windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        trial_idx, local_idx = self.window_mapping[idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        pfc_window = self.pfc[trial_idx, :, start:end].copy()
+        ca1_window = self.ca1[trial_idx, :, start:end].copy()
+
+        if self.zscore_per_window:
+            pfc_window = (pfc_window - pfc_window.mean(axis=1, keepdims=True)) / \
+                         (pfc_window.std(axis=1, keepdims=True) + 1e-8)
+            ca1_window = (ca1_window - ca1_window.mean(axis=1, keepdims=True)) / \
+                         (ca1_window.std(axis=1, keepdims=True) + 1e-8)
+
+        # Return trial type as label (for compatibility with training loop)
+        label = self.trial_types[trial_idx] if self.trial_types is not None else 0
+        return torch.from_numpy(pfc_window), torch.from_numpy(ca1_window), int(label)
+
+    def get_session_id(self, idx: int) -> Optional[int]:
+        """Get session ID for a given window index."""
+        if self.session_ids is None:
+            return None
+        trial_idx, _ = self.window_mapping[idx]
+        return self.session_ids[trial_idx]
+
+
+class MultiSessionSlidingWindowPFCDataset(Dataset):
+    """Dataset combining multiple PFC sessions with sliding windows.
+
+    Groups trials by session and provides session-aware batching.
+
+    Args:
+        pfc: PFC signals [n_trials, n_channels, n_samples]
+        ca1: CA1 signals [n_trials, n_channels, n_samples]
+        trial_indices: Which trials to include
+        session_ids: Session ID for each trial
+        trial_types: Trial type labels
+        window_size: Window size in samples
+        stride: Stride between windows
+        zscore_per_window: Whether to z-score each window
+        idx_to_session: Mapping from session index to session name
+    """
+    def __init__(
+        self,
+        pfc: np.ndarray,
+        ca1: np.ndarray,
+        trial_indices: np.ndarray,
+        session_ids: np.ndarray,
+        trial_types: Optional[np.ndarray] = None,
+        window_size: int = 2500,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        idx_to_session: Optional[Dict[int, str]] = None,
+    ):
+        self.pfc = pfc.astype(np.float32)
+        self.ca1 = ca1.astype(np.float32)
+        self.trial_indices = trial_indices
+        self.session_ids = session_ids
+        self.trial_types = trial_types
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+        self.idx_to_session = idx_to_session or {}
+
+        self.trial_length = pfc.shape[2]
+        self.windows_per_trial = max(0, (self.trial_length - window_size) // self.stride + 1)
+
+        # Build index mapping: global_idx -> (trial_idx, local_window_idx, session_idx)
+        self.window_mapping = []
+        session_window_counts = {}
+
+        for trial_idx in trial_indices:
+            sess_idx = session_ids[trial_idx]
+            for local_idx in range(self.windows_per_trial):
+                self.window_mapping.append((trial_idx, local_idx, sess_idx))
+                session_window_counts[sess_idx] = session_window_counts.get(sess_idx, 0) + 1
+
+        # Store unique sessions
+        self.unique_sessions = sorted(set(session_ids[trial_indices]))
+
+        print(f"MultiSessionSlidingWindowPFCDataset: {len(trial_indices)} trials, "
+              f"{len(self.unique_sessions)} sessions, "
+              f"{len(self.window_mapping)} total windows")
+        for sess_idx, count in sorted(session_window_counts.items()):
+            sess_name = self.idx_to_session.get(sess_idx, f"session_{sess_idx}")
+            print(f"  {sess_name}: {count} windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        trial_idx, local_idx, sess_idx = self.window_mapping[idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        pfc_window = self.pfc[trial_idx, :, start:end].copy()
+        ca1_window = self.ca1[trial_idx, :, start:end].copy()
+
+        if self.zscore_per_window:
+            pfc_window = (pfc_window - pfc_window.mean(axis=1, keepdims=True)) / \
+                         (pfc_window.std(axis=1, keepdims=True) + 1e-8)
+            ca1_window = (ca1_window - ca1_window.mean(axis=1, keepdims=True)) / \
+                         (ca1_window.std(axis=1, keepdims=True) + 1e-8)
+
+        label = self.trial_types[trial_idx] if self.trial_types is not None else 0
+        return torch.from_numpy(pfc_window), torch.from_numpy(ca1_window), int(label)
+
+    def get_session_name(self, sess_idx: int) -> str:
+        """Get session name by index."""
+        return self.idx_to_session.get(sess_idx, f"session_{sess_idx}")
+
+
+def create_pfc_sliding_window_dataloaders(
+    data: Dict[str, Any],
+    window_size: int = 2500,
+    stride: Optional[int] = None,
+    val_stride: Optional[int] = None,
+    batch_size: int = 32,
+    zscore_per_window: bool = False,
+    num_workers: int = 4,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    use_sessions: bool = False,
+    distributed: bool = False,
+) -> Dict[str, Any]:
+    """Create DataLoaders for PFC data with sliding windows.
+
+    Args:
+        data: Output from prepare_pfc_data()
+        window_size: Window size in samples (default: 2500 = 2s at 1250Hz)
+        stride: Training stride (default: window_size // 2)
+        val_stride: Validation stride (default: window_size for non-overlapping)
+        batch_size: Batch size for DataLoader
+        zscore_per_window: Whether to z-score each window
+        num_workers: Number of DataLoader workers
+        persistent_workers: Keep workers alive between batches
+        prefetch_factor: Prefetch multiplier
+        use_sessions: If True, use session-aware dataset
+        distributed: If True, use DistributedSampler for DDP
+
+    Returns:
+        Dictionary with train/val/test loaders and metadata
+    """
+    pfc = data["pfc"]
+    ca1 = data["ca1"]
+    trial_types = data.get("trial_types")
+    train_idx = data["train_idx"]
+    val_idx = data["val_idx"]
+    test_idx = data["test_idx"]
+
+    stride = stride if stride is not None else window_size // 2
+    val_stride = val_stride if val_stride is not None else window_size
+
+    # Get session info if available
+    session_ids = None
+    idx_to_session = None
+    if use_sessions and "split_info" in data and data["split_info"] is not None:
+        # Session-based split - load session IDs
+        session_ids, _, idx_to_session = load_pfc_session_ids(num_trials=pfc.shape[0])
+
+    # Create datasets
+    if use_sessions and session_ids is not None:
+        train_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, train_idx, session_ids, trial_types,
+            window_size=window_size, stride=stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+        val_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, val_idx, session_ids, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+        test_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, test_idx, session_ids, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+    else:
+        train_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, train_idx, trial_types,
+            window_size=window_size, stride=stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+        val_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, val_idx, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+        test_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, test_idx, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+
+    # Create samplers for distributed training
+    train_sampler = DistributedSampler(train_dataset, seed=42) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
+
+    # Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),  # Don't shuffle when using sampler
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    print(f"\nPFC Sliding Window DataLoaders created:")
+    print(f"  Window size: {window_size} samples")
+    print(f"  Train stride: {stride}, Val/Test stride: {val_stride}")
+    print(f"  Train: {len(train_dataset)} windows")
+    print(f"  Val: {len(val_dataset)} windows")
+    print(f"  Test: {len(test_dataset)} windows")
+
+    return {
+        "train": train_loader,
+        "val": val_loader,
+        "test": test_loader,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "window_size": window_size,
+        "stride": stride,
+        "val_stride": val_stride,
+        "n_channels_source": pfc.shape[1],
+        "n_channels_target": ca1.shape[1],
+    }
+
+
 def get_odor_name(vocab: Dict[str, int], odor_id: int) -> str:
     """Get odor name from ID."""
     for name, idx in vocab.items():
