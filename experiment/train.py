@@ -2081,6 +2081,15 @@ def train(
 
         batch_size = config.get("batch_size", 16)
 
+        # Custom collate function to convert DANDI dict format to (ob, pcx, odor) tuple
+        def dandi_collate_fn(batch):
+            """Convert DANDI batch dict to (source, target, label) tuple."""
+            sources = torch.stack([item["source"] for item in batch])
+            targets = torch.stack([item["target"] for item in batch])
+            # DANDI has no odor labels, use zeros as placeholder
+            labels = torch.zeros(len(batch), dtype=torch.long)
+            return sources, targets, labels
+
         # Create samplers for distributed training
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
@@ -2088,6 +2097,7 @@ def train(
         loader_kwargs = {
             "num_workers": num_workers,
             "pin_memory": True,
+            "collate_fn": dandi_collate_fn,
         }
 
         loaders = {
@@ -2121,10 +2131,11 @@ def train(
             )
 
         # Update in_channels and out_channels from actual data
-        # Get a sample batch to determine shapes
+        # Get a sample batch to determine shapes (collate_fn returns tuple: source, target, label)
         sample_batch = next(iter(loaders["train"]))
-        config["in_channels"] = sample_batch["source"].shape[1]  # [B, C, T]
-        config["out_channels"] = sample_batch["target"].shape[1]
+        source_batch, target_batch, _ = sample_batch
+        config["in_channels"] = source_batch.shape[1]  # [B, C, T]
+        config["out_channels"] = target_batch.shape[1]
 
         if is_primary():
             print(f"DANDI DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
