@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import random
+
+# Suppress hdmf namespace version warnings (harmless version mismatch in NWB files)
+warnings.filterwarnings("ignore", message="Ignoring the following cached namespace")
+warnings.filterwarnings("ignore", module="hdmf.spec.namespace")
 
 import numpy as np
 import pandas as pd
@@ -3392,6 +3397,7 @@ class DANDIMovieDataset(Dataset):
         window_size: Size of each window in samples (default: 5000 = 5s at 1kHz)
         stride: Stride between windows (default: 2500 = 2.5s)
         zscore_per_window: Whether to z-score each window independently
+        verbose: Whether to print info messages
     """
 
     def __init__(
@@ -3400,6 +3406,7 @@ class DANDIMovieDataset(Dataset):
         window_size: int = 5000,
         stride: int = 2500,
         zscore_per_window: bool = False,
+        verbose: bool = True,
     ):
         self.window_size = window_size
         self.stride = stride
@@ -3418,9 +3425,10 @@ class DANDIMovieDataset(Dataset):
 
         self.subjects_data = subjects_data
 
-        print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
-              f"{len(self.windows)} windows, "
-              f"window_size={window_size}, stride={stride}")
+        if verbose:
+            print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
+                  f"{len(self.windows)} windows, "
+                  f"window_size={window_size}, stride={stride}")
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -3463,6 +3471,7 @@ def prepare_dandi_data(
     test_ratio: float = 0.15,
     seed: int = 42,
     zscore: bool = True,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for DANDI 000623 dataset.
 
@@ -3477,13 +3486,15 @@ def prepare_dandi_data(
         test_ratio: Fraction of subjects for testing
         seed: Random seed for reproducibility
         zscore: Whether to z-score normalize the data
+        verbose: Whether to print progress messages (set False for non-primary processes)
 
     Returns:
         Dictionary containing train/val/test datasets and metadata
     """
-    print(f"Preparing DANDI 000623 dataset...")
-    print(f"  Source region: {source_region}")
-    print(f"  Target region: {target_region}")
+    if verbose:
+        print(f"Preparing DANDI 000623 dataset...")
+        print(f"  Source region: {source_region}")
+        print(f"  Target region: {target_region}")
 
     # Get available subjects
     nwb_files = list_dandi_nwb_files(data_dir)
@@ -3499,7 +3510,8 @@ def prepare_dandi_data(
         if subj_id not in subject_ids:
             subject_ids.append(subj_id)
 
-    print(f"  Found {len(subject_ids)} subjects")
+    if verbose:
+        print(f"  Found {len(subject_ids)} subjects")
 
     # Split subjects
     rng = np.random.default_rng(seed)
@@ -3512,12 +3524,13 @@ def prepare_dandi_data(
     val_subjects = subject_ids[n_train:n_train + n_val]
     test_subjects = subject_ids[n_train + n_val:]
 
-    print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
-    print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
-    print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+    if verbose:
+        print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+        print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
+        print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
 
     # Load data for each split
-    def load_subjects(subject_list):
+    def load_subjects(subject_list, split_name=""):
         data_list = []
         for subj_id in subject_list:
             try:
@@ -3525,26 +3538,31 @@ def prepare_dandi_data(
                     subj_id, data_dir, source_region, target_region, zscore
                 )
                 data_list.append(subj_data)
-                print(f"    Loaded {subj_id}: source={subj_data['n_source_channels']}ch, "
-                      f"target={subj_data['n_target_channels']}ch, "
-                      f"{subj_data['n_samples']} samples")
+                if verbose:
+                    print(f"    Loaded {subj_id}: source={subj_data['n_source_channels']}ch, "
+                          f"target={subj_data['n_target_channels']}ch, "
+                          f"{subj_data['n_samples']} samples")
             except Exception as e:
-                print(f"    Warning: Could not load {subj_id}: {e}")
+                if verbose:
+                    print(f"    Warning: Could not load {subj_id}: {e}")
         return data_list
 
-    print("\nLoading training subjects...")
-    train_data = load_subjects(train_subjects)
+    if verbose:
+        print("\nLoading training subjects...")
+    train_data = load_subjects(train_subjects, "train")
 
-    print("\nLoading validation subjects...")
-    val_data = load_subjects(val_subjects)
+    if verbose:
+        print("\nLoading validation subjects...")
+    val_data = load_subjects(val_subjects, "val")
 
-    print("\nLoading test subjects...")
-    test_data = load_subjects(test_subjects)
+    if verbose:
+        print("\nLoading test subjects...")
+    test_data = load_subjects(test_subjects, "test")
 
     # Create datasets
-    train_dataset = DANDIMovieDataset(train_data, window_size, stride)
-    val_dataset = DANDIMovieDataset(val_data, window_size, stride)
-    test_dataset = DANDIMovieDataset(test_data, window_size, stride)
+    train_dataset = DANDIMovieDataset(train_data, window_size, stride, verbose=verbose)
+    val_dataset = DANDIMovieDataset(val_data, window_size, stride, verbose=verbose)
+    test_dataset = DANDIMovieDataset(test_data, window_size, stride, verbose=verbose)
 
     return {
         "train_dataset": train_dataset,

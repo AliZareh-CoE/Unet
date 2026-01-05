@@ -3641,6 +3641,7 @@ def main():
             window_size=window_size,
             stride=train_stride,
             seed=config["seed"],
+            verbose=is_primary(),  # Only print from rank 0 in distributed training
         )
 
         # Create a minimal data dict for compatibility with training loop
