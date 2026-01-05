@@ -1809,12 +1809,19 @@ def train_epoch(
                 loss = loss + w_loss_rev
                 loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
 
+            # Cycle consistency: OB → PCx → OB and PCx → OB → PCx
+            # IMPORTANT: Set models to eval mode for cycle consistency to prevent
+            # BatchNorm running stats from being updated (which causes version conflicts
+            # when the same model is called multiple times in one forward pass).
+            # Gradients still flow since we're not using torch.no_grad().
+            # The detached inputs break the gradient flow back to the main predictions,
+            # but gradients DO flow through cycle_ob/cycle_pcx to train the models.
+            model_training = model.training
+            reverse_model_training = reverse_model.training
+            model.eval()
+            reverse_model.eval()
+
             # Cycle consistency: OB → PCx → OB
-            # IMPORTANT: Detach pred_raw to break interconnected computation graphs
-            # This prevents BatchNorm version tracking conflicts when the same model
-            # is called multiple times in the same forward pass. Gradients still flow
-            # through cycle_ob to train reverse_model, just not back through pred_raw.
-            # Use cond_emb_rev (detached) for same reason as main reverse call.
             if cond_emb_rev is not None:
                 cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev)
             else:
@@ -1825,8 +1832,6 @@ def train_epoch(
             loss_components["cycle_ob"] = loss_components["cycle_ob"] + cycle_loss_ob.detach()
 
             # Cycle consistency: PCx → OB → PCx
-            # IMPORTANT: Detach pred_rev_raw for same reason as above
-            # Use cond_emb_rev (detached) to prevent graph interconnection with main forward pass
             if cond_emb_rev is not None:
                 cycle_pcx = model(pred_rev_raw.detach(), cond_emb=cond_emb_rev)
             else:
@@ -1835,6 +1840,12 @@ def train_epoch(
             cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
             loss = loss + cycle_loss_pcx
             loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
+
+            # Restore training mode
+            if model_training:
+                model.train()
+            if reverse_model_training:
+                reverse_model.train()
 
         # Contrastive loss for session-invariant learning (CEBRA-style)
         # Two modes:
