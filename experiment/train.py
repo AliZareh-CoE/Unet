@@ -1767,11 +1767,16 @@ def train_epoch(
         # Bidirectional training with cycle consistency
         bottleneck_rev = None  # Initialize for contrastive loss check later
         if reverse_model is not None:
-            # Reverse: PCx → OB (use same cond_emb from forward - conditioning is symmetric)
+            # Reverse: PCx → OB
+            # IMPORTANT: Detach cond_emb for reverse_model to prevent computation graph
+            # interconnection that causes BatchNorm version tracking conflicts.
+            # The conditioning encoder still receives gradients from the forward model,
+            # which provides sufficient supervision for learning.
+            cond_emb_rev = cond_emb.detach() if cond_emb is not None else None
             # If contrastive learning enabled, also get bottleneck features
-            if cond_emb is not None:
+            if cond_emb_rev is not None:
                 rev_result = reverse_model(
-                    pcx, cond_emb=cond_emb,
+                    pcx, cond_emb=cond_emb_rev,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
@@ -1809,8 +1814,9 @@ def train_epoch(
             # This prevents BatchNorm version tracking conflicts when the same model
             # is called multiple times in the same forward pass. Gradients still flow
             # through cycle_ob to train reverse_model, just not back through pred_raw.
-            if cond_emb is not None:
-                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb)
+            # Use cond_emb_rev (detached) for same reason as main reverse call.
+            if cond_emb_rev is not None:
+                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev)
             else:
                 cycle_ob = reverse_model(pred_raw.detach(), odor)
             cycle_ob_c = crop_to_target_torch(cycle_ob)
@@ -1820,8 +1826,9 @@ def train_epoch(
 
             # Cycle consistency: PCx → OB → PCx
             # IMPORTANT: Detach pred_rev_raw for same reason as above
-            if cond_emb is not None:
-                cycle_pcx = model(pred_rev_raw.detach(), cond_emb=cond_emb)
+            # Use cond_emb_rev (detached) to prevent graph interconnection with main forward pass
+            if cond_emb_rev is not None:
+                cycle_pcx = model(pred_rev_raw.detach(), cond_emb=cond_emb_rev)
             else:
                 cycle_pcx = model(pred_rev_raw.detach(), odor)
             cycle_pcx_c = crop_to_target_torch(cycle_pcx)
