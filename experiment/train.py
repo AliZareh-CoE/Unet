@@ -1624,6 +1624,9 @@ def train_epoch(
     Args:
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
+    # DEBUG: Enable anomaly detection to find the exact inplace operation
+    torch.autograd.set_detect_anomaly(True)
+
     model.train()
     if reverse_model is not None:
         reverse_model.train()
