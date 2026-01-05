@@ -3148,45 +3148,43 @@ def load_dandi_nwb_file(
             electrodes_df = nwbfile.electrodes.to_dataframe()
             result["electrodes"] = electrodes_df
 
-        # Load LFP data (typically from ecephys processing module)
+        # Load LFP data from ecephys processing module
+        # DANDI 000623 uses LFP_micro (microwires) and LFP_macro (macroelectrodes)
         if load_lfp:
             try:
                 if "ecephys" in nwbfile.processing:
                     ecephys = nwbfile.processing["ecephys"]
-                    if "LFP" in ecephys.data_interfaces:
-                        lfp_module = ecephys.data_interfaces["LFP"]
-                        # Get the electrical series
-                        for name, es in lfp_module.electrical_series.items():
-                            lfp_data = es.data[:]  # Load all data
-                            result["lfp"] = np.array(lfp_data, dtype=np.float32).T  # [channels, samples]
-                            result["lfp_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
-                            if hasattr(es, 'electrodes') and es.electrodes is not None:
-                                result["lfp_electrodes"] = es.electrodes.to_dataframe()
+                    # Try LFP_micro first (microwire recordings)
+                    for lfp_name in ["LFP_micro", "LFP", "lfp"]:
+                        if lfp_name in ecephys.data_interfaces:
+                            lfp_module = ecephys.data_interfaces[lfp_name]
+                            for name, es in lfp_module.electrical_series.items():
+                                lfp_data = es.data[:]  # [time, channels]
+                                result["lfp"] = np.array(lfp_data, dtype=np.float32).T  # [channels, time]
+                                result["lfp_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                                if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                    result["lfp_electrodes"] = es.electrodes.to_dataframe()
+                                break
                             break
             except Exception as e:
                 print(f"Warning: Could not load LFP data: {e}")
 
-        # Load iEEG data (macroelectrodes)
+        # Load iEEG/macro data (macroelectrodes)
         if load_ieeg:
             try:
                 if "ecephys" in nwbfile.processing:
                     ecephys = nwbfile.processing["ecephys"]
-                    if "iEEG" in ecephys.data_interfaces:
-                        ieeg_module = ecephys.data_interfaces["iEEG"]
-                        for name, es in ieeg_module.electrical_series.items():
-                            ieeg_data = es.data[:]
-                            result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T
-                            result["ieeg_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
-                            if hasattr(es, 'electrodes') and es.electrodes is not None:
-                                result["ieeg_electrodes"] = es.electrodes.to_dataframe()
-                            break
-                # Alternative: check acquisition for raw iEEG
-                elif nwbfile.acquisition:
-                    for name, ts in nwbfile.acquisition.items():
-                        if "eeg" in name.lower() or "ieeg" in name.lower():
-                            ieeg_data = ts.data[:]
-                            result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T
-                            result["ieeg_rate"] = ts.rate if hasattr(ts, 'rate') and ts.rate else DANDI_SAMPLING_RATE_HZ
+                    # Try LFP_macro first (DANDI 000623 format)
+                    for ieeg_name in ["LFP_macro", "iEEG", "ieeg"]:
+                        if ieeg_name in ecephys.data_interfaces:
+                            ieeg_module = ecephys.data_interfaces[ieeg_name]
+                            for name, es in ieeg_module.electrical_series.items():
+                                ieeg_data = es.data[:]  # [time, channels]
+                                result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T  # [channels, time]
+                                result["ieeg_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                                if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                    result["ieeg_electrodes"] = es.electrodes.to_dataframe()
+                                break
                             break
             except Exception as e:
                 print(f"Warning: Could not load iEEG data: {e}")
@@ -3249,14 +3247,21 @@ def get_electrodes_by_region(
 
     region_electrodes = {}
 
-    for idx, row in electrodes_df.iterrows():
+    for i, (idx, row) in enumerate(electrodes_df.iterrows()):
         region = str(row[location_col]).lower().strip()
 
-        # Normalize region names
+        # Normalize region names (handle DANDI 000623 naming convention)
+        # Regions like "Left amygdala", "Right hippocampus" -> "amygdala", "hippocampus"
         if "amygdala" in region or "amy" in region:
             normalized = "amygdala"
         elif "hippocampus" in region or "hpc" in region or "hipp" in region:
             normalized = "hippocampus"
+        elif "vmpfc" in region or "vmfc" in region:
+            normalized = "medial_frontal_cortex"
+        elif "acc" in region:
+            normalized = "acc"
+        elif "presma" in region or "sma" in region:
+            normalized = "presma"
         elif "frontal" in region or "mfc" in region or "pfc" in region:
             normalized = "medial_frontal_cortex"
         else:
@@ -3265,7 +3270,8 @@ def get_electrodes_by_region(
         if target_regions is None or normalized in target_regions:
             if normalized not in region_electrodes:
                 region_electrodes[normalized] = []
-            region_electrodes[normalized].append(idx)
+            # Use sequential index (position in dataframe) not the original electrode ID
+            region_electrodes[normalized].append(i)
 
     return region_electrodes
 
