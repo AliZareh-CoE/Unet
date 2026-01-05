@@ -1624,9 +1624,6 @@ def train_epoch(
     Args:
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
-    # DEBUG: Enable anomaly detection to find the exact inplace operation
-    torch.autograd.set_detect_anomaly(True)
-
     model.train()
     if reverse_model is not None:
         reverse_model.train()
@@ -1808,20 +1805,25 @@ def train_epoch(
                 loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
 
             # Cycle consistency: OB → PCx → OB
+            # IMPORTANT: Detach pred_raw to break interconnected computation graphs
+            # This prevents BatchNorm version tracking conflicts when the same model
+            # is called multiple times in the same forward pass. Gradients still flow
+            # through cycle_ob to train reverse_model, just not back through pred_raw.
             if cond_emb is not None:
-                cycle_ob = reverse_model(pred_raw, cond_emb=cond_emb)
+                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb)
             else:
-                cycle_ob = reverse_model(pred_raw, odor)
+                cycle_ob = reverse_model(pred_raw.detach(), odor)
             cycle_ob_c = crop_to_target_torch(cycle_ob)
             cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
             loss = loss + cycle_loss_ob
             loss_components["cycle_ob"] = loss_components["cycle_ob"] + cycle_loss_ob.detach()
 
             # Cycle consistency: PCx → OB → PCx
+            # IMPORTANT: Detach pred_rev_raw for same reason as above
             if cond_emb is not None:
-                cycle_pcx = model(pred_rev_raw, cond_emb=cond_emb)
+                cycle_pcx = model(pred_rev_raw.detach(), cond_emb=cond_emb)
             else:
-                cycle_pcx = model(pred_rev_raw, odor)
+                cycle_pcx = model(pred_rev_raw.detach(), odor)
             cycle_pcx_c = crop_to_target_torch(cycle_pcx)
             cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
             loss = loss + cycle_loss_pcx
