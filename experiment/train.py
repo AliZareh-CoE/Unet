@@ -1672,6 +1672,17 @@ def train_epoch(
         ob = ob.clone()
         pcx = pcx.clone()
 
+        # CRITICAL FIX: Set model and reverse_model to eval mode for the entire batch
+        # to prevent BatchNorm running stats from being updated in-place multiple times.
+        # This causes version tracking conflicts during backward() when the same model
+        # is called multiple times (main forward + cycle consistency).
+        # Gradients still flow for weight/bias training; only running stats are frozen.
+        model_was_training = model.training
+        model.eval()
+        if reverse_model is not None:
+            reverse_model_was_training = reverse_model.training
+            reverse_model.eval()
+
         # Compute conditioning embedding
         # IMPORTANT: Set cond_encoder to eval mode during forward pass to prevent
         # BatchNorm running stats from being updated in-place. This avoids version
@@ -1820,16 +1831,9 @@ def train_epoch(
                 loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
 
             # Cycle consistency: OB → PCx → OB and PCx → OB → PCx
-            # IMPORTANT: Set models to eval mode for cycle consistency to prevent
-            # BatchNorm running stats from being updated (which causes version conflicts
-            # when the same model is called multiple times in one forward pass).
-            # Gradients still flow since we're not using torch.no_grad().
-            # The detached inputs break the gradient flow back to the main predictions,
-            # but gradients DO flow through cycle_ob/cycle_pcx to train the models.
-            model_training = model.training
-            reverse_model_training = reverse_model.training
-            model.eval()
-            reverse_model.eval()
+            # Models are already in eval mode (set at batch start) to prevent BatchNorm
+            # running stats updates. Detached inputs break gradient flow back to main
+            # predictions, but gradients DO flow through cycle_ob/cycle_pcx.
 
             # Cycle consistency: OB → PCx → OB
             if cond_emb_rev is not None:
@@ -1850,12 +1854,6 @@ def train_epoch(
             cycle_loss_pcx = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_pcx_c, pcx_c)
             loss = loss + cycle_loss_pcx
             loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
-
-            # Restore training mode
-            if model_training:
-                model.train()
-            if reverse_model_training:
-                reverse_model.train()
 
         # Contrastive loss for session-invariant learning (CEBRA-style)
         # Two modes:
@@ -1964,6 +1962,12 @@ def train_epoch(
             sync_gradients_manual(cond_encoder)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+        # Restore training mode for models after the batch
+        if model_was_training:
+            model.train()
+        if reverse_model is not None and reverse_model_was_training:
+            reverse_model.train()
 
         # Accumulate loss as tensor - NO .item() call to avoid GPU sync
         total_loss = total_loss + loss.detach()
