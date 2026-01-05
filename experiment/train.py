@@ -782,17 +782,20 @@ def apply_augmentations(
     # Time mask: apply same mask to both (maintains correspondence)
     if config.get("aug_time_mask", False):
         mask_ratio = config.get("aug_time_mask_ratio", 0.1)
-        batch_size, _, time_len = ob.shape
+        batch_size, n_ch_ob, time_len = ob.shape
+        _, n_ch_pcx, _ = pcx.shape
         mask_len = int(time_len * mask_ratio)
         if mask_len > 0:
-            # Create mask tensor (avoids inplace operation)
-            ob_masked = ob.clone()
-            pcx_masked = pcx.clone()
+            # Create binary mask (1 = keep, 0 = zero out) - NO inplace operations
+            mask_ob = torch.ones(batch_size, 1, time_len, device=ob.device, dtype=ob.dtype)
+            mask_pcx = torch.ones(batch_size, 1, time_len, device=pcx.device, dtype=pcx.dtype)
             for i in range(batch_size):
                 start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
-                ob_masked[i, :, start:start + mask_len] = 0
-                pcx_masked[i, :, start:start + mask_len] = 0
-            ob, pcx = ob_masked, pcx_masked
+                mask_ob[i, :, start:start + mask_len] = 0
+                mask_pcx[i, :, start:start + mask_len] = 0
+            # Apply mask via multiplication (creates new tensor, no inplace)
+            ob = ob * mask_ob
+            pcx = pcx * mask_pcx
 
     # Mixup: blend random pairs (applied to both input and target coherently)
     if config.get("aug_mixup", False):
@@ -803,20 +806,26 @@ def apply_augmentations(
     if config.get("aug_freq_mask", False):
         max_bands = config.get("aug_freq_mask_max_bands", 2)
         max_width = config.get("aug_freq_mask_max_width", 10)
-        batch_size = ob.shape[0]
-        # Apply same frequency mask pattern to both tensors independently
-        ob_fft = torch.fft.rfft(ob, dim=-1).clone()  # Clone to avoid inplace issues
-        pcx_fft = torch.fft.rfft(pcx, dim=-1).clone()
+        batch_size, n_ch_ob, _ = ob.shape
+        _, n_ch_pcx, _ = pcx.shape
+        # Apply same frequency mask pattern to both tensors
+        ob_fft = torch.fft.rfft(ob, dim=-1)
+        pcx_fft = torch.fft.rfft(pcx, dim=-1)
         n_freqs = ob_fft.shape[-1]
         if n_freqs > max_width:
+            # Create frequency mask (1 = keep, 0 = zero out) - NO inplace on FFT tensors
+            freq_mask_ob = torch.ones(batch_size, 1, n_freqs, device=ob.device, dtype=ob_fft.dtype)
+            freq_mask_pcx = torch.ones(batch_size, 1, n_freqs, device=pcx.device, dtype=pcx_fft.dtype)
             for i in range(batch_size):
                 n_bands_to_mask = torch.randint(1, max_bands + 1, (1,)).item()
                 for _ in range(n_bands_to_mask):
                     width = torch.randint(1, max_width + 1, (1,)).item()
                     start = torch.randint(0, n_freqs - width, (1,)).item()
-                    # Apply same mask to both ob[i] and pcx[i]
-                    ob_fft[i, :, start:start + width] = 0
-                    pcx_fft[i, :, start:start + width] = 0
+                    freq_mask_ob[i, :, start:start + width] = 0
+                    freq_mask_pcx[i, :, start:start + width] = 0
+            # Apply mask via multiplication (no inplace operation on FFT tensors)
+            ob_fft = ob_fft * freq_mask_ob
+            pcx_fft = pcx_fft * freq_mask_pcx
             ob = torch.fft.irfft(ob_fft, n=ob.shape[-1], dim=-1)
             pcx = torch.fft.irfft(pcx_fft, n=pcx.shape[-1], dim=-1)
 
