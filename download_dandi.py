@@ -4,8 +4,8 @@
 This script downloads the NWB files from the DANDI Archive using their API.
 
 Usage:
-    python experiment/download_dandi.py
-    python experiment/download_dandi.py --output /path/to/output
+    python download_dandi.py
+    python download_dandi.py --output /path/to/output
 
 Environment Variables:
     UNET_DATA_DIR: Base data directory (default: /data)

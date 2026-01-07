@@ -876,273 +876,6 @@ def make_uniform_bands(band_width_hz: float, min_freq_hz: float = 1.0, max_freq_
 
 
 # =============================================================================
-# Optimal Spectral Bias (Fixed per-odor correction, no signal-adaptive network)
-# =============================================================================
-
-class OptimalSpectralBias(nn.Module):
-    """Fixed per-odor spectral bias correction.
-
-    This module applies a FIXED per-odor, per-band spectral correction.
-
-    The key insight: OB→PCx spectral differences are physiologically determined
-    and should be FIXED for each odor, NOT signal-dependent.
-
-    Usage:
-    1. After UNet training, compute optimal bias from UNet output vs target PSD
-    2. Apply this fixed bias during inference
-
-    No training required - just compute once and apply!
-
-    Args:
-        n_channels: Number of input channels (default: 32)
-        n_odors: Number of odor conditions (default: 7)
-        sample_rate: Sampling rate in Hz (default: 1000)
-        band_width_hz: If set, use uniform bands with this spacing
-                       If None, use predefined neuroscience bands
-        min_freq_hz: Minimum frequency for uniform bands (default: 1.0)
-        max_freq_hz: Maximum frequency for uniform bands (default: None = Nyquist)
-                     IMPORTANT: Set to sample_rate/2 to cover ALL frequencies!
-    """
-
-    def __init__(
-        self,
-        n_channels: int = 32,
-        n_odors: int = NUM_ODORS,
-        sample_rate: float = SAMPLING_RATE_HZ,
-        band_width_hz: Optional[float] = None,
-        min_freq_hz: float = 1.0,
-        max_freq_hz: Optional[float] = None,  # None = Nyquist (sample_rate / 2)
-    ):
-        super().__init__()
-        self.n_channels = n_channels
-        self.n_odors = n_odors
-        self.sample_rate = sample_rate
-        self.band_width_hz = band_width_hz
-        self.min_freq_hz = min_freq_hz
-        # Default to Nyquist frequency to cover ALL frequencies
-        self.max_freq_hz = max_freq_hz if max_freq_hz is not None else (sample_rate / 2.0)
-
-        # Build frequency bands
-        if band_width_hz is not None:
-            # Use self.max_freq_hz (which defaults to Nyquist if not specified)
-            self.freq_bands = make_uniform_bands(band_width_hz, self.min_freq_hz, self.max_freq_hz)
-        else:
-            # When using predefined neuro bands, also add a high-frequency band
-            # to cover everything above 100 Hz up to Nyquist
-            self.freq_bands = FREQ_BANDS_NEURO.copy()
-            if self.max_freq_hz > 100.0:
-                self.freq_bands["High (100-500 Hz)"] = (100.0, self.max_freq_hz)
-
-        self.band_names = list(self.freq_bands.keys())
-        self.n_bands = len(self.freq_bands)
-
-        # Per-odor bias: fixed spectral correction per odor per band
-        # This is computed directly from data, not learned through gradient descent
-        self.odor_bias = nn.Parameter(torch.zeros(n_odors, self.n_bands))
-
-        # Cache for frequency band masks
-        self._cached_masks = None
-        self._cached_n_fft = None
-
-    def _build_freq_masks(self, n_fft: int, device: torch.device) -> torch.Tensor:
-        """Build frequency band masks for rfft output."""
-        freq_len = n_fft // 2 + 1
-        if self._cached_masks is not None and self._cached_n_fft == freq_len:
-            return self._cached_masks.to(device)
-
-        freqs = torch.fft.rfftfreq(n_fft, d=1.0 / self.sample_rate)
-        n_freq_bins = len(freqs)
-
-        masks = torch.zeros(self.n_bands, n_freq_bins)
-        transition_width = self.band_width_hz / 2.0 if self.band_width_hz else 1.0
-
-        for i, (band_name, (f_low, f_high)) in enumerate(self.freq_bands.items()):
-            rise = torch.sigmoid((freqs - f_low) / transition_width * 5)
-            fall = torch.sigmoid((f_high - freqs) / transition_width * 5)
-            masks[i] = rise * fall
-
-        # Normalize
-        mask_sum = masks.sum(dim=0, keepdim=True).clamp(min=1e-6)
-        masks = masks / mask_sum
-
-        self._cached_masks = masks
-        self._cached_n_fft = freq_len
-        return masks.to(device)
-
-    @torch.amp.autocast('cuda', enabled=False)
-    def forward(
-        self,
-        x: torch.Tensor,
-        odor_ids: Optional[torch.Tensor] = None,
-        inverse: bool = False,
-        target: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Apply fixed per-odor spectral bias correction.
-
-        Args:
-            x: Input tensor [B, C, T]
-            odor_ids: Odor indices [B] for selecting bias
-            inverse: If True, apply inverse scaling (negate bias)
-            target: Ignored (API compatibility)
-
-        Returns:
-            Spectrally corrected tensor [B, C, T]
-        """
-        B, C, T = x.shape
-        device = x.device
-        original_dtype = x.dtype
-
-        # Convert to float32 for FFT
-        x_float = x.float()
-
-        # Get frequency band masks
-        masks = self._build_freq_masks(T, device)
-
-        # FFT
-        x_fft = torch.fft.rfft(x_float, dim=-1)  # [B, C, n_freq]
-
-        # Get per-odor bias (fixed correction)
-        if odor_ids is not None:
-            log_scales = self.odor_bias[odor_ids]  # [B, n_bands]
-        else:
-            log_scales = x_float.new_zeros(B, self.n_bands)
-
-        # Apply inverse if needed
-        if inverse:
-            log_scales = -log_scales
-
-        # Convert to frequency-domain scales
-        scales = torch.exp(log_scales)  # [B, n_bands]
-
-        # Build per-frequency scale factors
-        # scales: [B, n_bands], masks: [n_bands, n_freq]
-        freq_scales = torch.einsum('bk,kf->bf', scales, masks)  # [B, n_freq]
-
-        # BUG FIX: Frequencies outside defined bands (e.g., >100Hz) have zero mask coverage,
-        # resulting in freq_scales=0, which zeroes out high-frequency content!
-        # These frequencies should be UNCHANGED (scale=1.0), not zeroed.
-        mask_coverage = masks.sum(dim=0)  # [n_freq] - how much each freq is covered by bands
-        uncovered_mask = (mask_coverage < 0.01)  # frequencies with no band coverage
-        freq_scales[:, uncovered_mask] = 1.0  # leave uncovered frequencies unchanged
-
-        freq_scales = freq_scales.unsqueeze(1)  # [B, 1, n_freq]
-
-        # Apply scaling in frequency domain
-        x_fft_scaled = x_fft * freq_scales.to(x_fft.dtype)
-        x_scaled = torch.fft.irfft(x_fft_scaled, n=T, dim=-1)
-
-        return x_scaled.to(original_dtype)
-
-    def get_bias_db(self, odor_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Get bias in dB for analysis/logging.
-
-        Args:
-            odor_ids: Odor indices [B] or None for all odors
-
-        Returns:
-            Bias in dB: [B, n_bands] or [n_odors, n_bands]
-        """
-        if odor_ids is not None:
-            bias = self.odor_bias[odor_ids]
-        else:
-            bias = self.odor_bias
-        return 20.0 * bias / math.log(10)
-
-    @torch.no_grad()
-    def compute_optimal_bias(
-        self,
-        unet_outputs: torch.Tensor,
-        targets: torch.Tensor,
-        odor_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute optimal per-odor bias by directly measuring PSD difference.
-
-        Measures what shift is needed: target_psd - unet_output_psd per band per odor.
-
-        Args:
-            unet_outputs: UNet output signals [N, C, T]
-            targets: Target signals [N, C, T]
-            odor_ids: Odor indices [N]
-
-        Returns:
-            Optimal bias in log-scale [n_odors, n_bands]
-        """
-        device = unet_outputs.device
-        N, C, T = unet_outputs.shape
-
-        # Build frequency masks
-        masks = self._build_freq_masks(T, device)  # [n_bands, n_freq]
-
-        # Compute PSD for both (in log scale)
-        unet_fft = torch.fft.rfft(unet_outputs.float(), dim=-1)
-        target_fft = torch.fft.rfft(targets.float(), dim=-1)
-
-        unet_power = unet_fft.abs().square()  # [N, C, n_freq]
-        target_power = target_fft.abs().square()
-
-        # Per-band power
-        unet_band_power = torch.einsum('ncf,kf->nck', unet_power, masks)  # [N, C, n_bands]
-        target_band_power = torch.einsum('ncf,kf->nck', target_power, masks)
-
-        # Log scale (dB-like)
-        unet_log = torch.log(unet_band_power + 1e-10)
-        target_log = torch.log(target_band_power + 1e-10)
-
-        # Difference: how much to shift UNet output to match target
-        # IMPORTANT: We compute log of POWER ratio, but apply to AMPLITUDE (FFT)
-        # Power = |FFT|², so to scale power by P, we scale amplitude by sqrt(P)
-        # Therefore: log_amplitude_ratio = log_power_ratio / 2
-        diff_log = (target_log - unet_log) / 2  # [N, C, n_bands] - log AMPLITUDE ratio
-
-        # Average across channels
-        diff_log = diff_log.mean(dim=1)  # [N, n_bands]
-
-        # Accumulate per odor
-        optimal_bias = torch.zeros(self.n_odors, self.n_bands, device=device)
-        counts = torch.zeros(self.n_odors, device=device)
-
-        for i in range(N):
-            odor = odor_ids[i].item()
-            optimal_bias[odor] += diff_log[i]
-            counts[odor] += 1
-
-        # Average per odor
-        for odor in range(self.n_odors):
-            if counts[odor] > 0:
-                optimal_bias[odor] /= counts[odor]
-
-        return optimal_bias
-
-    def set_bias_from_data(
-        self,
-        unet_outputs: torch.Tensor,
-        targets: torch.Tensor,
-        odor_ids: torch.Tensor,
-    ) -> None:
-        """Set odor_bias directly from measured PSD difference.
-
-        Args:
-            unet_outputs: UNet output signals [N, C, T]
-            targets: Target signals [N, C, T]
-            odor_ids: Odor indices [N]
-        """
-        optimal_bias = self.compute_optimal_bias(unet_outputs, targets, odor_ids)
-        self.odor_bias.data.copy_(optimal_bias)
-
-        # Convert to dB for logging (amplitude dB = 20*log10, we have ln)
-        # bias is in ln(amplitude_ratio), convert to dB: 20 * log10(exp(bias)) = 20 * bias / ln(10)
-        bias_db = optimal_bias * 20.0 / math.log(10)
-        print(f"Set optimal bias from data: mean={bias_db.mean():.2f}dB, "
-              f"range=[{bias_db.min():.2f}, {bias_db.max():.2f}]dB")
-
-    def extra_repr(self) -> str:
-        return (
-            f"n_channels={self.n_channels}, n_odors={self.n_odors}, "
-            f"n_bands={self.n_bands}"
-        )
-
-
-# =============================================================================
 # Envelope Histogram Matching (Closed-form amplitude dynamics correction)
 # =============================================================================
 
@@ -1530,6 +1263,12 @@ class SpectroTemporalEncoder(nn.Module):
         """
         original_dtype = x.dtype
         param_dtype = self._param_dtype
+
+        # IMPORTANT: Clone input to avoid autograd inplace errors
+        # When x is already float32 and param_dtype is float32, .float() and .to()
+        # return the same tensor (not copies). This can cause gradient computation
+        # issues when the same input tensor is used in both the model and cond_encoder.
+        x = x.clone()
 
         # FFT requires float32, but we need to match param dtype for linear layers
         x_float = x.float()
@@ -2075,7 +1814,6 @@ class CondUNet1D(nn.Module):
         attention_type: str = "basic",
         norm_type: str = "instance",
         cond_mode: str = "cross_attn_gated",
-        use_spectral_shift: bool = True,
         # Depth control for frequency resolution
         n_downsample: int = 2,  # 2 = 4x downsample (125 Hz Nyquist), 4 = 16x (31 Hz)
         # Modern convolution options
@@ -2175,10 +1913,6 @@ class CondUNet1D(nn.Module):
         nn.init.zeros_(self.outc.weight)
         nn.init.zeros_(self.outc.bias)
 
-        # Note: OptimalSpectralBias is applied OUTSIDE the model in train.py
-        # This flag is kept for backwards compatibility but is no longer used internally.
-        self.use_spectral_shift = use_spectral_shift
-
         # Output scaling correction: learnable per-channel scale and bias
         # Helps match target distribution, especially important for probabilistic losses
         self.use_output_scaling = use_output_scaling
@@ -2186,6 +1920,17 @@ class CondUNet1D(nn.Module):
             # Initialize scale to 1.0 and bias to 0.0 (identity at init)
             self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
             self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
+
+        # Gradient checkpointing: trade compute for memory
+        self.gradient_checkpointing = False
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        """Enable/disable gradient checkpointing for memory efficiency.
+
+        When enabled, encoder/decoder blocks are checkpointed to reduce memory
+        at the cost of ~30% more compute (recomputes activations during backward).
+        """
+        self.gradient_checkpointing = enable
 
     def _build_attention(self, channels: int, attention_type: str) -> nn.Module:
         """Build attention module based on type.
@@ -2234,6 +1979,18 @@ class CondUNet1D(nn.Module):
             If return_bottleneck=True: (predicted signal, pooled bottleneck features [B, bottleneck_ch])
             If return_bottleneck_temporal=True: (predicted signal, unpooled bottleneck features [B, bottleneck_ch, T'])
         """
+        # =================================================================
+        # INPUT NORMALIZATION - The key to session-agnostic generalization
+        # =================================================================
+        # Per-channel, per-sample z-score: each channel gets mean=0, std=1
+        # This makes the model see the same range regardless of:
+        #   - Which session (different electrode impedance, animal, etc.)
+        #   - Which channel (different baseline activity)
+        #   - Absolute amplitude (only PATTERN matters)
+        # The model learns SHAPE transformation, not SCALE transformation.
+        # =================================================================
+        ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
+
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
             emb = cond_emb
@@ -2243,9 +2000,16 @@ class CondUNet1D(nn.Module):
             emb = None
 
         # Encoder path with skip connections
-        skips = [self.inc(ob, emb)]
-        for encoder in self.encoders:
-            skips.append(encoder(skips[-1], emb))
+        # Use gradient checkpointing if enabled (saves memory, costs ~30% more compute)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            skips = [checkpoint(self.inc, ob, emb, use_reentrant=False)]
+            for encoder in self.encoders:
+                skips.append(checkpoint(encoder, skips[-1], emb, use_reentrant=False))
+        else:
+            skips = [self.inc(ob, emb)]
+            for encoder in self.encoders:
+                skips.append(encoder(skips[-1], emb))
 
         # Bottleneck
         bottleneck = self.mid(skips[-1])
@@ -2264,9 +2028,15 @@ class CondUNet1D(nn.Module):
 
         # Decoder path with skip connections (reverse order)
         x = bottleneck
-        for i, decoder in enumerate(self.decoders):
-            skip_idx = self.n_downsample - i - 1
-            x = decoder(x, skips[skip_idx], emb)
+        if self.gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            for i, decoder in enumerate(self.decoders):
+                skip_idx = self.n_downsample - i - 1
+                x = checkpoint(decoder, x, skips[skip_idx], emb, use_reentrant=False)
+        else:
+            for i, decoder in enumerate(self.decoders):
+                skip_idx = self.n_downsample - i - 1
+                x = decoder(x, skips[skip_idx], emb)
 
         delta = self.outc(x)
 
@@ -2378,259 +2148,8 @@ class CondUNet1D(nn.Module):
 
 
 # =============================================================================
-# Adversarial Discriminator
-# =============================================================================
-
-class PatchDiscriminator1D(nn.Module):
-    """1D PatchGAN Discriminator for neural signal adversarial training.
-
-    Uses spectral normalization for stable GAN training.
-    Multi-scale design captures both local patterns and global structure.
-
-    Conditional mode (default): Takes concatenated [source, output] to judge
-    whether the output matches the expected transformation of the source.
-    This is essential for improving correlation (not just realism).
-
-    Args:
-        in_channels: Number of input channels (e.g., 32 for LFP)
-        base_channels: Base number of feature channels (default: 64)
-        n_layers: Number of discriminator layers (default: 4)
-        use_spectral_norm: Apply spectral normalization (default: True)
-        conditional: If True, expects concatenated [source, output] input (default: True)
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 32,
-        base_channels: int = 64,
-        n_layers: int = 4,
-        use_spectral_norm: bool = True,
-        conditional: bool = True,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.conditional = conditional
-
-        # For conditional discriminator, input is concatenated [source, output]
-        actual_in_channels = in_channels * 2 if conditional else in_channels
-
-        # Spectral norm wrapper
-        norm_layer = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
-
-        # Build discriminator layers
-        layers = []
-
-        # First layer: no normalization
-        layers.append(norm_layer(nn.Conv1d(actual_in_channels, base_channels, kernel_size=15, stride=2, padding=7)))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
-
-        # Middle layers with increasing channels
-        ch_mult = 1
-        for i in range(1, n_layers):
-            ch_mult_prev = ch_mult
-            ch_mult = min(2 ** i, 8)
-            layers.append(norm_layer(nn.Conv1d(
-                base_channels * ch_mult_prev,
-                base_channels * ch_mult,
-                kernel_size=15,
-                stride=2,
-                padding=7,
-            )))
-            layers.append(nn.BatchNorm1d(base_channels * ch_mult))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-
-        # Final layer: produce patch-wise predictions
-        layers.append(norm_layer(nn.Conv1d(base_channels * ch_mult, 1, kernel_size=15, stride=1, padding=7)))
-
-        self.model = nn.Sequential(*layers)
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.normal_(m.weight, 0.0, 0.02)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Output signal [B, C, T] (generated or real target)
-            condition: Source signal [B, C, T] for conditional mode
-
-        Returns:
-            Patch-wise predictions [B, 1, T']
-        """
-        if self.conditional:
-            if condition is None:
-                raise ValueError("Conditional discriminator requires 'condition' argument")
-            # Concatenate source and output along channel dimension
-            x = torch.cat([condition, x], dim=1)
-        return self.model(x)
-
-
-class MultiScaleDiscriminator(nn.Module):
-    """Multi-scale conditional discriminator for robust adversarial training.
-
-    Uses multiple discriminators at different temporal scales to capture
-    both fine details and coarse patterns in neural signals.
-
-    Conditional mode: Judges whether output matches the expected transformation
-    of the source, essential for improving correlation (not just realism).
-
-    Args:
-        in_channels: Number of input channels
-        n_discriminators: Number of discriminators at different scales (default: 3)
-        base_channels: Base channels for each discriminator
-        conditional: If True, expects source condition for judgment (default: True)
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 32,
-        n_discriminators: int = 3,
-        base_channels: int = 64,
-        conditional: bool = True,
-    ):
-        super().__init__()
-        self.n_discriminators = n_discriminators
-        self.conditional = conditional
-
-        self.discriminators = nn.ModuleList([
-            PatchDiscriminator1D(in_channels, base_channels, n_layers=4 - i, conditional=conditional)
-            for i in range(n_discriminators)
-        ])
-
-        # Downsampling for multi-scale
-        self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor, condition: torch.Tensor = None) -> List[torch.Tensor]:
-        """Forward pass at multiple scales.
-
-        Args:
-            x: Output signal [B, C, T] (generated or real target)
-            condition: Source signal [B, C, T] for conditional mode
-
-        Returns:
-            List of predictions at each scale
-        """
-        outputs = []
-        for i, disc in enumerate(self.discriminators):
-            outputs.append(disc(x, condition))
-            if i < self.n_discriminators - 1:
-                x = self.downsample(x)
-                if condition is not None:
-                    condition = self.downsample(condition)
-        return outputs
-
-
-def adversarial_loss(pred, target_is_real: bool, loss_type: str = "lsgan") -> torch.Tensor:
-    """Compute adversarial loss.
-
-    Args:
-        pred: Discriminator prediction - can be a tensor or list of tensors (multi-scale)
-        target_is_real: Whether target should be real (True) or fake (False)
-        loss_type: Loss type - 'lsgan' (MSE), 'vanilla' (BCE), or 'hinge'
-
-    Returns:
-        Scalar loss value
-    """
-    # Handle multi-scale discriminator output (list of tensors)
-    if isinstance(pred, list):
-        losses = [adversarial_loss(p, target_is_real, loss_type) for p in pred]
-        return sum(losses) / len(losses)
-
-    if loss_type == "lsgan":
-        # Least-squares GAN (more stable)
-        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
-        return F.mse_loss(pred, target)
-    elif loss_type == "vanilla":
-        # Standard GAN with BCE
-        target = torch.ones_like(pred) if target_is_real else torch.zeros_like(pred)
-        return F.binary_cross_entropy_with_logits(pred, target)
-    elif loss_type == "hinge":
-        # Hinge loss (used in SAGAN, BigGAN)
-        if target_is_real:
-            return torch.mean(F.relu(1.0 - pred))
-        else:
-            return torch.mean(F.relu(1.0 + pred))
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
-
-
-def feature_matching_loss(
-    real_features: List[torch.Tensor],
-    fake_features: List[torch.Tensor],
-) -> torch.Tensor:
-    """Feature matching loss for stable GAN training.
-
-    Matches intermediate features between real and fake samples.
-
-    Args:
-        real_features: List of intermediate features from real samples
-        fake_features: List of intermediate features from fake samples
-
-    Returns:
-        Feature matching loss
-    """
-    loss = 0.0
-    for real_feat, fake_feat in zip(real_features, fake_features):
-        loss += F.l1_loss(fake_feat, real_feat.detach())
-    return loss / len(real_features)
-
-
-# =============================================================================
 # Loss Functions
 # =============================================================================
-
-def correlation_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-    """Differentiable Pearson correlation loss.
-
-    Directly optimizes correlation between prediction and target.
-    Loss = 1 - correlation (so minimizing loss maximizes correlation).
-
-    Args:
-        pred: Predicted signal [B, C, T]
-        target: Target signal [B, C, T]
-        reduction: "mean" (average over batch/channels) or "none"
-
-    Returns:
-        Loss in range [0, 2] where 0 = perfect correlation, 2 = perfect anti-correlation
-    """
-    # Flatten spatial dims for correlation computation
-    # [B, C, T] -> [B*C, T]
-    pred_flat = pred.reshape(-1, pred.shape[-1])
-    target_flat = target.reshape(-1, target.shape[-1])
-
-    # Center the signals (subtract mean)
-    pred_centered = pred_flat - pred_flat.mean(dim=-1, keepdim=True)
-    target_centered = target_flat - target_flat.mean(dim=-1, keepdim=True)
-
-    # Compute correlation per sample
-    # r = cov(x,y) / (std(x) * std(y))
-    numerator = (pred_centered * target_centered).sum(dim=-1)
-    pred_std = torch.sqrt((pred_centered ** 2).sum(dim=-1) + 1e-8)
-    target_std = torch.sqrt((target_centered ** 2).sum(dim=-1) + 1e-8)
-
-    corr = numerator / (pred_std * target_std + 1e-8)
-
-    # Loss = 1 - r (so perfect correlation = 0 loss)
-    loss = 1.0 - corr
-
-    if reduction == "mean":
-        return loss.mean()
-    return loss
-
-
-class TemporalSmoothness(nn.Module):
-    """Temporal smoothness loss (second derivative penalty)."""
-    def forward(self, signal: torch.Tensor) -> torch.Tensor:
-        d2 = signal[..., 2:] - 2 * signal[..., 1:-1] + signal[..., :-2]
-        return torch.mean(d2**2)
-
 
 class WaveletLoss(nn.Module):
     """Continuous Wavelet Transform loss for multi-scale frequency alignment.
@@ -3005,77 +2524,6 @@ def build_wavelet_loss(
 # Utility Functions
 # =============================================================================
 
-def cwt_phase_corr(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    wavelet_loss: Optional[nn.Module],
-    pred_coeffs: Optional[torch.Tensor] = None,
-    target_coeffs: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Compute phase correlation between pred and target using CWT.
-
-    Optimized version that can reuse pre-computed wavelet coefficients from
-    the wavelet loss forward pass, avoiding redundant computation.
-
-    Args:
-        pred: Predicted signal [B, C, T]
-        target: Target signal [B, C, T]
-        wavelet_loss: WaveletLoss module (used if coefficients not provided)
-        pred_coeffs: Pre-computed prediction coefficients (optional, for efficiency)
-        target_coeffs: Pre-computed target coefficients (optional, for efficiency)
-
-    Returns:
-        Phase correlation scalar (higher is better, max 1.0)
-    """
-    # Fast path: use pre-computed coefficients from wavelet loss
-    if pred_coeffs is not None and target_coeffs is not None:
-        if hasattr(wavelet_loss, 'compute_phase_correlation'):
-            return wavelet_loss.compute_phase_correlation(pred_coeffs, target_coeffs)
-        # Fallback: compute phase correlation directly
-        pred_phase = torch.angle(pred_coeffs)
-        target_phase = torch.angle(target_coeffs)
-        phase_diff = pred_phase - target_phase
-        corr = torch.mean(torch.cos(phase_diff))
-        return corr.real if torch.is_complex(corr) else corr
-
-    # Legacy path: compute coefficients from scratch
-    if wavelet_loss is None or not hasattr(wavelet_loss, 'morlet_bank'):
-        return pred.new_tensor(0.0)
-
-    # Use first level wavelet for phase computation
-    filt = wavelet_loss.morlet_bank[0] if hasattr(wavelet_loss, 'morlet_bank') else None
-    if filt is None:
-        return pred.new_tensor(0.0)
-
-    # Convert to float32 first if BFloat16 (complex64 doesn't support direct BF16 conversion)
-    if pred.dtype in (torch.bfloat16, torch.float16):
-        pred = pred.float()
-        target = target.float()
-
-    pred_c = pred.to(torch.complex64)
-    target_c = target.to(torch.complex64)
-
-    filt_t = filt.view(1, 1, -1).to(dtype=torch.complex64, device=pred.device)
-    pad = filt_t.shape[-1] // 2
-    # Cap padding to input size - 1 to prevent reflect padding error
-    max_pad = pred.shape[-1] - 1
-    pad = min(pad, max_pad)
-    filt_rep = filt_t.repeat(pred.shape[1], 1, 1)
-
-    # Use constant (zero) padding to avoid boundary artifacts from reflect padding
-    p_coeff = F.conv1d(F.pad(pred_c, (pad, pad), mode="constant", value=0), filt_rep, groups=pred_c.shape[1])
-    t_coeff = F.conv1d(F.pad(target_c, (pad, pad), mode="constant", value=0), filt_rep, groups=target_c.shape[1])
-
-    # Phase correlation
-    p_phase = torch.angle(p_coeff)
-    t_phase = torch.angle(t_coeff)
-    phase_diff = p_phase - t_phase
-
-    # Circular correlation
-    corr = torch.mean(torch.cos(phase_diff))
-    return corr
-
-
 def pearson_batch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Compute batch-averaged Pearson correlation."""
     pred_centered = pred - pred.mean(dim=-1, keepdim=True)
@@ -3084,6 +2532,61 @@ def pearson_batch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     denom = torch.sqrt((pred_centered**2).sum(dim=-1) * (target_centered**2).sum(dim=-1) + 1e-8)
     corr_channels = num / denom
     return corr_channels.mean()
+
+
+def pearson_per_channel(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute per-channel Pearson correlation, averaged over batch.
+
+    Args:
+        pred: Predicted tensor [B, C, T]
+        target: Target tensor [B, C, T]
+
+    Returns:
+        Per-channel correlations [C] - averaged over batch dimension
+    """
+    pred_centered = pred - pred.mean(dim=-1, keepdim=True)
+    target_centered = target - target.mean(dim=-1, keepdim=True)
+    num = (pred_centered * target_centered).sum(dim=-1)  # [B, C]
+    denom = torch.sqrt((pred_centered**2).sum(dim=-1) * (target_centered**2).sum(dim=-1) + 1e-8)
+    corr_channels = num / denom  # [B, C]
+    return corr_channels.mean(dim=0)  # [C] - mean over batch
+
+
+def cross_channel_correlation(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute cross-channel correlation matrix between pred and target.
+
+    Measures how much each predicted channel correlates with each target channel.
+    Useful for understanding if model is mixing/confusing channels.
+
+    Args:
+        pred: Predicted tensor [B, C, T]
+        target: Target tensor [B, C, T]
+
+    Returns:
+        Cross-correlation matrix [C, C] where entry [i,j] is correlation between
+        pred channel i and target channel j, averaged over batch.
+    """
+    B, C, T = pred.shape
+
+    # Center the data
+    pred_centered = pred - pred.mean(dim=-1, keepdim=True)  # [B, C, T]
+    target_centered = target - target.mean(dim=-1, keepdim=True)  # [B, C, T]
+
+    # Compute cross-correlation: for each pred channel i and target channel j
+    # corr[i,j] = sum(pred[i] * target[j]) / sqrt(sum(pred[i]^2) * sum(target[j]^2))
+    cross_corr = torch.zeros(C, C, device=pred.device, dtype=pred.dtype)
+
+    pred_norm = torch.sqrt((pred_centered**2).sum(dim=-1) + 1e-8)  # [B, C]
+    target_norm = torch.sqrt((target_centered**2).sum(dim=-1) + 1e-8)  # [B, C]
+
+    for i in range(C):
+        for j in range(C):
+            # Correlation between pred channel i and target channel j
+            num = (pred_centered[:, i, :] * target_centered[:, j, :]).sum(dim=-1)  # [B]
+            denom = pred_norm[:, i] * target_norm[:, j]  # [B]
+            cross_corr[i, j] = (num / denom).mean()  # scalar, avg over batch
+
+    return cross_corr
 
 
 # =============================================================================
@@ -3426,70 +2929,3 @@ def psd_diff_db_torch(
     return psd_diff
 
 
-# =============================================================================
-# Loss Functions
-# =============================================================================
-
-class TemporalGradientLoss(nn.Module):
-    """Loss that matches temporal derivatives of signals.
-
-    Matching signal derivatives captures transient events, sharp waves,
-    and other rapid changes that may be missed by direct signal comparison.
-
-    Args:
-        orders: List of derivative orders to compute (1=first derivative, etc.)
-        weights: Weights for each derivative order
-    """
-
-    def __init__(
-        self,
-        orders: List[int] = [1, 2],
-        weights: Optional[List[float]] = None,
-    ):
-        super().__init__()
-        self.orders = orders
-
-        if weights is None:
-            weights = [1.0] * len(orders)
-        self.weights = weights
-
-        total = sum(weights)
-        self.normalized_weights = [w / total for w in weights]
-
-    def _gradient(self, x: torch.Tensor, order: int) -> torch.Tensor:
-        """Compute temporal gradient of given order using finite differences."""
-        for _ in range(order):
-            x = x[..., 1:] - x[..., :-1]
-        return x
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute temporal gradient loss."""
-        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-
-        for order, weight in zip(self.orders, self.normalized_weights):
-            pred_grad = self._gradient(pred, order)
-            target_grad = self._gradient(target, order)
-            grad_loss = F.l1_loss(pred_grad, target_grad)
-            total_loss = total_loss + weight * grad_loss
-
-        return total_loss
-
-    def extra_repr(self) -> str:
-        orders_str = ", ".join(f"d{o}={w:.2f}" for o, w in zip(self.orders, self.weights))
-        return f"orders=[{orders_str}]"
-
-
-def build_loss(loss_type: str, **kwargs) -> nn.Module:
-    """Build a loss function by name.
-
-    Args:
-        loss_type: Type of loss ("temporal_gradient")
-        **kwargs: Additional arguments for the loss
-
-    Returns:
-        Loss module
-    """
-    if loss_type == "temporal_gradient":
-        return TemporalGradientLoss(**kwargs)
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}. Available: temporal_gradient")
