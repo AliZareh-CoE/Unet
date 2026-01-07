@@ -3625,6 +3625,9 @@ def main():
             cpu_count = os.cpu_count() or 8
             # With 8 GPUs, use 2 workers per GPU; with 1 GPU, use up to 8
             num_workers = max(2, min(8, cpu_count // max(1, world_size)))
+            # Further reduce workers for large batch sizes to avoid /dev/shm exhaustion
+            if config["batch_size"] >= 64:
+                num_workers = max(1, num_workers // 2)
         prefetch_factor = config["prefetch_factor"]
 
         # Reduce prefetch and disable persistent_workers when running multi-GPU to save shared memory
@@ -3634,6 +3637,9 @@ def main():
                 prefetch_factor = 2
             # Disable persistent_workers with many GPUs to avoid /dev/shm exhaustion
             use_persistent = False
+            # Further reduce for large batches
+            if config["batch_size"] >= 64:
+                prefetch_factor = 1
 
         if is_primary():
             print(f"DataLoader: {num_workers} workers, prefetch={prefetch_factor}, persistent={use_persistent}")
