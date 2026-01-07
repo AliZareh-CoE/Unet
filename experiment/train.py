@@ -3976,6 +3976,12 @@ def main():
             if data['split_info'].get('test_sessions'):
                 print(f"RESULT_TEST_SESSIONS={data['split_info']['test_sessions']}")
 
+    # Final synchronization and cleanup for distributed training
+    # This prevents NCCL timeout by ensuring all ranks sync before exit
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     try:
@@ -3991,3 +3997,11 @@ if __name__ == "__main__":
         print(f"{'='*70}\n", file=sys.stderr, flush=True)
         sys.stderr.flush()
         raise
+    finally:
+        # Ensure distributed process group is cleaned up even on errors
+        # This prevents NCCL hangs when one rank crashes
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass  # Ignore cleanup errors
