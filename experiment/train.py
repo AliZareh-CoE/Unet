@@ -116,6 +116,7 @@ from data import (
     create_dandi_dataloaders,
     DANDI_SAMPLING_RATE_HZ,
     DANDI_BRAIN_REGIONS,
+    _DANDI_DATA_DIR,
 )
 
 # Recording system imports (for comprehensive analysis)
@@ -3241,8 +3242,8 @@ def parse_args():
                         help="Stride between windows for DANDI (default: window_size // 2)")
     parser.add_argument("--dandi-stride-ratio", type=float, default=None,
                         help="Stride as ratio of window size for DANDI (0.5 = 50%% overlap)")
-    parser.add_argument("--dandi-data-dir", type=str, default="/data/movie",
-                        help="Directory containing DANDI NWB files (default: /data/movie)")
+    parser.add_argument("--dandi-data-dir", type=str, default=None,
+                        help="Directory containing DANDI NWB files (default: $UNET_DATA_DIR/movie)")
 
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
@@ -3677,8 +3678,6 @@ def main():
 
     elif args.dataset == "dandi":
         # DANDI 000623 human iEEG movie watching dataset
-        from pathlib import Path
-
         # Calculate stride
         window_size = args.dandi_window_size
         if args.dandi_stride_ratio is not None:
@@ -3690,15 +3689,19 @@ def main():
 
         val_stride = int(window_size * args.val_stride_multiplier)
 
+        # Use default DANDI data dir from data.py if not specified
+        dandi_data_dir = Path(args.dandi_data_dir) if args.dandi_data_dir else _DANDI_DATA_DIR
+
         if is_primary():
             print(f"\nLoading DANDI 000623 dataset...")
+            print(f"  Data directory: {dandi_data_dir}")
             print(f"  Source region: {args.dandi_source_region}")
             print(f"  Target region: {args.dandi_target_region}")
             print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
 
         # Prepare DANDI data - this returns datasets directly
         dandi_data = prepare_dandi_data(
-            data_dir=Path(args.dandi_data_dir),
+            data_dir=dandi_data_dir,
             source_region=args.dandi_source_region,
             target_region=args.dandi_target_region,
             window_size=window_size,
@@ -3725,7 +3728,7 @@ def main():
         config["dandi_val_stride"] = val_stride
         config["dandi_source_region"] = args.dandi_source_region
         config["dandi_target_region"] = args.dandi_target_region
-        config["dandi_data_dir"] = args.dandi_data_dir
+        config["dandi_data_dir"] = str(dandi_data_dir)
         config["sampling_rate"] = DANDI_SAMPLING_RATE_HZ
 
         # Channel counts from prepared data (normalized across all subjects)

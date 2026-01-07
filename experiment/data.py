@@ -56,8 +56,9 @@ class DatasetType(Enum):
 # =============================================================================
 # Constants - Olfactory Dataset (OB/PCx)
 # =============================================================================
-# Data directory - /data is the primary location on server
-_DATA_DIR = Path("/data")
+# Data directories - configurable via environment variables
+# Set UNET_DATA_DIR to override the default data location
+_DATA_DIR = Path(os.environ.get("UNET_DATA_DIR", "/data"))
 
 DATA_PATH = _DATA_DIR / "signal_windows_1khz.npy"
 ODOR_CSV_PATH = _DATA_DIR / "signal_windows_meta_1khz.csv"
@@ -91,7 +92,7 @@ NUM_ODORS = 7
 # =============================================================================
 # Constants - PFC/Hippocampus Dataset
 # =============================================================================
-_PFC_DATA_DIR = Path("/data/pfc/processed_data")
+_PFC_DATA_DIR = _DATA_DIR / "pfc" / "processed_data"
 PFC_DATA_PATH = _PFC_DATA_DIR / "neural_data.npy"
 PFC_META_PATH = _PFC_DATA_DIR / "metadata.csv"
 PFC_TRAIN_SPLIT_PATH = _PFC_DATA_DIR / "train_indices.npy"
@@ -123,7 +124,7 @@ NUM_TRIAL_TYPES = 2  # Right, Left
 # DANDI Archive: https://dandiarchive.org/dandiset/000623
 # GitHub: https://github.com/rutishauserlab/bmovie-release-NWB-BIDS
 
-_DANDI_DATA_DIR = Path("/data/movie")
+_DANDI_DATA_DIR = _DATA_DIR / "movie"
 DANDI_DANDISET_ID = "000623"
 DANDI_SAMPLING_RATE_HZ = 1000  # LFP/iEEG downsampled to 1000 Hz
 DANDI_MOVIE_DURATION_S = 480.0  # ~8 minutes movie clip
@@ -2592,7 +2593,7 @@ def get_data_info(data: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 # Paths for PCx1 continuous dataset
-PCX1_CONTINUOUS_PATH = Path("/data/PCx1/extracted/continuous_1khz")
+PCX1_CONTINUOUS_PATH = _DATA_DIR / "PCx1" / "extracted" / "continuous_1khz"
 PCX1_SAMPLING_RATE = 1000  # Hz
 PCX1_N_CHANNELS = 32  # per region (OB and PCx)
 

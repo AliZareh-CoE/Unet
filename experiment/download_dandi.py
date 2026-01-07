@@ -4,7 +4,12 @@
 This script downloads the NWB files from the DANDI Archive using their API.
 
 Usage:
-    python experiment/download_dandi.py --output /data/movie
+    python experiment/download_dandi.py
+    python experiment/download_dandi.py --output /path/to/output
+
+Environment Variables:
+    UNET_DATA_DIR: Base data directory (default: /data)
+                   NWB files will be saved to $UNET_DATA_DIR/movie/
 
 Reference:
     Keles et al., 2024, Scientific Data
@@ -171,11 +176,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download DANDI 000623 dataset (Human iEEG movie watching)"
     )
+    # Default output path uses UNET_DATA_DIR environment variable
+    default_output = Path(os.environ.get("UNET_DATA_DIR", "/data")) / "movie"
     parser.add_argument(
         "--output", "-o",
         type=Path,
-        default=Path("/data/movie"),
-        help="Output directory for downloaded files (default: /data/movie)"
+        default=default_output,
+        help=f"Output directory for downloaded files (default: $UNET_DATA_DIR/movie = {default_output})"
     )
     parser.add_argument(
         "--max-files", "-n",
