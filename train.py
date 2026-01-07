@@ -3304,25 +3304,6 @@ def parse_args():
     parser.add_argument("--no-separate-val-sessions", action="store_false", dest="separate_val_sessions",
                         help="Combine all validation sessions (default)")
 
-    # Contrastive learning for cross-session generalization (CEBRA-style)
-    parser.add_argument("--use-contrastive", action="store_true", default=None,
-                        help="Enable CEBRA-style contrastive learning for session-invariant representations")
-    parser.add_argument("--no-contrastive", action="store_true", default=None,
-                        help="Disable contrastive learning (default)")
-    parser.add_argument("--contrastive-weight", type=float, default=None,
-                        help="Weight for contrastive loss (default: 0.1)")
-    parser.add_argument("--contrastive-temperature", type=float, default=None,
-                        help="Temperature for InfoNCE loss (default: 0.1)")
-    parser.add_argument("--contrastive-mode", type=str, default=None,
-                        choices=["temporal", "label"],
-                        help="Contrastive mode: 'temporal' (true CEBRA with time-based positives) or "
-                             "'label' (behavior-supervised with odor labels). Default: temporal")
-    parser.add_argument("--contrastive-time-delta", type=int, default=None,
-                        help="Time delta in samples for temporal positive pairs (default: 10). "
-                             "Only used when --contrastive-mode=temporal")
-    parser.add_argument("--contrastive-num-samples", type=int, default=None,
-                        help="Number of time points to sample per trial for temporal CEBRA (default: 32)")
-
     # Conditioning mode override
     COND_MODES = ["none", "cross_attn_gated"]
     parser.add_argument("--cond-mode", type=str, default=None,
@@ -3342,59 +3323,9 @@ def parse_args():
     parser.add_argument("--no-bidirectional", action="store_true",
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
-    # Data augmentation (default=None means use config value, not override)
-    # Master toggle for all augmentations
-    parser.add_argument("--aug-enabled", action="store_true", default=None,
-                        help="Enable ALL data augmentations (master switch)")
-    parser.add_argument("--no-aug", "--no-augmentation", action="store_false", dest="aug_enabled",
-                        help="Disable ALL data augmentations (master switch)")
-    # Individual augmentation toggles
-    parser.add_argument("--aug-time-shift", action="store_true", default=None,
-                        help="Enable random circular time shift augmentation")
-    parser.add_argument("--no-aug-time-shift", action="store_false", dest="aug_time_shift",
-                        help="Disable time shift augmentation")
-    parser.add_argument("--aug-time-shift-max", type=float, default=None,
-                        help="Max time shift as fraction of signal length (default: 0.1)")
-    parser.add_argument("--aug-noise", action="store_true", default=None,
-                        help="Enable Gaussian noise augmentation")
-    parser.add_argument("--no-aug-noise", action="store_false", dest="aug_noise",
-                        help="Disable noise augmentation")
-    parser.add_argument("--aug-noise-std", type=float, default=None,
-                        help="Noise std relative to signal std (default: 0.05)")
-    parser.add_argument("--aug-channel-dropout", action="store_true", default=None,
-                        help="Enable random channel dropout augmentation")
-    parser.add_argument("--no-aug-channel-dropout", action="store_false", dest="aug_channel_dropout",
-                        help="Disable channel dropout augmentation")
-    parser.add_argument("--aug-channel-dropout-p", type=float, default=None,
-                        help="Probability of dropping each channel (default: 0.1)")
-    parser.add_argument("--aug-amplitude-scale", action="store_true", default=None,
-                        help="Enable random amplitude scaling augmentation")
-    parser.add_argument("--no-aug-amplitude-scale", action="store_false", dest="aug_amplitude_scale",
-                        help="Disable amplitude scale augmentation")
-    parser.add_argument("--aug-amplitude-scale-min", type=float, default=None,
-                        help="Min amplitude scale factor (default: 0.8)")
-    parser.add_argument("--aug-amplitude-scale-max", type=float, default=None,
-                        help="Max amplitude scale factor (default: 1.2)")
-    parser.add_argument("--aug-time-mask", action="store_true", default=None,
-                        help="Enable random time masking augmentation")
-    parser.add_argument("--no-aug-time-mask", action="store_false", dest="aug_time_mask",
-                        help="Disable time mask augmentation")
-    parser.add_argument("--aug-time-mask-ratio", type=float, default=None,
-                        help="Fraction of time to mask (default: 0.1)")
-    parser.add_argument("--aug-mixup", action="store_true", default=None,
-                        help="Enable Mixup augmentation (blend random sample pairs)")
-    parser.add_argument("--no-aug-mixup", action="store_false", dest="aug_mixup",
-                        help="Disable Mixup augmentation")
-    parser.add_argument("--aug-mixup-alpha", type=float, default=None,
-                        help="Mixup Beta distribution alpha (default: 0.4, higher=more mixing)")
-    parser.add_argument("--aug-freq-mask", action="store_true", default=None,
-                        help="Enable frequency masking augmentation")
-    parser.add_argument("--no-aug-freq-mask", action="store_false", dest="aug_freq_mask",
-                        help="Disable frequency masking augmentation")
-    parser.add_argument("--aug-freq-mask-max-bands", type=int, default=None,
-                        help="Max number of frequency bands to mask (default: 2)")
-    parser.add_argument("--aug-freq-mask-max-width", type=int, default=None,
-                        help="Max width of each masked band in freq bins (default: 10)")
+    # Data augmentation
+    parser.add_argument("--no-aug", action="store_true",
+                        help="Disable all data augmentations")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3491,29 +3422,6 @@ def main():
         config["no_test_set"] = args.no_test_set
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
-
-    # Contrastive learning config (CLI overrides config)
-    if args.use_contrastive:
-        config["use_contrastive"] = True
-    elif args.no_contrastive:
-        config["use_contrastive"] = False
-    if args.contrastive_weight is not None:
-        config["contrastive_weight"] = args.contrastive_weight
-    if args.contrastive_temperature is not None:
-        config["contrastive_temperature"] = args.contrastive_temperature
-    if args.contrastive_mode is not None:
-        config["contrastive_mode"] = args.contrastive_mode
-    if args.contrastive_time_delta is not None:
-        config["contrastive_time_delta"] = args.contrastive_time_delta
-    if args.contrastive_num_samples is not None:
-        config["contrastive_num_samples"] = args.contrastive_num_samples
-
-    # Print contrastive learning info
-    if is_primary() and config.get("use_contrastive", False):
-        mode = config.get("contrastive_mode", "temporal")
-        print(f"CONTRASTIVE LEARNING ENABLED: mode={mode}, weight={config['contrastive_weight']}, temp={config['contrastive_temperature']}")
-        if mode == "temporal":
-            print(f"  Temporal CEBRA: time_delta={config['contrastive_time_delta']}, num_samples={config['contrastive_num_samples']}")
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -3775,44 +3683,9 @@ def main():
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
 
-    # Data augmentation config from CLI (only override if explicitly set, not None)
-    # Master toggle first
-    if args.aug_enabled is not None:
-        config["aug_enabled"] = args.aug_enabled
-    if args.aug_time_shift is not None:
-        config["aug_time_shift"] = args.aug_time_shift
-    if args.aug_time_shift_max is not None:
-        config["aug_time_shift_max"] = args.aug_time_shift_max
-    if args.aug_noise is not None:
-        config["aug_noise"] = args.aug_noise
-    if args.aug_noise_std is not None:
-        config["aug_noise_std"] = args.aug_noise_std
-    if args.aug_channel_dropout is not None:
-        config["aug_channel_dropout"] = args.aug_channel_dropout
-    if args.aug_channel_dropout_p is not None:
-        config["aug_channel_dropout_p"] = args.aug_channel_dropout_p
-    if args.aug_amplitude_scale is not None:
-        config["aug_amplitude_scale"] = args.aug_amplitude_scale
-    if args.aug_amplitude_scale_min is not None or args.aug_amplitude_scale_max is not None:
-        # Get current range or default
-        current_range = config.get("aug_amplitude_scale_range", (0.8, 1.2))
-        min_val = args.aug_amplitude_scale_min if args.aug_amplitude_scale_min is not None else current_range[0]
-        max_val = args.aug_amplitude_scale_max if args.aug_amplitude_scale_max is not None else current_range[1]
-        config["aug_amplitude_scale_range"] = (min_val, max_val)
-    if args.aug_time_mask is not None:
-        config["aug_time_mask"] = args.aug_time_mask
-    if args.aug_time_mask_ratio is not None:
-        config["aug_time_mask_ratio"] = args.aug_time_mask_ratio
-    if args.aug_mixup is not None:
-        config["aug_mixup"] = args.aug_mixup
-    if args.aug_mixup_alpha is not None:
-        config["aug_mixup_alpha"] = args.aug_mixup_alpha
-    if args.aug_freq_mask is not None:
-        config["aug_freq_mask"] = args.aug_freq_mask
-    if args.aug_freq_mask_max_bands is not None:
-        config["aug_freq_mask_max_bands"] = args.aug_freq_mask_max_bands
-    if args.aug_freq_mask_max_width is not None:
-        config["aug_freq_mask_max_width"] = args.aug_freq_mask_max_width
+    # Data augmentation - simple toggle
+    if args.no_aug:
+        config["aug_enabled"] = False
 
     # Plot generation config
     if args.generate_plots is not None:
