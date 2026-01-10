@@ -201,7 +201,7 @@ class Phase2Visualizer:
 
     def _plot_learning_curves(self, ax: plt.Axes, result: Any):
         """Plot validation loss curves."""
-        # Group results by architecture, use first seed
+        # Group results by architecture, use first fold
         arch_results = {}
         for r in result.results:
             if r.architecture not in arch_results:

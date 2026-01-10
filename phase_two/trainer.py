@@ -166,10 +166,10 @@ class SignalAugmentation:
 
 @dataclass
 class TrainingResult:
-    """Results from a single training run."""
+    """Results from a single training run (one fold of cross-validation)."""
 
     architecture: str
-    seed: int
+    fold: int  # CV fold index (0 to n_folds-1)
 
     # Final metrics
     best_val_r2: float
@@ -199,7 +199,7 @@ class TrainingResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "architecture": self.architecture,
-            "seed": self.seed,
+            "fold": self.fold,
             "best_val_r2": self.best_val_r2,
             "best_val_mae": self.best_val_mae,
             "best_epoch": self.best_epoch,
@@ -453,7 +453,7 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader,
         arch_name: str = "model",
-        seed: int = 42,
+        fold: int = 0,
         verbose: bool = True,
         resume_from: Optional[Path] = None,
         checkpoint_every: int = 10,
@@ -464,7 +464,7 @@ class Trainer:
             train_loader: Training data loader
             val_loader: Validation data loader
             arch_name: Architecture name (for logging)
-            seed: Random seed used
+            fold: Cross-validation fold index
             verbose: Whether to print progress
             resume_from: Optional checkpoint path to resume from
             checkpoint_every: Save checkpoint every N epochs
@@ -472,7 +472,7 @@ class Trainer:
         Returns:
             TrainingResult with all metrics
         """
-        self.logger.info(f"Starting training for {arch_name} (seed={seed})")
+        self.logger.info(f"Starting training for {arch_name} (fold={fold})")
         self.logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
 
         # Resume if requested
@@ -533,13 +533,13 @@ class Trainer:
 
                     # Save best checkpoint
                     if self.checkpoint_dir:
-                        self._save_checkpoint(arch_name, seed, is_best=True, epoch=epoch+1)
+                        self._save_checkpoint(arch_name, fold, is_best=True, epoch=epoch+1)
                 else:
                     self.patience_counter += 1
 
                 # Periodic checkpoint
                 if self.checkpoint_dir and (epoch + 1) % checkpoint_every == 0:
-                    self._save_checkpoint(arch_name, seed, is_best=False, epoch=epoch+1)
+                    self._save_checkpoint(arch_name, fold, is_best=False, epoch=epoch+1)
 
                 # Log
                 epoch_time = time.time() - epoch_start
@@ -587,7 +587,7 @@ class Trainer:
 
         return TrainingResult(
             architecture=arch_name,
-            seed=seed,
+            fold=fold,
             best_val_r2=best_val_r2,
             best_val_mae=best_val_mae,
             best_epoch=best_epoch,
@@ -608,7 +608,7 @@ class Trainer:
     def _save_checkpoint(
         self,
         arch_name: str,
-        seed: int,
+        fold: int,
         is_best: bool = True,
         epoch: int = 0,
     ):
@@ -616,7 +616,7 @@ class Trainer:
 
         Args:
             arch_name: Architecture name
-            seed: Random seed
+            fold: Cross-validation fold index
             is_best: Whether this is the best model checkpoint
             epoch: Current epoch number
         """
@@ -632,14 +632,14 @@ class Trainer:
             'best_val_r2': self.best_val_r2,
             'best_val_loss': self.best_val_loss,
             'architecture': arch_name,
-            'seed': seed,
+            'fold': fold,
             'timestamp': datetime.now().isoformat(),
         }
 
         if is_best:
-            path = self.checkpoint_dir / f"{arch_name}_seed{seed}_best.pt"
+            path = self.checkpoint_dir / f"{arch_name}_fold{fold}_best.pt"
         else:
-            path = self.checkpoint_dir / f"{arch_name}_seed{seed}_epoch{epoch}.pt"
+            path = self.checkpoint_dir / f"{arch_name}_fold{fold}_epoch{epoch}.pt"
 
         torch.save(checkpoint, path)
         self.logger.debug(f"Saved checkpoint: {path}")

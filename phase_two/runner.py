@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Phase 2 Runner: Architecture Screening
-======================================
+Phase 2 Runner: Architecture Screening (5-Fold Cross-Validation)
+=================================================================
 
 Main execution script for Phase 2 of the Nature Methods study.
-Compares 8 neural architectures on the olfactory dataset.
+Compares 8 neural architectures on the olfactory dataset using
+rigorous 5-fold cross-validation for robust performance estimates.
 
 Usage:
     python -m phase_two.runner --dataset olfactory --epochs 60
     python -m phase_two.runner --dry-run  # Quick test
-    python -m phase_two.runner --arch condunet --seeds 42 43 44
+    python -m phase_two.runner --arch condunet wavenet --n-folds 5
+
+Cross-Validation:
+    Each architecture is evaluated using 5-fold CV, where the data
+    is split into 5 parts and each part is used as validation once.
+    Results are reported as mean ± std across all folds.
 
 Auto-loading Phase 1 Results:
     If --classical-r2 is not specified, Phase 2 will automatically
@@ -17,9 +23,9 @@ Auto-loading Phase 1 Results:
     classical R² as the gate threshold baseline.
 
 Output:
-    - JSON results with per-architecture metrics
+    - JSON results with per-architecture metrics (5-fold CV)
     - Learning curves and comparison figures
-    - Model checkpoints
+    - Model checkpoints per fold
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -160,7 +166,7 @@ class Phase2Result:
         for r in data["results"]:
             results.append(TrainingResult(
                 architecture=r["architecture"],
-                seed=r["seed"],
+                fold=r.get("fold", r.get("seed", 0)),  # Support both old and new format
                 best_val_r2=r["best_val_r2"],
                 best_val_mae=r["best_val_mae"],
                 best_epoch=r["best_epoch"],
@@ -195,7 +201,12 @@ class Phase2Result:
 # =============================================================================
 
 def load_olfactory_data():
-    """Load olfactory dataset."""
+    """Load olfactory dataset (full data for cross-validation).
+
+    Returns:
+        X: Input signals [N, C, T]
+        y: Target signals [N, C, T]
+    """
     from data import prepare_data
 
     print("Loading olfactory dataset...")
@@ -204,46 +215,75 @@ def load_olfactory_data():
     ob = data["ob"]    # [N, C, T]
     pcx = data["pcx"]  # [N, C, T]
 
+    # Combine train+val for CV (exclude test set for final evaluation)
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
-    test_idx = data["test_idx"]
 
-    X_train = ob[train_idx]
-    y_train = pcx[train_idx]
-    X_val = ob[val_idx]
-    y_val = pcx[val_idx]
+    all_idx = np.concatenate([train_idx, val_idx])
+    X = ob[all_idx]
+    y = pcx[all_idx]
 
-    print(f"  Train: {X_train.shape}, Val: {X_val.shape}")
+    print(f"  Loaded: {X.shape} samples for cross-validation")
 
-    return X_train, y_train, X_val, y_val
+    return X, y
 
 
 def create_synthetic_data(
-    n_train: int = 200,
-    n_val: int = 50,
+    n_samples: int = 250,
     n_channels: int = 32,
     time_steps: int = 1000,
     seed: int = 42,
 ):
-    """Create synthetic data for testing."""
+    """Create synthetic data for testing (full data for CV)."""
     np.random.seed(seed)
 
-    def generate(n):
-        X = np.random.randn(n, n_channels, time_steps).astype(np.float32)
-        # Target is smoothed + nonlinear transform
-        y = np.zeros_like(X)
-        for i in range(n):
-            for c in range(n_channels):
-                kernel = np.hanning(30) / np.hanning(30).sum()
-                y[i, c] = np.convolve(X[i, c], kernel, mode='same')
-                y[i, c] = np.tanh(y[i, c])
-        y += 0.1 * np.random.randn(*y.shape).astype(np.float32)
-        return X, y
+    X = np.random.randn(n_samples, n_channels, time_steps).astype(np.float32)
+    # Target is smoothed + nonlinear transform
+    y = np.zeros_like(X)
+    for i in range(n_samples):
+        for c in range(n_channels):
+            kernel = np.hanning(30) / np.hanning(30).sum()
+            y[i, c] = np.convolve(X[i, c], kernel, mode='same')
+            y[i, c] = np.tanh(y[i, c])
+    y += 0.1 * np.random.randn(*y.shape).astype(np.float32)
 
-    X_train, y_train = generate(n_train)
-    X_val, y_val = generate(n_val)
+    return X, y
 
-    return X_train, y_train, X_val, y_val
+
+# =============================================================================
+# Cross-Validation
+# =============================================================================
+
+def create_cv_splits(
+    n_samples: int,
+    n_folds: int = 5,
+    seed: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Create K-fold cross-validation splits.
+
+    Args:
+        n_samples: Total number of samples
+        n_folds: Number of folds
+        seed: Random seed for reproducibility
+
+    Returns:
+        List of (train_indices, val_indices) tuples
+    """
+    np.random.seed(seed)
+    indices = np.random.permutation(n_samples)
+    fold_size = n_samples // n_folds
+
+    splits = []
+    for i in range(n_folds):
+        val_start = i * fold_size
+        val_end = val_start + fold_size if i < n_folds - 1 else n_samples
+
+        val_idx = indices[val_start:val_end]
+        train_idx = np.concatenate([indices[:val_start], indices[val_end:]])
+
+        splits.append((train_idx, val_idx))
+
+    return splits
 
 
 # =============================================================================
@@ -252,36 +292,39 @@ def create_synthetic_data(
 
 def run_phase2(
     config: Phase2Config,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
     classical_r2: float = 0.35,  # From Phase 1
 ) -> Phase2Result:
-    """Run Phase 2 architecture screening.
+    """Run Phase 2 architecture screening with 5-fold cross-validation.
 
     Args:
         config: Phase 2 configuration
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
+        X: Input signals [N, C, T]
+        y: Target signals [N, C, T]
         classical_r2: Best R² from Phase 1 (for gate check)
 
     Returns:
         Phase2Result with all metrics
     """
     print("\n" + "=" * 70)
-    print("PHASE 2: Architecture Screening")
+    print("PHASE 2: Architecture Screening (5-Fold Cross-Validation)")
     print("=" * 70)
     print(f"Dataset: {config.dataset}")
     print(f"Architectures: {', '.join(config.architectures)}")
-    print(f"Seeds: {config.seeds}")
+    print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     print(f"Device: {config.device}")
     print()
 
-    in_channels = X_train.shape[1]
-    out_channels = y_train.shape[1]
-    time_steps = X_train.shape[2]
+    n_samples = X.shape[0]
+    in_channels = X.shape[1]
+    out_channels = y.shape[1]
+    time_steps = X.shape[2]
+
+    # Create CV splits
+    cv_splits = create_cv_splits(n_samples, config.n_folds, config.cv_seed)
+    print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
 
     all_results = []
     arch_r2s = {arch: [] for arch in config.architectures}
@@ -294,11 +337,16 @@ def run_phase2(
         print(f"Architecture: {arch_name.upper()}")
         print("=" * 60)
 
-        for seed in config.seeds:
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             run_idx += 1
-            print(f"\n[{run_idx}/{total_runs}] {arch_name} (seed={seed})")
+            print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds})")
 
-            # Set seed
+            # Get fold data
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            # Set seed for reproducibility (use fold index as seed offset)
+            seed = config.cv_seed + fold_idx
             torch.manual_seed(seed)
             np.random.seed(seed)
             if torch.cuda.is_available():
@@ -314,6 +362,7 @@ def run_phase2(
 
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"  Parameters: {n_params:,}")
+            print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
 
             # Create data loaders
             train_loader, val_loader = create_dataloaders(
@@ -327,7 +376,7 @@ def run_phase2(
                 model=model,
                 config=config.training,
                 device=config.device,
-                checkpoint_dir=config.checkpoint_dir / arch_name if config.save_checkpoints else None,
+                checkpoint_dir=config.checkpoint_dir / arch_name / f"fold{fold_idx}" if config.save_checkpoints else None,
                 log_dir=config.log_dir if hasattr(config, 'log_dir') else None,
             )
 
@@ -336,7 +385,7 @@ def run_phase2(
                 train_loader=train_loader,
                 val_loader=val_loader,
                 arch_name=arch_name,
-                seed=seed,
+                fold=fold_idx,
                 verbose=config.verbose > 0,
                 checkpoint_every=config.training.checkpoint_every,
             )
@@ -353,20 +402,23 @@ def run_phase2(
             if not result.completed_successfully:
                 print(f"  Error: {result.error_message}")
 
-    # Aggregate results per architecture
+    # Aggregate results per architecture (across CV folds)
     aggregated = {}
     for arch_name in config.architectures:
         r2s = arch_r2s[arch_name]
+        valid_r2s = [r for r in r2s if not np.isnan(r)]
         aggregated[arch_name] = {
-            "r2_mean": float(np.mean(r2s)),
-            "r2_std": float(np.std(r2s)),
-            "r2_min": float(np.min(r2s)),
-            "r2_max": float(np.max(r2s)),
-            "n_runs": len(r2s),
+            "r2_mean": float(np.mean(valid_r2s)) if valid_r2s else np.nan,
+            "r2_std": float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0,
+            "r2_min": float(np.min(valid_r2s)) if valid_r2s else np.nan,
+            "r2_max": float(np.max(valid_r2s)) if valid_r2s else np.nan,
+            "n_folds": len(valid_r2s),
+            "fold_r2s": r2s,  # Store individual fold results
         }
 
     # Find best
-    best_arch = max(aggregated.keys(), key=lambda k: aggregated[k]["r2_mean"])
+    valid_archs = [k for k in aggregated.keys() if not np.isnan(aggregated[k]["r2_mean"])]
+    best_arch = max(valid_archs, key=lambda k: aggregated[k]["r2_mean"]) if valid_archs else config.architectures[0]
     best_r2 = aggregated[best_arch]["r2_mean"]
 
     # Check gate
@@ -384,7 +436,7 @@ def run_phase2(
 
     # Print summary
     print("\n" + "=" * 70)
-    print("PHASE 2 RESULTS SUMMARY")
+    print("PHASE 2 RESULTS SUMMARY (5-Fold Cross-Validation)")
     print("=" * 70)
 
     print("\n{:<15} {:>10} {:>10} {:>12}".format(
@@ -423,13 +475,13 @@ def run_phase2(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 2: Architecture Screening",
+        description="Phase 2: Architecture Screening (5-Fold Cross-Validation)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
     python -m phase_two.runner --dataset olfactory --epochs 60
     python -m phase_two.runner --dry-run
-    python -m phase_two.runner --arch condunet wavenet --seeds 42 43 44
+    python -m phase_two.runner --arch condunet wavenet --n-folds 5
         """
     )
 
@@ -441,8 +493,10 @@ Examples:
                        help="Output directory")
     parser.add_argument("--arch", type=str, nargs="+", default=None,
                        help="Specific architectures to run")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44],
-                       help="Random seeds")
+    parser.add_argument("--n-folds", type=int, default=5,
+                       help="Number of cross-validation folds")
+    parser.add_argument("--cv-seed", type=int, default=42,
+                       help="Random seed for CV splits")
     parser.add_argument("--epochs", type=int, default=60,
                        help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -520,7 +574,8 @@ Examples:
     config = Phase2Config(
         dataset=args.dataset,
         architectures=architectures,
-        seeds=args.seeds if not args.dry_run else [42],
+        n_folds=args.n_folds if not args.dry_run else 2,  # Use 2 folds for dry-run
+        cv_seed=args.cv_seed,
         training=training_config,
         output_dir=Path(args.output),
         save_checkpoints=not args.no_checkpoints,
@@ -539,26 +594,24 @@ Examples:
     else:
         print(f"Using specified classical R²: {classical_r2:.4f}")
 
-    # Load data
+    # Load data (full dataset for cross-validation)
     if args.dry_run:
         print("[DRY-RUN] Using synthetic data")
-        X_train, y_train, X_val, y_val = create_synthetic_data(
-            n_train=100, n_val=30, time_steps=500
+        X, y = create_synthetic_data(
+            n_samples=100, time_steps=500
         )
     else:
         try:
-            X_train, y_train, X_val, y_val = load_olfactory_data()
+            X, y = load_olfactory_data()
         except Exception as e:
             print(f"Warning: Could not load data ({e}). Using synthetic.")
-            X_train, y_train, X_val, y_val = create_synthetic_data()
+            X, y = create_synthetic_data()
 
-    # Run
+    # Run with 5-fold cross-validation
     result = run_phase2(
         config=config,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
+        X=X,
+        y=y,
         classical_r2=classical_r2,
     )
 

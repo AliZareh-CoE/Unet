@@ -170,8 +170,9 @@ class Phase2Config:
     # Architectures to evaluate
     architectures: List[str] = field(default_factory=lambda: ARCHITECTURE_LIST.copy())
 
-    # Multiple seeds for statistical validity
-    seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
+    # Cross-validation settings
+    n_folds: int = 5
+    cv_seed: int = 42  # Seed for CV split reproducibility
 
     # Training config
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -214,7 +215,8 @@ class Phase2Config:
             "dataset": self.dataset,
             "sample_rate": self.sample_rate,
             "architectures": self.architectures,
-            "seeds": self.seeds,
+            "n_folds": self.n_folds,
+            "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
             "output_dir": str(self.output_dir),
             "device": self.device,
@@ -222,8 +224,8 @@ class Phase2Config:
 
     @property
     def total_runs(self) -> int:
-        """Total number of training runs."""
-        return len(self.architectures) * len(self.seeds)
+        """Total number of training runs (architectures × folds)."""
+        return len(self.architectures) * self.n_folds
 
 
 # =============================================================================
