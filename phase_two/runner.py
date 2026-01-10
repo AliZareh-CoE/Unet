@@ -79,6 +79,57 @@ class Phase2Result:
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
 
+    @classmethod
+    def load(cls, path: Path) -> "Phase2Result":
+        """Load results from JSON file.
+
+        Args:
+            path: Path to JSON results file
+
+        Returns:
+            Phase2Result object
+
+        Example:
+            >>> result = Phase2Result.load("results/phase2/phase2_results_20240101.json")
+            >>> print(result.best_architecture, result.best_r2)
+        """
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        # Reconstruct TrainingResult objects
+        results = []
+        for r in data["results"]:
+            results.append(TrainingResult(
+                architecture=r["architecture"],
+                seed=r["seed"],
+                best_val_r2=r["best_val_r2"],
+                best_val_mae=r["best_val_mae"],
+                best_epoch=r["best_epoch"],
+                train_losses=r["train_losses"],
+                val_losses=r["val_losses"],
+                val_r2s=r["val_r2s"],
+                total_time=r["total_time"],
+                epochs_trained=r["epochs_trained"],
+                n_parameters=r["n_parameters"],
+                nan_detected=r.get("nan_detected", False),
+                nan_recovery_count=r.get("nan_recovery_count", 0),
+                early_stopped=r.get("early_stopped", False),
+                error_message=r.get("error_message"),
+                peak_gpu_memory_mb=r.get("peak_gpu_memory_mb"),
+                completed_successfully=r.get("completed_successfully", True),
+            ))
+
+        return cls(
+            results=results,
+            aggregated=data["aggregated"],
+            best_architecture=data["best_architecture"],
+            best_r2=data["best_r2"],
+            gate_passed=data["gate_passed"],
+            classical_baseline_r2=data["classical_baseline_r2"],
+            config=data.get("config", {}),
+            timestamp=data.get("timestamp", ""),
+        )
+
 
 # =============================================================================
 # Data Loading
@@ -345,8 +396,50 @@ Examples:
                        help="Don't save model checkpoints")
     parser.add_argument("--classical-r2", type=float, default=0.35,
                        help="Phase 1 classical baseline R²")
+    parser.add_argument("--load-results", type=str, default=None,
+                       help="Load previous results and regenerate figures (path to JSON)")
+    parser.add_argument("--figure-format", type=str, default="pdf",
+                       choices=["pdf", "png", "svg", "eps"],
+                       help="Output format for figures")
+    parser.add_argument("--figure-dpi", type=int, default=300,
+                       help="DPI for raster figures (png)")
 
     args = parser.parse_args()
+
+    # Handle result loading mode (figures only)
+    if args.load_results:
+        from phase_two.visualization import Phase2Visualizer, create_summary_table
+
+        print(f"Loading results from: {args.load_results}")
+        result = Phase2Result.load(Path(args.load_results))
+
+        print(f"Loaded Phase 2 results:")
+        print(f"  Best architecture: {result.best_architecture} (R² = {result.best_r2:.4f})")
+        print(f"  Gate passed: {result.gate_passed}")
+        print(f"  Architectures evaluated: {len(result.aggregated)}")
+
+        # Generate figures
+        output_dir = Path(args.output)
+        viz = Phase2Visualizer(
+            output_dir=output_dir / "figures",
+            dpi=args.figure_dpi,
+        )
+
+        paths = viz.plot_all(result, format=args.figure_format)
+        print(f"\nFigures regenerated:")
+        for p in paths:
+            print(f"  {p}")
+
+        # LaTeX table
+        latex_table = create_summary_table(result)
+        latex_path = output_dir / "table_architecture_comparison.tex"
+        latex_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(latex_path, 'w') as f:
+            f.write(latex_table)
+        print(f"LaTeX table: {latex_path}")
+
+        print("\nFigure regeneration complete!")
+        return result
 
     # Determine architectures
     if args.arch:

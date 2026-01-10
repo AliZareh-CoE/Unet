@@ -25,10 +25,13 @@ __version__ = "1.0.0"
 
 from .config import Phase2Config, ARCHITECTURE_LIST
 from .runner import run_phase2, Phase2Result
+from .visualization import Phase2Visualizer, create_summary_table
 
 __all__ = [
     "Phase2Config",
     "ARCHITECTURE_LIST",
     "run_phase2",
     "Phase2Result",
+    "Phase2Visualizer",
+    "create_summary_table",
 ]

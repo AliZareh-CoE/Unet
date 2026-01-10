@@ -111,6 +111,69 @@ class Phase1Result:
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
 
+    @classmethod
+    def load(cls, path: Path) -> "Phase1Result":
+        """Load results from JSON file.
+
+        Args:
+            path: Path to JSON results file
+
+        Returns:
+            Phase1Result object
+
+        Example:
+            >>> result = Phase1Result.load("results/phase1/phase1_results_20240101.json")
+            >>> print(result.best_method, result.best_r2)
+        """
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        # Reconstruct Phase1Metrics objects
+        metrics = []
+        for m in data["metrics"]:
+            metrics.append(Phase1Metrics(
+                method=m["method"],
+                r2_mean=m["r2_mean"],
+                r2_std=m["r2_std"],
+                r2_ci=tuple(m["r2_ci"]),
+                mae_mean=m["mae_mean"],
+                mae_std=m["mae_std"],
+                pearson_mean=m["pearson_mean"],
+                pearson_std=m["pearson_std"],
+                psd_error_db=m.get("psd_error_db", 0.0),
+                band_r2=m.get("band_r2", {}),
+                fold_r2s=m.get("fold_r2s", []),
+                fold_maes=m.get("fold_maes", []),
+                fold_pearsons=m.get("fold_pearsons", []),
+                n_folds=m.get("n_folds", 5),
+                n_samples=m.get("n_samples", 0),
+            ))
+
+        # Reconstruct StatisticalComparison objects
+        comparisons = []
+        for c in data.get("statistical_comparisons", []):
+            comparisons.append(StatisticalComparison(
+                method1=c["method1"],
+                method2=c["method2"],
+                mean_diff=c["mean_diff"],
+                t_stat=c["t_stat"],
+                p_value=c["p_value"],
+                p_adjusted=c["p_adjusted"],
+                cohens_d=c["cohens_d"],
+                effect_size=c["effect_size"],
+                significant=c["significant"],
+            ))
+
+        return cls(
+            metrics=metrics,
+            best_method=data["best_method"],
+            best_r2=data["best_r2"],
+            gate_threshold=data["gate_threshold"],
+            statistical_comparisons=comparisons,
+            config=data.get("config"),
+            timestamp=data.get("timestamp", ""),
+        )
+
 
 # =============================================================================
 # Data Loading
@@ -477,8 +540,70 @@ Examples:
         action="store_true",
         help="Skip figure generation",
     )
+    parser.add_argument(
+        "--load-results",
+        type=str,
+        default=None,
+        help="Load previous results and regenerate figures (path to JSON)",
+    )
+    parser.add_argument(
+        "--figure-format",
+        type=str,
+        default="pdf",
+        choices=["pdf", "png", "svg", "eps"],
+        help="Output format for figures",
+    )
+    parser.add_argument(
+        "--figure-dpi",
+        type=int,
+        default=300,
+        help="DPI for raster figures (png)",
+    )
 
     args = parser.parse_args()
+
+    # Handle result loading mode (figures only)
+    if args.load_results:
+        print(f"Loading results from: {args.load_results}")
+        result = Phase1Result.load(Path(args.load_results))
+
+        print(f"Loaded Phase 1 results:")
+        print(f"  Best method: {result.best_method} (R² = {result.best_r2:.4f})")
+        print(f"  Gate threshold: {result.gate_threshold:.4f}")
+        print(f"  Methods evaluated: {len(result.metrics)}")
+
+        # Generate figures
+        output_dir = Path(args.output)
+        viz = Phase1Visualizer(
+            output_dir=output_dir / "figures",
+            sample_rate=result.config.get("sample_rate", 1000.0) if result.config else 1000.0,
+        )
+
+        fig_path = viz.plot_main_figure(
+            metrics_list=result.metrics,
+            predictions=None,  # No predictions when loading
+            ground_truth=None,
+            filename=f"figure_1_1_classical_baselines.{args.figure_format}",
+        )
+        print(f"\nFigure regenerated: {fig_path}")
+
+        # Stats figure
+        stats_path = viz.plot_statistical_summary(
+            result.metrics,
+            filename=f"figure_1_1_stats.{args.figure_format}",
+        )
+        print(f"Stats figure: {stats_path}")
+
+        # LaTeX table
+        latex_table = create_summary_table(result.metrics)
+        latex_path = output_dir / "table_classical_baselines.tex"
+        latex_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(latex_path, 'w') as f:
+            f.write(latex_table)
+        print(f"LaTeX table: {latex_path}")
+
+        print("\nFigure regeneration complete!")
+        return result
 
     # Create configuration
     baselines = FAST_BASELINES if args.fast else BASELINE_METHODS
