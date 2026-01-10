@@ -212,21 +212,23 @@ def run_phase2(
                 n_workers=config.n_workers,
             )
 
-            # Create trainer
+            # Create trainer with logging
             trainer = Trainer(
                 model=model,
                 config=config.training,
                 device=config.device,
                 checkpoint_dir=config.checkpoint_dir / arch_name if config.save_checkpoints else None,
+                log_dir=config.log_dir if hasattr(config, 'log_dir') else None,
             )
 
-            # Train
+            # Train with robustness features
             result = trainer.fit(
                 train_loader=train_loader,
                 val_loader=val_loader,
                 arch_name=arch_name,
                 seed=seed,
                 verbose=config.verbose > 0,
+                checkpoint_every=config.training.checkpoint_every,
             )
 
             all_results.append(result)
@@ -234,6 +236,12 @@ def run_phase2(
 
             print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
             print(f"  Time: {result.total_time:.1f}s")
+
+            # Show robustness info if any issues
+            if result.nan_detected:
+                print(f"  Warning: {result.nan_recovery_count} NaN batches recovered")
+            if not result.completed_successfully:
+                print(f"  Error: {result.error_message}")
 
     # Aggregate results per architecture
     aggregated = {}

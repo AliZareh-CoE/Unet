@@ -121,6 +121,11 @@ class TrainingConfig:
     # Mixed precision
     use_amp: bool = True
 
+    # Robustness settings for long runs
+    checkpoint_every: int = 10  # Save checkpoint every N epochs
+    max_nan_recovery: int = 100  # Max NaN batches before stopping
+    log_every: int = 5  # Log progress every N epochs
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "epochs": self.epochs,
@@ -135,6 +140,8 @@ class TrainingConfig:
             "loss_fn": self.loss_fn,
             "use_augmentation": self.use_augmentation,
             "use_amp": self.use_amp,
+            "checkpoint_every": self.checkpoint_every,
+            "max_nan_recovery": self.max_nan_recovery,
         }
 
 
@@ -184,6 +191,7 @@ class Phase2Config:
     use_wandb: bool = False
     wandb_project: str = "neural-signal-translation"
     verbose: int = 1
+    log_dir: Path = field(default_factory=lambda: Path("logs/phase2"))
 
     def __post_init__(self):
         """Validate configuration."""
@@ -192,6 +200,9 @@ class Phase2Config:
 
         self.checkpoint_dir = Path(self.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_dir = Path(self.log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # Validate architectures
         for arch in self.architectures:

@@ -17,13 +17,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def softmax_kernel(
+def softmax_kernel_favor_plus(
     data: torch.Tensor,
     projection_matrix: torch.Tensor,
     is_query: bool,
-    eps: float = 1e-4,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Compute FAVOR+ softmax kernel features.
+    """Compute FAVOR+ softmax kernel features (Choromanski et al., 2020).
+
+    Uses the positive random features approximation:
+        φ(x) = exp(w^T x - ||x||^2/2) / sqrt(m)
+
+    This approximates: softmax(Q @ K^T) ≈ φ(Q) @ φ(K)^T
 
     Args:
         data: Input tensor [B, heads, N, head_dim]
@@ -34,20 +39,31 @@ def softmax_kernel(
     Returns:
         Kernel features [B, heads, N, n_features]
     """
-    # Normalize data
-    data_normalizer = data.shape[-1] ** -0.25
+    head_dim = data.shape[-1]
+    n_features = projection_matrix.shape[0]
 
-    # Project data
-    data_proj = data @ projection_matrix.T  # [B, heads, N, n_features]
+    # Normalize by sqrt(head_dim) as in standard attention
+    data_normalized = data / math.sqrt(head_dim)
 
-    # Apply exponential (softmax approximation)
-    data_proj = data_proj * data_normalizer
+    # Compute ||x||^2 / 2 for the Gaussian kernel
+    data_norm_sq = (data_normalized ** 2).sum(dim=-1, keepdim=True) / 2  # [B, heads, N, 1]
 
-    # Compute exp(data_proj - max) for stability
-    data_proj_max = data_proj.max(dim=-1, keepdim=True).values
-    data_proj = torch.exp(data_proj - data_proj_max + eps)
+    # Project: w^T x
+    data_proj = data_normalized @ projection_matrix.T  # [B, heads, N, n_features]
 
-    return data_proj
+    # FAVOR+ kernel: exp(w^T x - ||x||^2/2) / sqrt(m)
+    # For numerical stability, subtract max before exp
+    data_combined = data_proj - data_norm_sq
+    data_max = data_combined.max(dim=-1, keepdim=True).values
+    kernel_features = torch.exp(data_combined - data_max)
+
+    # Normalize by sqrt(n_features) for unbiased estimate
+    kernel_features = kernel_features / math.sqrt(n_features)
+
+    # Add small epsilon for stability
+    kernel_features = kernel_features + eps
+
+    return kernel_features
 
 
 class FAVORPlusAttention(nn.Module):
@@ -108,9 +124,9 @@ class FAVORPlusAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, heads, N, head_dim]
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Compute kernel features
-        q_prime = softmax_kernel(q, self.projection_matrix, is_query=True)
-        k_prime = softmax_kernel(k, self.projection_matrix, is_query=False)
+        # Compute kernel features using FAVOR+
+        q_prime = softmax_kernel_favor_plus(q, self.projection_matrix, is_query=True)
+        k_prime = softmax_kernel_favor_plus(k, self.projection_matrix, is_query=False)
 
         # Linear attention: O(N) instead of O(N²)
         # Attention = Q' @ (K'^T @ V) instead of softmax(Q @ K^T) @ V
