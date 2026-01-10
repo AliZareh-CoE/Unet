@@ -180,6 +180,7 @@ class Phase4Config:
         "n_downsample": 2,
         "attention_type": "cross_freq_v2",
         "cond_mode": "cross_attn_gated",
+        "bidirectional": True,
     })
 
     # Output
