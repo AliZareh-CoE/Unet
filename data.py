@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import random
+
+# Suppress hdmf namespace version warnings (harmless version mismatch in NWB files)
+warnings.filterwarnings("ignore", message="Ignoring the following cached namespace")
+warnings.filterwarnings("ignore", module="hdmf.spec.namespace")
 
 import numpy as np
 import pandas as pd
@@ -45,13 +50,15 @@ class DatasetType(Enum):
     """Supported dataset types."""
     OLFACTORY = "olfactory"      # OB/PCx dataset
     PFC_HPC = "pfc_hpc"          # PFC/Hippocampus (CA1) dataset
+    DANDI_MOVIE = "dandi_movie"  # DANDI 000623: Human iEEG movie watching
 
 
 # =============================================================================
 # Constants - Olfactory Dataset (OB/PCx)
 # =============================================================================
-# Data directory - /data is the primary location on server
-_DATA_DIR = Path("/data")
+# Data directories - configurable via environment variables
+# Set UNET_DATA_DIR to override the default data location
+_DATA_DIR = Path(os.environ.get("UNET_DATA_DIR", "/data"))
 
 DATA_PATH = _DATA_DIR / "signal_windows_1khz.npy"
 ODOR_CSV_PATH = _DATA_DIR / "signal_windows_meta_1khz.csv"
@@ -85,7 +92,7 @@ NUM_ODORS = 7
 # =============================================================================
 # Constants - PFC/Hippocampus Dataset
 # =============================================================================
-_PFC_DATA_DIR = Path("/data/pfc/processed_data")
+_PFC_DATA_DIR = _DATA_DIR / "pfc" / "processed_data"
 PFC_DATA_PATH = _PFC_DATA_DIR / "neural_data.npy"
 PFC_META_PATH = _PFC_DATA_DIR / "metadata.csv"
 PFC_TRAIN_SPLIT_PATH = _PFC_DATA_DIR / "train_indices.npy"
@@ -106,6 +113,39 @@ CA1_CHANNEL_END = 96
 
 # Trial type labels for PFC dataset
 NUM_TRIAL_TYPES = 2  # Right, Left
+
+
+# =============================================================================
+# Constants - DANDI 000623 Movie Dataset (Human iEEG)
+# =============================================================================
+# Reference: Keles et al., 2024, Scientific Data
+# "Multimodal single-neuron, intracranial EEG, and fMRI brain responses
+# during movie watching in human patients"
+# DANDI Archive: https://dandiarchive.org/dandiset/000623
+# GitHub: https://github.com/rutishauserlab/bmovie-release-NWB-BIDS
+
+_DANDI_DATA_DIR = _DATA_DIR / "movie"
+DANDI_DANDISET_ID = "000623"
+DANDI_SAMPLING_RATE_HZ = 1000  # LFP/iEEG downsampled to 1000 Hz
+DANDI_MOVIE_DURATION_S = 480.0  # ~8 minutes movie clip
+
+# Brain regions in the dataset
+DANDI_BRAIN_REGIONS = ["amygdala", "hippocampus", "medial_frontal_cortex"]
+DANDI_REGION_ABBREVIATIONS = {"amygdala": "AMY", "hippocampus": "HPC", "medial_frontal_cortex": "MFC"}
+
+# Data paths (NWB files will be downloaded here)
+DANDI_RAW_PATH = _DANDI_DATA_DIR  # NWB files directly in /data/movie
+DANDI_PROCESSED_PATH = _DANDI_DATA_DIR / "processed"
+DANDI_CACHE_PATH = _DANDI_DATA_DIR / "cache"
+
+# Subject info (18 subjects in the dataset)
+DANDI_N_SUBJECTS = 18
+DANDI_SUBJECT_IDS = [f"sub-CS{i}" for i in range(41, 63) if i not in [43, 44, 48, 50]]
+
+# Train/val/test split paths
+DANDI_TRAIN_SPLIT_PATH = _DANDI_DATA_DIR / "train_indices.npy"
+DANDI_VAL_SPLIT_PATH = _DANDI_DATA_DIR / "val_indices.npy"
+DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
 
 
 # =============================================================================
@@ -2170,6 +2210,329 @@ class PFCDataModule:
         return self.data["n_labels"]
 
 
+# =============================================================================
+# PFC Sliding Window Dataset (for continuous-style training from trial data)
+# =============================================================================
+
+class SlidingWindowPFCDataset(Dataset):
+    """PyTorch Dataset for PFC data with sliding windows within trials.
+
+    Creates overlapping windows from trial-based recordings for training
+    neural translation models with more data augmentation.
+
+    Args:
+        pfc: PFC signals [n_trials, n_channels, n_samples] = [N, 64, 6250]
+        ca1: CA1 signals [n_trials, n_channels, n_samples] = [N, 32, 6250]
+        trial_indices: Which trials to include (e.g., train_idx)
+        trial_types: Trial type labels for each trial
+        window_size: Window size in samples (default: 2500 = 2 seconds at 1250 Hz)
+        stride: Stride between windows in samples (default: window_size // 2)
+        zscore_per_window: Whether to z-score each window independently
+        session_ids: Optional session IDs for each trial
+    """
+    def __init__(
+        self,
+        pfc: np.ndarray,
+        ca1: np.ndarray,
+        trial_indices: np.ndarray,
+        trial_types: Optional[np.ndarray] = None,
+        window_size: int = 2500,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        session_ids: Optional[np.ndarray] = None,
+    ):
+        self.pfc = pfc.astype(np.float32)
+        self.ca1 = ca1.astype(np.float32)
+        self.trial_indices = trial_indices
+        self.trial_types = trial_types
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+        self.session_ids = session_ids
+
+        # Get trial length
+        self.trial_length = pfc.shape[2]
+
+        # Calculate number of windows per trial
+        self.windows_per_trial = max(0, (self.trial_length - window_size) // self.stride + 1)
+
+        # Build index mapping: global_idx -> (trial_idx, local_window_idx)
+        self.window_mapping = []
+        for trial_idx in trial_indices:
+            for local_idx in range(self.windows_per_trial):
+                self.window_mapping.append((trial_idx, local_idx))
+
+        print(f"SlidingWindowPFCDataset: {len(trial_indices)} trials, "
+              f"{self.windows_per_trial} windows/trial, "
+              f"{len(self.window_mapping)} total windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        trial_idx, local_idx = self.window_mapping[idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        pfc_window = self.pfc[trial_idx, :, start:end].copy()
+        ca1_window = self.ca1[trial_idx, :, start:end].copy()
+
+        if self.zscore_per_window:
+            pfc_window = (pfc_window - pfc_window.mean(axis=1, keepdims=True)) / \
+                         (pfc_window.std(axis=1, keepdims=True) + 1e-8)
+            ca1_window = (ca1_window - ca1_window.mean(axis=1, keepdims=True)) / \
+                         (ca1_window.std(axis=1, keepdims=True) + 1e-8)
+
+        # Return trial type as label (for compatibility with training loop)
+        label = self.trial_types[trial_idx] if self.trial_types is not None else 0
+        return torch.from_numpy(pfc_window), torch.from_numpy(ca1_window), int(label)
+
+    def get_session_id(self, idx: int) -> Optional[int]:
+        """Get session ID for a given window index."""
+        if self.session_ids is None:
+            return None
+        trial_idx, _ = self.window_mapping[idx]
+        return self.session_ids[trial_idx]
+
+
+class MultiSessionSlidingWindowPFCDataset(Dataset):
+    """Dataset combining multiple PFC sessions with sliding windows.
+
+    Groups trials by session and provides session-aware batching.
+
+    Args:
+        pfc: PFC signals [n_trials, n_channels, n_samples]
+        ca1: CA1 signals [n_trials, n_channels, n_samples]
+        trial_indices: Which trials to include
+        session_ids: Session ID for each trial
+        trial_types: Trial type labels
+        window_size: Window size in samples
+        stride: Stride between windows
+        zscore_per_window: Whether to z-score each window
+        idx_to_session: Mapping from session index to session name
+    """
+    def __init__(
+        self,
+        pfc: np.ndarray,
+        ca1: np.ndarray,
+        trial_indices: np.ndarray,
+        session_ids: np.ndarray,
+        trial_types: Optional[np.ndarray] = None,
+        window_size: int = 2500,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        idx_to_session: Optional[Dict[int, str]] = None,
+    ):
+        self.pfc = pfc.astype(np.float32)
+        self.ca1 = ca1.astype(np.float32)
+        self.trial_indices = trial_indices
+        self.session_ids = session_ids
+        self.trial_types = trial_types
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+        self.idx_to_session = idx_to_session or {}
+
+        self.trial_length = pfc.shape[2]
+        self.windows_per_trial = max(0, (self.trial_length - window_size) // self.stride + 1)
+
+        # Build index mapping: global_idx -> (trial_idx, local_window_idx, session_idx)
+        self.window_mapping = []
+        session_window_counts = {}
+
+        for trial_idx in trial_indices:
+            sess_idx = session_ids[trial_idx]
+            for local_idx in range(self.windows_per_trial):
+                self.window_mapping.append((trial_idx, local_idx, sess_idx))
+                session_window_counts[sess_idx] = session_window_counts.get(sess_idx, 0) + 1
+
+        # Store unique sessions
+        self.unique_sessions = sorted(set(session_ids[trial_indices]))
+
+        print(f"MultiSessionSlidingWindowPFCDataset: {len(trial_indices)} trials, "
+              f"{len(self.unique_sessions)} sessions, "
+              f"{len(self.window_mapping)} total windows")
+        for sess_idx, count in sorted(session_window_counts.items()):
+            sess_name = self.idx_to_session.get(sess_idx, f"session_{sess_idx}")
+            print(f"  {sess_name}: {count} windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        trial_idx, local_idx, sess_idx = self.window_mapping[idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        pfc_window = self.pfc[trial_idx, :, start:end].copy()
+        ca1_window = self.ca1[trial_idx, :, start:end].copy()
+
+        if self.zscore_per_window:
+            pfc_window = (pfc_window - pfc_window.mean(axis=1, keepdims=True)) / \
+                         (pfc_window.std(axis=1, keepdims=True) + 1e-8)
+            ca1_window = (ca1_window - ca1_window.mean(axis=1, keepdims=True)) / \
+                         (ca1_window.std(axis=1, keepdims=True) + 1e-8)
+
+        label = self.trial_types[trial_idx] if self.trial_types is not None else 0
+        return torch.from_numpy(pfc_window), torch.from_numpy(ca1_window), int(label)
+
+    def get_session_name(self, sess_idx: int) -> str:
+        """Get session name by index."""
+        return self.idx_to_session.get(sess_idx, f"session_{sess_idx}")
+
+
+def create_pfc_sliding_window_dataloaders(
+    data: Dict[str, Any],
+    window_size: int = 2500,
+    stride: Optional[int] = None,
+    val_stride: Optional[int] = None,
+    batch_size: int = 32,
+    zscore_per_window: bool = False,
+    num_workers: int = 4,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    use_sessions: bool = False,
+    distributed: bool = False,
+) -> Dict[str, Any]:
+    """Create DataLoaders for PFC data with sliding windows.
+
+    Args:
+        data: Output from prepare_pfc_data()
+        window_size: Window size in samples (default: 2500 = 2s at 1250Hz)
+        stride: Training stride (default: window_size // 2)
+        val_stride: Validation stride (default: window_size for non-overlapping)
+        batch_size: Batch size for DataLoader
+        zscore_per_window: Whether to z-score each window
+        num_workers: Number of DataLoader workers
+        persistent_workers: Keep workers alive between batches
+        prefetch_factor: Prefetch multiplier
+        use_sessions: If True, use session-aware dataset
+        distributed: If True, use DistributedSampler for DDP
+
+    Returns:
+        Dictionary with train/val/test loaders and metadata
+    """
+    pfc = data["pfc"]
+    ca1 = data["ca1"]
+    trial_types = data.get("trial_types")
+    train_idx = data["train_idx"]
+    val_idx = data["val_idx"]
+    test_idx = data["test_idx"]
+
+    stride = stride if stride is not None else window_size // 2
+    val_stride = val_stride if val_stride is not None else window_size
+
+    # Get session info if available
+    session_ids = None
+    idx_to_session = None
+    if use_sessions and "split_info" in data and data["split_info"] is not None:
+        # Session-based split - load session IDs
+        session_ids, _, idx_to_session = load_pfc_session_ids(num_trials=pfc.shape[0])
+
+    # Create datasets
+    if use_sessions and session_ids is not None:
+        train_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, train_idx, session_ids, trial_types,
+            window_size=window_size, stride=stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+        val_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, val_idx, session_ids, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+        test_dataset = MultiSessionSlidingWindowPFCDataset(
+            pfc, ca1, test_idx, session_ids, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            idx_to_session=idx_to_session,
+        )
+    else:
+        train_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, train_idx, trial_types,
+            window_size=window_size, stride=stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+        val_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, val_idx, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+        test_dataset = SlidingWindowPFCDataset(
+            pfc, ca1, test_idx, trial_types,
+            window_size=window_size, stride=val_stride,
+            zscore_per_window=zscore_per_window,
+            session_ids=session_ids,
+        )
+
+    # Create samplers for distributed training
+    train_sampler = DistributedSampler(train_dataset, seed=42) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
+
+    # Create DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),  # Don't shuffle when using sampler
+        sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=test_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    print(f"\nPFC Sliding Window DataLoaders created:")
+    print(f"  Window size: {window_size} samples")
+    print(f"  Train stride: {stride}, Val/Test stride: {val_stride}")
+    print(f"  Train: {len(train_dataset)} windows")
+    print(f"  Val: {len(val_dataset)} windows")
+    print(f"  Test: {len(test_dataset)} windows")
+
+    return {
+        "train": train_loader,
+        "val": val_loader,
+        "test": test_loader,
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "window_size": window_size,
+        "stride": stride,
+        "val_stride": val_stride,
+        "n_channels_source": pfc.shape[1],
+        "n_channels_target": ca1.shape[1],
+    }
+
+
 def get_odor_name(vocab: Dict[str, int], odor_id: int) -> str:
     """Get odor name from ID."""
     for name, idx in vocab.items():
@@ -2188,7 +2551,7 @@ def get_label_name(vocab: Dict[str, int], label_id: int) -> str:
 
 def get_data_info(data: Dict[str, Any]) -> Dict[str, Any]:
     """Get summary information about loaded data.
-    
+
     Works for both olfactory and PFC datasets.
     """
     # Determine dataset type
@@ -2223,3 +2586,1129 @@ def get_data_info(data: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         raise ValueError("Unknown data format")
+
+
+# =============================================================================
+# PCx1 Continuous LFP Dataset (1kHz)
+# =============================================================================
+
+# Paths for PCx1 continuous dataset
+PCX1_CONTINUOUS_PATH = _DATA_DIR / "PCx1" / "extracted" / "continuous_1khz"
+PCX1_SAMPLING_RATE = 1000  # Hz
+PCX1_N_CHANNELS = 32  # per region (OB and PCx)
+
+
+def list_pcx1_sessions(path: Path = PCX1_CONTINUOUS_PATH) -> List[str]:
+    """List available PCx1 continuous sessions.
+
+    Returns:
+        List of session names (e.g., ['141208-1', '141208-2', ...])
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"PCx1 continuous data path not found: {path}")
+
+    sessions = sorted([
+        d.name for d in path.iterdir()
+        if d.is_dir() and (d / 'OB.npy').exists()
+    ])
+    return sessions
+
+
+def load_pcx1_session_metadata(
+    session: str,
+    path: Path = PCX1_CONTINUOUS_PATH
+) -> Dict[str, Any]:
+    """Load metadata for a PCx1 session.
+
+    Args:
+        session: Session name (e.g., '141208-1')
+        path: Base path to continuous_1khz folder
+
+    Returns:
+        Dictionary containing session metadata
+    """
+    session_path = path / session
+    metadata_path = session_path / 'metadata.json'
+
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata not found for session {session}: {metadata_path}")
+
+    with open(metadata_path) as f:
+        return json.load(f)
+
+
+def load_pcx1_session(
+    session: str,
+    path: Path = PCX1_CONTINUOUS_PATH,
+    load_resp: bool = True,
+    load_trials: bool = True,
+    zscore: bool = False,
+) -> Dict[str, Any]:
+    """Load a single PCx1 session's continuous data.
+
+    Args:
+        session: Session name (e.g., '141208-1')
+        path: Base path to continuous_1khz folder
+        load_resp: Whether to load respiration signal
+        load_trials: Whether to load trial info CSVs
+        zscore: Whether to z-score normalize the data (per channel)
+
+    Returns:
+        Dictionary containing:
+            - ob: OB signals [32, n_samples]
+            - pcx: PCx signals [32, n_samples]
+            - resp: Respiration signal [n_samples] (if load_resp=True)
+            - breath_times: Array of breath timestamps (if exists)
+            - trials: DataFrame of valid trials (if load_trials=True)
+            - metadata: Session metadata dict
+            - session: Session name
+            - sampling_rate: 1000 Hz
+    """
+    session_path = path / session
+
+    if not session_path.exists():
+        raise FileNotFoundError(f"Session not found: {session_path}")
+
+    # Load neural data
+    ob = np.load(session_path / 'OB.npy').astype(np.float32)
+    pcx = np.load(session_path / 'PCx.npy').astype(np.float32)
+
+    # Optional z-score normalization (per channel)
+    if zscore:
+        ob = (ob - ob.mean(axis=1, keepdims=True)) / (ob.std(axis=1, keepdims=True) + 1e-8)
+        pcx = (pcx - pcx.mean(axis=1, keepdims=True)) / (pcx.std(axis=1, keepdims=True) + 1e-8)
+
+    result = {
+        'ob': ob,
+        'pcx': pcx,
+        'session': session,
+        'sampling_rate': PCX1_SAMPLING_RATE,
+    }
+
+    # Load respiration
+    if load_resp:
+        resp_path = session_path / 'Resp.npy'
+        if resp_path.exists():
+            result['resp'] = np.load(resp_path).astype(np.float32)
+
+        breath_path = session_path / 'breath_times.npy'
+        if breath_path.exists():
+            result['breath_times'] = np.load(breath_path)
+
+    # Load trial info
+    if load_trials:
+        trials_path = session_path / 'valid_trials.csv'
+        if trials_path.exists():
+            result['trials'] = pd.read_csv(trials_path)
+
+    # Load metadata
+    metadata_path = session_path / 'metadata.json'
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            result['metadata'] = json.load(f)
+
+    return result
+
+
+def load_pcx1_all_sessions(
+    path: Path = PCX1_CONTINUOUS_PATH,
+    sessions: Optional[List[str]] = None,
+    zscore: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Load all PCx1 sessions.
+
+    Args:
+        path: Base path to continuous_1khz folder
+        sessions: List of session names to load (None = all)
+        zscore: Whether to z-score normalize
+
+    Returns:
+        Dictionary mapping session name to session data
+    """
+    if sessions is None:
+        sessions = list_pcx1_sessions(path)
+
+    all_data = {}
+    for session in sessions:
+        print(f"Loading session {session}...")
+        all_data[session] = load_pcx1_session(session, path, zscore=zscore)
+
+    return all_data
+
+
+class ContinuousLFPDataset(Dataset):
+    """PyTorch Dataset for continuous LFP data with sliding window.
+
+    Creates windows from continuous recordings for training neural translation models.
+
+    Args:
+        ob: OB signals [n_channels, n_samples] or [n_samples, n_channels]
+        pcx: PCx signals [n_channels, n_samples] or [n_samples, n_channels]
+        window_size: Window size in samples (default: 5000 = 5 seconds at 1kHz)
+        stride: Stride between windows in samples (default: window_size // 2)
+        zscore_per_window: Whether to z-score each window independently
+        channels_first: If True, expect input as [n_channels, n_samples]
+    """
+    def __init__(
+        self,
+        ob: np.ndarray,
+        pcx: np.ndarray,
+        window_size: int = 5000,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+        channels_first: bool = True,
+    ):
+        # Ensure channels-first format: [n_channels, n_samples]
+        if not channels_first:
+            ob = ob.T
+            pcx = pcx.T
+
+        self.ob = ob.astype(np.float32)
+        self.pcx = pcx.astype(np.float32)
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+
+        # Calculate number of windows
+        n_samples = self.ob.shape[1]
+        self.n_windows = max(0, (n_samples - window_size) // self.stride + 1)
+
+    def __len__(self) -> int:
+        return self.n_windows
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        start = idx * self.stride
+        end = start + self.window_size
+
+        ob_window = self.ob[:, start:end].copy()
+        pcx_window = self.pcx[:, start:end].copy()
+
+        if self.zscore_per_window:
+            ob_window = (ob_window - ob_window.mean(axis=1, keepdims=True)) / \
+                        (ob_window.std(axis=1, keepdims=True) + 1e-8)
+            pcx_window = (pcx_window - pcx_window.mean(axis=1, keepdims=True)) / \
+                         (pcx_window.std(axis=1, keepdims=True) + 1e-8)
+
+        # Return dummy label 0 for compatibility with training loop
+        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window), 0
+
+
+class MultiSessionContinuousDataset(Dataset):
+    """PyTorch Dataset combining multiple sessions with sliding windows.
+
+    Useful for training on data from multiple recording sessions.
+
+    Args:
+        sessions_data: List of session data dicts (from load_pcx1_session)
+        window_size: Window size in samples
+        stride: Stride between windows
+        zscore_per_window: Whether to z-score each window
+    """
+    def __init__(
+        self,
+        sessions_data: List[Dict[str, Any]],
+        window_size: int = 5000,
+        stride: Optional[int] = None,
+        zscore_per_window: bool = False,
+    ):
+        self.window_size = window_size
+        self.stride = stride if stride is not None else window_size // 2
+        self.zscore_per_window = zscore_per_window
+
+        # Build index mapping: global_idx -> (session_idx, local_window_idx)
+        self.sessions = []
+        self.window_mapping = []
+
+        for sess_idx, sess_data in enumerate(sessions_data):
+            ob = sess_data['ob'].astype(np.float32)
+            pcx = sess_data['pcx'].astype(np.float32)
+            n_samples = ob.shape[1]
+            n_windows = max(0, (n_samples - window_size) // self.stride + 1)
+
+            self.sessions.append({
+                'ob': ob,
+                'pcx': pcx,
+                'name': sess_data.get('session', f'session_{sess_idx}'),
+                'n_windows': n_windows,
+            })
+
+            for local_idx in range(n_windows):
+                self.window_mapping.append((sess_idx, local_idx))
+
+        print(f"MultiSessionContinuousDataset: {len(sessions_data)} sessions, "
+              f"{len(self.window_mapping)} total windows")
+
+    def __len__(self) -> int:
+        return len(self.window_mapping)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        sess_idx, local_idx = self.window_mapping[idx]
+        sess = self.sessions[sess_idx]
+
+        start = local_idx * self.stride
+        end = start + self.window_size
+
+        ob_window = sess['ob'][:, start:end].copy()
+        pcx_window = sess['pcx'][:, start:end].copy()
+
+        if self.zscore_per_window:
+            ob_window = (ob_window - ob_window.mean(axis=1, keepdims=True)) / \
+                        (ob_window.std(axis=1, keepdims=True) + 1e-8)
+            pcx_window = (pcx_window - pcx_window.mean(axis=1, keepdims=True)) / \
+                         (pcx_window.std(axis=1, keepdims=True) + 1e-8)
+
+        return torch.from_numpy(ob_window), torch.from_numpy(pcx_window), sess_idx
+
+    def get_session_name(self, sess_idx: int) -> str:
+        """Get session name by index."""
+        return self.sessions[sess_idx]['name']
+
+
+def create_pcx1_dataloaders(
+    train_sessions: List[str],
+    val_sessions: List[str],
+    test_sessions: Optional[List[str]] = None,
+    window_size: int = 5000,
+    stride: Optional[int] = None,
+    val_stride: Optional[int] = None,
+    batch_size: int = 32,
+    zscore_per_window: bool = False,  # Model handles input normalization internally
+    num_workers: int = 4,
+    path: Path = PCX1_CONTINUOUS_PATH,
+    separate_val_sessions: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+) -> Dict[str, Any]:
+    """Create DataLoaders for PCx1 continuous data with session-based splits.
+
+    Args:
+        train_sessions: List of session names for training
+        val_sessions: List of session names for validation
+        test_sessions: List of session names for testing (optional)
+        window_size: Window size in samples (5000 = 5 seconds)
+        stride: Stride between windows for training (default: window_size // 2)
+        val_stride: Stride for validation (default: same as stride). Use larger for faster eval.
+        batch_size: Batch size for DataLoader
+        zscore_per_window: Whether to z-score each window
+        num_workers: Number of DataLoader workers
+        path: Base path to continuous_1khz folder
+        separate_val_sessions: If True, also create per-session val loaders
+        persistent_workers: Keep workers alive between epochs (faster)
+        prefetch_factor: Number of batches to prefetch per worker
+
+    Returns:
+        Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
+    """
+    # Default strides
+    if stride is None:
+        stride = window_size // 2
+    if val_stride is None:
+        val_stride = stride
+
+    # persistent_workers requires num_workers > 0
+    use_persistent = persistent_workers and num_workers > 0
+    # Load sessions
+    print("Loading training sessions...")
+    train_data = [load_pcx1_session(s, path) for s in train_sessions]
+    print("Loading validation sessions...")
+    val_data = [load_pcx1_session(s, path) for s in val_sessions]
+
+    # Create datasets (val can use larger stride for faster eval)
+    train_dataset = MultiSessionContinuousDataset(
+        train_data, window_size, stride, zscore_per_window
+    )
+    val_dataset = MultiSessionContinuousDataset(
+        val_data, window_size, val_stride, zscore_per_window
+    )
+
+    # Common DataLoader kwargs for speed
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+    )
+
+    dataloaders = {
+        'train': DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        ),
+        'val': DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        ),
+    }
+
+    # Create per-session validation loaders for separate evaluation
+    if separate_val_sessions:
+        val_sessions_loaders = {}
+        for sess_data in val_data:
+            sess_name = sess_data['session']
+            sess_dataset = ContinuousLFPDataset(
+                ob=sess_data['ob'],
+                pcx=sess_data['pcx'],
+                window_size=window_size,
+                stride=val_stride,  # Use val_stride for faster eval
+                zscore_per_window=zscore_per_window,
+            )
+            val_sessions_loaders[sess_name] = DataLoader(
+                sess_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+        dataloaders['val_sessions'] = val_sessions_loaders
+
+    if test_sessions:
+        print("Loading test sessions...")
+        test_data = [load_pcx1_session(s, path) for s in test_sessions]
+        test_dataset = MultiSessionContinuousDataset(
+            test_data, window_size, val_stride, zscore_per_window  # Use val_stride for test too
+        )
+        dataloaders['test'] = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        )
+
+    return dataloaders
+
+
+def get_pcx1_session_splits(
+    seed: int = 42,
+    n_val: int = 2,
+    n_test: int = 2,
+    path: Path = PCX1_CONTINUOUS_PATH,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Get random session-based train/val/test splits for PCx1.
+
+    Args:
+        seed: Random seed for reproducibility
+        n_val: Number of validation sessions
+        n_test: Number of test sessions
+        path: Base path to continuous_1khz folder
+
+    Returns:
+        Tuple of (train_sessions, val_sessions, test_sessions)
+    """
+    sessions = list_pcx1_sessions(path)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(sessions)
+
+    test_sessions = sessions[:n_test]
+    val_sessions = sessions[n_test:n_test + n_val]
+    train_sessions = sessions[n_test + n_val:]
+
+    print(f"PCx1 Session Split (seed={seed}):")
+    print(f"  Train: {train_sessions}")
+    print(f"  Val:   {val_sessions}")
+    print(f"  Test:  {test_sessions}")
+
+    return train_sessions, val_sessions, test_sessions
+
+
+# =============================================================================
+# DANDI 000623 Movie Dataset (Human iEEG during movie watching)
+# =============================================================================
+# Reference: Keles et al., 2024, Scientific Data
+# "Multimodal single-neuron, intracranial EEG, and fMRI brain responses
+# during movie watching in human patients"
+
+def check_dandi_dependencies() -> bool:
+    """Check if DANDI/NWB dependencies are available."""
+    try:
+        import pynwb
+        import h5py
+        return True
+    except ImportError:
+        return False
+
+
+def download_dandi_dataset(
+    dandiset_id: str = DANDI_DANDISET_ID,
+    output_dir: Path = DANDI_RAW_PATH,
+    version: str = "draft",
+) -> Path:
+    """Download DANDI dataset using dandi-cli.
+
+    Args:
+        dandiset_id: DANDI dataset ID (default: "000623")
+        output_dir: Directory to save downloaded files
+        version: Dataset version ("draft" or specific version)
+
+    Returns:
+        Path to downloaded dataset directory
+    """
+    import subprocess
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Use dandi CLI to download
+    cmd = [
+        "dandi", "download",
+        f"https://dandiarchive.org/dandiset/{dandiset_id}/{version}",
+        "-o", str(output_dir),
+    ]
+
+    print(f"Downloading DANDI dataset {dandiset_id}...")
+    print(f"Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Download failed: {result.stderr}")
+        raise RuntimeError(f"Failed to download DANDI dataset: {result.stderr}")
+
+    print(f"Dataset downloaded to: {output_dir}")
+    return output_dir / dandiset_id
+
+
+def list_dandi_nwb_files(
+    data_dir: Path = DANDI_RAW_PATH,
+    dandiset_id: str = DANDI_DANDISET_ID,
+) -> List[Path]:
+    """List all NWB files in the DANDI dataset directory.
+
+    Args:
+        data_dir: Base directory containing the dataset
+        dandiset_id: DANDI dataset ID
+
+    Returns:
+        List of paths to NWB files
+    """
+    dataset_path = data_dir / dandiset_id
+    if not dataset_path.exists():
+        dataset_path = data_dir  # Try direct path
+
+    nwb_files = sorted(dataset_path.glob("**/*.nwb"))
+
+    if not nwb_files:
+        raise FileNotFoundError(f"No NWB files found in {dataset_path}")
+
+    return nwb_files
+
+
+def load_dandi_nwb_file(
+    nwb_path: Path,
+    load_lfp: bool = True,
+    load_ieeg: bool = True,
+    load_spikes: bool = False,
+    load_behavior: bool = False,
+) -> Dict[str, Any]:
+    """Load data from a single DANDI 000623 NWB file.
+
+    Args:
+        nwb_path: Path to the NWB file
+        load_lfp: Whether to load LFP data (microwires)
+        load_ieeg: Whether to load iEEG data (macroelectrodes)
+        load_spikes: Whether to load spike times
+        load_behavior: Whether to load behavioral data (eye tracking, etc.)
+
+    Returns:
+        Dictionary containing loaded data with keys:
+            - subject_id: Subject identifier
+            - lfp: LFP data array [n_channels, n_samples] (if load_lfp=True)
+            - lfp_electrodes: Electrode info for LFP channels
+            - ieeg: iEEG data array [n_channels, n_samples] (if load_ieeg=True)
+            - ieeg_electrodes: Electrode info for iEEG channels
+            - spikes: Dict of unit_id -> spike_times (if load_spikes=True)
+            - behavior: Behavioral data dict (if load_behavior=True)
+            - sampling_rate: Sampling rate in Hz
+            - metadata: Session/subject metadata
+    """
+    if not check_dandi_dependencies():
+        raise ImportError("pynwb and h5py required. Install with: pip install pynwb h5py")
+
+    from pynwb import NWBHDF5IO
+
+    nwb_path = Path(nwb_path)
+    if not nwb_path.exists():
+        raise FileNotFoundError(f"NWB file not found: {nwb_path}")
+
+    result = {
+        "file_path": str(nwb_path),
+        "sampling_rate": DANDI_SAMPLING_RATE_HZ,
+    }
+
+    with NWBHDF5IO(str(nwb_path), "r") as io:
+        nwbfile = io.read()
+
+        # Extract subject info
+        result["subject_id"] = nwbfile.subject.subject_id if nwbfile.subject else nwb_path.stem
+        result["metadata"] = {
+            "session_id": nwbfile.session_id,
+            "session_description": nwbfile.session_description,
+            "experimenter": list(nwbfile.experimenter) if nwbfile.experimenter else [],
+            "institution": nwbfile.institution,
+        }
+
+        # Load electrode information
+        if nwbfile.electrodes is not None:
+            electrodes_df = nwbfile.electrodes.to_dataframe()
+            result["electrodes"] = electrodes_df
+
+        # Load LFP data from ecephys processing module
+        # DANDI 000623 uses LFP_micro (microwires) and LFP_macro (macroelectrodes)
+        if load_lfp:
+            try:
+                if "ecephys" in nwbfile.processing:
+                    ecephys = nwbfile.processing["ecephys"]
+                    # Try LFP_micro first (microwire recordings)
+                    for lfp_name in ["LFP_micro", "LFP", "lfp"]:
+                        if lfp_name in ecephys.data_interfaces:
+                            lfp_module = ecephys.data_interfaces[lfp_name]
+                            for name, es in lfp_module.electrical_series.items():
+                                lfp_data = es.data[:]  # [time, channels]
+                                result["lfp"] = np.array(lfp_data, dtype=np.float32).T  # [channels, time]
+                                result["lfp_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                                if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                    result["lfp_electrodes"] = es.electrodes.to_dataframe()
+                                break
+                            break
+            except Exception as e:
+                print(f"Warning: Could not load LFP data: {e}")
+
+        # Load iEEG/macro data (macroelectrodes)
+        if load_ieeg:
+            try:
+                if "ecephys" in nwbfile.processing:
+                    ecephys = nwbfile.processing["ecephys"]
+                    # Try LFP_macro first (DANDI 000623 format)
+                    for ieeg_name in ["LFP_macro", "iEEG", "ieeg"]:
+                        if ieeg_name in ecephys.data_interfaces:
+                            ieeg_module = ecephys.data_interfaces[ieeg_name]
+                            for name, es in ieeg_module.electrical_series.items():
+                                ieeg_data = es.data[:]  # [time, channels]
+                                result["ieeg"] = np.array(ieeg_data, dtype=np.float32).T  # [channels, time]
+                                result["ieeg_rate"] = es.rate if hasattr(es, 'rate') and es.rate else DANDI_SAMPLING_RATE_HZ
+                                if hasattr(es, 'electrodes') and es.electrodes is not None:
+                                    result["ieeg_electrodes"] = es.electrodes.to_dataframe()
+                                break
+                            break
+            except Exception as e:
+                print(f"Warning: Could not load iEEG data: {e}")
+
+        # Load spike data
+        if load_spikes:
+            try:
+                if nwbfile.units is not None:
+                    units_df = nwbfile.units.to_dataframe()
+                    result["spikes"] = {}
+                    for idx, row in units_df.iterrows():
+                        if "spike_times" in row:
+                            result["spikes"][idx] = np.array(row["spike_times"])
+                    result["units_metadata"] = units_df.drop(columns=["spike_times"], errors="ignore")
+            except Exception as e:
+                print(f"Warning: Could not load spike data: {e}")
+
+        # Load behavioral data
+        if load_behavior:
+            try:
+                if "behavior" in nwbfile.processing:
+                    behavior = nwbfile.processing["behavior"]
+                    result["behavior"] = {}
+                    for name, ts in behavior.data_interfaces.items():
+                        if hasattr(ts, 'data'):
+                            result["behavior"][name] = {
+                                "data": np.array(ts.data[:]),
+                                "timestamps": np.array(ts.timestamps[:]) if hasattr(ts, 'timestamps') and ts.timestamps is not None else None,
+                            }
+            except Exception as e:
+                print(f"Warning: Could not load behavioral data: {e}")
+
+    return result
+
+
+def get_electrodes_by_region(
+    electrodes_df: pd.DataFrame,
+    target_regions: Optional[List[str]] = None,
+) -> Dict[str, List[int]]:
+    """Group electrode indices by brain region.
+
+    Args:
+        electrodes_df: DataFrame with electrode information (must have 'location' column)
+        target_regions: List of regions to extract (None = all regions)
+
+    Returns:
+        Dictionary mapping region name to list of electrode indices
+    """
+    if "location" not in electrodes_df.columns:
+        # Try alternative column names
+        location_col = None
+        for col in ["brain_region", "region", "area", "group_name"]:
+            if col in electrodes_df.columns:
+                location_col = col
+                break
+        if location_col is None:
+            raise ValueError("No location/region column found in electrodes DataFrame")
+    else:
+        location_col = "location"
+
+    region_electrodes = {}
+
+    for i, (idx, row) in enumerate(electrodes_df.iterrows()):
+        region = str(row[location_col]).lower().strip()
+
+        # Normalize region names (handle DANDI 000623 naming convention)
+        # Regions like "Left amygdala", "Right hippocampus" -> "amygdala", "hippocampus"
+        if "amygdala" in region or "amy" in region:
+            normalized = "amygdala"
+        elif "hippocampus" in region or "hpc" in region or "hipp" in region:
+            normalized = "hippocampus"
+        elif "vmpfc" in region or "vmfc" in region:
+            normalized = "medial_frontal_cortex"
+        elif "acc" in region:
+            normalized = "acc"
+        elif "presma" in region or "sma" in region:
+            normalized = "presma"
+        elif "frontal" in region or "mfc" in region or "pfc" in region:
+            normalized = "medial_frontal_cortex"
+        else:
+            normalized = region
+
+        if target_regions is None or normalized in target_regions:
+            if normalized not in region_electrodes:
+                region_electrodes[normalized] = []
+            # Use sequential index (position in dataframe) not the original electrode ID
+            region_electrodes[normalized].append(i)
+
+    return region_electrodes
+
+
+def extract_region_signals(
+    data: np.ndarray,
+    electrodes_df: pd.DataFrame,
+    source_region: str,
+    target_region: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract signals from source and target brain regions.
+
+    Args:
+        data: Full data array [n_channels, n_samples]
+        electrodes_df: Electrode information DataFrame
+        source_region: Source region name (e.g., "amygdala")
+        target_region: Target region name (e.g., "hippocampus")
+
+    Returns:
+        Tuple of (source_signals, target_signals) arrays
+    """
+    region_indices = get_electrodes_by_region(electrodes_df)
+
+    if source_region not in region_indices:
+        raise ValueError(f"Source region '{source_region}' not found. Available: {list(region_indices.keys())}")
+    if target_region not in region_indices:
+        raise ValueError(f"Target region '{target_region}' not found. Available: {list(region_indices.keys())}")
+
+    source_idx = region_indices[source_region]
+    target_idx = region_indices[target_region]
+
+    source_signals = data[source_idx, :]
+    target_signals = data[target_idx, :]
+
+    return source_signals, target_signals
+
+
+def load_dandi_subject(
+    subject_id: str,
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    zscore: bool = True,
+) -> Dict[str, Any]:
+    """Load and preprocess data for a single DANDI subject.
+
+    Args:
+        subject_id: Subject ID (e.g., "sub-CS41")
+        data_dir: Directory containing NWB files
+        source_region: Source brain region for translation
+        target_region: Target brain region for translation
+        zscore: Whether to z-score normalize the data
+
+    Returns:
+        Dictionary containing preprocessed data
+    """
+    # Find NWB file for this subject
+    nwb_files = list_dandi_nwb_files(data_dir)
+    subject_file = None
+
+    for f in nwb_files:
+        if subject_id in f.stem or subject_id.replace("sub-", "") in f.stem:
+            subject_file = f
+            break
+
+    if subject_file is None:
+        raise FileNotFoundError(f"No NWB file found for subject {subject_id}")
+
+    # Load the NWB file
+    data = load_dandi_nwb_file(subject_file, load_lfp=True, load_ieeg=True)
+
+    # Determine which data to use (prefer LFP, fallback to iEEG)
+    if "lfp" in data and data["lfp"] is not None:
+        neural_data = data["lfp"]
+        electrodes = data.get("lfp_electrodes", data.get("electrodes"))
+    elif "ieeg" in data and data["ieeg"] is not None:
+        neural_data = data["ieeg"]
+        electrodes = data.get("ieeg_electrodes", data.get("electrodes"))
+    else:
+        raise ValueError(f"No LFP or iEEG data found for subject {subject_id}")
+
+    # Extract regions
+    source_signals, target_signals = extract_region_signals(
+        neural_data, electrodes, source_region, target_region
+    )
+
+    # Z-score normalization
+    if zscore:
+        source_signals = (source_signals - source_signals.mean(axis=1, keepdims=True)) / (
+            source_signals.std(axis=1, keepdims=True) + 1e-8
+        )
+        target_signals = (target_signals - target_signals.mean(axis=1, keepdims=True)) / (
+            target_signals.std(axis=1, keepdims=True) + 1e-8
+        )
+
+    return {
+        "subject_id": subject_id,
+        "source": source_signals.astype(np.float32),
+        "target": target_signals.astype(np.float32),
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": data["sampling_rate"],
+        "n_source_channels": source_signals.shape[0],
+        "n_target_channels": target_signals.shape[0],
+        "n_samples": source_signals.shape[1],
+        "metadata": data["metadata"],
+    }
+
+
+class DANDIMovieDataset(Dataset):
+    """PyTorch Dataset for DANDI 000623 movie watching iEEG data.
+
+    Provides sliding window segments for neural signal translation between
+    brain regions during naturalistic movie watching.
+
+    Args:
+        subjects_data: List of subject data dicts from load_dandi_subject()
+        window_size: Size of each window in samples (default: 5000 = 5s at 1kHz)
+        stride: Stride between windows (default: 2500 = 2.5s)
+        zscore_per_window: Whether to z-score each window independently
+        verbose: Whether to print info messages
+        n_source_channels: Fixed number of source channels (None = use min across subjects)
+        n_target_channels: Fixed number of target channels (None = use min across subjects)
+    """
+
+    def __init__(
+        self,
+        subjects_data: List[Dict[str, Any]],
+        window_size: int = 5000,
+        stride: int = 2500,
+        zscore_per_window: bool = False,
+        verbose: bool = True,
+        n_source_channels: Optional[int] = None,
+        n_target_channels: Optional[int] = None,
+    ):
+        self.window_size = window_size
+        self.stride = stride
+        self.zscore_per_window = zscore_per_window
+
+        # Determine channel counts - use minimum across subjects to ensure consistent shapes
+        if n_source_channels is None:
+            self.n_source_channels = min(s["n_source_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_source_channels = n_source_channels
+
+        if n_target_channels is None:
+            self.n_target_channels = min(s["n_target_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_target_channels = n_target_channels
+
+        # Build index of all windows across subjects
+        self.windows = []  # List of (subject_idx, start_sample)
+
+        for subj_idx, subj_data in enumerate(subjects_data):
+            n_samples = subj_data["n_samples"]
+            n_windows = (n_samples - window_size) // stride + 1
+
+            for w in range(n_windows):
+                start = w * stride
+                self.windows.append((subj_idx, start))
+
+        self.subjects_data = subjects_data
+
+        if verbose:
+            print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
+                  f"{len(self.windows)} windows, "
+                  f"window_size={window_size}, stride={stride}, "
+                  f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}")
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        subj_idx, start = self.windows[idx]
+        subj_data = self.subjects_data[subj_idx]
+
+        end = start + self.window_size
+
+        # Extract window and truncate to normalized channel counts
+        # This ensures consistent tensor shapes across subjects
+        source = subj_data["source"][:self.n_source_channels, start:end].copy()
+        target = subj_data["target"][:self.n_target_channels, start:end].copy()
+
+        # Optional per-window normalization
+        if self.zscore_per_window:
+            source = (source - source.mean(axis=1, keepdims=True)) / (
+                source.std(axis=1, keepdims=True) + 1e-8
+            )
+            target = (target - target.mean(axis=1, keepdims=True)) / (
+                target.std(axis=1, keepdims=True) + 1e-8
+            )
+
+        return {
+            "source": torch.from_numpy(source).float(),
+            "target": torch.from_numpy(target).float(),
+            "subject_idx": torch.tensor(subj_idx),
+            "start_sample": torch.tensor(start),
+        }
+
+
+def prepare_dandi_data(
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    window_size: int = 5000,
+    stride: int = 2500,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+    verbose: bool = True,
+    min_channels: int = 12,
+) -> Dict[str, Any]:
+    """Complete data preparation pipeline for DANDI 000623 dataset.
+
+    Args:
+        data_dir: Directory containing NWB files
+        source_region: Source brain region for translation
+        target_region: Target brain region for translation
+        window_size: Window size in samples
+        stride: Stride between windows
+        train_ratio: Fraction of subjects for training
+        val_ratio: Fraction of subjects for validation
+        test_ratio: Fraction of subjects for testing
+        seed: Random seed for reproducibility
+        zscore: Whether to z-score normalize the data
+        verbose: Whether to print progress messages (set False for non-primary processes)
+        min_channels: Minimum channels required in both source and target (subjects with fewer are excluded)
+
+    Returns:
+        Dictionary containing train/val/test datasets and metadata
+    """
+    if verbose:
+        print(f"Preparing DANDI 000623 dataset...")
+        print(f"  Source region: {source_region}")
+        print(f"  Target region: {target_region}")
+
+    # Get available subjects
+    nwb_files = list_dandi_nwb_files(data_dir)
+    subject_ids = []
+
+    for f in nwb_files:
+        # Extract subject ID from filename
+        stem = f.stem
+        if "sub-" in stem:
+            subj_id = stem.split("_")[0]  # Get sub-CSXX part
+        else:
+            subj_id = stem
+        if subj_id not in subject_ids:
+            subject_ids.append(subj_id)
+
+    if verbose:
+        print(f"  Found {len(subject_ids)} subjects")
+
+    # Split subjects
+    rng = np.random.default_rng(seed)
+    rng.shuffle(subject_ids)
+
+    n_train = int(len(subject_ids) * train_ratio)
+    n_val = int(len(subject_ids) * val_ratio)
+
+    train_subjects = subject_ids[:n_train]
+    val_subjects = subject_ids[n_train:n_train + n_val]
+    test_subjects = subject_ids[n_train + n_val:]
+
+    if verbose:
+        print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+        print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
+        print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+
+    # Load data for each split
+    def load_subjects(subject_list, split_name=""):
+        data_list = []
+        for subj_id in subject_list:
+            try:
+                subj_data = load_dandi_subject(
+                    subj_id, data_dir, source_region, target_region, zscore
+                )
+                # Filter out subjects with too few channels
+                n_src = subj_data['n_source_channels']
+                n_tgt = subj_data['n_target_channels']
+                if n_src < min_channels or n_tgt < min_channels:
+                    if verbose:
+                        print(f"    Skipping {subj_id}: only {n_src} source / {n_tgt} target channels (min={min_channels})")
+                    continue
+                data_list.append(subj_data)
+                if verbose:
+                    print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, "
+                          f"{subj_data['n_samples']} samples")
+            except Exception as e:
+                if verbose:
+                    print(f"    Warning: Could not load {subj_id}: {e}")
+        return data_list
+
+    if verbose:
+        print("\nLoading training subjects...")
+    train_data = load_subjects(train_subjects, "train")
+
+    if verbose:
+        print("\nLoading validation subjects...")
+    val_data = load_subjects(val_subjects, "val")
+
+    if verbose:
+        print("\nLoading test subjects...")
+    test_data = load_subjects(test_subjects, "test")
+
+    # Compute minimum channel counts across ALL subjects for consistent batching
+    all_data = train_data + val_data + test_data
+    if not all_data:
+        raise ValueError("No subjects could be loaded from DANDI dataset")
+
+    min_source_channels = min(s["n_source_channels"] for s in all_data)
+    min_target_channels = min(s["n_target_channels"] for s in all_data)
+
+    if verbose:
+        print(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
+
+    # Create datasets with consistent channel counts
+    train_dataset = DANDIMovieDataset(
+        train_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+    )
+    val_dataset = DANDIMovieDataset(
+        val_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+    )
+    test_dataset = DANDIMovieDataset(
+        test_data, window_size, stride, verbose=verbose,
+        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+    )
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "train_subjects": train_subjects,
+        "val_subjects": val_subjects,
+        "test_subjects": test_subjects,
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": DANDI_SAMPLING_RATE_HZ,
+        "window_size": window_size,
+        "stride": stride,
+        "dataset_type": DatasetType.DANDI_MOVIE,
+        "n_source_channels": min_source_channels,
+        "n_target_channels": min_target_channels,
+    }
+
+
+def create_dandi_dataloaders(
+    data_dir: Path = DANDI_RAW_PATH,
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    window_size: int = 5000,
+    stride: int = 2500,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    distributed: bool = False,
+    seed: int = 42,
+) -> Dict[str, DataLoader]:
+    """Create DataLoaders for DANDI 000623 dataset.
+
+    Args:
+        data_dir: Directory containing NWB files
+        source_region: Source brain region
+        target_region: Target brain region
+        window_size: Window size in samples
+        stride: Stride between windows
+        batch_size: Batch size for training
+        num_workers: Number of data loading workers
+        distributed: Whether to use distributed samplers
+        seed: Random seed
+
+    Returns:
+        Dictionary with 'train', 'val', 'test' DataLoaders
+    """
+    # Prepare data
+    data = prepare_dandi_data(
+        data_dir=data_dir,
+        source_region=source_region,
+        target_region=target_region,
+        window_size=window_size,
+        stride=stride,
+        seed=seed,
+    )
+
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Create samplers for distributed training
+    train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+    test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=seed) if distributed else None
+
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+
+    dataloaders = {
+        "train": DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            drop_last=True,
+            **loader_kwargs,
+        ),
+        "val": DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=test_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+    }
+
+    print(f"\nDANDI DataLoaders created:")
+    print(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
+    print(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
+    print(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
+
+    return dataloaders
