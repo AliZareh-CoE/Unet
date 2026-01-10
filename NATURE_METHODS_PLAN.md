@@ -1,774 +1,864 @@
 # Nature Methods Publication Plan: Neural Signal Translation
 
-## Executive Summary
+## Study Structure Overview
 
-**Title:** "CondUNet: Cross-Regional Neural Signal Translation via Conditional U-Net with Cross-Frequency Attention"
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         STUDY STRUCTURE                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PHASE 1-3: CORE METHOD DEVELOPMENT                                      │
+│  ══════════════════════════════════                                      │
+│  Dataset: Olfactory (OB→PCx, fixed 5s windows, trial-based)              │
+│  • Phase 1: Classical Baseline Floor                                     │
+│  • Phase 2: Neural Architecture Screening                                │
+│  • Phase 3: CondUNet Ablation Studies                                    │
+│                                                                          │
+│  PHASE 4: GENERALIZATION - INTER vs INTRA SESSION                        │
+│  ════════════════════════════════════════════════                        │
+│  Dataset: Olfactory (same dataset, different splits)                     │
+│  • Intra-session: Random split within sessions                           │
+│  • Inter-session: Held-out entire sessions (cross-session)               │
+│                                                                          │
+│  PHASE 5: GENERALIZATION - CROSS-DATASET                                 │
+│  ═══════════════════════════════════════                                 │
+│  Datasets: PFC→CA1 (rodent), DANDI (human iEEG)                          │
+│  • All fixed window (same approach, different brain regions/species)     │
+│                                                                          │
+│  PHASE 6: REAL-TIME FEASIBILITY - CONTINUOUS                             │
+│  ═══════════════════════════════════════════                             │
+│  Dataset: PCx1 continuous recordings                                     │
+│  • Sliding window training and inference                                 │
+│  • Latency and throughput benchmarks                                     │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-**Datasets:**
-| Dataset | Species | Regions | Channels | Sessions | Duration |
-|---------|---------|---------|----------|----------|----------|
-| Olfactory | Rodent | OB → PCx | 32 → 32 | Multiple | 5s trials, 7 odors |
-| PFC-CA1 | Rodent | PFC → CA1 | 64 → 32 | 494 trials | 5s, Left/Right task |
-| PCx1 | Rodent | OB → PCx | 32 → 32 | Continuous | Hours of recording |
-| DANDI 000623 | Human | AMY/HPC/MFC | Variable | 18 subjects | 8min movie |
+---
 
-**Baselines Available:**
-- Classical: Wiener Filter, Ridge Regression, VAR Model (7 variants)
-- Neural: Linear, SimpleCNN, WaveNet, FNet, ViT1D, Performer, Mamba (7 architectures)
+# PRIMARY DATASET: Olfactory (OB → PCx)
+
+| Property | Value |
+|----------|-------|
+| Species | Rodent |
+| Source Region | Olfactory Bulb (OB) |
+| Target Region | Piriform Cortex (PCx) |
+| Channels | 32 → 32 |
+| Sampling Rate | 1000 Hz |
+| Window | 5 seconds (5000 samples) |
+| Trial Types | 7 odors |
+| Format | Fixed windows, trial-based |
 
 ---
 
 # PHASE 1: CLASSICAL BASELINE FLOOR
-## "How hard is this problem?"
+## Dataset: Olfactory | Mode: Fixed Window
 
 ### Objective
-Establish performance floor with classical methods. All neural methods must beat this.
+Establish performance floor. All neural methods must beat this.
 
-### Experiments to Run
+### Experiments
 
 ```bash
-# Run all classical baselines on all datasets
+# Run all classical baselines on olfactory dataset
 cd experiments/tier0_classical
 
-# Olfactory dataset
-python run_tier0.py --dataset olfactory --output results/tier0_olfactory/
+python run_tier0.py --dataset olfactory --output results/phase1/
 
-# PCx1 continuous
-python run_tier0.py --dataset pcx1 --output results/tier0_pcx1/
-
-# PFC-CA1
-python run_tier0.py --dataset pfc --output results/tier0_pfc/
-
-# DANDI human
-python run_tier0.py --dataset dandi --output results/tier0_dandi/
+# Individual baselines for debugging
+python run_baseline.py --method wiener --dataset olfactory
+python run_baseline.py --method wiener_mimo --dataset olfactory
+python run_baseline.py --method ridge --dataset olfactory
+python run_baseline.py --method ridge_temporal --dataset olfactory
+python run_baseline.py --method ridge_cv --dataset olfactory
+python run_baseline.py --method var --dataset olfactory
+python run_baseline.py --method var_exog --dataset olfactory
 ```
 
-### Baselines to Compare
-| Method | Description | Variants |
-|--------|-------------|----------|
-| Wiener Filter | Optimal linear filter | Single-channel, MIMO |
-| Ridge Regression | L2-regularized | Standard, Temporal, CV |
-| VAR Model | Autoregressive | Standard, Exogenous |
+### Methods (7 total)
+| Method | Type | Description |
+|--------|------|-------------|
+| Wiener | Linear | Single-channel optimal filter |
+| Wiener MIMO | Linear | Multi-input multi-output |
+| Ridge | Linear | L2-regularized regression |
+| Ridge Temporal | Linear | With temporal features |
+| Ridge CV | Linear | Cross-validated regularization |
+| VAR | Autoregressive | Vector autoregressive model |
+| VAR Exogenous | Autoregressive | VAR with input signals |
 
-### Phase 1 Figures
-
-#### Figure P1.1: Classical Baseline Performance Matrix
+### Figure P1.1: Classical Baseline Comparison
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  CLASSICAL BASELINE COMPARISON ACROSS DATASETS              │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Heatmap: R² scores                                     │
-│      Rows: 7 baselines                                      │
-│      Cols: 4 datasets                                       │
-│      Color: Performance (0 to 1)                            │
-│                                                             │
-│  (B) Bar plot: Best classical per dataset                   │
-│      X: Datasets                                            │
-│      Y: R² with 95% CI                                      │
-│      Annotations: Method name on each bar                   │
-│                                                             │
-│  (C) Radar plot: Per-frequency-band performance             │
-│      5 axes: Delta, Theta, Alpha, Beta, Gamma               │
-│      Lines: Best classical method per dataset               │
-│                                                             │
-│  (D) Computation time comparison                            │
-│      Training time vs inference time                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P1.2: Example Predictions - Classical Methods
-```
-┌─────────────────────────────────────────────────────────────┐
-│  CLASSICAL METHOD PREDICTIONS                               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Olfactory: 3 channels × 5 seconds                      │
-│      Row 1: Ground truth                                    │
-│      Row 2: Wiener prediction                               │
-│      Row 3: Ridge prediction                                │
-│      Row 4: Residual (error)                                │
-│                                                             │
-│  (B) PSD comparison: Predicted vs Actual                    │
-│      Overlay plots per frequency band                       │
-│                                                             │
-│  (C) Scatter: Predicted vs Actual amplitude                 │
-│      Per dataset, with R² annotation                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  CLASSICAL BASELINE PERFORMANCE (Olfactory Dataset)          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Bar plot: R² for each method                            │
+│      7 bars with 95% CI                                      │
+│      Sorted by performance                                   │
+│      Best method highlighted                                 │
+│                                                              │
+│  (B) Per-frequency-band breakdown                            │
+│      Grouped bars: Delta/Theta/Alpha/Beta/Gamma              │
+│      Top 3 classical methods                                 │
+│                                                              │
+│  (C) Example predictions                                     │
+│      3 channels × 5 seconds                                  │
+│      Ground truth vs Best classical                          │
+│      Residual plot below                                     │
+│                                                              │
+│  (D) PSD comparison                                          │
+│      Actual vs Predicted power spectrum                      │
+│      Log-log scale, 1-200 Hz                                 │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 1 Deliverables
-- [ ] Table: All baseline results with 95% CI
-- [ ] Best classical baseline identified per dataset
-- [ ] Performance floor established (GATE for Phase 2)
-- [ ] 2 figures generated
+### Deliverables
+- [ ] All 7 baselines evaluated (5-fold CV, 3 seeds)
+- [ ] Best classical method identified: ____________
+- [ ] Best R²: ______, Best Correlation: ______
+- [ ] Performance floor established for GATE
+
+### GATE Criterion
+**Neural methods must beat best classical R² by ≥ 0.05**
 
 ---
 
 # PHASE 2: NEURAL ARCHITECTURE SCREENING
-## "Which neural architecture works best?"
+## Dataset: Olfactory | Mode: Fixed Window
 
 ### Objective
-Screen 7 neural architectures against classical floor. Identify top performers.
+Screen neural architectures. Identify best performers vs classical floor.
 
-### Experiments to Run
+### Experiments
 
 ```bash
-# Run architecture screening
+# Run all neural architectures
 cd experiments/tier1_screening
 
-# Test all architectures on each dataset
-for arch in linear simplecnn wavenet fnet vit performer mamba conunet; do
-  for dataset in olfactory pcx1 pfc dandi; do
-    python run_tier1.py --arch $arch --dataset $dataset --seeds 42,43,44
+# Full screening (all architectures, 3 seeds each)
+for arch in linear simplecnn wavenet fnet vit performer mamba condunet; do
+  for seed in 42 43 44; do
+    python train.py --dataset olfactory \
+      --arch $arch \
+      --epochs 60 \
+      --seed $seed \
+      --output results/phase2/${arch}_seed${seed}/
   done
 done
 ```
 
-### Architectures to Compare
-| Architecture | Type | Key Feature |
-|--------------|------|-------------|
-| Linear | Baseline | Simple linear mapping |
-| SimpleCNN | Convolutional | Basic conv layers |
-| WaveNet1D | Dilated Conv | Causal dilated convolutions |
-| FNet1D | Fourier | FFT-based mixing |
-| ViT1D | Transformer | Self-attention |
-| Performer1D | Efficient Transformer | Linear attention |
-| Mamba1D | State Space | SSM-based |
-| **CondUNet** | **U-Net** | **Skip connections + conditioning** |
+### Architectures (8 total)
+| Architecture | Type | Parameters | Key Feature |
+|--------------|------|------------|-------------|
+| Linear | Baseline | ~100K | Simple linear mapping |
+| SimpleCNN | CNN | ~500K | Basic conv layers |
+| WaveNet1D | Dilated CNN | ~1M | Causal dilated convolutions |
+| FNet1D | Fourier | ~800K | FFT-based token mixing |
+| ViT1D | Transformer | ~2M | Full self-attention |
+| Performer1D | Efficient Trans | ~1.5M | Linear attention (FAVOR+) |
+| Mamba1D | State Space | ~1M | Selective SSM |
+| **CondUNet** | **U-Net** | **~2M** | **Skip connections + conditioning** |
 
-### Phase 2 Figures
-
-#### Figure P2.1: Architecture Comparison
+### Figure P2.1: Architecture Comparison
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  NEURAL ARCHITECTURE SCREENING                              │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Grouped bar plot: R² by architecture                   │
-│      Groups: 4 datasets                                     │
-│      Bars: 8 architectures                                  │
-│      Error bars: 95% CI from 3 seeds                        │
-│      Horizontal line: Classical baseline floor              │
-│                                                             │
-│  (B) Improvement over classical baseline                    │
-│      Delta R² with significance stars                       │
-│      Color: Green (significant) / Gray (not)                │
-│                                                             │
-│  (C) Ranking plot: Mean rank across datasets                │
-│      Box plot showing rank distribution                     │
-│                                                             │
-│  (D) Parameter count vs Performance                         │
-│      Scatter: X=params, Y=R², size=inference time           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P2.2: Architecture Deep Dive
-```
-┌─────────────────────────────────────────────────────────────┐
-│  TOP 3 ARCHITECTURES DETAILED COMPARISON                    │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Learning curves: Loss over epochs                      │
-│      3 architectures × 4 datasets                           │
-│      Train (solid) vs Val (dashed)                          │
-│                                                             │
-│  (B) Per-frequency performance                              │
-│      Grouped bars: Delta/Theta/Alpha/Beta/Gamma             │
-│      Groups: Top 3 architectures                            │
-│                                                             │
-│  (C) Example predictions: Best vs Worst architecture        │
-│      Side-by-side trace comparison                          │
-│                                                             │
-│  (D) Statistical test matrix                                │
-│      Pairwise Wilcoxon tests                                │
-│      Bonferroni corrected p-values                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  NEURAL ARCHITECTURE SCREENING (Olfactory Dataset)           │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Bar plot: R² by architecture                            │
+│      8 architectures, sorted by performance                  │
+│      Error bars: std across 3 seeds                          │
+│      Horizontal line: Classical baseline floor               │
+│      Color: Beat baseline (green) / Below (gray)             │
+│                                                              │
+│  (B) Improvement over classical baseline                     │
+│      ΔR² with significance stars (* p<0.05, ** p<0.01)       │
+│      Only show methods that beat baseline                    │
+│                                                              │
+│  (C) Learning curves                                         │
+│      Loss vs Epoch for top 3 architectures                   │
+│      Train (solid) vs Val (dashed)                           │
+│                                                              │
+│  (D) Params vs Performance trade-off                         │
+│      Scatter: X=parameters, Y=R²                             │
+│      Size: inference time                                    │
+│      Pareto frontier marked                                  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 2 Deliverables
-- [ ] Full comparison table with all metrics
-- [ ] Top 3 architectures identified
-- [ ] Statistical significance tests (vs baseline, pairwise)
-- [ ] 2 figures generated
-- [ ] GATE: At least one architecture beats classical by R² ≥ 0.10
+### Figure P2.2: Top Architectures Deep Dive
+```
+┌──────────────────────────────────────────────────────────────┐
+│  TOP 3 ARCHITECTURES DETAILED COMPARISON                     │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Example predictions side-by-side                        │
+│      Same trial: Ground truth + 3 predictions                │
+│      3 channels shown                                        │
+│                                                              │
+│  (B) Per-frequency R²                                        │
+│      Line plot across frequency bands                        │
+│      3 architectures + classical baseline                    │
+│                                                              │
+│  (C) Pairwise statistical comparison                         │
+│      3×3 matrix: Wilcoxon p-values                           │
+│      Bonferroni corrected                                    │
+│                                                              │
+│  (D) Computational comparison table                          │
+│      Params | Train time | Inference | Memory                │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Deliverables
+- [ ] All 8 architectures evaluated (3 seeds each = 24 runs)
+- [ ] Top 3 architectures identified: 1.______ 2.______ 3.______
+- [ ] Statistical tests vs classical baseline
+- [ ] CondUNet ranking: ______
+
+### GATE Criterion
+**At least one architecture beats classical by R² ≥ 0.05 (p < 0.05)**
 
 ---
 
 # PHASE 3: CONDUNET ABLATION STUDIES
-## "What makes CondUNet work?"
+## Dataset: Olfactory | Mode: Fixed Window
 
 ### Objective
-Systematic ablation of CondUNet components to justify design decisions.
+Justify every CondUNet design decision with ablation evidence.
 
-### Experiments to Run
+### Experiments
 
 ```bash
-# Ablation studies (Tier 3)
+# Ablation experiments (Tier 3)
 cd experiments/tier3_ablation
 
-# Attention ablation
-python run_ablation.py --ablation attention \
-  --variants none,basic,cross_freq,cross_freq_v2 \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-
-# Conditioning ablation
-python run_ablation.py --ablation conditioning \
-  --variants none,odor_onehot,spectro_temporal,cpc,vqvae \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-
-# Loss function ablation
-python run_ablation.py --ablation loss \
-  --variants l1,huber,wavelet,l1_wavelet,huber_wavelet \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-
-# Depth ablation
-python run_ablation.py --ablation depth \
-  --variants 3,4,5 \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-
-# Bidirectional ablation
-python run_ablation.py --ablation bidirectional \
-  --variants unidirectional,bidirectional \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-
-# Augmentation ablation
-python run_ablation.py --ablation augmentation \
-  --variants none,full \
-  --datasets olfactory,pcx1,pfc,dandi --seeds 42,43,44
-```
-
-### Ablation Components
-| Component | Variants | Hypothesis |
-|-----------|----------|------------|
-| Attention | none, basic, cross_freq, cross_freq_v2 | Cross-freq attention captures theta-gamma coupling |
-| Conditioning | none, odor, spectro_temporal | Self-conditioning enables label-free training |
-| Loss | L1, Huber, Wavelet, Combined | Multi-scale wavelet preserves spectral content |
-| Depth | 3, 4, 5 layers | 4 layers optimal for 5s windows |
-| Bidirectional | uni, bi | Cycle consistency improves both directions |
-| Augmentation | none, full | Augmentation critical for generalization |
-
-### Phase 3 Figures
-
-#### Figure P3.1: Attention Mechanism Ablation
-```
-┌─────────────────────────────────────────────────────────────┐
-│  ATTENTION MECHANISM ABLATION                               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Bar plot: R² by attention type                         │
-│      4 variants × 4 datasets                                │
-│      Significance stars vs "none"                           │
-│                                                             │
-│  (B) Attention weight visualization                         │
-│      Heatmap: Query vs Key positions                        │
-│      For cross_freq_v2 on example input                     │
-│                                                             │
-│  (C) Frequency band preservation                            │
-│      Improvement in gamma band with cross_freq attention    │
-│                                                             │
-│  (D) Effect size (Cohen's d) summary                        │
-│      Forest plot with CI                                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P3.2: Loss Function Ablation
-```
-┌─────────────────────────────────────────────────────────────┐
-│  LOSS FUNCTION ABLATION                                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Overall R² comparison                                  │
-│      5 loss functions × 4 datasets                          │
-│                                                             │
-│  (B) PSD error comparison                                   │
-│      Wavelet losses should have lower PSD error             │
-│                                                             │
-│  (C) Per-frequency breakdown                                │
-│      Which loss works best for which band?                  │
-│                                                             │
-│  (D) Trade-off plot: R² vs PSD error                        │
-│      Pareto frontier visualization                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P3.3: Component Removal Impact
-```
-┌─────────────────────────────────────────────────────────────┐
-│  COMPONENT REMOVAL SUMMARY                                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Waterfall chart: Performance drop per removal          │
-│      Full model → -attention → -conditioning → etc.         │
-│                                                             │
-│  (B) Interaction effects                                    │
-│      Heatmap: Pairwise removal effects                      │
-│      Are effects additive or synergistic?                   │
-│                                                             │
-│  (C) Critical components identified                         │
-│      Ranked by Cohen's d effect size                        │
-│                                                             │
-│  (D) Final recipe: Minimal effective configuration          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Phase 3 Deliverables
-- [ ] Complete ablation table (6 ablations × 4 datasets × 3 seeds)
-- [ ] Effect sizes for all components
-- [ ] Justified architectural decisions
-- [ ] 3 figures generated
-
----
-
-# PHASE 4: CROSS-SESSION GENERALIZATION
-## "Does it generalize to unseen recordings?"
-
-### Objective
-Prove the model learns generalizable mappings, not session-specific patterns.
-
-### Experiments to Run
-
-```bash
-# Session holdout experiments
-for dataset in olfactory pcx1 pfc; do
-  # Leave-one-session-out
-  python train.py --dataset $dataset \
-    --split-by-session --no-test-set \
-    --separate-val-sessions \
-    --epochs 60 --seed 42
-
-  # Multiple held-out sessions
-  for n_val in 1 2 4 6; do
-    python train.py --dataset $dataset \
-      --split-by-session --n-val-sessions $n_val \
-      --epochs 60 --seed 42
+# 1. Attention mechanism ablation
+for attn in none basic cross_freq cross_freq_v2; do
+  for seed in 42 43 44; do
+    python train.py --dataset olfactory \
+      --attention-type $attn \
+      --epochs 60 --seed $seed
   done
 done
 
-# DANDI: Leave-one-subject-out
+# 2. Conditioning ablation
+for cond in none odor_onehot spectro_temporal; do
+  for seed in 42 43 44; do
+    python train.py --dataset olfactory \
+      --conditioning $cond \
+      --epochs 60 --seed $seed
+  done
+done
+
+# 3. Loss function ablation
+for loss in l1 huber wavelet l1_wavelet huber_wavelet; do
+  for seed in 42 43 44; do
+    python train.py --dataset olfactory \
+      --loss $loss \
+      --epochs 60 --seed $seed
+  done
+done
+
+# 4. Model capacity ablation
+for channels in 32 64 128; do
+  for seed in 42 43 44; do
+    python train.py --dataset olfactory \
+      --base-channels $channels \
+      --epochs 60 --seed $seed
+  done
+done
+
+# 5. Bidirectional training ablation
+for seed in 42 43 44; do
+  python train.py --dataset olfactory --epochs 60 --seed $seed  # bidirectional (default)
+  python train.py --dataset olfactory --no-bidirectional --epochs 60 --seed $seed
+done
+
+# 6. Data augmentation ablation
+for seed in 42 43 44; do
+  python train.py --dataset olfactory --epochs 60 --seed $seed  # with aug (default)
+  python train.py --dataset olfactory --no-aug --epochs 60 --seed $seed
+done
+```
+
+### Ablation Summary
+| Ablation | Variants | Hypothesis |
+|----------|----------|------------|
+| Attention | none, basic, cross_freq, cross_freq_v2 | Cross-freq captures theta-gamma coupling |
+| Conditioning | none, odor, spectro_temporal | Self-conditioning enables unsupervised learning |
+| Loss | L1, Huber, Wavelet, Combined | Multi-scale wavelet preserves spectrum |
+| Capacity | 32, 64, 128 channels | 64 is sweet spot |
+| Bidirectional | uni, bi | Cycle consistency regularizes |
+| Augmentation | none, full | Aug critical for generalization |
+
+**Total: 6 ablations × 3-5 variants × 3 seeds = ~60 runs**
+
+### Figure P3.1: Attention Ablation
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ATTENTION MECHANISM ABLATION                                │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) R² by attention type                                    │
+│      4 bars: none → basic → cross_freq → cross_freq_v2       │
+│      Error bars from 3 seeds                                 │
+│      Significance stars vs "none"                            │
+│                                                              │
+│  (B) Per-frequency improvement                               │
+│      Which bands benefit most from attention?                │
+│      Grouped bars: Δ improvement per band                    │
+│                                                              │
+│  (C) Attention visualization                                 │
+│      Heatmap: What does cross_freq_v2 attend to?             │
+│      Example from validation set                             │
+│                                                              │
+│  (D) Effect size forest plot                                 │
+│      Cohen's d with 95% CI for each variant vs none          │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Figure P3.2: Loss Function Ablation
+```
+┌──────────────────────────────────────────────────────────────┐
+│  LOSS FUNCTION ABLATION                                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) R² comparison                                           │
+│      5 loss functions                                        │
+│                                                              │
+│  (B) PSD error comparison                                    │
+│      Wavelet losses should have lower spectral error         │
+│                                                              │
+│  (C) Trade-off: R² vs PSD error                              │
+│      Scatter plot, Pareto frontier                           │
+│      huber_wavelet should be on frontier                     │
+│                                                              │
+│  (D) Per-frequency breakdown                                 │
+│      Which loss best for which band?                         │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Figure P3.3: Component Importance Summary
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ABLATION SUMMARY: COMPONENT IMPORTANCE                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Waterfall chart                                         │
+│      Full model R² → remove each component                   │
+│      Shows contribution of each part                         │
+│                                                              │
+│  (B) Ranked importance                                       │
+│      Bar plot: Cohen's d effect size                         │
+│      Sorted by importance                                    │
+│      1. Attention  2. Loss  3. Conditioning  etc.            │
+│                                                              │
+│  (C) Interaction effects (optional)                          │
+│      Does removing A+B hurt more than A alone + B alone?     │
+│                                                              │
+│  (D) Final recipe table                                      │
+│      Recommended configuration with justification            │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Deliverables
+- [ ] 6 ablation studies completed (~60 runs)
+- [ ] Effect sizes computed for all comparisons
+- [ ] Optimal configuration identified
+- [ ] All design decisions justified with p-values
+
+---
+
+# PHASE 4: GENERALIZATION - INTER vs INTRA SESSION
+## Dataset: Olfactory | Mode: Fixed Window
+
+### Objective
+Compare within-session vs cross-session generalization.
+**Key question: Does the model learn session-specific patterns or generalizable mappings?**
+
+### Experimental Design
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  INTRA-SESSION (Within Session)                             │
+│  ═══════════════════════════════                            │
+│  • Random 80/20 split WITHIN each session                   │
+│  • Train and test data from SAME recording sessions         │
+│  • Easier: Same electrode positions, same day               │
+├─────────────────────────────────────────────────────────────┤
+│  INTER-SESSION (Cross Session)                              │
+│  ═══════════════════════════════                            │
+│  • Hold out ENTIRE sessions for validation                  │
+│  • Train on sessions A,B,C → Test on session D              │
+│  • Harder: Different days, potential electrode drift        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Experiments
+
+```bash
+# INTRA-SESSION: Random split within sessions
+for seed in 42 43 44; do
+  python train.py --dataset olfactory \
+    --no-split-by-session \
+    --epochs 60 --seed $seed \
+    --output results/phase4/intra_session/seed${seed}/
+done
+
+# INTER-SESSION: Hold out entire sessions
+for seed in 42 43 44; do
+  python train.py --dataset olfactory \
+    --split-by-session \
+    --no-test-set \
+    --separate-val-sessions \
+    --epochs 60 --seed $seed \
+    --output results/phase4/inter_session/seed${seed}/
+done
+
+# Vary number of held-out sessions
+for n_val in 1 2 3 4; do
+  python train.py --dataset olfactory \
+    --split-by-session \
+    --n-val-sessions $n_val \
+    --no-test-set \
+    --epochs 60 --seed 42 \
+    --output results/phase4/inter_session_n${n_val}/
+done
+```
+
+### Figure P4.1: Intra vs Inter Session Comparison
+```
+┌──────────────────────────────────────────────────────────────┐
+│  GENERALIZATION: INTRA vs INTER SESSION                      │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Bar plot comparison                                     │
+│      Two bars: Intra-session vs Inter-session                │
+│      Error bars from 3 seeds                                 │
+│      Significance test between them                          │
+│      QUANTIFY THE GENERALIZATION GAP                         │
+│                                                              │
+│  (B) Per-session performance (Inter-session)                 │
+│      Box plot: Each held-out session                         │
+│      Shows variance across sessions                          │
+│      Identify easy vs hard sessions                          │
+│                                                              │
+│  (C) Learning curve by # training sessions                   │
+│      X: Number of training sessions                          │
+│      Y: Val R² on held-out sessions                          │
+│      Does more data help?                                    │
+│                                                              │
+│  (D) Classical vs Neural on both settings                    │
+│      Grouped bars: Intra/Inter × Classical/CondUNet          │
+│      Does neural advantage hold for cross-session?           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Figure P4.2: Session Difficulty Analysis
+```
+┌──────────────────────────────────────────────────────────────┐
+│  SESSION DIFFICULTY ANALYSIS                                 │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Session performance heatmap                             │
+│      Rows: Training configuration                            │
+│      Cols: Test session                                      │
+│      Color: R² score                                         │
+│                                                              │
+│  (B) Session characteristics vs performance                  │
+│      Scatter plots:                                          │
+│      - # trials vs R²                                        │
+│      - Recording date vs R²                                  │
+│      - Signal quality vs R²                                  │
+│                                                              │
+│  (C) Transfer matrix                                         │
+│      Train on session i, test on session j                   │
+│      Which sessions transfer well to each other?             │
+│                                                              │
+│  (D) Failure case examples                                   │
+│      Worst predictions from hardest session                  │
+│      What went wrong?                                        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Deliverables
+- [ ] Intra-session R²: ______ ± ______
+- [ ] Inter-session R²: ______ ± ______
+- [ ] Generalization gap: ______ (should be small if model generalizes)
+- [ ] Per-session breakdown
+- [ ] Session difficulty analysis
+
+### Key Metrics
+| Metric | Intra-Session | Inter-Session | Gap |
+|--------|---------------|---------------|-----|
+| R² | | | |
+| Correlation | | | |
+| PSD Error | | | |
+
+---
+
+# PHASE 5: GENERALIZATION - CROSS-DATASET
+## Datasets: PFC→CA1, DANDI | Mode: Fixed Window
+
+### Objective
+Test if method generalizes to different brain regions and species.
+**No retraining of hyperparameters - use same config as olfactory.**
+
+### Experiments
+
+```bash
+# PFC → CA1 (Rodent hippocampus)
+for seed in 42 43 44; do
+  python train.py --dataset pfc \
+    --split-by-session \
+    --no-test-set \
+    --epochs 60 --seed $seed \
+    --output results/phase5/pfc/seed${seed}/
+done
+
+# DANDI Human iEEG: AMY → HPC
+for seed in 42 43 44; do
+  python train.py --dataset dandi \
+    --dandi-source-region amygdala \
+    --dandi-target-region hippocampus \
+    --split-by-session \
+    --no-test-set \
+    --epochs 60 --seed $seed \
+    --output results/phase5/dandi_amy_hpc/seed${seed}/
+done
+
+# DANDI Human iEEG: Other region pairs
 python train.py --dataset dandi \
-  --split-by-session --no-test-set \
+  --dandi-source-region hippocampus \
+  --dandi-target-region medial_frontal_cortex \
+  --epochs 60 --seed 42
+
+python train.py --dataset dandi \
+  --dandi-source-region amygdala \
+  --dandi-target-region medial_frontal_cortex \
   --epochs 60 --seed 42
 ```
 
-### Phase 4 Figures
+### Dataset Comparison
+| Dataset | Species | Regions | Channels | Challenge |
+|---------|---------|---------|----------|-----------|
+| Olfactory | Rodent | OB→PCx | 32→32 | Primary dataset |
+| PFC-CA1 | Rodent | PFC→CA1 | 64→32 | Different regions |
+| DANDI | **Human** | AMY→HPC | Variable | Cross-species |
 
-#### Figure P4.1: Cross-Session Performance
+### Figure P5.1: Cross-Dataset Generalization
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  CROSS-SESSION GENERALIZATION                               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Per-session performance heatmap                        │
-│      Rows: Training configuration                           │
-│      Cols: Test sessions                                    │
-│      Color: R² score                                        │
-│                                                             │
-│  (B) Within-session vs Cross-session comparison             │
-│      Paired bar plot with significance test                 │
-│      Quantify generalization gap                            │
-│                                                             │
-│  (C) Session difficulty analysis                            │
-│      Which sessions are hard? Why?                          │
-│      Scatter: Session R² vs session characteristics         │
-│                                                             │
-│  (D) Learning with more sessions                            │
-│      Line plot: R² vs number of training sessions           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P4.2: Human Subject Generalization (DANDI)
-```
-┌─────────────────────────────────────────────────────────────┐
-│  HUMAN iEEG: CROSS-SUBJECT TRANSFER                         │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Leave-one-subject-out results                          │
-│      18 subjects, per-subject R²                            │
-│      Box plot with individual points                        │
-│                                                             │
-│  (B) Subject similarity analysis                            │
-│      Dendrogram: Which subjects cluster together?           │
-│      Does anatomical similarity predict transfer?           │
-│                                                             │
-│  (C) Channel count effect                                   │
-│      Scatter: #channels vs R²                               │
-│      Does more electrodes help?                             │
-│                                                             │
-│  (D) Brain region comparison                                │
-│      AMY→HPC vs HPC→MFC vs AMY→MFC                          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  CROSS-DATASET GENERALIZATION                                │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) R² across datasets                                      │
+│      3 datasets: Olfactory, PFC, DANDI                       │
+│      CondUNet vs Best Classical                              │
+│      Error bars from seeds                                   │
+│                                                              │
+│  (B) Per-frequency breakdown by dataset                      │
+│      Heatmap: Dataset × Frequency band                       │
+│      Does gamma transfer across datasets?                    │
+│                                                              │
+│  (C) Human iEEG detailed results                             │
+│      Per-subject performance (18 subjects)                   │
+│      Box plot with individual points                         │
+│                                                              │
+│  (D) Region pair comparison (DANDI)                          │
+│      AMY→HPC vs HPC→MFC vs AMY→MFC                           │
+│      Which direction is easier?                              │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 4 Deliverables
-- [ ] Cross-session generalization quantified
-- [ ] Generalization gap measured (within vs across)
-- [ ] Human subject leave-one-out validation
-- [ ] 2 figures generated
+### Figure P5.2: Human iEEG Deep Dive
+```
+┌──────────────────────────────────────────────────────────────┐
+│  DANDI 000623: HUMAN iEEG RESULTS                            │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Leave-one-subject-out                                   │
+│      18 subjects, cross-subject transfer                     │
+│      Performance distribution                                │
+│                                                              │
+│  (B) Channel count effect                                    │
+│      Scatter: # electrodes vs R²                             │
+│      Does more channels help?                                │
+│                                                              │
+│  (C) Example human predictions                               │
+│      Best and worst subject                                  │
+│      AMY→HPC translation example                             │
+│                                                              │
+│  (D) Comparison to rodent                                    │
+│      Same method, different species                          │
+│      What transfers, what doesn't?                           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Deliverables
+- [ ] PFC→CA1 results: R² = ______ ± ______
+- [ ] DANDI AMY→HPC results: R² = ______ ± ______
+- [ ] Cross-species generalization demonstrated
+- [ ] Human data validates method
 
 ---
 
-# PHASE 5: SPECTRAL & PHASE FIDELITY
-## "Does it preserve neural dynamics?"
+# PHASE 6: REAL-TIME FEASIBILITY - CONTINUOUS
+## Dataset: PCx1 Continuous | Mode: Sliding Window
 
 ### Objective
-Verify the model preserves biologically meaningful spectral and phase relationships.
+Demonstrate real-time applicability with continuous sliding window.
+**Different from fixed trials - streaming data simulation.**
 
-### Experiments to Run
+### Experimental Design
 
-```bash
-# Compute comprehensive neural metrics
-python evaluate.py --checkpoint best_model.pt \
-  --metrics spectral,phase,pac \
-  --datasets olfactory,pcx1,pfc,dandi
-```
-
-### Metrics to Compute
-| Metric | Description | Biological Relevance |
-|--------|-------------|---------------------|
-| PSD Error | Power spectral density match | Oscillation strength preserved |
-| PLV | Phase locking value | Inter-regional synchrony |
-| PLI | Phase lag index | Directed coupling |
-| PAC | Phase-amplitude coupling | Theta-gamma nesting |
-| Coherence | Frequency-resolved correlation | Band-specific coupling |
-
-### Phase 5 Figures
-
-#### Figure P5.1: Spectral Fidelity
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  SPECTRAL CONTENT PRESERVATION                              │
-├─────────────────────────────────────────────────────────────┤
+│  FIXED WINDOW (Phases 1-5)        SLIDING WINDOW (Phase 6)  │
+│  ════════════════════════         ════════════════════════  │
 │                                                             │
-│  (A) PSD overlay: Predicted vs Actual                       │
-│      Log-log plot, 1-200 Hz                                 │
-│      Shaded: 95% CI across trials                           │
-│      Per dataset subplot                                    │
-│                                                             │
-│  (B) PSD error by frequency band                            │
-│      Bar plot: Delta/Theta/Alpha/Beta/Gamma                 │
-│      Grouped by dataset                                     │
-│                                                             │
-│  (C) Spectrogram comparison                                 │
-│      Time-frequency representation                          │
-│      Actual | Predicted | Difference                        │
-│                                                             │
-│  (D) 1/f slope preservation                                 │
-│      Scatter: Actual vs Predicted slope                     │
-│                                                             │
+│  |--trial 1--|--trial 2--|        |====|                    │
+│                                     |====|                  │
+│  Discrete, non-overlapping            |====|                │
+│  Trial boundaries known                  |====|             │
+│                                             |====|          │
+│                                   Continuous, overlapping   │
+│                                   No trial boundaries       │
+│                                   Simulates real-time       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-#### Figure P5.2: Phase Relationship Preservation
-```
-┌─────────────────────────────────────────────────────────────┐
-│  PHASE DYNAMICS PRESERVATION                                │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) PLV comparison: Actual vs Predicted                    │
-│      Scatter plot with identity line                        │
-│      Per frequency band                                     │
-│                                                             │
-│  (B) Phase-amplitude coupling (PAC)                         │
-│      Comodulogram: Actual | Predicted                       │
-│      Theta phase × Gamma amplitude                          │
-│                                                             │
-│  (C) PAC preservation ratio                                 │
-│      Bar plot: How much PAC is preserved?                   │
-│      Comparison to baseline methods                         │
-│                                                             │
-│  (D) Coherence matrices                                     │
-│      Channel × Channel coherence                            │
-│      Actual | Predicted | Correlation                       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Phase 5 Deliverables
-- [ ] All spectral metrics computed
-- [ ] Phase metrics (PLV, PLI, PAC) computed
-- [ ] Comparison to baselines on phase preservation
-- [ ] 2 figures generated
-
----
-
-# PHASE 6: FULL BASELINE COMPARISON
-## "How does CondUNet compare to everything?"
-
-### Objective
-Comprehensive comparison against all classical and neural baselines.
-
-### Experiments to Run
+### Experiments
 
 ```bash
-# Run all methods on all datasets
-# Classical (7) + Neural (7) + CondUNet variants (3) = 17 methods
-
-# All baselines
-for method in wiener ridge_cv var linear simplecnn wavenet fnet vit performer mamba; do
-  for dataset in olfactory pcx1 pfc dandi; do
-    python run_baseline.py --method $method --dataset $dataset --seeds 42,43,44
-  done
+# Sliding window with different strides
+for stride_ratio in 0.25 0.5 0.75; do
+  python train.py --dataset pcx1 \
+    --pcx1-window-size 5000 \
+    --pcx1-stride-ratio $stride_ratio \
+    --split-by-session \
+    --no-test-set \
+    --epochs 60 --seed 42 \
+    --output results/phase6/stride_${stride_ratio}/
 done
 
-# CondUNet variants
-for variant in conunet conunet_small conunet_large; do
-  for dataset in olfactory pcx1 pfc dandi; do
-    python train.py --dataset $dataset --model $variant --seeds 42,43,44
-  done
+# Window size ablation
+for window in 1000 2500 5000 10000; do
+  python train.py --dataset pcx1 \
+    --pcx1-window-size $window \
+    --pcx1-stride-ratio 0.5 \
+    --split-by-session \
+    --epochs 60 --seed 42 \
+    --output results/phase6/window_${window}/
 done
+
+# Latency benchmark
+python benchmark.py --model best_model.pt \
+  --batch-sizes 1 4 16 64 \
+  --measure-latency
 ```
 
-### Phase 6 Figures
+### Sliding Window Parameters
+| Parameter | Values to Test | Purpose |
+|-----------|---------------|---------|
+| Window Size | 1s, 2.5s, 5s, 10s | Temporal context |
+| Stride Ratio | 25%, 50%, 75% | Overlap vs speed |
+| Batch Size | 1, 4, 16, 64 | Throughput vs latency |
 
-#### Figure P6.1: Grand Comparison
+### Figure P6.1: Continuous Processing Performance
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  COMPREHENSIVE METHOD COMPARISON                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Overall ranking                                        │
-│      Stacked bar: Mean R² across all datasets               │
-│      17 methods ordered by performance                      │
-│      Error bars: 95% CI                                     │
-│      Color: Classical (blue) / Neural (orange) / Ours (red) │
-│                                                             │
-│  (B) Per-dataset comparison                                 │
-│      4 subplots (one per dataset)                           │
-│      Top 5 methods highlighted                              │
-│                                                             │
-│  (C) Metric trade-offs                                      │
-│      Scatter: R² vs PSD error                               │
-│      Scatter: R² vs Inference time                          │
-│      Pareto frontier marked                                 │
-│                                                             │
-│  (D) Statistical significance matrix                        │
-│      17×17 pairwise comparison                              │
-│      Significant wins/losses marked                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P6.2: Best Methods Deep Dive
-```
-┌─────────────────────────────────────────────────────────────┐
-│  TOP 5 METHODS DETAILED ANALYSIS                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Example predictions side-by-side                       │
-│      5 methods on same trial                                │
-│      Ground truth + 5 predictions + residuals               │
-│                                                             │
-│  (B) Per-frequency performance                              │
-│      Line plot: R² across frequency bands                   │
-│      5 methods overlaid                                     │
-│                                                             │
-│  (C) Failure case analysis                                  │
-│      When does each method fail?                            │
-│      Low-SNR, artifacts, specific conditions                │
-│                                                             │
-│  (D) Computational requirements                             │
-│      Table: Params / Train time / Inference time / Memory   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  CONTINUOUS SLIDING WINDOW PERFORMANCE                       │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) R² vs Window Size                                       │
+│      Line plot: 1s → 2.5s → 5s → 10s                         │
+│      Longer windows = more context = better?                 │
+│                                                              │
+│  (B) R² vs Stride (overlap)                                  │
+│      More overlap = more compute but maybe better?           │
+│                                                              │
+│  (C) Fixed window vs Sliding window comparison               │
+│      Same model, different evaluation                        │
+│      Does continuous hurt performance?                       │
+│                                                              │
+│  (D) Long recording example                                  │
+│      60 seconds of continuous prediction                     │
+│      Ground truth vs Predicted overlay                       │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 6 Deliverables
-- [ ] Full comparison table (17 methods × 4 datasets)
-- [ ] Statistical tests (all pairwise)
-- [ ] CondUNet shown to be best or among best
-- [ ] 2 figures generated
-
----
-
-# PHASE 7: INTERPRETABILITY & BIOLOGICAL VALIDATION
-## "What has the model learned?"
-
-### Objective
-Interpret model behavior and validate biological relevance.
-
-### Experiments to Run
-
-```bash
-# Channel importance analysis
-python analyze.py --checkpoint best_model.pt \
-  --analysis channel_importance,frequency_importance,temporal_importance
-
-# Biological validation
-python analyze.py --checkpoint best_model.pt \
-  --analysis odor_decoding,phase_preservation,information_transfer
+### Figure P6.2: Real-Time Feasibility
+```
+┌──────────────────────────────────────────────────────────────┐
+│  REAL-TIME FEASIBILITY ANALYSIS                              │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  (A) Latency benchmark                                       │
+│      Inference time vs batch size                            │
+│      CPU vs GPU comparison                                   │
+│      Target: <100ms for real-time                            │
+│                                                              │
+│  (B) Throughput analysis                                     │
+│      Samples/second at different batch sizes                 │
+│      Can we keep up with 1kHz sampling?                      │
+│                                                              │
+│  (C) Memory footprint                                        │
+│      GPU memory vs batch size                                │
+│      Can run on edge device?                                 │
+│                                                              │
+│  (D) Quality vs Speed trade-off                              │
+│      Scatter: R² vs Latency                                  │
+│      Pareto frontier for deployment                          │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Phase 7 Figures
+### Deliverables
+- [ ] Optimal window size: ______ ms
+- [ ] Optimal stride: ______%
+- [ ] Inference latency: ______ ms (batch=1)
+- [ ] Throughput: ______ samples/sec
+- [ ] Real-time feasible: YES / NO
 
-#### Figure P7.1: What the Model Learns
-```
-┌─────────────────────────────────────────────────────────────┐
-│  MODEL INTERPRETABILITY                                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Channel importance map                                 │
-│      Which source channels drive predictions?               │
-│      Heatmap: Source channel × Target channel               │
-│                                                             │
-│  (B) Frequency band importance                              │
-│      Bar plot: Contribution of each band                    │
-│      Ablation: Mask each band, measure drop                 │
-│                                                             │
-│  (C) Temporal importance                                    │
-│      Line plot: When in trial matters most?                 │
-│      Gradient-based saliency over time                      │
-│                                                             │
-│  (D) Attention pattern analysis                             │
-│      What does cross-frequency attention focus on?          │
-│      Theta-gamma coupling visualization                     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Figure P7.2: Biological Validation
-```
-┌─────────────────────────────────────────────────────────────┐
-│  BIOLOGICAL RELEVANCE                                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  (A) Odor information preservation                          │
-│      Train classifier on predicted signals                  │
-│      Compare: Actual vs Predicted decoding accuracy         │
-│                                                             │
-│  (B) Negative control: Shuffled labels                      │
-│      Model trained with shuffled correspondences            │
-│      Should fail → proves real mapping learned              │
-│                                                             │
-│  (C) Temporal structure preservation                        │
-│      Cross-correlation: Actual vs Predicted                 │
-│      Lag analysis: Is timing preserved?                     │
-│                                                             │
-│  (D) Information theoretic analysis                         │
-│      Mutual information: Source-Target vs Source-Predicted  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Phase 7 Deliverables
-- [ ] Interpretability analysis complete
-- [ ] Negative controls passed
-- [ ] Biological relevance demonstrated
-- [ ] 2 figures generated
+### Real-Time Requirements
+| Requirement | Target | Achieved |
+|-------------|--------|----------|
+| Latency (batch=1) | < 100 ms | |
+| Throughput | > 1000 Hz | |
+| GPU Memory | < 4 GB | |
+| R² (continuous) | > 0.5 | |
 
 ---
 
 # MAIN PAPER FIGURES (6 figures)
 
-After all phases, combine into main paper figures:
-
 ## Figure 1: Method Overview
-- Architecture schematic (from Phase 3)
-- Training pipeline
-- Dataset overview table
+- (A) Problem schematic: Brain regions, translation concept
+- (B) CondUNet architecture diagram
+- (C) Training pipeline
+- (D) Dataset summary table
 
-## Figure 2: Main Results
-- CondUNet performance on all 4 datasets (from Phase 6)
-- Example predictions (best cases)
-- Key metrics summary
+## Figure 2: Baseline Comparison
+- From Phase 1: Classical baselines
+- From Phase 2: Neural architectures
+- (A) Classical floor (7 methods)
+- (B) Neural screening (8 architectures)
+- (C) CondUNet vs all others
+- (D) Statistical significance matrix
 
-## Figure 3: Comparison to Baselines
-- Classical baseline comparison (from Phase 1 & 6)
-- Neural baseline comparison (from Phase 2 & 6)
-- Statistical significance
+## Figure 3: Ablation Studies
+- From Phase 3
+- (A) Attention ablation
+- (B) Loss function ablation
+- (C) Component importance waterfall
+- (D) Optimal configuration
 
-## Figure 4: Ablation Studies
-- Component importance (from Phase 3)
-- Loss function comparison
-- Attention mechanism impact
+## Figure 4: Generalization - Sessions
+- From Phase 4
+- (A) Intra vs Inter session
+- (B) Per-session breakdown
+- (C) Generalization gap analysis
+- (D) Session transfer matrix
 
-## Figure 5: Generalization
-- Cross-session (from Phase 4)
-- Cross-subject/human data (from Phase 4)
-- Cross-region (DANDI variants)
+## Figure 5: Generalization - Datasets
+- From Phase 5
+- (A) Cross-dataset comparison (3 datasets)
+- (B) Human iEEG results (DANDI)
+- (C) Per-frequency transfer
+- (D) Species comparison
 
-## Figure 6: Biological Validation
-- Spectral fidelity (from Phase 5)
-- Phase preservation (from Phase 5)
-- Interpretability (from Phase 7)
-
----
-
-# SUPPLEMENTARY MATERIALS
-
-## Supp. Tables
-1. Full hyperparameter table
-2. Complete baseline results (all metrics)
-3. Per-session breakdown
-4. Statistical test results
-
-## Supp. Figures
-1. Extended architecture details
-2. All ablation results
-3. Learning curves for all experiments
-4. Failure cases analysis
-5. Additional DANDI region pairs
-6. Computational benchmarks
+## Figure 6: Real-Time Feasibility
+- From Phase 6
+- (A) Continuous processing performance
+- (B) Window/stride optimization
+- (C) Latency benchmarks
+- (D) Deployment feasibility
 
 ---
 
-# EXECUTION COMMANDS SUMMARY
+# EXECUTION SUMMARY
 
 ```bash
-# Phase 1: Classical Baselines
-python experiments/tier0_classical/run_tier0.py --all-datasets
+# ═══════════════════════════════════════════════════════════
+# PHASE 1: Classical Baselines (Olfactory)
+# Runs: 7 methods × 5-fold × 3 seeds = ~105 evaluations
+# Time: ~1 day
+# ═══════════════════════════════════════════════════════════
+python experiments/tier0_classical/run_tier0.py --dataset olfactory
 
-# Phase 2: Architecture Screening
-python experiments/tier1_screening/run_tier1.py --all-datasets
+# ═══════════════════════════════════════════════════════════
+# PHASE 2: Architecture Screening (Olfactory)
+# Runs: 8 architectures × 3 seeds = 24 training runs
+# Time: ~2-3 days (60 epochs each)
+# ═══════════════════════════════════════════════════════════
+python experiments/tier1_screening/run_tier1.py --dataset olfactory
 
-# Phase 3: Ablations
-python experiments/tier3_ablation/run_tier3.py --all-datasets
+# ═══════════════════════════════════════════════════════════
+# PHASE 3: Ablations (Olfactory)
+# Runs: ~60 training runs
+# Time: ~4-5 days
+# ═══════════════════════════════════════════════════════════
+python experiments/tier3_ablation/run_tier3.py --dataset olfactory
 
-# Phase 4: Cross-Session
-python train.py --dataset pcx1 --split-by-session --no-test-set --separate-val-sessions
+# ═══════════════════════════════════════════════════════════
+# PHASE 4: Inter vs Intra Session (Olfactory)
+# Runs: ~12 training runs
+# Time: ~1-2 days
+# ═══════════════════════════════════════════════════════════
+python train.py --dataset olfactory --split-by-session ...
+python train.py --dataset olfactory --no-split-by-session ...
 
-# Phase 5: Spectral Analysis
-python evaluate.py --comprehensive --metrics spectral,phase,pac
+# ═══════════════════════════════════════════════════════════
+# PHASE 5: Cross-Dataset (PFC, DANDI)
+# Runs: ~10 training runs
+# Time: ~2 days
+# ═══════════════════════════════════════════════════════════
+python train.py --dataset pfc ...
+python train.py --dataset dandi ...
 
-# Phase 6: Full Comparison
-python experiments/run_full_comparison.py --all-methods --all-datasets
-
-# Phase 7: Interpretability
-python analyze.py --interpretability --biological-validation
+# ═══════════════════════════════════════════════════════════
+# PHASE 6: Continuous (PCx1)
+# Runs: ~12 training runs + benchmarks
+# Time: ~2 days
+# ═══════════════════════════════════════════════════════════
+python train.py --dataset pcx1 --pcx1-stride-ratio 0.5 ...
+python benchmark.py ...
 ```
 
 ---
 
 # TIMELINE
 
-| Phase | Duration | Experiments | Figures |
-|-------|----------|-------------|---------|
-| Phase 1 | 2-3 days | 7 baselines × 4 datasets | 2 |
-| Phase 2 | 3-4 days | 8 architectures × 4 datasets | 2 |
-| Phase 3 | 5-7 days | 6 ablations × multiple variants | 3 |
-| Phase 4 | 3-4 days | Session holdout experiments | 2 |
-| Phase 5 | 2-3 days | Spectral/phase analysis | 2 |
-| Phase 6 | 3-4 days | Full comparison | 2 |
-| Phase 7 | 3-4 days | Interpretability | 2 |
-| **Total** | **~4 weeks** | | **15 figures** |
+| Phase | Focus | Dataset | Duration | Runs |
+|-------|-------|---------|----------|------|
+| 1 | Classical Floor | Olfactory | 1 day | ~100 |
+| 2 | Architecture Screen | Olfactory | 2-3 days | 24 |
+| 3 | Ablations | Olfactory | 4-5 days | ~60 |
+| 4 | Inter/Intra Session | Olfactory | 1-2 days | ~12 |
+| 5 | Cross-Dataset | PFC, DANDI | 2 days | ~10 |
+| 6 | Continuous | PCx1 | 2 days | ~12 |
+| **Total** | | | **~2 weeks** | **~220 runs** |
 
 ---
 
-# STATISTICAL REQUIREMENTS
+# STATISTICAL CHECKLIST
 
-For each comparison:
-- [ ] 3+ random seeds
-- [ ] 95% bootstrap confidence intervals
-- [ ] Paired statistical tests (Wilcoxon signed-rank)
-- [ ] Multiple comparison correction (Bonferroni)
-- [ ] Effect sizes (Cohen's d)
-- [ ] All p-values reported
+For ALL comparisons:
+- [ ] Minimum 3 random seeds
+- [ ] 95% bootstrap confidence intervals (10,000 resamples)
+- [ ] Paired Wilcoxon signed-rank tests
+- [ ] Bonferroni correction for multiple comparisons
+- [ ] Cohen's d effect sizes
+- [ ] All p-values reported (exact, not just < 0.05)
