@@ -16,22 +16,22 @@
 ┌────────────────────────────────────────────────────────────────────────┐
 │  PHASE 1: CLASSICAL BASELINES                                          │
 │  ─────────────────────────────                                         │
-│  All 3 datasets (Olfactory, PFC, DANDI)                                │
+│  Olfactory only (fixed window)                                         │
 │  7 classical methods, establish performance floor                      │
 ├────────────────────────────────────────────────────────────────────────┤
 │  PHASE 2: ARCHITECTURE SCREENING                                       │
 │  ───────────────────────────────                                       │
-│  All 3 datasets                                                        │
+│  Olfactory only (fixed window)                                         │
 │  8 neural architectures, identify top performers                       │
 ├────────────────────────────────────────────────────────────────────────┤
 │  PHASE 3: CONDUNET ABLATIONS                                           │
 │  ───────────────────────────                                           │
-│  Olfactory only (primary dataset)                                      │
+│  Olfactory only (fixed window)                                         │
 │  6 ablation studies, justify design decisions                          │
 ├────────────────────────────────────────────────────────────────────────┤
 │  PHASE 4: INTER vs INTRA SESSION                                       │
 │  ──────────────────────────────                                        │
-│  All 3 datasets                                                        │
+│  All 3 datasets (Olfactory, PFC, DANDI)                                │
 │  Cross-session vs within-session generalization                        │
 ├────────────────────────────────────────────────────────────────────────┤
 │  PHASE 5: REAL-TIME CONTINUOUS                                         │
@@ -44,26 +44,10 @@
 ---
 
 # PHASE 1: CLASSICAL BASELINES
-## All Datasets | Establish Performance Floor
-
-### 1A: Olfactory (OB → PCx)
+## Olfactory Only | Establish Performance Floor
 
 ```bash
-python run_tier0.py --dataset olfactory --output results/p1/olfactory/
-```
-
-### 1B: PFC (PFC → CA1)
-
-```bash
-python run_tier0.py --dataset pfc --output results/p1/pfc/
-```
-
-### 1C: DANDI (AMY → HPC)
-
-```bash
-python run_tier0.py --dataset dandi \
-  --source-region amygdala --target-region hippocampus \
-  --output results/p1/dandi/
+python run_tier0.py --dataset olfactory --output results/p1/
 ```
 
 ### Methods (7 total)
@@ -77,54 +61,29 @@ python run_tier0.py --dataset dandi \
 | VAR | Vector autoregressive |
 | VAR Exogenous | VAR with input signals |
 
-### Figure 1.1: Classical Baselines Across Datasets
+### Figure 1.1: Classical Baselines
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  (A) R² by method - Olfactory                           │
-│  (B) R² by method - PFC                                 │
-│  (C) R² by method - DANDI                               │
-│  (D) Cross-dataset comparison: best classical per dataset│
+│  (A) R² by method (7 methods, sorted)                   │
+│  (B) Per-frequency breakdown (top 3 methods)            │
+│  (C) Example predictions vs ground truth                │
+│  (D) PSD comparison (actual vs predicted)               │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### Deliverables
-- [ ] Best classical R² (Olfactory): ______
-- [ ] Best classical R² (PFC): ______
-- [ ] Best classical R² (DANDI): ______
+- [ ] Best classical R²: ______
+- [ ] Best method: ______
 
 ---
 
 # PHASE 2: ARCHITECTURE SCREENING
-## All Datasets | Neural Methods
-
-### 2A: Olfactory
+## Olfactory Only | Neural Methods
 
 ```bash
 for arch in linear simplecnn wavenet fnet vit performer mamba condunet; do
   for seed in 42 43 44; do
     python train.py --dataset olfactory --arch $arch --epochs 60 --seed $seed
-  done
-done
-```
-
-### 2B: PFC
-
-```bash
-for arch in linear simplecnn wavenet fnet vit performer mamba condunet; do
-  for seed in 42 43 44; do
-    python train.py --dataset pfc --arch $arch --epochs 60 --seed $seed
-  done
-done
-```
-
-### 2C: DANDI
-
-```bash
-for arch in linear simplecnn wavenet fnet vit performer mamba condunet; do
-  for seed in 42 43 44; do
-    python train.py --dataset dandi \
-      --dandi-source-region amygdala --dandi-target-region hippocampus \
-      --arch $arch --epochs 60 --seed $seed
   done
 done
 ```
@@ -141,30 +100,20 @@ done
 | Mamba1D | State Space | Selective SSM |
 | **CondUNet** | **U-Net** | **Skip + conditioning** |
 
-### Figure 2.1: Architecture Comparison Across Datasets
+### Figure 2.1: Architecture Comparison
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  (A) R² by architecture - Olfactory                     │
-│  (B) R² by architecture - PFC                           │
-│  (C) R² by architecture - DANDI                         │
-│  (D) CondUNet rank across all 3 datasets                │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Figure 2.2: Neural vs Classical
-```
-┌─────────────────────────────────────────────────────────┐
-│  (A) ΔR² improvement over classical (per dataset)       │
-│  (B) Which architectures beat classical baseline?       │
+│  (A) R² by architecture (8 methods, sorted)             │
+│  (B) ΔR² improvement over classical baseline            │
 │  (C) Params vs Performance trade-off                    │
-│  (D) Consistent winners across datasets                 │
+│  (D) Learning curves (top 3 architectures)              │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ### Deliverables
-- [ ] Top architecture per dataset
-- [ ] CondUNet ranking across datasets
-- [ ] Runs: 8 × 3 seeds × 3 datasets = 72 runs
+- [ ] Top architecture: ______
+- [ ] CondUNet ranking: ______
+- [ ] Runs: 8 × 3 seeds = 24 runs
 
 ---
 
@@ -381,9 +330,9 @@ python benchmark.py --model best_dandi.pt --batch-sizes 1 4 16 64
 | Figure | Content | Source Phase |
 |--------|---------|--------------|
 | **Fig 1** | Method overview, architecture | - |
-| **Fig 2** | Classical baselines (3 datasets) | Phase 1 |
-| **Fig 3** | Architecture screening (3 datasets) | Phase 2 |
-| **Fig 4** | CondUNet ablations | Phase 3 |
+| **Fig 2** | Classical baselines (Olfactory) | Phase 1 |
+| **Fig 3** | Architecture screening (Olfactory) | Phase 2 |
+| **Fig 4** | CondUNet ablations (Olfactory) | Phase 3 |
 | **Fig 5** | Inter vs Intra session (3 datasets) | Phase 4 |
 | **Fig 6** | Real-time continuous (3 datasets) | Phase 5 |
 
@@ -393,12 +342,12 @@ python benchmark.py --model best_dandi.pt --batch-sizes 1 4 16 64
 
 | Phase | Focus | Datasets | Est. Runs |
 |-------|-------|----------|-----------|
-| 1 | Classical Baselines | All 3 | ~21 (7×3) |
-| 2 | Architecture Screening | All 3 | 72 (8×3×3) |
+| 1 | Classical Baselines | Olfactory | 7 |
+| 2 | Architecture Screening | Olfactory | 24 (8×3) |
 | 3 | CondUNet Ablations | Olfactory | 18 |
 | 4 | Inter vs Intra Session | All 3 | 18 (2×3×3 seeds) |
 | 5 | Real-time Continuous | All 3 | ~30 |
-| **Total** | | | **~160 runs** |
+| **Total** | | | **~97 runs** |
 
 ---
 
