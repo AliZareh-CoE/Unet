@@ -52,12 +52,12 @@ from .trainer import Phase5Trainer
 
 @dataclass
 class ExperimentResult:
-    """Result from a single experiment."""
+    """Result from a single experiment (one fold)."""
 
     dataset: str
     window_size: int
     stride_ratio: float
-    seed: int
+    fold: int  # CV fold index
 
     # Performance
     train_r2: float
@@ -77,7 +77,7 @@ class ExperimentResult:
             "dataset": self.dataset,
             "window_size": self.window_size,
             "stride_ratio": self.stride_ratio,
-            "seed": self.seed,
+            "fold": self.fold,
             "train_r2": self.train_r2,
             "val_r2": self.val_r2,
             "test_r2": self.test_r2,
@@ -219,18 +219,20 @@ def run_experiment(
     dataset: str,
     window_size: int,
     stride_ratio: float,
-    seed: int,
+    fold: int,
+    cv_seed: int,
     training_config: TrainingConfig,
     model_config: Dict[str, Any],
     device: str = "cuda",
     verbose: int = 1,
 ) -> ExperimentResult:
-    """Run a single real-time experiment."""
+    """Run a single real-time experiment (one fold)."""
+    seed = cv_seed + fold
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     if verbose >= 1:
-        print(f"\n  [{dataset}] seed={seed}")
+        print(f"\n  [{dataset}] fold {fold + 1}")
 
     # Create data
     train_ds, val_ds, test_ds, test_source, test_target = create_synthetic_sliding_data(
@@ -279,7 +281,7 @@ def run_experiment(
         dataset=dataset,
         window_size=window_size,
         stride_ratio=stride_ratio,
-        seed=seed,
+        fold=fold,
         train_r2=train_r2,
         val_r2=history["best_val_r2"],
         test_r2=test_r2,
@@ -312,14 +314,14 @@ def run_benchmarks(
 # =============================================================================
 
 def run_phase5(config: Phase5Config) -> Phase5Result:
-    """Run all Phase 5 experiments."""
+    """Run all Phase 5 experiments with 5-fold cross-validation."""
     print("\n" + "=" * 60)
-    print("Phase 5: Real-Time Continuous Processing")
+    print("Phase 5: Real-Time Continuous Processing (5-Fold CV)")
     print("=" * 60)
     print(f"Datasets: {config.datasets}")
     print(f"Window size: {config.window_size} samples")
     print(f"Stride ratio: {config.stride_ratio}")
-    print(f"Seeds: {config.seeds}")
+    print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     print("=" * 60)
 
@@ -331,12 +333,13 @@ def run_phase5(config: Phase5Config) -> Phase5Result:
         print(f"Dataset: {dataset.upper()}")
         print(f"{'=' * 40}")
 
-        for seed in config.seeds:
+        for fold_idx in range(config.n_folds):
             result = run_experiment(
                 dataset=dataset,
                 window_size=config.window_size,
                 stride_ratio=config.stride_ratio,
-                seed=seed,
+                fold=fold_idx,
+                cv_seed=config.cv_seed,
                 training_config=config.training,
                 model_config=config.model_config,
                 device=config.device,
@@ -465,7 +468,8 @@ def main():
                        help="Stride ratio (default: 0.5)")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    parser.add_argument("--n-folds", type=int, default=5, help="Number of CV folds")
+    parser.add_argument("--cv-seed", type=int, default=42, help="Random seed for CV")
     parser.add_argument("--output-dir", type=str, default="results/phase5")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -505,7 +509,8 @@ def main():
         datasets=datasets,
         window_size=args.window_size,
         stride_ratio=args.stride_ratio,
-        seeds=args.seeds,
+        n_folds=2 if args.dry_run else args.n_folds,
+        cv_seed=args.cv_seed,
         training=training_config,
         benchmark=benchmark_config,
         output_dir=Path(args.output_dir),

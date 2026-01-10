@@ -153,7 +153,8 @@ class Phase4Config:
     Attributes:
         datasets: List of datasets to evaluate
         split_modes: Split modes to test (intra, inter)
-        seeds: Random seeds for multiple runs
+        n_folds: Number of cross-validation folds
+        cv_seed: Random seed for CV splits
         training: Training configuration
         output_dir: Directory for results
     """
@@ -166,8 +167,9 @@ class Phase4Config:
         default_factory=lambda: [SplitMode.INTRA_SESSION, SplitMode.INTER_SESSION]
     )
 
-    # Multiple seeds for statistical validity
-    seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
+    # Cross-validation settings
+    n_folds: int = 5
+    cv_seed: int = 42
 
     # Training config
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -225,7 +227,8 @@ class Phase4Config:
         return {
             "datasets": self.datasets,
             "split_modes": [m.value for m in self.split_modes],
-            "seeds": self.seeds,
+            "n_folds": self.n_folds,
+            "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
             "model_config": self.model_config,
             "output_dir": str(self.output_dir),
@@ -236,8 +239,8 @@ class Phase4Config:
 
     @property
     def total_runs(self) -> int:
-        """Total number of training runs."""
-        return len(self.datasets) * len(self.split_modes) * len(self.seeds)
+        """Total number of training runs (datasets × split_modes × folds)."""
+        return len(self.datasets) * len(self.split_modes) * self.n_folds
 
 
 @dataclass

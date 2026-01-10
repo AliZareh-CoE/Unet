@@ -226,7 +226,8 @@ class Phase3Config:
     Attributes:
         dataset: Dataset name ('olfactory')
         studies: Which ablation studies to run
-        seeds: Random seeds for multiple runs (default: single seed for ablations)
+        n_folds: Number of cross-validation folds
+        cv_seed: Random seed for CV splits
         training: Training configuration
         output_dir: Directory for results
     """
@@ -238,8 +239,9 @@ class Phase3Config:
     # Which ablation studies to run
     studies: List[str] = field(default_factory=lambda: list(ABLATION_STUDIES.keys()))
 
-    # Seeds (fewer for ablations - 1 seed by default, can be extended)
-    seeds: List[int] = field(default_factory=lambda: [42])
+    # Cross-validation settings
+    n_folds: int = 5
+    cv_seed: int = 42
 
     # Training config
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -294,7 +296,8 @@ class Phase3Config:
             "dataset": self.dataset,
             "sample_rate": self.sample_rate,
             "studies": self.studies,
-            "seeds": self.seeds,
+            "n_folds": self.n_folds,
+            "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
             "output_dir": str(self.output_dir),
             "device": self.device,
@@ -303,11 +306,11 @@ class Phase3Config:
 
     @property
     def total_runs(self) -> int:
-        """Total number of ablation runs."""
+        """Total number of ablation runs (ablations × folds)."""
         total = 0
         for study in self.studies:
             total += ABLATION_STUDIES[study]["n_variants"]
-        return total * len(self.seeds)
+        return total * self.n_folds
 
 
 def get_baseline_config() -> AblationConfig:

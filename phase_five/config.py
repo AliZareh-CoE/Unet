@@ -171,8 +171,9 @@ class Phase5Config:
     window_size: int = DEFAULT_WINDOW_SIZE
     stride_ratio: float = DEFAULT_STRIDE_RATIO
 
-    # Seeds for statistical validity
-    seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
+    # Cross-validation settings
+    n_folds: int = 5
+    cv_seed: int = 42
 
     # Benchmark config
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
@@ -219,9 +220,10 @@ class Phase5Config:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "datasets": self.datasets,
-            "window_sizes": self.window_sizes,
-            "stride_ratios": self.stride_ratios,
-            "seeds": self.seeds,
+            "window_size": self.window_size,
+            "stride_ratio": self.stride_ratio,
+            "n_folds": self.n_folds,
+            "cv_seed": self.cv_seed,
             "benchmark": self.benchmark.to_dict(),
             "training": self.training.to_dict(),
             "model_config": self.model_config,
@@ -231,8 +233,8 @@ class Phase5Config:
 
     @property
     def total_runs(self) -> int:
-        """Total training runs (one per dataset per seed)."""
-        return len(self.datasets) * len(self.seeds)
+        """Total training runs (datasets × folds)."""
+        return len(self.datasets) * self.n_folds
 
 
 @dataclass

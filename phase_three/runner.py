@@ -40,11 +40,11 @@ from .model_builder import build_condunet, count_parameters
 
 @dataclass
 class AblationResult:
-    """Result from a single ablation experiment."""
+    """Result from a single ablation experiment (one fold)."""
 
     study: str
     variant: str
-    seed: int
+    fold: int  # CV fold index
 
     # Performance
     best_r2: float
@@ -65,7 +65,7 @@ class AblationResult:
         return {
             "study": self.study,
             "variant": self.variant,
-            "seed": self.seed,
+            "fold": self.fold,
             "best_r2": self.best_r2,
             "best_loss": self.best_loss,
             "train_losses": self.train_losses,
@@ -117,7 +117,7 @@ class Phase3Result:
             AblationResult(
                 study=r["study"],
                 variant=r["variant"],
-                seed=r["seed"],
+                fold=r.get("fold", r.get("seed", 0)),  # Support old and new format
                 best_r2=r["best_r2"],
                 best_loss=r["best_loss"],
                 train_losses=r["train_losses"],
@@ -142,41 +142,131 @@ class Phase3Result:
 
 
 # =============================================================================
-# Data Loading
+# Data Loading and Cross-Validation
 # =============================================================================
 
-def load_dataset(
+def create_cv_splits(
+    n_samples: int,
+    n_folds: int = 5,
+    seed: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Create K-fold cross-validation splits.
+
+    Args:
+        n_samples: Total number of samples
+        n_folds: Number of folds
+        seed: Random seed for reproducibility
+
+    Returns:
+        List of (train_indices, val_indices) tuples
+    """
+    np.random.seed(seed)
+    indices = np.random.permutation(n_samples)
+    fold_size = n_samples // n_folds
+
+    splits = []
+    for i in range(n_folds):
+        val_start = i * fold_size
+        val_end = val_start + fold_size if i < n_folds - 1 else n_samples
+
+        val_idx = indices[val_start:val_end]
+        train_idx = np.concatenate([indices[:val_start], indices[val_end:]])
+
+        splits.append((train_idx, val_idx))
+
+    return splits
+
+
+def load_dataset_raw(
     dataset_name: str,
-    batch_size: int = 32,
-    n_workers: int = 4,
-) -> Tuple[DataLoader, DataLoader, int, int]:
-    """Load dataset and create dataloaders.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Load dataset as raw tensors for cross-validation.
 
     Args:
         dataset_name: Name of dataset ('olfactory', etc.)
-        batch_size: Batch size
-        n_workers: DataLoader workers
 
     Returns:
-        train_loader, val_loader, in_channels, out_channels
+        X, y, odor_ids, in_channels, out_channels
     """
     try:
-        # Try to load real dataset
-        from data import get_dataloader
+        from data import prepare_data
 
-        train_loader = get_dataloader(dataset_name, split="train", batch_size=batch_size)
-        val_loader = get_dataloader(dataset_name, split="val", batch_size=batch_size)
+        print(f"Loading {dataset_name} dataset...")
+        data = prepare_data()
 
-        # Get channel info from first batch
-        sample = next(iter(train_loader))
-        in_channels = sample[0].shape[1]
-        out_channels = sample[1].shape[1] if len(sample) > 1 else in_channels
+        ob = data["ob"]    # [N, C, T]
+        pcx = data["pcx"]  # [N, C, T]
 
-        return train_loader, val_loader, in_channels, out_channels
+        # Combine train+val for CV
+        train_idx = data["train_idx"]
+        val_idx = data["val_idx"]
+        all_idx = np.concatenate([train_idx, val_idx])
 
-    except (ImportError, FileNotFoundError):
-        print(f"Dataset '{dataset_name}' not available, using synthetic data")
-        return create_synthetic_data(batch_size, n_workers)
+        X = torch.from_numpy(ob[all_idx]).float()
+        y = torch.from_numpy(pcx[all_idx]).float()
+
+        # Create dummy odor IDs if not available
+        odor_ids = torch.zeros(len(all_idx), dtype=torch.long)
+
+        in_channels = X.shape[1]
+        out_channels = y.shape[1]
+
+        print(f"  Loaded: {X.shape} samples for cross-validation")
+
+        return X, y, odor_ids, in_channels, out_channels
+
+    except (ImportError, FileNotFoundError) as e:
+        print(f"Dataset '{dataset_name}' not available ({e}), using synthetic data")
+        return create_synthetic_data_raw()
+
+
+def create_synthetic_data_raw(
+    n_samples: int = 1000,
+    seq_len: int = 5000,
+    in_channels: int = 32,
+    out_channels: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Create synthetic data as raw tensors."""
+    X = torch.randn(n_samples, in_channels, seq_len)
+    y = X + 0.5 * torch.randn_like(X)
+
+    # Smooth with simple conv
+    kernel = torch.ones(1, 1, 51) / 51
+    for c in range(out_channels):
+        y[:, c:c+1, :] = torch.nn.functional.conv1d(
+            y[:, c:c+1, :], kernel, padding=25
+        )
+
+    odor_ids = torch.randint(0, 7, (n_samples,))
+
+    return X, y, odor_ids, in_channels, out_channels
+
+
+def create_dataloaders_from_indices(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    odor_ids: torch.Tensor,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    batch_size: int = 32,
+    n_workers: int = 4,
+) -> Tuple[DataLoader, DataLoader]:
+    """Create dataloaders from data and indices."""
+    train_dataset = TensorDataset(
+        X[train_idx], y[train_idx], odor_ids[train_idx]
+    )
+    val_dataset = TensorDataset(
+        X[val_idx], y[val_idx], odor_ids[val_idx]
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_workers
+    )
+
+    return train_loader, val_loader
 
 
 def create_synthetic_data(
@@ -234,12 +324,13 @@ def run_single_ablation(
     val_loader: DataLoader,
     in_channels: int,
     out_channels: int,
-    seed: int,
+    fold: int,
+    cv_seed: int = 42,
     device: str = "cuda",
     checkpoint_dir: Optional[Path] = None,
     verbose: int = 1,
 ) -> AblationResult:
-    """Run a single ablation experiment.
+    """Run a single ablation experiment (one fold).
 
     Args:
         ablation_config: Ablation configuration
@@ -248,7 +339,8 @@ def run_single_ablation(
         val_loader: Validation dataloader
         in_channels: Input channels
         out_channels: Output channels
-        seed: Random seed
+        fold: Cross-validation fold index
+        cv_seed: Base seed for reproducibility
         device: Device to use
         checkpoint_dir: Directory for checkpoints
         verbose: Verbosity level
@@ -256,7 +348,8 @@ def run_single_ablation(
     Returns:
         AblationResult with training metrics
     """
-    # Set seed
+    # Set seed based on fold for reproducibility
+    seed = cv_seed + fold
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -265,7 +358,7 @@ def run_single_ablation(
     n_params = count_parameters(model)
 
     if verbose >= 1:
-        print(f"\n  [{ablation_config.study}] {ablation_config.variant}")
+        print(f"\n  [{ablation_config.study}] {ablation_config.variant} (fold {fold + 1})")
         print(f"    Parameters: {n_params:,}")
 
     # Create trainer
@@ -288,7 +381,7 @@ def run_single_ablation(
     return AblationResult(
         study=ablation_config.study,
         variant=ablation_config.variant,
-        seed=seed,
+        fold=fold,
         best_r2=history["best_val_r2"],
         best_loss=history["best_val_loss"],
         train_losses=history["train_losses"],
@@ -302,7 +395,7 @@ def run_single_ablation(
 
 
 def run_phase3(config: Phase3Config) -> Phase3Result:
-    """Run all Phase 3 ablation studies.
+    """Run all Phase 3 ablation studies with 5-fold cross-validation.
 
     Args:
         config: Phase 3 configuration
@@ -311,27 +404,33 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
         Phase3Result with all ablation results
     """
     print("\n" + "=" * 60)
-    print("Phase 3: CondUNet Ablation Studies")
+    print("Phase 3: CondUNet Ablation Studies (5-Fold Cross-Validation)")
     print("=" * 60)
     print(f"Dataset: {config.dataset}")
     print(f"Studies: {config.studies}")
-    print(f"Seeds: {config.seeds}")
+    print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     print("=" * 60)
 
-    # Load data
-    train_loader, val_loader, in_channels, out_channels = load_dataset(
-        config.dataset,
-        batch_size=config.training.batch_size,
-        n_workers=config.n_workers,
-    )
+    # Load raw data for CV
+    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
 
-    # First, run baseline
+    # Create CV splits
+    cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
+    print(f"CV splits: {[len(s[1]) for s in cv_splits]} validation samples per fold")
+
+    # First, run baseline across all folds
     print("\n[Baseline] Running full CondUNet configuration...")
     baseline_config = get_baseline_config()
     baseline_results = []
 
-    for seed in config.seeds:
+    for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
+        train_loader, val_loader = create_dataloaders_from_indices(
+            X, y, odor_ids, train_idx, val_idx,
+            batch_size=config.training.batch_size,
+            n_workers=config.n_workers,
+        )
+
         result = run_single_ablation(
             ablation_config=baseline_config,
             training_config=config.training,
@@ -339,15 +438,17 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
             val_loader=val_loader,
             in_channels=in_channels,
             out_channels=out_channels,
-            seed=seed,
+            fold=fold_idx,
+            cv_seed=config.cv_seed,
             device=config.device,
-            checkpoint_dir=config.checkpoint_dir / "baseline",
+            checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
             verbose=config.verbose,
         )
         baseline_results.append(result)
 
     baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
-    print(f"\nBaseline R²: {baseline_r2:.4f}")
+    baseline_std = np.std([r.best_r2 for r in baseline_results])
+    print(f"\nBaseline R²: {baseline_r2:.4f} ± {baseline_std:.4f}")
 
     # Run ablation studies
     all_results = baseline_results.copy()
@@ -363,7 +464,13 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
         ]
 
         for ablation_config in ablation_configs:
-            for seed in config.seeds:
+            for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, train_idx, val_idx,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                )
+
                 result = run_single_ablation(
                     ablation_config=ablation_config,
                     training_config=config.training,
@@ -371,9 +478,10 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
                     val_loader=val_loader,
                     in_channels=in_channels,
                     out_channels=out_channels,
-                    seed=seed,
+                    fold=fold_idx,
+                    cv_seed=config.cv_seed,
                     device=config.device,
-                    checkpoint_dir=config.checkpoint_dir / study,
+                    checkpoint_dir=config.checkpoint_dir / study / f"fold{fold_idx}",
                     verbose=config.verbose,
                 )
                 all_results.append(result)
@@ -523,9 +631,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
 
-    # Seeds
+    # Cross-validation
     parser.add_argument(
-        "--seeds", type=int, nargs="+", default=[42], help="Random seeds"
+        "--n-folds", type=int, default=5, help="Number of CV folds"
+    )
+    parser.add_argument(
+        "--cv-seed", type=int, default=42, help="Random seed for CV splits"
     )
 
     # Output
@@ -608,7 +719,8 @@ def main():
     config = Phase3Config(
         dataset=args.dataset,
         studies=studies,
-        seeds=args.seeds,
+        n_folds=2 if args.dry_run else args.n_folds,
+        cv_seed=args.cv_seed,
         training=training_config,
         output_dir=Path(args.output_dir),
         device=args.device,

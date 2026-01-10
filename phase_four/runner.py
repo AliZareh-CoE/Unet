@@ -50,11 +50,11 @@ from .trainer import Phase4Trainer
 
 @dataclass
 class ExperimentResult:
-    """Result from a single experiment."""
+    """Result from a single experiment (one fold)."""
 
     dataset: str
     split_mode: str  # "intra" or "inter"
-    seed: int
+    fold: int  # CV fold index
 
     # Performance
     train_r2: float
@@ -82,7 +82,7 @@ class ExperimentResult:
         return {
             "dataset": self.dataset,
             "split_mode": self.split_mode,
-            "seed": self.seed,
+            "fold": self.fold,
             "train_r2": self.train_r2,
             "val_r2": self.val_r2,
             "test_r2": self.test_r2,
@@ -142,7 +142,7 @@ class Phase4Result:
             ExperimentResult(
                 dataset=r["dataset"],
                 split_mode=r["split_mode"],
-                seed=r["seed"],
+                fold=r.get("fold", r.get("seed", 0)),  # Support old and new format
                 train_r2=r["train_r2"],
                 val_r2=r["val_r2"],
                 test_r2=r["test_r2"],
@@ -286,7 +286,8 @@ def build_model(
 def run_single_experiment(
     dataset_name: str,
     split_mode: SplitMode,
-    seed: int,
+    fold: int,
+    cv_seed: int,
     training_config: TrainingConfig,
     model_config: Dict[str, Any],
     device: str = "cuda",
@@ -294,8 +295,9 @@ def run_single_experiment(
     verbose: int = 1,
     n_samples: int = 1000,
 ) -> ExperimentResult:
-    """Run a single experiment."""
-    # Set seed
+    """Run a single experiment (one fold)."""
+    # Set seed based on fold
+    seed = cv_seed + fold
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -304,12 +306,12 @@ def run_single_experiment(
         dataset_name, n_samples=n_samples
     )
 
-    # Create splits
+    # Create splits (use fold as random state for different splits)
     splitter = SessionSplitter(session_ids, random_state=seed)
     split = splitter.split(split_mode)
 
     if verbose >= 1:
-        print(f"\n  [{dataset_name}] {split_mode.value} | seed={seed}")
+        print(f"\n  [{dataset_name}] {split_mode.value} | fold {fold + 1}")
         print(f"    Train: {split.n_train} | Val: {split.n_val} | Test: {split.n_test}")
         print(f"    Train sessions: {len(split.train_sessions)} | Test sessions: {len(split.test_sessions)}")
 
@@ -344,7 +346,7 @@ def run_single_experiment(
     exp_config = ExperimentConfig(
         dataset=dataset_name,
         split_mode=split_mode,
-        seed=seed,
+        seed=cv_seed + fold,
     )
 
     # Train
@@ -378,7 +380,7 @@ def run_single_experiment(
     return ExperimentResult(
         dataset=dataset_name,
         split_mode=split_mode.value,
-        seed=seed,
+        fold=fold,
         train_r2=train_r2,
         val_r2=history["best_val_r2"],
         test_r2=test_r2,
@@ -397,13 +399,13 @@ def run_single_experiment(
 
 
 def run_phase4(config: Phase4Config) -> Phase4Result:
-    """Run all Phase 4 experiments."""
+    """Run all Phase 4 experiments with 5-fold cross-validation."""
     print("\n" + "=" * 60)
-    print("Phase 4: Inter vs Intra Session Generalization")
+    print("Phase 4: Inter vs Intra Session Generalization (5-Fold CV)")
     print("=" * 60)
     print(f"Datasets: {config.datasets}")
     print(f"Split modes: {[m.value for m in config.split_modes]}")
-    print(f"Seeds: {config.seeds}")
+    print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     print("=" * 60)
 
@@ -415,15 +417,16 @@ def run_phase4(config: Phase4Config) -> Phase4Result:
         print(f"{'=' * 40}")
 
         for split_mode in config.split_modes:
-            for seed in config.seeds:
+            for fold_idx in range(config.n_folds):
                 result = run_single_experiment(
                     dataset_name=dataset,
                     split_mode=split_mode,
-                    seed=seed,
+                    fold=fold_idx,
+                    cv_seed=config.cv_seed,
                     training_config=config.training,
                     model_config=config.model_config,
                     device=config.device,
-                    checkpoint_dir=config.checkpoint_dir / dataset,
+                    checkpoint_dir=config.checkpoint_dir / dataset / f"fold{fold_idx}",
                     verbose=config.verbose,
                 )
                 all_results.append(result)
@@ -588,9 +591,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
 
-    # Seeds
+    # Cross-validation
     parser.add_argument(
-        "--seeds", type=int, nargs="+", default=[42, 43, 44], help="Random seeds"
+        "--n-folds", type=int, default=5, help="Number of CV folds"
+    )
+    parser.add_argument(
+        "--cv-seed", type=int, default=42, help="Random seed for CV splits"
     )
 
     # Output
@@ -655,7 +661,8 @@ def main():
 
     config = Phase4Config(
         datasets=datasets,
-        seeds=args.seeds,
+        n_folds=2 if args.dry_run else args.n_folds,
+        cv_seed=args.cv_seed,
         training=training_config,
         output_dir=Path(args.output_dir),
         device=args.device,
