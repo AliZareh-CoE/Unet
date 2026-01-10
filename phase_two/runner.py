@@ -56,6 +56,17 @@ from phase_two.config import (
 from phase_two.architectures import create_architecture, list_architectures
 from phase_two.trainer import Trainer, TrainingResult, create_dataloaders
 
+# Import shared statistical utilities
+from utils import (
+    compare_methods,
+    compare_multiple_methods,
+    holm_correction,
+    fdr_correction,
+    check_assumptions,
+    format_mean_ci,
+    confidence_interval,
+)
+
 
 # =============================================================================
 # Phase 1 Result Loading
@@ -126,6 +137,8 @@ class Phase2Result:
     gate_passed: bool
     classical_baseline_r2: float
     config: Dict[str, Any]
+    comprehensive_stats: Optional[Dict[str, Any]] = None
+    assumption_checks: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -137,6 +150,8 @@ class Phase2Result:
             "gate_passed": self.gate_passed,
             "classical_baseline_r2": self.classical_baseline_r2,
             "config": self.config,
+            "comprehensive_stats": self.comprehensive_stats,
+            "assumption_checks": self.assumption_checks,
             "timestamp": self.timestamp,
         }
 
@@ -424,6 +439,49 @@ def run_phase2(
     # Check gate
     gate_passed = check_gate_threshold(best_r2, classical_r2)
 
+    # Comprehensive statistical analysis
+    comprehensive_stats = {}
+    assumption_checks = {}
+
+    if len(valid_archs) >= 2:
+        print("\nComputing comprehensive statistical analysis...")
+
+        best_r2s = aggregated[best_arch].get("fold_r2s", [])
+
+        for arch_name in aggregated.keys():
+            if arch_name == best_arch:
+                continue
+
+            arch_r2s_list = aggregated[arch_name].get("fold_r2s", [])
+
+            if len(best_r2s) >= 2 and len(arch_r2s_list) >= 2:
+                values_best = np.array(best_r2s)
+                values_other = np.array(arch_r2s_list)
+
+                # Comprehensive comparison
+                comp_result = compare_methods(
+                    values_best, values_other,
+                    name_a=best_arch, name_b=arch_name,
+                    paired=True, alpha=0.05
+                )
+                comprehensive_stats[arch_name] = comp_result.to_dict()
+
+                # Check assumptions
+                assumptions = check_assumptions(values_best, values_other, alpha=0.05)
+                assumption_checks[arch_name] = assumptions
+
+        # Apply multiple comparison corrections
+        if comprehensive_stats:
+            p_values = [comprehensive_stats[m]["parametric_test"]["p_value"]
+                       for m in comprehensive_stats]
+            significant_holm = holm_correction(p_values, alpha=0.05)
+            significant_fdr, adjusted_p = fdr_correction(p_values, alpha=0.05)
+
+            for i, arch_name in enumerate(comprehensive_stats.keys()):
+                comprehensive_stats[arch_name]["significant_holm"] = significant_holm[i]
+                comprehensive_stats[arch_name]["significant_fdr"] = significant_fdr[i]
+                comprehensive_stats[arch_name]["p_fdr_adjusted"] = adjusted_p[i]
+
     result = Phase2Result(
         results=all_results,
         aggregated=aggregated,
@@ -432,6 +490,8 @@ def run_phase2(
         gate_passed=gate_passed,
         classical_baseline_r2=classical_r2,
         config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
+        assumption_checks=assumption_checks,
     )
 
     # Print summary
@@ -465,6 +525,28 @@ def run_phase2(
         print(f"\n✓ GATE PASSED: {best_arch} beats classical by {best_r2 - classical_r2:.4f}")
     else:
         print(f"\n✗ GATE FAILED: Best neural ({best_r2:.4f}) did not beat classical + 0.10")
+
+    # Print comprehensive statistics summary
+    if comprehensive_stats:
+        print("\n" + "=" * 70)
+        print("STATISTICAL ANALYSIS (vs best architecture)")
+        print("=" * 70)
+        print(f"{'Architecture':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("-" * 70)
+        for arch_name, stats in comprehensive_stats.items():
+            t_p = stats["parametric_test"]["p_value"]
+            w_p = stats["nonparametric_test"]["p_value"]
+            d = stats["parametric_test"]["effect_size"] or 0
+            holm_sig = "Yes" if stats.get("significant_holm", False) else "No"
+            fdr_sig = "Yes" if stats.get("significant_fdr", False) else "No"
+            print(f"{arch_name:<15}{t_p:<12.4f}{w_p:<12.4f}{d:<12.3f}{holm_sig:<8}{fdr_sig:<8}")
+
+        # Assumption check summary
+        print("\nAssumption Checks (Normality of differences):")
+        for arch_name, checks in assumption_checks.items():
+            norm_ok = "OK" if checks["normality_diff"]["ok"] else "VIOLATED"
+            rec = checks["recommendation"]
+            print(f"  {arch_name}: {norm_ok} (recommended: {rec})")
 
     return result
 

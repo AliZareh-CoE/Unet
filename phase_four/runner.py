@@ -43,6 +43,15 @@ from .data_splitter import (
 )
 from .trainer import Phase4Trainer
 
+# Import shared statistical utilities
+from utils import (
+    compare_methods,
+    holm_correction,
+    fdr_correction,
+    check_assumptions,
+    confidence_interval,
+)
+
 
 # =============================================================================
 # Result Classes
@@ -109,6 +118,7 @@ class Phase4Result:
     generalization_gaps: Dict[str, float]  # dataset -> gap
     easy_hard_sessions: Dict[str, Tuple[List[int], List[int]]]
     config: Dict[str, Any]
+    comprehensive_stats: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -121,6 +131,7 @@ class Phase4Result:
                 for k, v in self.easy_hard_sessions.items()
             },
             "config": self.config,
+            "comprehensive_stats": self.comprehensive_stats,
             "timestamp": self.timestamp,
         }
 
@@ -436,6 +447,34 @@ def run_phase4(config: Phase4Config) -> Phase4Result:
     generalization_gaps = compute_generalization_gaps(summary)
     easy_hard = identify_all_easy_hard_sessions(all_results)
 
+    # Compute comprehensive statistics (intra vs inter for each dataset)
+    comprehensive_stats = {}
+    print("\nComputing statistical analysis...")
+
+    for dataset, modes in summary.items():
+        if "intra" in modes and "inter" in modes:
+            intra_r2s = modes["intra"].get("fold_test_r2s", [])
+            inter_r2s = modes["inter"].get("fold_test_r2s", [])
+
+            if len(intra_r2s) >= 2 and len(inter_r2s) >= 2:
+                comp = compare_methods(
+                    np.array(intra_r2s),
+                    np.array(inter_r2s),
+                    name_a="intra",
+                    name_b="inter",
+                    paired=True,
+                    alpha=0.05
+                )
+                comprehensive_stats[dataset] = comp.to_dict()
+
+                # Check assumptions
+                assumptions = check_assumptions(
+                    np.array(intra_r2s),
+                    np.array(inter_r2s),
+                    alpha=0.05
+                )
+                comprehensive_stats[dataset]["assumptions"] = assumptions
+
     # Create final result
     phase4_result = Phase4Result(
         results=all_results,
@@ -443,6 +482,7 @@ def run_phase4(config: Phase4Config) -> Phase4Result:
         generalization_gaps=generalization_gaps,
         easy_hard_sessions=easy_hard,
         config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
     )
 
     # Print summary
@@ -488,6 +528,7 @@ def aggregate_results(
             summary[dataset][mode] = {
                 "test_r2_mean": float(np.mean(test_r2s)),
                 "test_r2_std": float(np.std(test_r2s)),
+                "fold_test_r2s": test_r2s,  # Store for statistical analysis
                 "train_r2_mean": float(np.mean(train_r2s)),
                 "train_r2_std": float(np.std(train_r2s)),
                 "time_mean": float(np.mean(times)),
@@ -565,6 +606,27 @@ def print_summary(result: Phase4Result):
     print("\nGeneralization Gaps:")
     for dataset, gap in result.generalization_gaps.items():
         print(f"  {dataset}: {gap:.4f}")
+
+    # Print comprehensive statistics
+    if result.comprehensive_stats:
+        print("\n" + "=" * 60)
+        print("STATISTICAL ANALYSIS (Intra vs Inter)")
+        print("=" * 60)
+        print(f"{'Dataset':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Sig':<8}")
+        print("-" * 60)
+        for dataset, stats in result.comprehensive_stats.items():
+            t_p = stats["parametric_test"]["p_value"]
+            w_p = stats["nonparametric_test"]["p_value"]
+            d = stats["parametric_test"]["effect_size"] or 0
+            sig = "***" if t_p < 0.001 else "**" if t_p < 0.01 else "*" if t_p < 0.05 else "ns"
+            print(f"{dataset:<15}{t_p:<12.4f}{w_p:<12.4f}{d:<12.3f}{sig:<8}")
+
+            # Print assumption check
+            assumptions = stats.get("assumptions", {})
+            if assumptions:
+                norm_ok = "OK" if assumptions.get("normality_diff", {}).get("ok", False) else "VIOLATED"
+                rec = assumptions.get("recommendation", "")
+                print(f"  Normality: {norm_ok} | Recommended: {rec}")
 
     print("=" * 60)
 

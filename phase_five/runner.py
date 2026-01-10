@@ -45,6 +45,14 @@ from .sliding_window import (
 from .benchmark import LatencyBenchmark, BenchmarkResults
 from .trainer import Phase5Trainer
 
+# Import shared statistical utilities
+from utils import (
+    compare_methods,
+    holm_correction,
+    fdr_correction,
+    confidence_interval,
+)
+
 
 # =============================================================================
 # Result Classes
@@ -96,6 +104,7 @@ class Phase5Result:
     benchmark_results: Dict[str, BenchmarkResults]
     summary: Dict[str, Any]
     config: Dict[str, Any]
+    comprehensive_stats: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -104,6 +113,7 @@ class Phase5Result:
             "benchmark_results": {k: v.to_dict() for k, v in self.benchmark_results.items()},
             "summary": self.summary,
             "config": self.config,
+            "comprehensive_stats": self.comprehensive_stats,
             "timestamp": self.timestamp,
         }
 
@@ -358,12 +368,50 @@ def run_phase5(config: Phase5Config) -> Phase5Result:
     # Create summary
     summary = create_summary(all_results, benchmark_results)
 
+    # Compute comprehensive statistics
+    comprehensive_stats = {}
+    print("\nComputing statistical analysis...")
+
+    # Compare test vs continuous R² across all datasets
+    all_test_r2 = [r.test_r2 for r in all_results]
+    all_cont_r2 = [r.continuous_r2 for r in all_results if r.continuous_r2 is not None]
+
+    if len(all_test_r2) >= 2 and len(all_cont_r2) >= 2:
+        # Paired comparison (same folds)
+        min_len = min(len(all_test_r2), len(all_cont_r2))
+        comp = compare_methods(
+            np.array(all_test_r2[:min_len]),
+            np.array(all_cont_r2[:min_len]),
+            name_a="test",
+            name_b="continuous",
+            paired=True,
+            alpha=0.05
+        )
+        comprehensive_stats["test_vs_continuous"] = comp.to_dict()
+
+    # Per-dataset comparisons (vs overall average)
+    for ds, stats in summary.get("by_dataset", {}).items():
+        fold_test = stats.get("fold_test_r2s", [])
+        fold_cont = stats.get("fold_cont_r2s", [])
+
+        if len(fold_test) >= 2 and len(fold_cont) >= 2:
+            comp = compare_methods(
+                np.array(fold_test),
+                np.array(fold_cont),
+                name_a="test",
+                name_b="continuous",
+                paired=True,
+                alpha=0.05
+            )
+            comprehensive_stats[f"{ds}_test_vs_cont"] = comp.to_dict()
+
     # Create result
     phase5_result = Phase5Result(
         results=all_results,
         benchmark_results=benchmark_results,
         summary=summary,
         config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
     )
 
     # Print summary
@@ -407,8 +455,10 @@ def create_summary(
         summary["by_dataset"][ds] = {
             "test_r2_mean": float(np.mean(test_r2s)),
             "test_r2_std": float(np.std(test_r2s)),
+            "fold_test_r2s": test_r2s,  # Store for statistical analysis
             "continuous_r2_mean": float(np.mean(cont_r2s)) if cont_r2s else None,
             "continuous_r2_std": float(np.std(cont_r2s)) if cont_r2s else None,
+            "fold_cont_r2s": cont_r2s if cont_r2s else [],
             "n_runs": len(test_r2s),
         }
 
@@ -451,6 +501,18 @@ def print_summary(result: Phase5Result):
     print(f"{'Overall':<15} {overall.get('test_r2_mean', 0):.4f}")
 
     print(f"\nReal-time Feasible: {result.summary.get('realtime_feasible', False)}")
+
+    # Print comprehensive statistics
+    if result.comprehensive_stats:
+        print("\n" + "=" * 60)
+        print("STATISTICAL ANALYSIS")
+        print("=" * 60)
+        for key, stats in result.comprehensive_stats.items():
+            t_p = stats["parametric_test"]["p_value"]
+            d = stats["parametric_test"]["effect_size"] or 0
+            sig = "***" if t_p < 0.001 else "**" if t_p < 0.01 else "*" if t_p < 0.05 else "ns"
+            print(f"{key}: p={t_p:.4f} {sig}, Cohen's d={d:.3f}")
+
     print("=" * 60)
 
 

@@ -10,12 +10,18 @@ Figures generated:
         (B) Per-frequency breakdown (top 3 methods)
         (C) Example predictions vs ground truth
         (D) PSD comparison (actual vs predicted)
+
+    1.2: Statistical Analysis
+        (A) Box plot with individual fold data
+        (B) Statistical comparison heatmap
+        (C) Effect size forest plot
+        (D) Assumption check summary
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -27,14 +33,36 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 from .config import NEURAL_BANDS
-from .metrics import Phase1Metrics
+from .metrics import Phase1Metrics, StatisticalComparison
+
+# Import shared utilities
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils import (
+    setup_nature_style,
+    NATURE_STYLE as UTILS_NATURE_STYLE,
+    COLORS_CATEGORICAL,
+    add_significance_marker,
+    add_significance_stars,
+    box_plot_with_points,
+    effect_size_forest_plot,
+    comparison_heatmap,
+    create_figure,
+    save_figure,
+    add_panel_labels,
+    compare_methods,
+    compare_multiple_methods,
+    fdr_correction,
+    holm_correction,
+    check_assumptions,
+)
 
 
 # =============================================================================
 # Style Configuration
 # =============================================================================
 
-# Nature Methods style
+# Nature Methods style (local copy for backward compatibility)
 NATURE_STYLE = {
     "font.family": "sans-serif",
     "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
@@ -81,6 +109,7 @@ METHOD_COLORS = {
 def apply_nature_style():
     """Apply Nature Methods style to matplotlib."""
     plt.rcParams.update(NATURE_STYLE)
+    setup_nature_style()  # Also apply shared style
 
 
 # =============================================================================
@@ -400,6 +429,296 @@ class Phase1Visualizer:
         plt.close(fig)
 
         return output_path
+
+    def plot_comprehensive_stats_figure(
+        self,
+        metrics_list: List[Phase1Metrics],
+        comparisons: Optional[List[StatisticalComparison]] = None,
+        filename: str = "figure_1_2_statistical_analysis.pdf",
+    ) -> Path:
+        """Generate comprehensive statistical analysis figure.
+
+        Four panels:
+            (A) Box plot with individual fold data points
+            (B) Statistical comparison heatmap (p-values)
+            (C) Effect size forest plot
+            (D) Metrics comparison table
+
+        Args:
+            metrics_list: List of Phase1Metrics objects
+            comparisons: List of StatisticalComparison objects
+            filename: Output filename
+
+        Returns:
+            Path to saved figure
+        """
+        apply_nature_style()
+
+        # Create figure with 2x2 layout
+        fig = plt.figure(figsize=(7.2, 6.5))
+        gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.4)
+
+        sorted_metrics = sorted(metrics_list, key=lambda m: m.r2_mean, reverse=True)
+        methods = [m.method for m in sorted_metrics]
+
+        # (A) Box plot with individual points
+        ax_a = fig.add_subplot(gs[0, 0])
+        self._plot_boxplot_with_points(ax_a, sorted_metrics)
+
+        # (B) Statistical comparison heatmap
+        ax_b = fig.add_subplot(gs[0, 1])
+        self._plot_comparison_heatmap(ax_b, sorted_metrics, comparisons)
+
+        # (C) Effect size forest plot
+        ax_c = fig.add_subplot(gs[1, 0])
+        self._plot_effect_sizes(ax_c, sorted_metrics, comparisons)
+
+        # (D) Summary metrics table
+        ax_d = fig.add_subplot(gs[1, 1])
+        self._plot_metrics_summary_table(ax_d, sorted_metrics)
+
+        # Add panel labels
+        for ax, label in zip([ax_a, ax_b, ax_c, ax_d], ['A', 'B', 'C', 'D']):
+            ax.text(-0.15, 1.05, label, transform=ax.transAxes,
+                   fontsize=10, fontweight='bold', va='top')
+
+        # Save in multiple formats
+        output_path = self.output_dir / filename
+        fig.savefig(output_path, format='pdf', bbox_inches='tight')
+
+        # Also save PNG
+        png_path = output_path.with_suffix('.png')
+        fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return output_path
+
+    def _plot_boxplot_with_points(
+        self,
+        ax: plt.Axes,
+        metrics_list: List[Phase1Metrics],
+    ):
+        """Plot box plot with individual fold R² values."""
+        methods = [m.method for m in metrics_list]
+        fold_data = {m.method: m.fold_r2s for m in metrics_list if m.fold_r2s}
+
+        if not fold_data:
+            ax.text(0.5, 0.5, "No fold data available",
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(A) R² Distribution Across Folds")
+            return
+
+        # Create box plot
+        positions = list(range(len(methods)))
+        valid_data = [fold_data.get(m, []) for m in methods]
+
+        bp = ax.boxplot([d for d in valid_data if d], positions=[i for i, d in enumerate(valid_data) if d],
+                        patch_artist=True, widths=0.6, showfliers=False)
+
+        # Color boxes
+        colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods if fold_data.get(m)]
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+            patch.set_edgecolor('black')
+
+        # Overlay individual points
+        for i, m in enumerate(methods):
+            if m in fold_data and fold_data[m]:
+                points = fold_data[m]
+                jitter = np.random.uniform(-0.12, 0.12, len(points))
+                ax.scatter([i + j for j in jitter], points, color='black',
+                          s=15, alpha=0.6, zorder=3)
+
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels([m.replace('_', '\n') for m in methods], rotation=0, fontsize=6)
+        ax.set_ylabel('R²')
+        ax.set_title('(A) R² Distribution Across Folds')
+
+        # Add mean markers
+        for i, m in enumerate(metrics_list):
+            ax.plot(i, m.r2_mean, 'r_', markersize=12, markeredgewidth=2)
+
+    def _plot_comparison_heatmap(
+        self,
+        ax: plt.Axes,
+        metrics_list: List[Phase1Metrics],
+        comparisons: Optional[List[StatisticalComparison]] = None,
+    ):
+        """Plot pairwise statistical comparison heatmap."""
+        methods = [m.method for m in metrics_list]
+        n_methods = len(methods)
+
+        # Build p-value matrix
+        p_matrix = np.ones((n_methods, n_methods))
+
+        if comparisons:
+            for c in comparisons:
+                if c.method1 in methods and c.method2 in methods:
+                    i = methods.index(c.method1)
+                    j = methods.index(c.method2)
+                    p_matrix[i, j] = c.p_adjusted
+                    p_matrix[j, i] = c.p_adjusted
+        else:
+            # Compute from fold data
+            for i, m1 in enumerate(metrics_list):
+                for j, m2 in enumerate(metrics_list):
+                    if i < j and m1.fold_r2s and m2.fold_r2s:
+                        comp = compare_methods(
+                            np.array(m1.fold_r2s),
+                            np.array(m2.fold_r2s),
+                            m1.method, m2.method,
+                            paired=True
+                        )
+                        p_matrix[i, j] = comp.parametric_test.p_value
+                        p_matrix[j, i] = comp.parametric_test.p_value
+
+        # Plot heatmap
+        im = ax.imshow(p_matrix, cmap='RdYlGn_r', vmin=0, vmax=0.1)
+
+        ax.set_xticks(range(n_methods))
+        ax.set_yticks(range(n_methods))
+        ax.set_xticklabels([m[:8] for m in methods], rotation=45, ha='right', fontsize=6)
+        ax.set_yticklabels([m[:8] for m in methods], fontsize=6)
+        ax.set_title('(B) Pairwise p-values')
+
+        # Add significance markers
+        for i in range(n_methods):
+            for j in range(n_methods):
+                if i != j:
+                    p = p_matrix[i, j]
+                    if p < 0.001:
+                        text = "***"
+                    elif p < 0.01:
+                        text = "**"
+                    elif p < 0.05:
+                        text = "*"
+                    else:
+                        text = ""
+                    ax.text(j, i, text, ha='center', va='center', fontsize=6, color='white' if p < 0.05 else 'black')
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label('p-value', fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+    def _plot_effect_sizes(
+        self,
+        ax: plt.Axes,
+        metrics_list: List[Phase1Metrics],
+        comparisons: Optional[List[StatisticalComparison]] = None,
+    ):
+        """Plot effect size forest plot vs best method."""
+        if len(metrics_list) < 2:
+            ax.text(0.5, 0.5, "Need multiple methods for comparison",
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(C) Effect Sizes")
+            return
+
+        best = metrics_list[0]  # Already sorted
+        other_methods = metrics_list[1:]
+
+        effect_data = {}
+        for m in other_methods:
+            if comparisons:
+                # Find comparison
+                comp = next((c for c in comparisons
+                           if (c.method1 == best.method and c.method2 == m.method) or
+                              (c.method2 == best.method and c.method1 == m.method)), None)
+                if comp:
+                    d = comp.cohens_d if comp.method1 == best.method else -comp.cohens_d
+                    effect_data[m.method] = {"effect": d, "interp": comp.effect_size}
+            elif best.fold_r2s and m.fold_r2s:
+                comp = compare_methods(
+                    np.array(best.fold_r2s),
+                    np.array(m.fold_r2s),
+                    best.method, m.method, paired=True
+                )
+                d = comp.parametric_test.effect_size or 0
+                effect_data[m.method] = {"effect": d, "interp": self._interpret_effect(d)}
+
+        if not effect_data:
+            ax.text(0.5, 0.5, "No effect size data available",
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(C) Effect Sizes")
+            return
+
+        # Plot forest plot
+        methods = list(effect_data.keys())
+        effects = [effect_data[m]["effect"] for m in methods]
+        y_pos = np.arange(len(methods))
+
+        colors = ['#2E86AB' if e > 0 else '#A23B72' for e in effects]
+        ax.barh(y_pos, effects, color=colors, height=0.6, alpha=0.8)
+
+        # Reference lines for effect size interpretation
+        for x in [-0.8, -0.5, -0.2, 0.2, 0.5, 0.8]:
+            ax.axvline(x=x, color='lightgray', linestyle=':', linewidth=0.5, alpha=0.7)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([m[:10] for m in methods], fontsize=6)
+        ax.set_xlabel(f"Cohen's d (vs {best.method})")
+        ax.set_title("(C) Effect Sizes vs Best Method")
+        ax.invert_yaxis()
+
+        # Add interpretation labels
+        ax.text(0.02, 0.98, "← Best wins | Other wins →", transform=ax.transAxes,
+               fontsize=5, va='top', ha='left', style='italic')
+
+    def _interpret_effect(self, d: float) -> str:
+        """Interpret Cohen's d effect size."""
+        d_abs = abs(d)
+        if d_abs < 0.2:
+            return "negligible"
+        elif d_abs < 0.5:
+            return "small"
+        elif d_abs < 0.8:
+            return "medium"
+        else:
+            return "large"
+
+    def _plot_metrics_summary_table(
+        self,
+        ax: plt.Axes,
+        metrics_list: List[Phase1Metrics],
+    ):
+        """Plot comprehensive metrics summary table."""
+        ax.axis('off')
+
+        # Table data
+        columns = ['Method', 'R²', '95% CI', 'Pearson', 'MAE', 'PSD Err']
+        cell_data = []
+
+        for m in metrics_list[:6]:  # Top 6 methods
+            ci_str = f"[{m.r2_ci[0]:.3f}, {m.r2_ci[1]:.3f}]"
+            row = [
+                m.method[:12],
+                f"{m.r2_mean:.4f}",
+                ci_str,
+                f"{m.pearson_mean:.4f}",
+                f"{m.mae_mean:.4f}",
+                f"{m.psd_error_db:.2f}"
+            ]
+            cell_data.append(row)
+
+        table = ax.table(
+            cellText=cell_data,
+            colLabels=columns,
+            loc='center',
+            cellLoc='center',
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(6)
+        table.scale(1.2, 1.4)
+
+        # Style header row
+        for i in range(len(columns)):
+            table[(0, i)].set_facecolor('#E6E6E6')
+            table[(0, i)].set_text_props(weight='bold')
+
+        ax.set_title('(D) Performance Summary', pad=10)
 
 
 def create_summary_table(metrics_list: List[Phase1Metrics]) -> str:

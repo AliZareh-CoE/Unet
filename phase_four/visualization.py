@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+import sys
 
 import numpy as np
 
@@ -29,6 +30,17 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+
+# Add project root for shared utilities
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils import (
+    setup_nature_style,
+    compare_methods,
+    holm_correction,
+    confidence_interval,
+)
 
 
 # =============================================================================
@@ -76,6 +88,7 @@ DATASET_NAMES = {
 def apply_nature_style():
     """Apply Nature Methods style."""
     plt.rcParams.update(NATURE_STYLE)
+    setup_nature_style()  # Also apply shared style
 
 
 # =============================================================================
@@ -397,6 +410,205 @@ class Phase4Visualizer:
         ax.set_title("(D) Session Difficulty Distribution")
         ax.legend(loc='upper left', frameon=False, fontsize=6)
 
+    def plot_figure_4_3(
+        self,
+        result: Any,
+        filename: str = "figure_4_3_statistical_analysis.pdf",
+    ) -> Path:
+        """Generate Figure 4.3: Statistical Analysis of Intra vs Inter.
+
+        Three panels:
+            (A) Box plots: Intra vs Inter for each dataset with fold data
+            (B) Effect sizes for the generalization gap
+            (C) Statistical significance table
+
+        Args:
+            result: Phase4Result object
+            filename: Output filename
+
+        Returns:
+            Path to saved figure
+        """
+        apply_nature_style()
+
+        fig = plt.figure(figsize=(7.2, 4.5))
+        gs = GridSpec(1, 3, figure=fig, wspace=0.4)
+
+        # (A) Box plots
+        ax_a = fig.add_subplot(gs[0, 0])
+        self._plot_intra_inter_boxplots(ax_a, result)
+
+        # (B) Effect sizes
+        ax_b = fig.add_subplot(gs[0, 1])
+        self._plot_generalization_effect_sizes(ax_b, result)
+
+        # (C) Statistical table
+        ax_c = fig.add_subplot(gs[0, 2])
+        self._plot_statistical_table(ax_c, result)
+
+        # Add panel labels
+        for ax, label in zip([ax_a, ax_b, ax_c], ['A', 'B', 'C']):
+            ax.text(-0.15, 1.08, label, transform=ax.transAxes,
+                   fontsize=10, fontweight='bold', va='top')
+
+        output_path = self.output_dir / filename
+        fig.savefig(output_path, format='pdf', bbox_inches='tight')
+
+        png_path = output_path.with_suffix('.png')
+        fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return output_path
+
+    def _plot_intra_inter_boxplots(self, ax: plt.Axes, result: Any):
+        """Plot box plots comparing intra vs inter for each dataset."""
+        # Collect fold data
+        data = {}
+        for r in result.results:
+            key = f"{r.dataset}:{r.split_mode}"
+            if key not in data:
+                data[key] = []
+            data[key].append(r.test_r2)
+
+        datasets = list(set(r.dataset for r in result.results))
+        n_datasets = len(datasets)
+
+        positions = []
+        fold_data = []
+        colors = []
+        labels = []
+
+        for i, dataset in enumerate(datasets):
+            intra_key = f"{dataset}:intra"
+            inter_key = f"{dataset}:inter"
+
+            if intra_key in data:
+                positions.append(i * 3)
+                fold_data.append(data[intra_key])
+                colors.append(COLORS["intra"])
+                labels.append(f"{dataset[:3]} intra")
+
+            if inter_key in data:
+                positions.append(i * 3 + 1)
+                fold_data.append(data[inter_key])
+                colors.append(COLORS["inter"])
+                labels.append(f"{dataset[:3]} inter")
+
+        if fold_data:
+            bp = ax.boxplot(fold_data, positions=positions, patch_artist=True, widths=0.7, showfliers=False)
+
+            for patch, color in zip(bp["boxes"], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.7)
+
+            # Overlay points
+            for pos, fd in zip(positions, fold_data):
+                jitter = np.random.uniform(-0.15, 0.15, len(fd))
+                ax.scatter([pos + j for j in jitter], fd, color='black', s=15, alpha=0.5, zorder=3)
+
+            ax.set_xticks([i * 3 + 0.5 for i in range(n_datasets)])
+            ax.set_xticklabels([d[:3].upper() for d in datasets], fontsize=7)
+
+        ax.set_ylabel('Test R²')
+        ax.set_title('(A) Intra vs Inter by Dataset')
+
+        # Legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=COLORS["intra"], alpha=0.7, label='Intra'),
+            Patch(facecolor=COLORS["inter"], alpha=0.7, label='Inter'),
+        ]
+        ax.legend(handles=legend_elements, loc='lower right', fontsize=6, frameon=False)
+
+    def _plot_generalization_effect_sizes(self, ax: plt.Axes, result: Any):
+        """Plot effect sizes for generalization gap."""
+        # Collect fold data for statistical comparison
+        effect_data = {}
+
+        for dataset in set(r.dataset for r in result.results):
+            intra_r2s = [r.test_r2 for r in result.results if r.dataset == dataset and r.split_mode == "intra"]
+            inter_r2s = [r.test_r2 for r in result.results if r.dataset == dataset and r.split_mode == "inter"]
+
+            if len(intra_r2s) >= 2 and len(inter_r2s) >= 2:
+                comp = compare_methods(
+                    np.array(intra_r2s), np.array(inter_r2s),
+                    "intra", "inter", paired=True
+                )
+                d = comp.parametric_test.effect_size or 0
+                effect_data[dataset] = d
+
+        if not effect_data:
+            ax.text(0.5, 0.5, "Insufficient data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(B) Effect Sizes")
+            return
+
+        datasets = list(effect_data.keys())
+        effects = [effect_data[d] for d in datasets]
+        y_pos = np.arange(len(datasets))
+
+        colors = [COLORS.get(d, COLORS["gap"]) for d in datasets]
+        ax.barh(y_pos, effects, color=colors, height=0.6, alpha=0.8)
+
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+        for x in [-0.8, -0.5, -0.2, 0.2, 0.5, 0.8]:
+            ax.axvline(x=x, color='lightgray', linestyle=':', linewidth=0.5, alpha=0.7)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([d[:8] for d in datasets], fontsize=6)
+        ax.set_xlabel("Cohen's d (Intra vs Inter)")
+        ax.set_title("(B) Effect Sizes")
+        ax.invert_yaxis()
+
+    def _plot_statistical_table(self, ax: plt.Axes, result: Any):
+        """Plot statistical comparison table."""
+        ax.axis('off')
+
+        table_data = []
+        for dataset in set(r.dataset for r in result.results):
+            intra_r2s = [r.test_r2 for r in result.results if r.dataset == dataset and r.split_mode == "intra"]
+            inter_r2s = [r.test_r2 for r in result.results if r.dataset == dataset and r.split_mode == "inter"]
+
+            if len(intra_r2s) >= 2 and len(inter_r2s) >= 2:
+                comp = compare_methods(
+                    np.array(intra_r2s), np.array(inter_r2s),
+                    "intra", "inter", paired=True
+                )
+                p_val = comp.parametric_test.p_value
+                d = comp.parametric_test.effect_size or 0
+                gap = result.generalization_gaps.get(dataset, 0)
+
+                sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+
+                table_data.append([
+                    dataset[:8],
+                    f"{gap:.3f}",
+                    f"{p_val:.3f}",
+                    f"{d:.2f}",
+                    sig
+                ])
+
+        if not table_data:
+            ax.text(0.5, 0.5, "No statistical data", ha='center', va='center', transform=ax.transAxes)
+            return
+
+        columns = ['Dataset', 'Gap', 'p-value', "Cohen's d", 'Sig']
+        table = ax.table(
+            cellText=table_data,
+            colLabels=columns,
+            loc='center',
+            cellLoc='center',
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(6)
+        table.scale(1.2, 1.4)
+
+        for i in range(len(columns)):
+            table[(0, i)].set_facecolor('#E6E6E6')
+            table[(0, i)].set_text_props(weight='bold')
+
+        ax.set_title('(C) Statistical Comparison', pad=10)
+
     def plot_all(self, result: Any, format: str = "pdf") -> List[Path]:
         """Generate all Phase 4 figures.
 
@@ -415,6 +627,10 @@ class Phase4Visualizer:
 
         paths.append(self.plot_figure_4_2(
             result, filename=f"figure_4_2_session_analysis.{format}"
+        ))
+
+        paths.append(self.plot_figure_4_3(
+            result, filename=f"figure_4_3_statistical_analysis.{format}"
         ))
 
         return [p for p in paths if p is not None]

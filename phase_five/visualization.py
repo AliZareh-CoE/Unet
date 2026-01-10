@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+import sys
 
 import numpy as np
 
@@ -29,6 +30,16 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+
+# Add project root for shared utilities
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils import (
+    setup_nature_style,
+    compare_methods,
+    confidence_interval,
+)
 
 
 # =============================================================================
@@ -70,6 +81,7 @@ DATASET_NAMES = {
 
 def apply_nature_style():
     plt.rcParams.update(NATURE_STYLE)
+    setup_nature_style()  # Also apply shared style
 
 
 # =============================================================================
@@ -371,6 +383,205 @@ class Phase5Visualizer:
         ax.set_title('(D) R² vs Latency')
         ax.legend(frameon=False, fontsize=6, loc='lower right')
 
+    def plot_figure_5_3(
+        self,
+        result: Any,
+        filename: str = "figure_5_3_statistical_analysis.pdf",
+    ) -> Path:
+        """Generate Figure 5.3: Statistical Analysis.
+
+        Three panels:
+            (A) Box plots: Test R² and Continuous R² by dataset with fold data
+            (B) Test vs Continuous comparison statistical analysis
+            (C) Summary metrics table
+
+        Args:
+            result: Phase5Result object
+            filename: Output filename
+
+        Returns:
+            Path to saved figure
+        """
+        apply_nature_style()
+
+        fig = plt.figure(figsize=(7.2, 4.5))
+        gs = GridSpec(1, 3, figure=fig, wspace=0.4)
+
+        # (A) Box plots
+        ax_a = fig.add_subplot(gs[0, 0])
+        self._plot_performance_boxplots(ax_a, result)
+
+        # (B) Test vs Continuous comparison
+        ax_b = fig.add_subplot(gs[0, 1])
+        self._plot_test_continuous_comparison(ax_b, result)
+
+        # (C) Summary table
+        ax_c = fig.add_subplot(gs[0, 2])
+        self._plot_summary_table(ax_c, result)
+
+        # Add panel labels
+        for ax, label in zip([ax_a, ax_b, ax_c], ['A', 'B', 'C']):
+            ax.text(-0.15, 1.08, label, transform=ax.transAxes,
+                   fontsize=10, fontweight='bold', va='top')
+
+        output_path = self.output_dir / filename
+        fig.savefig(output_path, format='pdf', bbox_inches='tight')
+
+        png_path = output_path.with_suffix('.png')
+        fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return output_path
+
+    def _plot_performance_boxplots(self, ax: plt.Axes, result: Any):
+        """Plot box plots for test R² and continuous R² by dataset."""
+        # Collect fold data
+        test_data = {}
+        cont_data = {}
+
+        for r in result.results:
+            ds = r.dataset
+            if ds not in test_data:
+                test_data[ds] = []
+                cont_data[ds] = []
+            test_data[ds].append(r.test_r2)
+            if r.continuous_r2 is not None:
+                cont_data[ds].append(r.continuous_r2)
+
+        datasets = list(test_data.keys())
+        n_datasets = len(datasets)
+
+        if not datasets:
+            ax.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title('(A) R² by Dataset')
+            return
+
+        positions = []
+        fold_data = []
+        colors = []
+
+        for i, ds in enumerate(datasets):
+            # Test R²
+            positions.append(i * 3)
+            fold_data.append(test_data[ds])
+            colors.append(COLORS.get(ds, "#6B7280"))
+
+            # Continuous R²
+            if cont_data[ds]:
+                positions.append(i * 3 + 1)
+                fold_data.append(cont_data[ds])
+                colors.append(COLORS["latency"])
+
+        bp = ax.boxplot(fold_data, positions=positions, patch_artist=True, widths=0.6, showfliers=False)
+
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+
+        # Overlay points
+        for pos, fd in zip(positions, fold_data):
+            jitter = np.random.uniform(-0.1, 0.1, len(fd))
+            ax.scatter([pos + j for j in jitter], fd, color='black', s=12, alpha=0.5, zorder=3)
+
+        ax.set_xticks([i * 3 + 0.5 for i in range(n_datasets)])
+        ax.set_xticklabels([ds[:3].upper() for ds in datasets], fontsize=7)
+        ax.set_ylabel('R²')
+        ax.set_title('(A) R² Distribution by Dataset')
+
+        # Legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=COLORS["throughput"], alpha=0.7, label='Test R²'),
+            Patch(facecolor=COLORS["latency"], alpha=0.7, label='Continuous R²'),
+        ]
+        ax.legend(handles=legend_elements, loc='lower right', fontsize=6, frameon=False)
+
+    def _plot_test_continuous_comparison(self, ax: plt.Axes, result: Any):
+        """Plot effect size comparison between test and continuous R²."""
+        # Collect all fold data
+        all_test = []
+        all_cont = []
+
+        for r in result.results:
+            all_test.append(r.test_r2)
+            if r.continuous_r2 is not None:
+                all_cont.append(r.continuous_r2)
+
+        if len(all_test) < 2 or len(all_cont) < 2:
+            ax.text(0.5, 0.5, "Insufficient data", ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(B) Test vs Continuous")
+            return
+
+        # Compare test vs continuous
+        test_arr = np.array(all_test[:len(all_cont)])
+        cont_arr = np.array(all_cont)
+
+        comp = compare_methods(test_arr, cont_arr, "test", "continuous", paired=True)
+        d = comp.parametric_test.effect_size or 0
+        p_val = comp.parametric_test.p_value
+
+        # Bar plot of means with error bars
+        means = [np.mean(all_test), np.mean(all_cont)]
+        stds = [np.std(all_test), np.std(all_cont)]
+
+        x = [0, 1]
+        colors = [COLORS["throughput"], COLORS["latency"]]
+        labels = ["Test R²", "Continuous R²"]
+
+        bars = ax.bar(x, means, color=colors, edgecolor='white', linewidth=0.5, alpha=0.7)
+        ax.errorbar(x, means, yerr=stds, fmt='none', color='black', capsize=4)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel('R²')
+        ax.set_title('(B) Test vs Continuous')
+
+        # Add statistical annotation
+        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+        ax.text(0.5, max(means) + max(stds) + 0.05, f"p={p_val:.3f} {sig}\nd={d:.2f}",
+               ha='center', va='bottom', fontsize=6, transform=ax.get_xaxis_transform())
+
+    def _plot_summary_table(self, ax: plt.Axes, result: Any):
+        """Plot summary statistics table."""
+        ax.axis('off')
+
+        by_dataset = result.summary.get("by_dataset", {})
+
+        if not by_dataset:
+            ax.text(0.5, 0.5, "No summary data", ha='center', va='center', transform=ax.transAxes)
+            return
+
+        table_data = []
+        for ds, stats in by_dataset.items():
+            test_mean = stats.get("test_r2_mean", 0)
+            test_std = stats.get("test_r2_std", 0)
+            cont_mean = stats.get("continuous_r2_mean")
+            cont_str = f"{cont_mean:.3f}" if cont_mean else "N/A"
+
+            table_data.append([
+                DATASET_NAMES.get(ds, ds)[:8],
+                f"{test_mean:.3f} ± {test_std:.3f}",
+                cont_str,
+            ])
+
+        columns = ['Dataset', 'Test R²', 'Cont. R²']
+        table = ax.table(
+            cellText=table_data,
+            colLabels=columns,
+            loc='center',
+            cellLoc='center',
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(6)
+        table.scale(1.2, 1.4)
+
+        for i in range(len(columns)):
+            table[(0, i)].set_facecolor('#E6E6E6')
+            table[(0, i)].set_text_props(weight='bold')
+
+        ax.set_title('(C) Performance Summary', pad=10)
+
     def plot_all(self, result: Any, format: str = "pdf") -> List[Path]:
         """Generate all Phase 5 figures."""
         paths = []
@@ -381,6 +592,10 @@ class Phase5Visualizer:
 
         paths.append(self.plot_figure_5_2(
             result, filename=f"figure_5_2_realtime_feasibility.{format}"
+        ))
+
+        paths.append(self.plot_figure_5_3(
+            result, filename=f"figure_5_3_statistical_analysis.{format}"
         ))
 
         return [p for p in paths if p is not None]

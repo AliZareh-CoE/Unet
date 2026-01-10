@@ -54,6 +54,18 @@ from phase_one.metrics import (
 )
 from phase_one.visualization import Phase1Visualizer, create_summary_table
 
+# Import shared statistical utilities
+from utils import (
+    compare_methods,
+    compare_multiple_methods,
+    holm_correction,
+    fdr_correction,
+    check_assumptions,
+    format_mean_ci,
+    TestResult,
+    ComparisonResult,
+)
+
 
 # =============================================================================
 # Result Dataclass
@@ -69,6 +81,8 @@ class Phase1Result:
         best_r2: R² of best method
         gate_threshold: Minimum R² for neural methods to pass
         statistical_comparisons: Pairwise method comparisons
+        comprehensive_stats: Enhanced statistical analysis with both parametric/non-parametric tests
+        assumption_checks: Results of normality and homogeneity tests
         config: Configuration used
         timestamp: Evaluation timestamp
     """
@@ -78,6 +92,8 @@ class Phase1Result:
     best_r2: float
     gate_threshold: float
     statistical_comparisons: List[StatisticalComparison] = field(default_factory=list)
+    comprehensive_stats: Optional[Dict[str, Any]] = None
+    assumption_checks: Optional[Dict[str, Any]] = None
     config: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -102,6 +118,8 @@ class Phase1Result:
                 }
                 for c in self.statistical_comparisons
             ],
+            "comprehensive_stats": self.comprehensive_stats,
+            "assumption_checks": self.assumption_checks,
             "config": self.config,
             "timestamp": self.timestamp,
         }
@@ -437,8 +455,55 @@ def run_phase1(
     best = max(valid_metrics, key=lambda m: m.r2_mean)
     gate_threshold = get_gate_threshold(best.r2_mean)
 
-    # Statistical comparisons
+    # Statistical comparisons (legacy)
     comparisons = compute_statistical_comparisons(method_fold_r2s)
+
+    # Comprehensive statistical analysis using new utilities
+    comprehensive_stats = {}
+    assumption_checks = {}
+
+    if len(method_fold_r2s) >= 2:
+        # Compare all methods against the best method
+        print("\nComputing comprehensive statistical analysis...")
+
+        for method_name, fold_values in method_fold_r2s.items():
+            if method_name == best.method:
+                continue
+
+            values_best = np.array(method_fold_r2s[best.method])
+            values_other = np.array(fold_values)
+
+            # Skip if not enough data
+            if len(values_best) < 2 or len(values_other) < 2:
+                continue
+
+            # Comprehensive comparison (parametric + non-parametric)
+            comp_result = compare_methods(
+                values_best, values_other,
+                name_a=best.method, name_b=method_name,
+                paired=True, alpha=0.05
+            )
+
+            comprehensive_stats[method_name] = comp_result.to_dict()
+
+            # Check assumptions
+            assumptions = check_assumptions(values_best, values_other, alpha=0.05)
+            assumption_checks[method_name] = assumptions
+
+        # Apply multiple comparison correction (Holm method)
+        if comprehensive_stats:
+            p_values = [comprehensive_stats[m]["parametric_test"]["p_value"]
+                       for m in comprehensive_stats]
+            significant_holm = holm_correction(p_values, alpha=0.05)
+
+            for i, method_name in enumerate(comprehensive_stats.keys()):
+                comprehensive_stats[method_name]["significant_holm"] = significant_holm[i]
+
+            # Also apply FDR correction
+            significant_fdr, adjusted_p = fdr_correction(p_values, alpha=0.05)
+            for i, method_name in enumerate(comprehensive_stats.keys()):
+                comprehensive_stats[method_name]["significant_fdr"] = significant_fdr[i]
+                comprehensive_stats[method_name]["p_fdr_adjusted"] = adjusted_p[i]
 
     # Create result
     result = Phase1Result(
@@ -447,6 +512,8 @@ def run_phase1(
         best_r2=best.r2_mean,
         gate_threshold=gate_threshold,
         statistical_comparisons=comparisons,
+        comprehensive_stats=comprehensive_stats,
+        assumption_checks=assumption_checks,
         config=config.to_dict(),
     )
 
@@ -470,9 +537,30 @@ def run_phase1(
     # Statistical summary
     sig_comparisons = [c for c in comparisons if c.significant]
     if sig_comparisons:
-        print(f"\nSignificant Differences ({len(sig_comparisons)} comparisons, p < 0.05):")
+        print(f"\nSignificant Differences ({len(sig_comparisons)} comparisons, p < 0.05 Bonferroni):")
         for c in sorted(sig_comparisons, key=lambda x: -abs(x.cohens_d))[:5]:
             print(f"  {c.method1} vs {c.method2}: d={c.cohens_d:.2f} ({c.effect_size}), p_adj={c.p_adjusted:.4f}")
+
+    # Comprehensive stats summary
+    if comprehensive_stats:
+        print("\nComprehensive Statistical Analysis (vs best method):")
+        print("-" * 70)
+        print(f"{'Method':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("-" * 70)
+        for method_name, stats in comprehensive_stats.items():
+            t_p = stats["parametric_test"]["p_value"]
+            w_p = stats["nonparametric_test"]["p_value"]
+            d = stats["parametric_test"]["effect_size"] or 0
+            holm_sig = "Yes" if stats.get("significant_holm", False) else "No"
+            fdr_sig = "Yes" if stats.get("significant_fdr", False) else "No"
+            print(f"{method_name:<15}{t_p:<12.4f}{w_p:<12.4f}{d:<12.3f}{holm_sig:<8}{fdr_sig:<8}")
+
+        # Assumption check summary
+        print("\nAssumption Checks (Normality of differences):")
+        for method_name, checks in assumption_checks.items():
+            norm_ok = "OK" if checks["normality_diff"]["ok"] else "VIOLATED"
+            rec = checks["recommendation"]
+            print(f"  {method_name}: {norm_ok} (recommended: {rec})")
 
     # Gate threshold
     print("\n" + "=" * 70)
@@ -587,12 +675,20 @@ Examples:
         )
         print(f"\nFigure regenerated: {fig_path}")
 
-        # Stats figure
+        # Stats figure (simple)
         stats_path = viz.plot_statistical_summary(
             result.metrics,
             filename=f"figure_1_1_stats.{args.figure_format}",
         )
         print(f"Stats figure: {stats_path}")
+
+        # Comprehensive statistical analysis figure
+        comprehensive_path = viz.plot_comprehensive_stats_figure(
+            result.metrics,
+            result.statistical_comparisons,
+            filename=f"figure_1_2_statistical_analysis.{args.figure_format}",
+        )
+        print(f"Comprehensive stats figure: {comprehensive_path}")
 
         # LaTeX table
         latex_table = create_summary_table(result.metrics)
@@ -665,6 +761,13 @@ Examples:
             ground_truth=ground_truth,
         )
         print(f"Figure saved to: {fig_path}")
+
+        # Comprehensive statistical analysis figure
+        comprehensive_path = viz.plot_comprehensive_stats_figure(
+            result.metrics,
+            result.statistical_comparisons,
+        )
+        print(f"Comprehensive stats figure: {comprehensive_path}")
 
         # LaTeX table
         latex_table = create_summary_table(result.metrics)

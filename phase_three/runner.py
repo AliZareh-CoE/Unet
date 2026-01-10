@@ -33,6 +33,15 @@ from .config import (
 from .trainer import AblationTrainer
 from .model_builder import build_condunet, count_parameters
 
+# Import shared statistical utilities
+from utils import (
+    compare_methods,
+    holm_correction,
+    fdr_correction,
+    check_assumptions,
+    confidence_interval,
+)
+
 
 # =============================================================================
 # Result Classes
@@ -87,6 +96,7 @@ class Phase3Result:
     baseline_r2: float
     optimal_config: Dict[str, str]
     config: Dict[str, Any]
+    comprehensive_stats: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -96,6 +106,7 @@ class Phase3Result:
             "baseline_r2": self.baseline_r2,
             "optimal_config": self.optimal_config,
             "config": self.config,
+            "comprehensive_stats": self.comprehensive_stats,
             "timestamp": self.timestamp,
         }
 
@@ -488,6 +499,43 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
     # Determine optimal configuration
     optimal_config = determine_optimal_config(aggregated)
 
+    # Compute comprehensive statistics
+    comprehensive_stats = {}
+    baseline_fold_r2s = [r.best_r2 for r in baseline_results]
+
+    if len(baseline_fold_r2s) >= 2:
+        print("\nComputing statistical analysis...")
+
+        for study, variants in aggregated.items():
+            if study == "baseline":
+                continue
+
+            for variant, stats in variants.items():
+                fold_r2s = stats.get("fold_r2s", [])
+
+                if len(fold_r2s) >= 2:
+                    comp = compare_methods(
+                        np.array(baseline_fold_r2s),
+                        np.array(fold_r2s),
+                        name_a="baseline",
+                        name_b=f"{study}:{variant}",
+                        paired=True,
+                        alpha=0.05
+                    )
+                    comprehensive_stats[f"{study}:{variant}"] = comp.to_dict()
+
+        # Apply multiple comparison corrections
+        if comprehensive_stats:
+            p_values = [comprehensive_stats[k]["parametric_test"]["p_value"]
+                       for k in comprehensive_stats]
+            significant_holm = holm_correction(p_values, alpha=0.05)
+            significant_fdr, adjusted_p = fdr_correction(p_values, alpha=0.05)
+
+            for i, key in enumerate(comprehensive_stats.keys()):
+                comprehensive_stats[key]["significant_holm"] = significant_holm[i]
+                comprehensive_stats[key]["significant_fdr"] = significant_fdr[i]
+                comprehensive_stats[key]["p_fdr_adjusted"] = adjusted_p[i]
+
     # Create final result
     phase3_result = Phase3Result(
         results=all_results,
@@ -495,6 +543,7 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
         baseline_r2=baseline_r2,
         optimal_config=optimal_config,
         config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
     )
 
     # Print summary
@@ -540,6 +589,7 @@ def aggregate_results(
             aggregated[study][variant] = {
                 "r2_mean": float(np.mean(r2_values)),
                 "r2_std": float(np.std(r2_values)),
+                "fold_r2s": r2_values,  # Store for statistical analysis
                 "loss_mean": float(np.mean(loss_values)),
                 "loss_std": float(np.std(loss_values)),
                 "time_mean": float(np.mean(times)),
@@ -597,6 +647,21 @@ def print_summary(result: Phase3Result):
     print("Optimal Configuration:")
     for study, variant in result.optimal_config.items():
         print(f"  {study}: {variant}")
+
+    # Print comprehensive statistics if available
+    if result.comprehensive_stats:
+        print("\n" + "=" * 60)
+        print("STATISTICAL ANALYSIS (vs baseline)")
+        print("=" * 60)
+        print(f"{'Ablation':<25}{'t-test p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("-" * 60)
+        for key, stats in result.comprehensive_stats.items():
+            t_p = stats["parametric_test"]["p_value"]
+            d = stats["parametric_test"]["effect_size"] or 0
+            holm_sig = "Yes" if stats.get("significant_holm", False) else "No"
+            fdr_sig = "Yes" if stats.get("significant_fdr", False) else "No"
+            print(f"{key:<25}{t_p:<12.4f}{d:<12.3f}{holm_sig:<8}{fdr_sig:<8}")
+
     print("=" * 60)
 
 

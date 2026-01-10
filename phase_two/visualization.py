@@ -10,12 +10,19 @@ Figures generated:
         (B) Training curves (loss over epochs)
         (C) R² progression over epochs
         (D) Parameter efficiency (R² vs params)
+
+    2.2: Statistical Analysis
+        (A) Box plot with individual fold data
+        (B) Statistical comparison heatmap (p-values)
+        (C) Effect size forest plot
+        (D) Summary metrics table
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+import sys
 
 import numpy as np
 
@@ -24,6 +31,23 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import shared statistical utilities
+from utils import (
+    setup_nature_style,
+    COLORS_CATEGORICAL,
+    compare_methods,
+    compare_multiple_methods,
+    holm_correction,
+    fdr_correction,
+    check_assumptions,
+    format_mean_ci,
+    confidence_interval,
+)
 
 
 # =============================================================================
@@ -77,6 +101,7 @@ ARCH_COLORS = {
 def apply_nature_style():
     """Apply Nature Methods style to matplotlib."""
     plt.rcParams.update(NATURE_STYLE)
+    setup_nature_style()  # Also apply shared style
 
 
 # =============================================================================
@@ -309,6 +334,281 @@ class Phase2Visualizer:
 
         return output_path
 
+    def plot_comprehensive_stats_figure(
+        self,
+        result: Any,
+        filename: str = "figure_2_2_statistical_analysis.pdf",
+    ) -> Path:
+        """Generate comprehensive statistical analysis figure.
+
+        Four panels:
+            (A) Box plot with individual fold data points
+            (B) Statistical comparison heatmap (p-values)
+            (C) Effect size forest plot (vs best architecture)
+            (D) Summary metrics table
+
+        Args:
+            result: Phase2Result object
+            filename: Output filename
+
+        Returns:
+            Path to saved figure
+        """
+        apply_nature_style()
+
+        fig = plt.figure(figsize=(7.2, 6.5))
+        gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.4)
+
+        aggregated = result.aggregated
+        sorted_archs = sorted(aggregated.keys(),
+                             key=lambda k: aggregated[k]["r2_mean"],
+                             reverse=True)
+
+        # (A) Box plot with individual fold data
+        ax_a = fig.add_subplot(gs[0, 0])
+        self._plot_boxplot_with_points(ax_a, result, sorted_archs)
+
+        # (B) Statistical comparison heatmap
+        ax_b = fig.add_subplot(gs[0, 1])
+        self._plot_comparison_heatmap(ax_b, result, sorted_archs)
+
+        # (C) Effect size forest plot
+        ax_c = fig.add_subplot(gs[1, 0])
+        self._plot_effect_sizes(ax_c, result, sorted_archs)
+
+        # (D) Summary metrics table
+        ax_d = fig.add_subplot(gs[1, 1])
+        self._plot_summary_table(ax_d, result, sorted_archs)
+
+        # Add panel labels
+        for ax, label in zip([ax_a, ax_b, ax_c, ax_d], ['A', 'B', 'C', 'D']):
+            ax.text(-0.15, 1.05, label, transform=ax.transAxes,
+                   fontsize=10, fontweight='bold', va='top')
+
+        # Save in multiple formats
+        output_path = self.output_dir / filename
+        fig.savefig(output_path, format='pdf', bbox_inches='tight')
+
+        png_path = output_path.with_suffix('.png')
+        fig.savefig(png_path, format='png', dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+        return output_path
+
+    def _plot_boxplot_with_points(
+        self,
+        ax: plt.Axes,
+        result: Any,
+        sorted_archs: List[str],
+    ):
+        """Plot box plot with individual fold R² values."""
+        aggregated = result.aggregated
+
+        fold_data = []
+        for arch in sorted_archs:
+            r2s = aggregated[arch].get("fold_r2s", [])
+            fold_data.append(r2s if r2s else [aggregated[arch]["r2_mean"]])
+
+        # Create box plot
+        bp = ax.boxplot(fold_data, patch_artist=True, widths=0.6, showfliers=False)
+
+        # Color boxes
+        for i, (patch, arch) in enumerate(zip(bp["boxes"], sorted_archs)):
+            color = ARCH_COLORS.get(arch, COLORS["neutral"])
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+            patch.set_edgecolor('black')
+
+        # Overlay individual points
+        for i, (arch, data) in enumerate(zip(sorted_archs, fold_data)):
+            if len(data) > 1:
+                jitter = np.random.uniform(-0.12, 0.12, len(data))
+                ax.scatter([i + 1 + j for j in jitter], data, color='black',
+                          s=15, alpha=0.6, zorder=3)
+
+        ax.set_xticklabels([a[:8] for a in sorted_archs], rotation=45, ha='right', fontsize=6)
+        ax.set_ylabel('R²')
+        ax.set_title('(A) R² Distribution Across Folds')
+
+        # Add mean markers
+        for i, arch in enumerate(sorted_archs):
+            mean = aggregated[arch]["r2_mean"]
+            ax.plot(i + 1, mean, 'r_', markersize=10, markeredgewidth=2)
+
+    def _plot_comparison_heatmap(
+        self,
+        ax: plt.Axes,
+        result: Any,
+        sorted_archs: List[str],
+    ):
+        """Plot pairwise statistical comparison heatmap."""
+        aggregated = result.aggregated
+        n_archs = len(sorted_archs)
+
+        # Build p-value matrix
+        p_matrix = np.ones((n_archs, n_archs))
+
+        for i, arch1 in enumerate(sorted_archs):
+            for j, arch2 in enumerate(sorted_archs):
+                if i < j:
+                    r2s_1 = aggregated[arch1].get("fold_r2s", [])
+                    r2s_2 = aggregated[arch2].get("fold_r2s", [])
+
+                    if len(r2s_1) >= 2 and len(r2s_2) >= 2:
+                        comp = compare_methods(
+                            np.array(r2s_1), np.array(r2s_2),
+                            arch1, arch2, paired=True
+                        )
+                        p_matrix[i, j] = comp.parametric_test.p_value
+                        p_matrix[j, i] = comp.parametric_test.p_value
+
+        # Plot heatmap
+        im = ax.imshow(p_matrix, cmap='RdYlGn_r', vmin=0, vmax=0.1)
+
+        ax.set_xticks(range(n_archs))
+        ax.set_yticks(range(n_archs))
+        ax.set_xticklabels([a[:6] for a in sorted_archs], rotation=45, ha='right', fontsize=5)
+        ax.set_yticklabels([a[:6] for a in sorted_archs], fontsize=5)
+        ax.set_title('(B) Pairwise p-values')
+
+        # Add significance markers
+        for i in range(n_archs):
+            for j in range(n_archs):
+                if i != j:
+                    p = p_matrix[i, j]
+                    if p < 0.001:
+                        text = "***"
+                    elif p < 0.01:
+                        text = "**"
+                    elif p < 0.05:
+                        text = "*"
+                    else:
+                        text = ""
+                    ax.text(j, i, text, ha='center', va='center', fontsize=5,
+                           color='white' if p < 0.05 else 'black')
+
+        # Colorbar
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label('p-value', fontsize=6)
+        cbar.ax.tick_params(labelsize=5)
+
+    def _plot_effect_sizes(
+        self,
+        ax: plt.Axes,
+        result: Any,
+        sorted_archs: List[str],
+    ):
+        """Plot effect size forest plot vs best architecture."""
+        aggregated = result.aggregated
+
+        if len(sorted_archs) < 2:
+            ax.text(0.5, 0.5, "Need multiple architectures",
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(C) Effect Sizes")
+            return
+
+        best_arch = sorted_archs[0]
+        best_r2s = aggregated[best_arch].get("fold_r2s", [])
+        other_archs = sorted_archs[1:]
+
+        effect_data = {}
+        for arch in other_archs:
+            r2s = aggregated[arch].get("fold_r2s", [])
+            if len(best_r2s) >= 2 and len(r2s) >= 2:
+                comp = compare_methods(
+                    np.array(best_r2s), np.array(r2s),
+                    best_arch, arch, paired=True
+                )
+                d = comp.parametric_test.effect_size or 0
+                effect_data[arch] = d
+
+        if not effect_data:
+            ax.text(0.5, 0.5, "Insufficient fold data",
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("(C) Effect Sizes")
+            return
+
+        # Plot forest plot
+        archs = list(effect_data.keys())
+        effects = [effect_data[a] for a in archs]
+        y_pos = np.arange(len(archs))
+
+        colors = [COLORS["primary"] if e > 0 else COLORS["secondary"] for e in effects]
+        ax.barh(y_pos, effects, color=colors, height=0.6, alpha=0.8)
+
+        # Reference lines
+        for x in [-0.8, -0.5, -0.2, 0.2, 0.5, 0.8]:
+            ax.axvline(x=x, color='lightgray', linestyle=':', linewidth=0.5, alpha=0.7)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([a[:10] for a in archs], fontsize=6)
+        ax.set_xlabel(f"Cohen's d (vs {best_arch})")
+        ax.set_title("(C) Effect Sizes vs Best")
+        ax.invert_yaxis()
+
+    def _plot_summary_table(
+        self,
+        ax: plt.Axes,
+        result: Any,
+        sorted_archs: List[str],
+    ):
+        """Plot comprehensive summary table."""
+        ax.axis('off')
+
+        aggregated = result.aggregated
+        gate_threshold = result.classical_baseline_r2 + 0.10
+
+        # Get param counts
+        arch_params = {}
+        for r in result.results:
+            if r.architecture not in arch_params:
+                arch_params[r.architecture] = r.n_parameters
+
+        # Table data
+        columns = ['Arch', 'R² Mean', '± Std', 'Params', 'Gate']
+        cell_data = []
+
+        for arch in sorted_archs[:6]:  # Top 6
+            stats = aggregated[arch]
+            params = arch_params.get(arch, 0)
+            passed = "Pass" if stats["r2_mean"] >= gate_threshold else "Fail"
+
+            # Compute CI if fold data available
+            fold_r2s = stats.get("fold_r2s", [])
+            if len(fold_r2s) >= 2:
+                ci = confidence_interval(np.array(fold_r2s))
+                ci_str = f"[{ci[0]:.3f}, {ci[1]:.3f}]"
+            else:
+                ci_str = f"± {stats['r2_std']:.3f}"
+
+            row = [
+                arch[:10],
+                f"{stats['r2_mean']:.4f}",
+                ci_str,
+                f"{params/1e6:.1f}M",
+                passed,
+            ]
+            cell_data.append(row)
+
+        table = ax.table(
+            cellText=cell_data,
+            colLabels=columns,
+            loc='center',
+            cellLoc='center',
+        )
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(5)
+        table.scale(1.2, 1.4)
+
+        # Style header row
+        for i in range(len(columns)):
+            table[(0, i)].set_facecolor('#E6E6E6')
+            table[(0, i)].set_text_props(weight='bold')
+
+        ax.set_title('(D) Performance Summary', pad=10)
+
     def plot_all(self, result: Any, format: str = "pdf") -> List[Path]:
         """Generate all Phase 2 figures.
 
@@ -329,6 +629,11 @@ class Phase2Visualizer:
         paths.append(self.plot_training_summary(
             result,
             filename=f"figure_2_1_training_summary.{format}",
+        ))
+
+        paths.append(self.plot_comprehensive_stats_figure(
+            result,
+            filename=f"figure_2_2_statistical_analysis.{format}",
         ))
 
         return paths
