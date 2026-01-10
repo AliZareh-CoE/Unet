@@ -653,7 +653,7 @@ def print_summary(result: Phase3Result):
         print("\n" + "=" * 60)
         print("STATISTICAL ANALYSIS (vs baseline)")
         print("=" * 60)
-        print(f"{'Ablation':<25}{'t-test p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("{:<25}{:<12}{:<12}{:<8}{:<8}".format("Ablation", "t-test p", "Cohen's d", "Holm", "FDR"))
         print("-" * 60)
         for key, stats in result.comprehensive_stats.items():
             t_p = stats["parametric_test"]["p_value"]

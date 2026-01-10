@@ -679,7 +679,7 @@ def run_phase1(
     if comprehensive_stats:
         print("\nComprehensive Statistical Analysis (vs best method):")
         print("-" * 70)
-        print(f"{'Method':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("{:<15}{:<12}{:<12}{:<12}{:<8}{:<8}".format("Method", "t-test p", "Wilcoxon p", "Cohen's d", "Holm", "FDR"))
         print("-" * 70)
         for method_name, stats in comprehensive_stats.items():
             t_p = stats["parametric_test"]["p_value"]

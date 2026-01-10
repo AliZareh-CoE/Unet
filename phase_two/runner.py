@@ -585,7 +585,7 @@ def run_phase2(
         print("\n" + "=" * 70)
         print("STATISTICAL ANALYSIS (vs best architecture)")
         print("=" * 70)
-        print(f"{'Architecture':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Holm':<8}{'FDR':<8}")
+        print("{:<15}{:<12}{:<12}{:<12}{:<8}{:<8}".format("Architecture", "t-test p", "Wilcoxon p", "Cohen's d", "Holm", "FDR"))
         print("-" * 70)
         for arch_name, stats in comprehensive_stats.items():
             t_p = stats["parametric_test"]["p_value"]
