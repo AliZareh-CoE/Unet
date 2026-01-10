@@ -15,14 +15,14 @@ import torch
 
 
 # =============================================================================
-# Ablation Constants
+# Default Constants
 # =============================================================================
 
-# Window sizes in samples (at 1000 Hz: 1s, 2.5s, 5s)
-WINDOW_SIZES: List[int] = [1000, 2500, 5000]
+# Fixed window size (5 seconds at 1000 Hz)
+DEFAULT_WINDOW_SIZE: int = 5000
 
-# Stride ratios (fraction of window size)
-STRIDE_RATIOS: List[float] = [0.25, 0.5, 0.75]
+# Fixed stride ratio (50% overlap)
+DEFAULT_STRIDE_RATIO: float = 0.5
 
 # Batch sizes for latency benchmarks
 BATCH_SIZES: List[int] = [1, 4, 16, 64]
@@ -158,8 +158,8 @@ class Phase5Config:
 
     Attributes:
         datasets: Datasets to evaluate
-        window_sizes: Window sizes to test
-        stride_ratios: Stride ratios to test
+        window_size: Fixed window size in samples
+        stride_ratio: Fixed stride ratio
         benchmark: Benchmark configuration
         training: Training configuration
     """
@@ -167,12 +167,12 @@ class Phase5Config:
     # Datasets
     datasets: List[str] = field(default_factory=lambda: ["olfactory", "pfc", "dandi"])
 
-    # Sliding window ablations
-    window_sizes: List[int] = field(default_factory=lambda: WINDOW_SIZES.copy())
-    stride_ratios: List[float] = field(default_factory=lambda: STRIDE_RATIOS.copy())
+    # Fixed sliding window settings
+    window_size: int = DEFAULT_WINDOW_SIZE
+    stride_ratio: float = DEFAULT_STRIDE_RATIO
 
-    # Use single seed for ablations
-    seeds: List[int] = field(default_factory=lambda: [42])
+    # Seeds for statistical validity
+    seeds: List[int] = field(default_factory=lambda: [42, 43, 44])
 
     # Benchmark config
     benchmark: BenchmarkConfig = field(default_factory=BenchmarkConfig)
@@ -230,23 +230,9 @@ class Phase5Config:
         }
 
     @property
-    def total_window_ablations(self) -> int:
-        """Total window size ablation runs."""
-        return len(self.datasets) * len(self.window_sizes) * len(self.seeds)
-
-    @property
-    def total_stride_ablations(self) -> int:
-        """Total stride ablation runs."""
-        return len(self.datasets) * len(self.stride_ratios) * len(self.seeds)
-
-    @property
     def total_runs(self) -> int:
-        """Total training runs (window + stride ablations)."""
-        # Window ablations (fixed stride=0.5)
-        window_runs = len(self.datasets) * len(self.window_sizes)
-        # Stride ablations (fixed window=5000)
-        stride_runs = len(self.datasets) * len(self.stride_ratios)
-        return (window_runs + stride_runs) * len(self.seeds)
+        """Total training runs (one per dataset per seed)."""
+        return len(self.datasets) * len(self.seeds)
 
 
 @dataclass
@@ -257,11 +243,10 @@ class ExperimentConfig:
     window_size: int
     stride_ratio: float
     seed: int
-    experiment_type: str = "window"  # "window" or "stride"
 
     @property
     def name(self) -> str:
-        return f"{self.dataset}_w{self.window_size}_s{self.stride_ratio}_seed{self.seed}"
+        return f"{self.dataset}_seed{self.seed}"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -269,5 +254,4 @@ class ExperimentConfig:
             "window_size": self.window_size,
             "stride_ratio": self.stride_ratio,
             "seed": self.seed,
-            "experiment_type": self.experiment_type,
         }

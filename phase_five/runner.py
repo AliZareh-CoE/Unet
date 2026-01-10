@@ -34,8 +34,8 @@ from .config import (
     ExperimentConfig,
     SlidingWindowConfig,
     BenchmarkConfig,
-    WINDOW_SIZES,
-    STRIDE_RATIOS,
+    DEFAULT_WINDOW_SIZE,
+    DEFAULT_STRIDE_RATIO,
 )
 from .sliding_window import (
     SlidingWindowDataset,
@@ -51,8 +51,8 @@ from .trainer import Phase5Trainer
 # =============================================================================
 
 @dataclass
-class WindowAblationResult:
-    """Result from a single window/stride ablation."""
+class ExperimentResult:
+    """Result from a single experiment."""
 
     dataset: str
     window_size: int
@@ -92,8 +92,7 @@ class WindowAblationResult:
 class Phase5Result:
     """Aggregated results from Phase 5."""
 
-    window_ablations: List[WindowAblationResult]
-    stride_ablations: List[WindowAblationResult]
+    results: List[ExperimentResult]
     benchmark_results: Dict[str, BenchmarkResults]
     summary: Dict[str, Any]
     config: Dict[str, Any]
@@ -101,8 +100,7 @@ class Phase5Result:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "window_ablations": [r.to_dict() for r in self.window_ablations],
-            "stride_ablations": [r.to_dict() for r in self.stride_ablations],
+            "results": [r.to_dict() for r in self.results],
             "benchmark_results": {k: v.to_dict() for k, v in self.benchmark_results.items()},
             "summary": self.summary,
             "config": self.config,
@@ -123,19 +121,15 @@ class Phase5Result:
         with open(path, "r") as f:
             data = json.load(f)
 
-        window_ablations = [
-            WindowAblationResult(**r) for r in data["window_ablations"]
-        ]
-        stride_ablations = [
-            WindowAblationResult(**r) for r in data["stride_ablations"]
+        results = [
+            ExperimentResult(**r) for r in data["results"]
         ]
 
         # Reconstruct benchmark results (simplified)
         benchmark_results = {}
 
         return cls(
-            window_ablations=window_ablations,
-            stride_ablations=stride_ablations,
+            results=results,
             benchmark_results=benchmark_results,
             summary=data["summary"],
             config=data["config"],
@@ -221,7 +215,7 @@ def build_model(in_channels: int, out_channels: int, model_config: Dict[str, Any
 # Experiment Functions
 # =============================================================================
 
-def run_window_ablation(
+def run_experiment(
     dataset: str,
     window_size: int,
     stride_ratio: float,
@@ -230,13 +224,13 @@ def run_window_ablation(
     model_config: Dict[str, Any],
     device: str = "cuda",
     verbose: int = 1,
-) -> WindowAblationResult:
-    """Run a single window/stride ablation experiment."""
+) -> ExperimentResult:
+    """Run a single real-time experiment."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     if verbose >= 1:
-        print(f"\n  [{dataset}] window={window_size}, stride={stride_ratio}")
+        print(f"\n  [{dataset}] seed={seed}")
 
     # Create data
     train_ds, val_ds, test_ds, test_source, test_target = create_synthetic_sliding_data(
@@ -281,7 +275,7 @@ def run_window_ablation(
     if verbose >= 1:
         print(f"    Test R²: {test_r2:.4f} | Continuous R²: {continuous_r2:.4f}")
 
-    return WindowAblationResult(
+    return ExperimentResult(
         dataset=dataset,
         window_size=window_size,
         stride_ratio=stride_ratio,
@@ -323,53 +317,32 @@ def run_phase5(config: Phase5Config) -> Phase5Result:
     print("Phase 5: Real-Time Continuous Processing")
     print("=" * 60)
     print(f"Datasets: {config.datasets}")
-    print(f"Window sizes: {config.window_sizes}")
-    print(f"Stride ratios: {config.stride_ratios}")
+    print(f"Window size: {config.window_size} samples")
+    print(f"Stride ratio: {config.stride_ratio}")
+    print(f"Seeds: {config.seeds}")
     print(f"Total runs: {config.total_runs}")
     print("=" * 60)
 
-    window_ablations = []
-    stride_ablations = []
+    all_results = []
 
-    # Window size ablations (fixed stride=0.5)
-    print("\n" + "-" * 40)
-    print("Window Size Ablations")
-    print("-" * 40)
-
+    # Run experiments for each dataset
     for dataset in config.datasets:
-        for window_size in config.window_sizes:
-            for seed in config.seeds:
-                result = run_window_ablation(
-                    dataset=dataset,
-                    window_size=window_size,
-                    stride_ratio=0.5,  # Fixed stride
-                    seed=seed,
-                    training_config=config.training,
-                    model_config=config.model_config,
-                    device=config.device,
-                    verbose=config.verbose,
-                )
-                window_ablations.append(result)
+        print(f"\n{'=' * 40}")
+        print(f"Dataset: {dataset.upper()}")
+        print(f"{'=' * 40}")
 
-    # Stride ablations (fixed window=5000)
-    print("\n" + "-" * 40)
-    print("Stride Ratio Ablations")
-    print("-" * 40)
-
-    for dataset in config.datasets:
-        for stride_ratio in config.stride_ratios:
-            for seed in config.seeds:
-                result = run_window_ablation(
-                    dataset=dataset,
-                    window_size=5000,  # Fixed window
-                    stride_ratio=stride_ratio,
-                    seed=seed,
-                    training_config=config.training,
-                    model_config=config.model_config,
-                    device=config.device,
-                    verbose=config.verbose,
-                )
-                stride_ablations.append(result)
+        for seed in config.seeds:
+            result = run_experiment(
+                dataset=dataset,
+                window_size=config.window_size,
+                stride_ratio=config.stride_ratio,
+                seed=seed,
+                training_config=config.training,
+                model_config=config.model_config,
+                device=config.device,
+                verbose=config.verbose,
+            )
+            all_results.append(result)
 
     # Run benchmarks
     benchmark_results = {}
@@ -380,12 +353,11 @@ def run_phase5(config: Phase5Config) -> Phase5Result:
     )
 
     # Create summary
-    summary = create_summary(window_ablations, stride_ablations, benchmark_results)
+    summary = create_summary(all_results, benchmark_results)
 
     # Create result
     phase5_result = Phase5Result(
-        window_ablations=window_ablations,
-        stride_ablations=stride_ablations,
+        results=all_results,
         benchmark_results=benchmark_results,
         summary=summary,
         config=config.to_dict(),
@@ -402,59 +374,50 @@ def run_phase5(config: Phase5Config) -> Phase5Result:
 
 
 def create_summary(
-    window_ablations: List[WindowAblationResult],
-    stride_ablations: List[WindowAblationResult],
+    results: List[ExperimentResult],
     benchmark_results: Dict[str, BenchmarkResults],
 ) -> Dict[str, Any]:
     """Create summary statistics."""
     summary = {
-        "window_ablation": {},
-        "stride_ablation": {},
-        "best_config": {},
+        "by_dataset": {},
+        "overall": {},
         "realtime_feasible": False,
     }
 
-    # Window ablation summary
-    for result in window_ablations:
-        key = f"{result.dataset}_{result.window_size}"
-        if key not in summary["window_ablation"]:
-            summary["window_ablation"][key] = {
-                "r2_values": [],
-                "window_size": result.window_size,
-                "dataset": result.dataset,
+    # Group by dataset
+    for result in results:
+        ds = result.dataset
+        if ds not in summary["by_dataset"]:
+            summary["by_dataset"][ds] = {
+                "test_r2_values": [],
+                "continuous_r2_values": [],
             }
-        summary["window_ablation"][key]["r2_values"].append(result.test_r2)
+        summary["by_dataset"][ds]["test_r2_values"].append(result.test_r2)
+        if result.continuous_r2 is not None:
+            summary["by_dataset"][ds]["continuous_r2_values"].append(result.continuous_r2)
 
-    for key in summary["window_ablation"]:
-        r2s = summary["window_ablation"][key]["r2_values"]
-        summary["window_ablation"][key]["r2_mean"] = float(np.mean(r2s))
-        summary["window_ablation"][key]["r2_std"] = float(np.std(r2s))
+    # Compute statistics per dataset
+    for ds in summary["by_dataset"]:
+        test_r2s = summary["by_dataset"][ds]["test_r2_values"]
+        cont_r2s = summary["by_dataset"][ds]["continuous_r2_values"]
 
-    # Stride ablation summary
-    for result in stride_ablations:
-        key = f"{result.dataset}_{result.stride_ratio}"
-        if key not in summary["stride_ablation"]:
-            summary["stride_ablation"][key] = {
-                "r2_values": [],
-                "stride_ratio": result.stride_ratio,
-                "dataset": result.dataset,
-            }
-        summary["stride_ablation"][key]["r2_values"].append(result.test_r2)
-
-    for key in summary["stride_ablation"]:
-        r2s = summary["stride_ablation"][key]["r2_values"]
-        summary["stride_ablation"][key]["r2_mean"] = float(np.mean(r2s))
-        summary["stride_ablation"][key]["r2_std"] = float(np.std(r2s))
-
-    # Find best config
-    all_results = window_ablations + stride_ablations
-    if all_results:
-        best = max(all_results, key=lambda x: x.test_r2)
-        summary["best_config"] = {
-            "window_size": best.window_size,
-            "stride_ratio": best.stride_ratio,
-            "r2": best.test_r2,
+        summary["by_dataset"][ds] = {
+            "test_r2_mean": float(np.mean(test_r2s)),
+            "test_r2_std": float(np.std(test_r2s)),
+            "continuous_r2_mean": float(np.mean(cont_r2s)) if cont_r2s else None,
+            "continuous_r2_std": float(np.std(cont_r2s)) if cont_r2s else None,
+            "n_runs": len(test_r2s),
         }
+
+    # Overall statistics
+    all_test_r2 = [r.test_r2 for r in results]
+    all_cont_r2 = [r.continuous_r2 for r in results if r.continuous_r2 is not None]
+
+    summary["overall"] = {
+        "test_r2_mean": float(np.mean(all_test_r2)),
+        "test_r2_std": float(np.std(all_test_r2)),
+        "continuous_r2_mean": float(np.mean(all_cont_r2)) if all_cont_r2 else None,
+    }
 
     # Check real-time feasibility
     if "default" in benchmark_results:
@@ -469,23 +432,20 @@ def print_summary(result: Phase5Result):
     print("Phase 5 Summary")
     print("=" * 60)
 
-    print("\nWindow Size Ablation (stride=0.5):")
-    print("-" * 40)
-    for key, stats in result.summary.get("window_ablation", {}).items():
-        print(f"  {stats['dataset']} w={stats['window_size']}: "
-              f"R²={stats['r2_mean']:.4f} ± {stats['r2_std']:.4f}")
+    print("\nResults by Dataset:")
+    print("-" * 60)
+    print(f"{'Dataset':<15} {'Test R²':<20} {'Continuous R²':<20}")
+    print("-" * 60)
 
-    print("\nStride Ratio Ablation (window=5000):")
-    print("-" * 40)
-    for key, stats in result.summary.get("stride_ablation", {}).items():
-        print(f"  {stats['dataset']} s={stats['stride_ratio']}: "
-              f"R²={stats['r2_mean']:.4f} ± {stats['r2_std']:.4f}")
+    for ds, stats in result.summary.get("by_dataset", {}).items():
+        test_str = f"{stats['test_r2_mean']:.4f} ± {stats['test_r2_std']:.4f}"
+        cont_mean = stats.get('continuous_r2_mean')
+        cont_str = f"{cont_mean:.4f}" if cont_mean is not None else "N/A"
+        print(f"{ds:<15} {test_str:<20} {cont_str:<20}")
 
-    print("\nBest Configuration:")
-    best = result.summary.get("best_config", {})
-    print(f"  Window: {best.get('window_size', 'N/A')}")
-    print(f"  Stride: {best.get('stride_ratio', 'N/A')}")
-    print(f"  R²: {best.get('r2', 'N/A')}")
+    overall = result.summary.get("overall", {})
+    print("-" * 60)
+    print(f"{'Overall':<15} {overall.get('test_r2_mean', 0):.4f}")
 
     print(f"\nReal-time Feasible: {result.summary.get('realtime_feasible', False)}")
     print("=" * 60)
@@ -499,9 +459,13 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 5: Real-Time Continuous")
 
     parser.add_argument("--datasets", nargs="+", default=["olfactory", "pfc", "dandi"])
+    parser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE,
+                       help="Window size in samples (default: 5000)")
+    parser.add_argument("--stride-ratio", type=float, default=DEFAULT_STRIDE_RATIO,
+                       help="Stride ratio (default: 0.5)")
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     parser.add_argument("--output-dir", type=str, default="results/phase5")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
@@ -536,13 +500,11 @@ def main():
     )
 
     datasets = ["olfactory"] if args.fast else args.datasets
-    window_sizes = [1000] if args.fast else WINDOW_SIZES
-    stride_ratios = [0.5] if args.fast else STRIDE_RATIOS
 
     config = Phase5Config(
         datasets=datasets,
-        window_sizes=window_sizes,
-        stride_ratios=stride_ratios,
+        window_size=args.window_size,
+        stride_ratio=args.stride_ratio,
         seeds=args.seeds,
         training=training_config,
         benchmark=benchmark_config,

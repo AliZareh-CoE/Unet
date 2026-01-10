@@ -28,8 +28,8 @@ from .config import (
     Phase5Config,
     SlidingWindowConfig,
     BenchmarkConfig,
-    WINDOW_SIZES,
-    STRIDE_RATIOS,
+    DEFAULT_WINDOW_SIZE,
+    DEFAULT_STRIDE_RATIO,
     BATCH_SIZES,
 )
 from .sliding_window import (
@@ -50,8 +50,8 @@ __all__ = [
     "Phase5Config",
     "SlidingWindowConfig",
     "BenchmarkConfig",
-    "WINDOW_SIZES",
-    "STRIDE_RATIOS",
+    "DEFAULT_WINDOW_SIZE",
+    "DEFAULT_STRIDE_RATIO",
     "BATCH_SIZES",
     "SlidingWindowDataset",
     "create_sliding_windows",
