@@ -54,6 +54,21 @@ AUGMENTATION_VARIANTS: Dict[str, bool] = {
 }
 
 # =============================================================================
+# Simplified Ablation Configuration (One variant per study)
+# =============================================================================
+
+# For each study, select the "ablated" variant (feature removed/reduced)
+# Baseline has all features ON, ablated versions remove one feature each
+ABLATION_VARIANTS_SIMPLE: Dict[str, str] = {
+    "attention": "none",           # Remove attention
+    "conditioning": "none",        # Remove conditioning
+    "loss": "l1",                  # Alternative loss (L1 instead of Huber)
+    "capacity": "small",           # Reduced capacity
+    "bidirectional": "unidirectional",  # Remove bidirectional
+    "augmentation": "none",        # No augmentation
+}
+
+# =============================================================================
 # Ablation Study Definitions
 # =============================================================================
 
@@ -283,12 +298,12 @@ class Phase3Config:
                 raise ValueError(f"Unknown ablation study: {study}")
 
     def get_ablation_configs(self) -> List[AblationConfig]:
-        """Generate all ablation configurations to run."""
+        """Generate ablation configurations (one ablated variant per study)."""
         configs = []
         for study in self.studies:
-            variants = ABLATION_STUDIES[study]["variants"]
-            for variant in variants:
-                configs.append(AblationConfig(study=study, variant=variant))
+            # Use simplified variant (one per study)
+            variant = ABLATION_VARIANTS_SIMPLE[study]
+            configs.append(AblationConfig(study=study, variant=variant))
         return configs
 
     def to_dict(self) -> Dict[str, Any]:
@@ -306,11 +321,9 @@ class Phase3Config:
 
     @property
     def total_runs(self) -> int:
-        """Total number of ablation runs (ablations × folds)."""
-        total = 0
-        for study in self.studies:
-            total += ABLATION_STUDIES[study]["n_variants"]
-        return total * self.n_folds
+        """Total number of runs: (1 baseline + n_studies ablations) × n_folds."""
+        # 1 baseline + 6 ablation studies = 7 configs × 5 folds = 35
+        return (1 + len(self.studies)) * self.n_folds
 
 
 def get_baseline_config() -> AblationConfig:

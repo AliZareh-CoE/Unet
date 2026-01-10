@@ -450,41 +450,37 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
     baseline_std = np.std([r.best_r2 for r in baseline_results])
     print(f"\nBaseline R²: {baseline_r2:.4f} ± {baseline_std:.4f}")
 
-    # Run ablation studies
+    # Run ablation studies (one ablated variant per study)
     all_results = baseline_results.copy()
+    ablation_configs = config.get_ablation_configs()  # One per study
 
-    for study in config.studies:
+    for ablation_config in ablation_configs:
         print(f"\n{'=' * 40}")
-        print(f"Study: {ABLATION_STUDIES[study]['description']}")
+        print(f"Study: {ABLATION_STUDIES[ablation_config.study]['description']}")
+        print(f"Ablated variant: {ablation_config.variant}")
         print(f"{'=' * 40}")
 
-        ablation_configs = [
-            AblationConfig(study=study, variant=variant)
-            for variant in ABLATION_STUDIES[study]["variants"]
-        ]
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
+            train_loader, val_loader = create_dataloaders_from_indices(
+                X, y, odor_ids, train_idx, val_idx,
+                batch_size=config.training.batch_size,
+                n_workers=config.n_workers,
+            )
 
-        for ablation_config in ablation_configs:
-            for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
-                train_loader, val_loader = create_dataloaders_from_indices(
-                    X, y, odor_ids, train_idx, val_idx,
-                    batch_size=config.training.batch_size,
-                    n_workers=config.n_workers,
-                )
-
-                result = run_single_ablation(
-                    ablation_config=ablation_config,
-                    training_config=config.training,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    fold=fold_idx,
-                    cv_seed=config.cv_seed,
-                    device=config.device,
-                    checkpoint_dir=config.checkpoint_dir / study / f"fold{fold_idx}",
-                    verbose=config.verbose,
-                )
-                all_results.append(result)
+            result = run_single_ablation(
+                ablation_config=ablation_config,
+                training_config=config.training,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                fold=fold_idx,
+                cv_seed=config.cv_seed,
+                device=config.device,
+                checkpoint_dir=config.checkpoint_dir / ablation_config.study / f"fold{fold_idx}",
+                verbose=config.verbose,
+            )
+            all_results.append(result)
 
     # Aggregate results
     aggregated = aggregate_results(all_results)
