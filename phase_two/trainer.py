@@ -33,6 +33,17 @@ from torch.cuda.amp import GradScaler, autocast
 
 from .config import TrainingConfig
 
+# Add project root to path
+from pathlib import Path
+import sys
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    from utils.dsp_metrics import compute_all_dsp_metrics, compute_batch_metrics
+    DSP_AVAILABLE = True
+except ImportError:
+    DSP_AVAILABLE = False
+
 
 # =============================================================================
 # Logging Setup
@@ -196,8 +207,11 @@ class TrainingResult:
     peak_gpu_memory_mb: Optional[float] = None
     completed_successfully: bool = True
 
+    # DSP Metrics (computed on final validation predictions)
+    dsp_metrics: Optional[Dict[str, Any]] = None
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "architecture": self.architecture,
             "fold": self.fold,
             "best_val_r2": self.best_val_r2,
@@ -215,7 +229,9 @@ class TrainingResult:
             "error_message": self.error_message,
             "peak_gpu_memory_mb": self.peak_gpu_memory_mb,
             "completed_successfully": self.completed_successfully,
+            "dsp_metrics": self.dsp_metrics,
         }
+        return result
 
 
 # =============================================================================
@@ -424,6 +440,74 @@ class Trainer:
 
         return loss, r2, mae
 
+    @torch.no_grad()
+    def compute_dsp_metrics(
+        self,
+        dataloader: DataLoader,
+        sample_rate: float = 1000.0,
+    ) -> Dict[str, Any]:
+        """Compute comprehensive DSP metrics on validation set.
+
+        Args:
+            dataloader: Validation data loader
+            sample_rate: Sampling rate in Hz
+
+        Returns:
+            Dictionary of DSP metrics
+        """
+        if not DSP_AVAILABLE:
+            self.logger.warning("DSP metrics module not available")
+            return {}
+
+        self.model.eval()
+        all_preds = []
+        all_targets = []
+
+        for x, y in dataloader:
+            x = x.to(self.device)
+            y_pred = self.model(x)
+            all_preds.append(y_pred.cpu().numpy())
+            all_targets.append(y.numpy())
+
+        # Concatenate
+        y_pred = np.concatenate(all_preds, axis=0)  # [N, C, T]
+        y_true = np.concatenate(all_targets, axis=0)
+
+        # Compute batch metrics (sample subset for efficiency)
+        N, C, T = y_pred.shape
+        max_samples = min(N, 50)
+        sample_indices = np.linspace(0, N - 1, max_samples, dtype=int)
+
+        # Average across channels, compute per sample
+        y_pred_avg = np.mean(y_pred[sample_indices], axis=1)  # [N_sample, T]
+        y_true_avg = np.mean(y_true[sample_indices], axis=1)
+
+        try:
+            dsp = compute_batch_metrics(
+                y_true_avg, y_pred_avg,
+                fs=sample_rate,
+                nperseg=min(256, T // 4)
+            )
+
+            # Extract key metrics with proper naming
+            result = {
+                "plv_mean": dsp.get("plv_mean", 0),
+                "pli_mean": dsp.get("pli_mean", 0),
+                "wpli_mean": dsp.get("wpli_mean", 0),
+                "coherence_mean": dsp.get("coherence_mean_mean", 0),
+                "envelope_corr_mean": dsp.get("envelope_correlation_mean", 0),
+                "reconstruction_snr_db": dsp.get("reconstruction_snr_db_mean", 0),
+                "psd_correlation": dsp.get("psd_correlation_mean", 0),
+                "mutual_info": dsp.get("normalized_mi_mean", 0),
+                "cross_corr_max": dsp.get("cross_correlation_max_mean", 0),
+            }
+
+            return result
+
+        except Exception as e:
+            self.logger.warning(f"DSP metrics computation failed: {e}")
+            return {}
+
     def load_checkpoint(self, path: Path) -> int:
         """Load checkpoint and return epoch to resume from.
 
@@ -580,6 +664,18 @@ class Trainer:
             self.model.load_state_dict(self._best_model_state)
             self.logger.info(f"Restored best model from epoch {best_epoch}")
 
+        # Compute DSP metrics on final predictions
+        dsp_metrics = {}
+        if completed_successfully and DSP_AVAILABLE:
+            self.logger.info("Computing DSP metrics...")
+            dsp_metrics = self.compute_dsp_metrics(val_loader)
+            if dsp_metrics:
+                self.logger.info(
+                    f"DSP: PLV={dsp_metrics.get('plv_mean', 0):.4f}, "
+                    f"Coh={dsp_metrics.get('coherence_mean', 0):.4f}, "
+                    f"SNR={dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB"
+                )
+
         self.logger.info(
             f"Training completed: best_val_r2={best_val_r2:.4f} at epoch {best_epoch}, "
             f"total_time={total_time/60:.1f}min"
@@ -603,6 +699,7 @@ class Trainer:
             error_message=error_message,
             peak_gpu_memory_mb=self.peak_gpu_memory_mb if self.device == "cuda" else None,
             completed_successfully=completed_successfully,
+            dsp_metrics=dsp_metrics if dsp_metrics else None,
         )
 
     def _save_checkpoint(

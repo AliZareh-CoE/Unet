@@ -3,14 +3,17 @@ Comprehensive Metrics for Phase 1
 =================================
 
 Publication-quality evaluation metrics for neural signal translation.
-Includes per-channel, per-frequency-band, and statistical analysis.
+Includes per-channel, per-frequency-band, DSP metrics, and statistical analysis.
 
 Metrics computed:
     - R² (coefficient of determination)
     - MAE (mean absolute error)
-    - Pearson correlation
+    - Pearson/Spearman correlations
     - Per-frequency-band R² (delta, theta, alpha, beta, gamma)
     - PSD error in dB (spectral fidelity)
+    - DSP Metrics: PLV, PLI, wPLI, coherence, SNR, envelope correlation
+    - Cross-correlation analysis
+    - Mutual information
     - Bootstrap confidence intervals
     - Statistical comparisons (paired tests, effect sizes)
 """
@@ -26,6 +29,19 @@ from scipy import signal as scipy_signal
 from scipy import stats
 
 from .config import NEURAL_BANDS
+
+# Import DSP metrics
+import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+sys.path.insert(0, str(PROJECT_ROOT))
+from utils.dsp_metrics import (
+    compute_plv, compute_pli, compute_wpli,
+    compute_coherence, compute_reconstruction_snr,
+    compute_cross_correlation, compute_envelope_correlation,
+    compute_mutual_information, compute_normalized_mi,
+    compare_psd, FREQUENCY_BANDS,
+)
 
 
 # =============================================================================
@@ -45,11 +61,29 @@ class Phase1Metrics:
         mae_std: MAE standard deviation
         pearson_mean: Mean Pearson correlation
         pearson_std: Pearson correlation std
+        spearman_mean: Mean Spearman correlation
+        spearman_std: Spearman correlation std
         psd_error_db: PSD error in decibels
         band_r2: Per-frequency-band R² values
         fold_r2s: R² values for each fold (for statistical tests)
         n_folds: Number of CV folds
         n_samples: Number of samples evaluated
+
+        # DSP Metrics
+        plv_mean: Phase Locking Value mean
+        pli_mean: Phase Lag Index mean
+        wpli_mean: Weighted Phase Lag Index mean
+        coherence_mean: Mean coherence across frequencies
+        coherence_bands: Per-band coherence values
+        snr_db_mean: Signal-to-noise ratio mean (dB)
+        reconstruction_snr_db: SNR of reconstruction vs original
+        cross_corr_max: Maximum cross-correlation
+        cross_corr_lag: Lag at maximum cross-correlation
+        envelope_corr_mean: Envelope correlation mean
+        mutual_info_mean: Mutual information mean
+        normalized_mi_mean: Normalized mutual information mean
+        psd_correlation: Correlation between PSDs
+        band_power_errors: Per-band power errors
     """
 
     method: str
@@ -79,41 +113,155 @@ class Phase1Metrics:
     n_folds: int = 5
     n_samples: int = 0
 
+    # Additional correlation
+    spearman_mean: float = 0.0
+    spearman_std: float = 0.0
+
+    # DSP Metrics - Phase connectivity
+    plv_mean: float = 0.0
+    plv_std: float = 0.0
+    pli_mean: float = 0.0
+    pli_std: float = 0.0
+    wpli_mean: float = 0.0
+    wpli_std: float = 0.0
+
+    # DSP Metrics - Coherence
+    coherence_mean: float = 0.0
+    coherence_std: float = 0.0
+    coherence_bands: Dict[str, float] = field(default_factory=dict)
+
+    # DSP Metrics - SNR
+    snr_db_mean: float = 0.0
+    reconstruction_snr_db: float = 0.0
+
+    # DSP Metrics - Cross-correlation
+    cross_corr_max: float = 0.0
+    cross_corr_lag: int = 0
+
+    # DSP Metrics - Envelope
+    envelope_corr_mean: float = 0.0
+    envelope_corr_std: float = 0.0
+
+    # DSP Metrics - Information theory
+    mutual_info_mean: float = 0.0
+    normalized_mi_mean: float = 0.0
+
+    # DSP Metrics - PSD comparison
+    psd_correlation: float = 0.0
+    band_power_errors: Dict[str, float] = field(default_factory=dict)
+
+    # Fold-level DSP metrics for statistical analysis
+    fold_plvs: List[float] = field(default_factory=list)
+    fold_plis: List[float] = field(default_factory=list)
+    fold_coherences: List[float] = field(default_factory=list)
+    fold_envelope_corrs: List[float] = field(default_factory=list)
+    fold_reconstruction_snrs: List[float] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return {
+        result = {
             "method": self.method,
             "r2_mean": self.r2_mean,
             "r2_std": self.r2_std,
+            "r2_ci": list(self.r2_ci),
             "r2_ci_lower": self.r2_ci[0],
             "r2_ci_upper": self.r2_ci[1],
             "mae_mean": self.mae_mean,
             "mae_std": self.mae_std,
             "pearson_mean": self.pearson_mean,
             "pearson_std": self.pearson_std,
+            "spearman_mean": self.spearman_mean,
+            "spearman_std": self.spearman_std,
             "psd_error_db": self.psd_error_db,
-            **{f"r2_{band}": r2 for band, r2 in self.band_r2.items()},
+            "band_r2": self.band_r2,
             "n_folds": self.n_folds,
             "n_samples": self.n_samples,
+            # DSP metrics
+            "plv_mean": self.plv_mean,
+            "plv_std": self.plv_std,
+            "pli_mean": self.pli_mean,
+            "pli_std": self.pli_std,
+            "wpli_mean": self.wpli_mean,
+            "wpli_std": self.wpli_std,
+            "coherence_mean": self.coherence_mean,
+            "coherence_std": self.coherence_std,
+            "coherence_bands": self.coherence_bands,
+            "snr_db_mean": self.snr_db_mean,
+            "reconstruction_snr_db": self.reconstruction_snr_db,
+            "cross_corr_max": self.cross_corr_max,
+            "cross_corr_lag": self.cross_corr_lag,
+            "envelope_corr_mean": self.envelope_corr_mean,
+            "envelope_corr_std": self.envelope_corr_std,
+            "mutual_info_mean": self.mutual_info_mean,
+            "normalized_mi_mean": self.normalized_mi_mean,
+            "psd_correlation": self.psd_correlation,
+            "band_power_errors": self.band_power_errors,
+            # Fold-level data
+            "fold_r2s": self.fold_r2s,
+            "fold_maes": self.fold_maes,
+            "fold_pearsons": self.fold_pearsons,
+            "fold_plvs": self.fold_plvs,
+            "fold_plis": self.fold_plis,
+            "fold_coherences": self.fold_coherences,
+            "fold_envelope_corrs": self.fold_envelope_corrs,
+            "fold_reconstruction_snrs": self.fold_reconstruction_snrs,
         }
+        # Add band R² individually for backward compatibility
+        for band, r2 in self.band_r2.items():
+            result[f"r2_{band}"] = r2
+        return result
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Phase1Metrics":
         """Create from dictionary."""
-        band_r2 = {band: d.get(f"r2_{band}", np.nan) for band in NEURAL_BANDS.keys()}
+        band_r2 = d.get("band_r2", {band: d.get(f"r2_{band}", np.nan) for band in NEURAL_BANDS.keys()})
+        r2_ci = d.get("r2_ci", (d.get("r2_ci_lower", 0.0), d.get("r2_ci_upper", 0.0)))
+        if isinstance(r2_ci, list):
+            r2_ci = tuple(r2_ci)
         return cls(
             method=d["method"],
             r2_mean=d["r2_mean"],
             r2_std=d["r2_std"],
-            r2_ci=(d["r2_ci_lower"], d["r2_ci_upper"]),
+            r2_ci=r2_ci,
             mae_mean=d["mae_mean"],
             mae_std=d["mae_std"],
             pearson_mean=d["pearson_mean"],
             pearson_std=d["pearson_std"],
+            spearman_mean=d.get("spearman_mean", 0.0),
+            spearman_std=d.get("spearman_std", 0.0),
             psd_error_db=d["psd_error_db"],
             band_r2=band_r2,
             n_folds=d.get("n_folds", 5),
             n_samples=d.get("n_samples", 0),
+            # DSP metrics
+            plv_mean=d.get("plv_mean", 0.0),
+            plv_std=d.get("plv_std", 0.0),
+            pli_mean=d.get("pli_mean", 0.0),
+            pli_std=d.get("pli_std", 0.0),
+            wpli_mean=d.get("wpli_mean", 0.0),
+            wpli_std=d.get("wpli_std", 0.0),
+            coherence_mean=d.get("coherence_mean", 0.0),
+            coherence_std=d.get("coherence_std", 0.0),
+            coherence_bands=d.get("coherence_bands", {}),
+            snr_db_mean=d.get("snr_db_mean", 0.0),
+            reconstruction_snr_db=d.get("reconstruction_snr_db", 0.0),
+            cross_corr_max=d.get("cross_corr_max", 0.0),
+            cross_corr_lag=d.get("cross_corr_lag", 0),
+            envelope_corr_mean=d.get("envelope_corr_mean", 0.0),
+            envelope_corr_std=d.get("envelope_corr_std", 0.0),
+            mutual_info_mean=d.get("mutual_info_mean", 0.0),
+            normalized_mi_mean=d.get("normalized_mi_mean", 0.0),
+            psd_correlation=d.get("psd_correlation", 0.0),
+            band_power_errors=d.get("band_power_errors", {}),
+            # Fold-level data
+            fold_r2s=d.get("fold_r2s", []),
+            fold_maes=d.get("fold_maes", []),
+            fold_pearsons=d.get("fold_pearsons", []),
+            fold_plvs=d.get("fold_plvs", []),
+            fold_plis=d.get("fold_plis", []),
+            fold_coherences=d.get("fold_coherences", []),
+            fold_envelope_corrs=d.get("fold_envelope_corrs", []),
+            fold_reconstruction_snrs=d.get("fold_reconstruction_snrs", []),
         )
 
 
@@ -165,7 +313,7 @@ class MetricsCalculator:
         self.n_bootstrap = n_bootstrap
         self.ci_level = ci_level
 
-    def compute(self, y_pred: NDArray, y_true: NDArray) -> Dict[str, float]:
+    def compute(self, y_pred: NDArray, y_true: NDArray) -> Dict[str, Any]:
         """Compute all metrics for a single evaluation.
 
         Args:
@@ -197,6 +345,11 @@ class MetricsCalculator:
         metrics["pearson"] = pearson
         metrics["pearson_std"] = pearson_std
 
+        # Spearman correlation
+        spearman, spearman_std = self._compute_spearman(y_pred, y_true)
+        metrics["spearman"] = spearman
+        metrics["spearman_std"] = spearman_std
+
         # PSD error in dB
         metrics["psd_error_db"] = self._compute_psd_error(y_pred, y_true)
 
@@ -204,6 +357,10 @@ class MetricsCalculator:
         band_r2 = self._compute_band_r2(y_pred, y_true)
         for band, r2_val in band_r2.items():
             metrics[f"r2_{band}"] = r2_val
+
+        # DSP Metrics
+        dsp_metrics = self._compute_dsp_metrics(y_pred, y_true)
+        metrics.update(dsp_metrics)
 
         return metrics
 
@@ -249,6 +406,25 @@ class MetricsCalculator:
 
         if valid.any():
             return float(np.mean(correlations[valid])), float(np.std(correlations[valid]))
+        return 0.0, 0.0
+
+    def _compute_spearman(self, y_pred: NDArray, y_true: NDArray) -> Tuple[float, float]:
+        """Compute Spearman correlation per channel, then average."""
+        N, C, T = y_pred.shape
+
+        correlations = []
+        for c in range(C):
+            pred_flat = y_pred[:, c, :].flatten()
+            true_flat = y_true[:, c, :].flatten()
+            try:
+                corr, _ = stats.spearmanr(pred_flat, true_flat)
+                if np.isfinite(corr):
+                    correlations.append(corr)
+            except Exception:
+                pass
+
+        if correlations:
+            return float(np.mean(correlations)), float(np.std(correlations))
         return 0.0, 0.0
 
     def _compute_psd_error(self, y_pred: NDArray, y_true: NDArray) -> float:
@@ -334,6 +510,136 @@ class MetricsCalculator:
         ci_upper = float(np.percentile(bootstrap_means, 100 * (1 - alpha / 2)))
 
         return (ci_lower, ci_upper)
+
+    def _compute_dsp_metrics(self, y_pred: NDArray, y_true: NDArray) -> Dict[str, Any]:
+        """Compute comprehensive DSP metrics for signal reconstruction quality.
+
+        Computes phase connectivity, coherence, SNR, cross-correlation,
+        envelope correlation, mutual information, and PSD comparison metrics.
+
+        Args:
+            y_pred: Predictions [N, C, T]
+            y_true: Ground truth [N, C, T]
+
+        Returns:
+            Dictionary of DSP metric name -> value
+        """
+        N, C, T = y_pred.shape
+        dsp = {}
+
+        # Sample a subset of channels/samples for computational efficiency
+        max_samples = min(N, 50)
+        max_channels = min(C, 8)
+        sample_indices = np.linspace(0, N - 1, max_samples, dtype=int)
+        channel_indices = np.linspace(0, C - 1, max_channels, dtype=int)
+
+        # Collect per-sample metrics
+        plvs, plis, wplis = [], [], []
+        coherences = []
+        reconstruction_snrs = []
+        cross_corr_maxs, cross_corr_lags = [], []
+        envelope_corrs = []
+        mutual_infos, normalized_mis = [], []
+        psd_corrs = []
+        band_coherences = {band: [] for band in FREQUENCY_BANDS.keys()}
+        band_power_errs = {band: [] for band in FREQUENCY_BANDS.keys()}
+
+        for n in sample_indices:
+            for c in channel_indices:
+                pred_signal = y_pred[n, c, :]
+                true_signal = y_true[n, c, :]
+
+                try:
+                    # Phase connectivity metrics
+                    plv = compute_plv(true_signal, pred_signal, fs=self.sample_rate)
+                    pli = compute_pli(true_signal, pred_signal, fs=self.sample_rate)
+                    wpli = compute_wpli(true_signal, pred_signal, fs=self.sample_rate)
+                    plvs.append(plv)
+                    plis.append(pli)
+                    wplis.append(wpli)
+
+                    # Coherence
+                    nperseg = min(256, T // 4) if T >= 256 else T // 2
+                    freqs, coh, band_coh = compute_coherence(
+                        true_signal, pred_signal,
+                        fs=self.sample_rate, nperseg=nperseg
+                    )
+                    coherences.append(np.mean(coh))
+                    for band, val in band_coh.items():
+                        if not np.isnan(val):
+                            band_coherences[band].append(val)
+
+                    # Reconstruction SNR
+                    recon_snr = compute_reconstruction_snr(true_signal, pred_signal)
+                    reconstruction_snrs.append(recon_snr)
+
+                    # Cross-correlation
+                    max_corr, lag, _ = compute_cross_correlation(
+                        true_signal, pred_signal,
+                        max_lag=min(int(self.sample_rate), T // 2)
+                    )
+                    cross_corr_maxs.append(max_corr)
+                    cross_corr_lags.append(lag)
+
+                    # Envelope correlation
+                    env_corr = compute_envelope_correlation(
+                        true_signal, pred_signal, fs=self.sample_rate
+                    )
+                    envelope_corrs.append(env_corr)
+
+                    # Mutual information
+                    mi = compute_mutual_information(true_signal, pred_signal, bins=32)
+                    nmi = compute_normalized_mi(true_signal, pred_signal, bins=32)
+                    mutual_infos.append(mi)
+                    normalized_mis.append(nmi)
+
+                    # PSD comparison
+                    psd_comp = compare_psd(true_signal, pred_signal,
+                                          fs=self.sample_rate, nperseg=nperseg)
+                    psd_corrs.append(psd_comp['psd_correlation'])
+                    for band, err in psd_comp['band_power_errors'].items():
+                        if not np.isnan(err):
+                            band_power_errs[band].append(err)
+
+                except Exception:
+                    # Skip failed computations
+                    pass
+
+        # Aggregate metrics
+        def safe_mean(arr):
+            arr = [x for x in arr if np.isfinite(x)]
+            return float(np.mean(arr)) if arr else 0.0
+
+        def safe_std(arr):
+            arr = [x for x in arr if np.isfinite(x)]
+            return float(np.std(arr)) if len(arr) > 1 else 0.0
+
+        dsp['plv'] = safe_mean(plvs)
+        dsp['plv_std'] = safe_std(plvs)
+        dsp['pli'] = safe_mean(plis)
+        dsp['pli_std'] = safe_std(plis)
+        dsp['wpli'] = safe_mean(wplis)
+        dsp['wpli_std'] = safe_std(wplis)
+
+        dsp['coherence'] = safe_mean(coherences)
+        dsp['coherence_std'] = safe_std(coherences)
+        dsp['coherence_bands'] = {band: safe_mean(vals) for band, vals in band_coherences.items()}
+
+        dsp['reconstruction_snr_db'] = safe_mean(reconstruction_snrs)
+
+        dsp['cross_corr_max'] = safe_mean(cross_corr_maxs)
+        dsp['cross_corr_lag'] = int(np.round(safe_mean(cross_corr_lags)))
+
+        dsp['envelope_corr'] = safe_mean(envelope_corrs)
+        dsp['envelope_corr_std'] = safe_std(envelope_corrs)
+
+        dsp['mutual_info'] = safe_mean(mutual_infos)
+        dsp['normalized_mi'] = safe_mean(normalized_mis)
+
+        dsp['psd_correlation'] = safe_mean(psd_corrs)
+        dsp['band_power_errors'] = {band: safe_mean(errs) for band, errs in band_power_errs.items()}
+
+        return dsp
 
 
 # =============================================================================

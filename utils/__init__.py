@@ -2,7 +2,7 @@
 Utilities for Nature Methods Publication
 ========================================
 
-Shared utilities for statistical testing, visualization, and metrics.
+Shared utilities for statistical testing, visualization, metrics, and DSP analysis.
 """
 
 from .statistics import (
@@ -66,6 +66,47 @@ from .plotting import (
     add_panel_labels,
 )
 
+from .dsp_metrics import (
+    # Constants
+    FREQUENCY_BANDS,
+    # Data classes
+    PSDResult,
+    ConnectivityResult,
+    SNRResult,
+    ComprehensiveMetrics,
+    # PSD functions
+    compute_psd,
+    compare_psd,
+    # Phase connectivity
+    compute_analytic_signal,
+    compute_plv,
+    compute_pli,
+    compute_wpli,
+    compute_band_plv,
+    # Coherence
+    compute_coherence,
+    # SNR
+    compute_snr,
+    compute_reconstruction_snr,
+    # Correlations
+    compute_cross_correlation,
+    compute_envelope_correlation,
+    # Information theory
+    compute_mutual_information,
+    compute_normalized_mi,
+    # Spectral features
+    compute_spectral_flatness,
+    compute_spectral_centroid,
+    compute_spectral_bandwidth,
+    # Main functions
+    compute_all_dsp_metrics,
+    compute_connectivity_metrics,
+    compute_batch_metrics,
+    # Utilities
+    metrics_to_dict,
+    connectivity_to_dict,
+)
+
 __all__ = [
     # Statistics - Result classes
     "TestResult",
@@ -122,4 +163,42 @@ __all__ = [
     "create_figure",
     "save_figure",
     "add_panel_labels",
+    # DSP - Constants
+    "FREQUENCY_BANDS",
+    # DSP - Data classes
+    "PSDResult",
+    "ConnectivityResult",
+    "SNRResult",
+    "ComprehensiveMetrics",
+    # DSP - PSD functions
+    "compute_psd",
+    "compare_psd",
+    # DSP - Phase connectivity
+    "compute_analytic_signal",
+    "compute_plv",
+    "compute_pli",
+    "compute_wpli",
+    "compute_band_plv",
+    # DSP - Coherence
+    "compute_coherence",
+    # DSP - SNR
+    "compute_snr",
+    "compute_reconstruction_snr",
+    # DSP - Correlations
+    "compute_cross_correlation",
+    "compute_envelope_correlation",
+    # DSP - Information theory
+    "compute_mutual_information",
+    "compute_normalized_mi",
+    # DSP - Spectral features
+    "compute_spectral_flatness",
+    "compute_spectral_centroid",
+    "compute_spectral_bandwidth",
+    # DSP - Main functions
+    "compute_all_dsp_metrics",
+    "compute_connectivity_metrics",
+    "compute_batch_metrics",
+    # DSP - Utilities
+    "metrics_to_dict",
+    "connectivity_to_dict",
 ]

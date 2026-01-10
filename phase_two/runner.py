@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -139,6 +140,7 @@ class Phase2Result:
     config: Dict[str, Any]
     comprehensive_stats: Optional[Dict[str, Any]] = None
     assumption_checks: Optional[Dict[str, Any]] = None
+    models: Optional[Dict[str, Any]] = None  # Architecture -> model state dict
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -152,12 +154,36 @@ class Phase2Result:
             "config": self.config,
             "comprehensive_stats": self.comprehensive_stats,
             "assumption_checks": self.assumption_checks,
+            "has_models": self.models is not None,
             "timestamp": self.timestamp,
         }
 
     def save(self, path: Path) -> None:
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
+
+    def save_models(self, path: Path) -> None:
+        """Save trained models to pickle file."""
+        if self.models is None:
+            print("No models to save")
+            return
+
+        model_path = Path(path)
+        if model_path.suffix != '.pkl':
+            model_path = model_path.with_suffix('.pkl')
+
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.models, f)
+
+        print(f"Models saved to: {model_path}")
+
+    @staticmethod
+    def load_models(path: Path) -> Dict[str, Any]:
+        """Load trained models from pickle file."""
+        with open(path, 'rb') as f:
+            return pickle.load(f)
 
     @classmethod
     def load(cls, path: Path) -> "Phase2Result":
@@ -343,6 +369,7 @@ def run_phase2(
 
     all_results = []
     arch_r2s = {arch: [] for arch in config.architectures}
+    all_models = {}  # Store best model for each architecture
 
     run_idx = 0
     total_runs = config.total_runs
@@ -408,8 +435,21 @@ def run_phase2(
             all_results.append(result)
             arch_r2s[arch_name].append(result.best_val_r2)
 
+            # Store best model for this architecture (keep the best across folds)
+            if arch_name not in all_models or result.best_val_r2 > all_models[arch_name]['r2']:
+                all_models[arch_name] = {
+                    'state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
+                    'r2': result.best_val_r2,
+                    'fold': fold_idx,
+                    'n_parameters': n_params,
+                }
+
             print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
             print(f"  Time: {result.total_time:.1f}s")
+            if result.dsp_metrics:
+                print(f"  DSP: PLV={result.dsp_metrics.get('plv_mean', 0):.4f}, "
+                      f"Coh={result.dsp_metrics.get('coherence_mean', 0):.4f}, "
+                      f"SNR={result.dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB")
 
             # Show robustness info if any issues
             if result.nan_detected:
@@ -422,6 +462,18 @@ def run_phase2(
     for arch_name in config.architectures:
         r2s = arch_r2s[arch_name]
         valid_r2s = [r for r in r2s if not np.isnan(r)]
+
+        # Get DSP metrics from results
+        arch_results = [r for r in all_results if r.architecture == arch_name]
+        dsp_agg = {}
+        if arch_results and arch_results[0].dsp_metrics:
+            dsp_keys = arch_results[0].dsp_metrics.keys()
+            for key in dsp_keys:
+                vals = [r.dsp_metrics.get(key, 0) for r in arch_results if r.dsp_metrics]
+                if vals:
+                    dsp_agg[f"{key}_mean"] = float(np.mean(vals))
+                    dsp_agg[f"{key}_std"] = float(np.std(vals))
+
         aggregated[arch_name] = {
             "r2_mean": float(np.mean(valid_r2s)) if valid_r2s else np.nan,
             "r2_std": float(np.std(valid_r2s, ddof=1)) if len(valid_r2s) > 1 else 0.0,
@@ -429,6 +481,7 @@ def run_phase2(
             "r2_max": float(np.max(valid_r2s)) if valid_r2s else np.nan,
             "n_folds": len(valid_r2s),
             "fold_r2s": r2s,  # Store individual fold results
+            **dsp_agg,  # Include aggregated DSP metrics
         }
 
     # Find best
@@ -492,6 +545,7 @@ def run_phase2(
         config=config.to_dict(),
         comprehensive_stats=comprehensive_stats,
         assumption_checks=assumption_checks,
+        models=all_models if all_models else None,
     )
 
     # Print summary
@@ -702,6 +756,11 @@ Examples:
     results_file = config.output_dir / f"phase2_results_{timestamp}.json"
     result.save(results_file)
     print(f"\nResults saved to: {results_file}")
+
+    # Save models separately
+    if result.models:
+        models_file = config.output_dir / f"phase2_models_{timestamp}.pkl"
+        result.save_models(models_file)
 
     print("\nPhase 2 complete!")
     return result

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ class Phase1Result:
         statistical_comparisons: Pairwise method comparisons
         comprehensive_stats: Enhanced statistical analysis with both parametric/non-parametric tests
         assumption_checks: Results of normality and homogeneity tests
+        models: Dictionary of trained models (method_name -> model object)
         config: Configuration used
         timestamp: Evaluation timestamp
     """
@@ -94,6 +96,7 @@ class Phase1Result:
     statistical_comparisons: List[StatisticalComparison] = field(default_factory=list)
     comprehensive_stats: Optional[Dict[str, Any]] = None
     assumption_checks: Optional[Dict[str, Any]] = None
+    models: Optional[Dict[str, Any]] = None  # Trained models for each method
     config: Optional[Dict[str, Any]] = None
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -120,6 +123,7 @@ class Phase1Result:
             ],
             "comprehensive_stats": self.comprehensive_stats,
             "assumption_checks": self.assumption_checks,
+            "has_models": self.models is not None,
             "config": self.config,
             "timestamp": self.timestamp,
         }
@@ -128,6 +132,40 @@ class Phase1Result:
         """Save results to JSON file."""
         with open(path, 'w') as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
+
+    def save_models(self, path: Path) -> None:
+        """Save trained models to pickle file.
+
+        Args:
+            path: Path to save models (will add .pkl extension if not present)
+        """
+        if self.models is None:
+            print("No models to save")
+            return
+
+        model_path = Path(path)
+        if model_path.suffix != '.pkl':
+            model_path = model_path.with_suffix('.pkl')
+
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(model_path, 'wb') as f:
+            pickle.dump(self.models, f)
+
+        print(f"Models saved to: {model_path}")
+
+    @staticmethod
+    def load_models(path: Path) -> Dict[str, Any]:
+        """Load trained models from pickle file.
+
+        Args:
+            path: Path to models pickle file
+
+        Returns:
+            Dictionary of method_name -> model object
+        """
+        with open(path, 'rb') as f:
+            return pickle.load(f)
 
     @classmethod
     def load(cls, path: Path) -> "Phase1Result":
@@ -307,7 +345,8 @@ def evaluate_baseline(
     X: NDArray,
     y: NDArray,
     config: Phase1Config,
-) -> Tuple[Phase1Metrics, Optional[NDArray]]:
+    return_model: bool = True,
+) -> Tuple[Phase1Metrics, Optional[NDArray], Optional[Any]]:
     """Evaluate a single baseline with cross-validation.
 
     Args:
@@ -315,9 +354,10 @@ def evaluate_baseline(
         X: Input signals [N, C, T]
         y: Target signals [N, C, T]
         config: Configuration object
+        return_model: Whether to return a trained model on full data
 
     Returns:
-        Phase1Metrics object and optional predictions on last fold
+        Phase1Metrics object, optional predictions on last fold, and optional trained model
     """
     n_samples = X.shape[0]
     splits = create_cv_splits(n_samples, config.n_folds, config.seed)
@@ -341,7 +381,7 @@ def evaluate_baseline(
             model.fit(X_train, y_train)
             y_pred = model.predict(X_val)
 
-            # Compute metrics
+            # Compute metrics (including DSP metrics)
             metrics = metrics_calc.compute(y_pred, y_val)
             fold_results.append(metrics)
 
@@ -353,14 +393,16 @@ def evaluate_baseline(
             print(f"    Warning: Fold {fold_idx} failed for {baseline_name}: {e}")
             fold_results.append({"r2": np.nan, "mae": np.nan, "pearson": np.nan})
 
-    # Aggregate across folds
+    # Aggregate across folds - basic metrics
     fold_r2s = [r.get("r2", np.nan) for r in fold_results]
     fold_maes = [r.get("mae", np.nan) for r in fold_results]
     fold_pearsons = [r.get("pearson", np.nan) for r in fold_results]
+    fold_spearmans = [r.get("spearman", np.nan) for r in fold_results]
 
     valid_r2s = np.array([r for r in fold_r2s if not np.isnan(r)])
     valid_maes = np.array([m for m in fold_maes if not np.isnan(m)])
     valid_pearsons = np.array([p for p in fold_pearsons if not np.isnan(p)])
+    valid_spearmans = np.array([s for s in fold_spearmans if not np.isnan(s)])
 
     # Compute bootstrap CI
     ci = metrics_calc.bootstrap_ci(np.array(fold_r2s))
@@ -377,6 +419,46 @@ def evaluate_baseline(
     valid_psd = [p for p in psd_errors if not np.isnan(p)]
     psd_error_db = float(np.mean(valid_psd)) if valid_psd else np.nan
 
+    # Aggregate DSP metrics across folds
+    def aggregate_metric(key):
+        vals = [r.get(key, np.nan) for r in fold_results]
+        valid = [v for v in vals if not np.isnan(v)]
+        return (float(np.mean(valid)) if valid else 0.0,
+                float(np.std(valid)) if len(valid) > 1 else 0.0,
+                vals)
+
+    plv_mean, plv_std, fold_plvs = aggregate_metric("plv")
+    pli_mean, pli_std, fold_plis = aggregate_metric("pli")
+    wpli_mean, wpli_std, _ = aggregate_metric("wpli")
+    coherence_mean, coherence_std, fold_coherences = aggregate_metric("coherence")
+    recon_snr, _, fold_snrs = aggregate_metric("reconstruction_snr_db")
+    cross_corr_max, _, _ = aggregate_metric("cross_corr_max")
+    cross_corr_lag = int(np.nanmean([r.get("cross_corr_lag", 0) for r in fold_results]))
+    env_corr_mean, env_corr_std, fold_env_corrs = aggregate_metric("envelope_corr")
+    mi_mean, _, _ = aggregate_metric("mutual_info")
+    nmi_mean, _, _ = aggregate_metric("normalized_mi")
+    psd_corr_mean, _, _ = aggregate_metric("psd_correlation")
+
+    # Aggregate coherence bands
+    coherence_bands = {}
+    for band in NEURAL_BANDS.keys():
+        band_vals = []
+        for r in fold_results:
+            coh_bands = r.get("coherence_bands", {})
+            if band in coh_bands and not np.isnan(coh_bands[band]):
+                band_vals.append(coh_bands[band])
+        coherence_bands[band] = float(np.mean(band_vals)) if band_vals else 0.0
+
+    # Aggregate band power errors
+    band_power_errors = {}
+    for band in NEURAL_BANDS.keys():
+        band_vals = []
+        for r in fold_results:
+            bp_errors = r.get("band_power_errors", {})
+            if band in bp_errors and not np.isnan(bp_errors[band]):
+                band_vals.append(bp_errors[band])
+        band_power_errors[band] = float(np.mean(band_vals)) if band_vals else 0.0
+
     result = Phase1Metrics(
         method=baseline_name,
         r2_mean=float(np.mean(valid_r2s)) if len(valid_r2s) > 0 else np.nan,
@@ -386,6 +468,8 @@ def evaluate_baseline(
         mae_std=float(np.std(valid_maes, ddof=1)) if len(valid_maes) > 1 else 0.0,
         pearson_mean=float(np.mean(valid_pearsons)) if len(valid_pearsons) > 0 else np.nan,
         pearson_std=float(np.std(valid_pearsons, ddof=1)) if len(valid_pearsons) > 1 else 0.0,
+        spearman_mean=float(np.mean(valid_spearmans)) if len(valid_spearmans) > 0 else np.nan,
+        spearman_std=float(np.std(valid_spearmans, ddof=1)) if len(valid_spearmans) > 1 else 0.0,
         psd_error_db=psd_error_db,
         band_r2=band_r2,
         fold_r2s=fold_r2s,
@@ -393,9 +477,43 @@ def evaluate_baseline(
         fold_pearsons=fold_pearsons,
         n_folds=config.n_folds,
         n_samples=n_samples,
+        # DSP metrics
+        plv_mean=plv_mean,
+        plv_std=plv_std,
+        pli_mean=pli_mean,
+        pli_std=pli_std,
+        wpli_mean=wpli_mean,
+        wpli_std=wpli_std,
+        coherence_mean=coherence_mean,
+        coherence_std=coherence_std,
+        coherence_bands=coherence_bands,
+        reconstruction_snr_db=recon_snr,
+        cross_corr_max=cross_corr_max,
+        cross_corr_lag=cross_corr_lag,
+        envelope_corr_mean=env_corr_mean,
+        envelope_corr_std=env_corr_std,
+        mutual_info_mean=mi_mean,
+        normalized_mi_mean=nmi_mean,
+        psd_correlation=psd_corr_mean,
+        band_power_errors=band_power_errors,
+        # Fold-level DSP data
+        fold_plvs=fold_plvs,
+        fold_plis=fold_plis,
+        fold_coherences=fold_coherences,
+        fold_envelope_corrs=fold_env_corrs,
+        fold_reconstruction_snrs=fold_snrs,
     )
 
-    return result, last_predictions
+    # Train final model on full data if requested
+    final_model = None
+    if return_model:
+        try:
+            final_model = create_baseline(baseline_name)
+            final_model.fit(X, y)
+        except Exception as e:
+            print(f"    Warning: Could not train final model for {baseline_name}: {e}")
+
+    return result, last_predictions, final_model
 
 
 # =============================================================================
@@ -428,6 +546,7 @@ def run_phase1(
 
     all_metrics = []
     all_predictions = {}
+    all_models = {}
     method_fold_r2s = {}
 
     # Evaluate each baseline
@@ -435,17 +554,22 @@ def run_phase1(
         print(f"[{i+1}/{len(config.baselines)}] Evaluating {baseline_name}...")
         start_time = time.time()
 
-        result, predictions = evaluate_baseline(baseline_name, X, y, config)
+        result, predictions, model = evaluate_baseline(baseline_name, X, y, config, return_model=True)
         all_metrics.append(result)
 
         if predictions is not None:
             all_predictions[baseline_name] = predictions[0]  # y_pred
+
+        if model is not None:
+            all_models[baseline_name] = model
 
         method_fold_r2s[baseline_name] = result.fold_r2s
 
         elapsed = time.time() - start_time
         ci_str = f"[{result.r2_ci[0]:.4f}, {result.r2_ci[1]:.4f}]"
         print(f"    R² = {result.r2_mean:.4f} ± {result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
+        # Print key DSP metrics
+        print(f"    PLV = {result.plv_mean:.4f}, Coherence = {result.coherence_mean:.4f}, SNR = {result.reconstruction_snr_db:.1f} dB")
 
     # Find best method
     valid_metrics = [m for m in all_metrics if not np.isnan(m.r2_mean)]
@@ -514,6 +638,7 @@ def run_phase1(
         statistical_comparisons=comparisons,
         comprehensive_stats=comprehensive_stats,
         assumption_checks=assumption_checks,
+        models=all_models if all_models else None,
         config=config.to_dict(),
     )
 
@@ -522,6 +647,15 @@ def run_phase1(
     print("PHASE 1 RESULTS SUMMARY")
     print("=" * 70)
     print(format_metrics_table(all_metrics))
+
+    # DSP Metrics Summary
+    print("\nDSP Metrics Summary:")
+    print("-" * 90)
+    print(f"{'Method':<18}{'PLV':>8}{'PLI':>8}{'Coh':>8}{'Env.Corr':>10}{'SNR(dB)':>10}{'NMI':>8}")
+    print("-" * 90)
+    for m in sorted(all_metrics, key=lambda x: -x.r2_mean):
+        print(f"{m.method:<18}{m.plv_mean:>8.4f}{m.pli_mean:>8.4f}{m.coherence_mean:>8.4f}"
+              f"{m.envelope_corr_mean:>10.4f}{m.reconstruction_snr_db:>10.2f}{m.normalized_mi_mean:>8.4f}")
 
     # Per-band breakdown for top 3
     print("\nPer-Band R² (Top 3 Methods):")
@@ -737,6 +871,11 @@ Examples:
     results_file = config.output_dir / f"phase1_results_{timestamp}.json"
     result.save(results_file)
     print(f"\nResults saved to: {results_file}")
+
+    # Save models separately (they can be large)
+    if result.models:
+        models_file = config.output_dir / f"phase1_models_{timestamp}.pkl"
+        result.save_models(models_file)
 
     # Generate figures
     if not args.no_figures:
