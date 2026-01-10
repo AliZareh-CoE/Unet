@@ -11,6 +11,11 @@ Usage:
     python -m phase_two.runner --dry-run  # Quick test
     python -m phase_two.runner --arch condunet --seeds 42 43 44
 
+Auto-loading Phase 1 Results:
+    If --classical-r2 is not specified, Phase 2 will automatically
+    search for Phase 1 results in results/phase1/ and use the best
+    classical R² as the gate threshold baseline.
+
 Output:
     - JSON results with per-architecture metrics
     - Learning curves and comparison figures
@@ -44,6 +49,60 @@ from phase_two.config import (
 )
 from phase_two.architectures import create_architecture, list_architectures
 from phase_two.trainer import Trainer, TrainingResult, create_dataloaders
+
+
+# =============================================================================
+# Phase 1 Result Loading
+# =============================================================================
+
+def load_phase1_classical_r2(phase1_dir: Path = None) -> Optional[float]:
+    """Auto-load best classical R² from Phase 1 results.
+
+    Searches for Phase 1 result files and extracts the best R².
+
+    Args:
+        phase1_dir: Directory containing Phase 1 results.
+                    Defaults to results/phase1/
+
+    Returns:
+        Best R² value from Phase 1, or None if not found.
+    """
+    if phase1_dir is None:
+        phase1_dir = PROJECT_ROOT / "results" / "phase1"
+
+    phase1_dir = Path(phase1_dir)
+
+    if not phase1_dir.exists():
+        return None
+
+    # Find phase1 result files (sorted by modification time, newest first)
+    result_files = sorted(
+        phase1_dir.glob("phase1_results*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+    if not result_files:
+        return None
+
+    # Load the most recent result file
+    result_file = result_files[0]
+    try:
+        with open(result_file, "r") as f:
+            data = json.load(f)
+
+        # Extract best R²
+        best_r2 = data.get("best_r2")
+        best_method = data.get("best_method", "unknown")
+
+        if best_r2 is not None:
+            print(f"[Auto-loaded] Phase 1 best R²: {best_r2:.4f} ({best_method})")
+            print(f"  Source: {result_file}")
+            return float(best_r2)
+    except Exception as e:
+        print(f"Warning: Could not load Phase 1 results from {result_file}: {e}")
+
+    return None
 
 
 # =============================================================================
@@ -394,8 +453,10 @@ Examples:
                        help="Only run fast architectures")
     parser.add_argument("--no-checkpoints", action="store_true",
                        help="Don't save model checkpoints")
-    parser.add_argument("--classical-r2", type=float, default=0.35,
-                       help="Phase 1 classical baseline R²")
+    parser.add_argument("--classical-r2", type=float, default=None,
+                       help="Phase 1 classical baseline R² (auto-loads from results/phase1/ if not specified)")
+    parser.add_argument("--phase1-dir", type=str, default=None,
+                       help="Directory containing Phase 1 results for auto-loading")
     parser.add_argument("--load-results", type=str, default=None,
                        help="Load previous results and regenerate figures (path to JSON)")
     parser.add_argument("--figure-format", type=str, default="pdf",
@@ -465,6 +526,19 @@ Examples:
         save_checkpoints=not args.no_checkpoints,
     )
 
+    # Auto-load classical R² from Phase 1 if not specified
+    classical_r2 = args.classical_r2
+    if classical_r2 is None:
+        phase1_dir = Path(args.phase1_dir) if args.phase1_dir else None
+        classical_r2 = load_phase1_classical_r2(phase1_dir)
+
+        if classical_r2 is None:
+            classical_r2 = 0.35  # Fallback default
+            print(f"Warning: Could not auto-load Phase 1 results. Using default R²={classical_r2}")
+            print("  Run Phase 1 first, or specify --classical-r2 manually")
+    else:
+        print(f"Using specified classical R²: {classical_r2:.4f}")
+
     # Load data
     if args.dry_run:
         print("[DRY-RUN] Using synthetic data")
@@ -485,7 +559,7 @@ Examples:
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
-        classical_r2=args.classical_r2,
+        classical_r2=classical_r2,
     )
 
     # Save results
