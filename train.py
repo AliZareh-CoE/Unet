@@ -1131,13 +1131,15 @@ def load_checkpoint(
             )
 
     # Load UNet (forward) - handle FSDP
+    # Wrap in inference_mode(False) for consistency with save_checkpoint
     if isinstance(model, FSDP):
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-        ):
-            model.load_state_dict(checkpoint["model"])
+        with torch.inference_mode(False):
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            ):
+                model.load_state_dict(checkpoint["model"])
     else:
         if hasattr(model, 'module'):
             model.module.load_state_dict(checkpoint["model"])
@@ -1147,12 +1149,13 @@ def load_checkpoint(
     # Load reverse UNet - handle FSDP
     if reverse_model is not None and "reverse_model" in checkpoint:
         if isinstance(reverse_model, FSDP):
-            with FSDP.state_dict_type(
-                reverse_model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-            ):
-                reverse_model.load_state_dict(checkpoint["reverse_model"])
+            with torch.inference_mode(False):
+                with FSDP.state_dict_type(
+                    reverse_model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+                ):
+                    reverse_model.load_state_dict(checkpoint["reverse_model"])
         else:
             if hasattr(reverse_model, 'module'):
                 reverse_model.module.load_state_dict(checkpoint["reverse_model"])
@@ -1205,21 +1208,24 @@ def save_checkpoint(
             checkpoint["split_info"] = split_info
 
         # Save forward model
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            checkpoint["model"] = model.state_dict()
-
-        # Save reverse model if exists (also FSDP)
-        if reverse_model is not None and isinstance(reverse_model, FSDP):
+        # Wrap in inference_mode(False) to avoid "Inplace update to inference tensor" errors
+        # that can occur when FSDP gathers and offloads state dict to CPU
+        with torch.inference_mode(False):
             with FSDP.state_dict_type(
-                reverse_model,
+                model,
                 StateDictType.FULL_STATE_DICT,
                 FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
             ):
-                checkpoint["reverse_model"] = reverse_model.state_dict()
+                checkpoint["model"] = model.state_dict()
+
+            # Save reverse model if exists (also FSDP)
+            if reverse_model is not None and isinstance(reverse_model, FSDP):
+                with FSDP.state_dict_type(
+                    reverse_model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                ):
+                    checkpoint["reverse_model"] = reverse_model.state_dict()
 
         if is_primary():
             torch.save(checkpoint, path)
