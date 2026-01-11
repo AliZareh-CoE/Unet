@@ -2955,6 +2955,7 @@ def train(
             print("NO TEST SET (all held-out sessions used for validation)")
             print("="*60)
             print("Final evaluation uses per-session validation metrics above.")
+            sys.stdout.flush()
 
     if is_primary() and has_test_set:
         print("\n" + "="*60)
@@ -3106,8 +3107,23 @@ def train(
                 print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
 
+    if is_primary():
+        print("[DEBUG] Post-test evaluation checkpoint 1")
+        sys.stdout.flush()
+
     if is_distributed:
+        if is_primary():
+            print("[DEBUG] Entering distributed barrier...")
+            sys.stdout.flush()
         dist.barrier()
+        if is_primary():
+            print("[DEBUG] Exited distributed barrier")
+            sys.stdout.flush()
+
+    if is_primary():
+        print("[DEBUG] Post-test evaluation checkpoint 2 (plots check)")
+        print(f"[DEBUG] generate_plots={config.get('generate_plots', True)}, VALIDATION_PLOTS_AVAILABLE={VALIDATION_PLOTS_AVAILABLE}")
+        sys.stdout.flush()
 
     # =========================================================================
     # Generate Validation Plots (galleries, per-session, per-odor)
@@ -3158,6 +3174,10 @@ def train(
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")
             traceback.print_exc()
+
+    if is_primary():
+        print("[DEBUG] Post-test evaluation checkpoint 3 (after plots)")
+        sys.stdout.flush()
 
     # =========================================================================
     # Recording: Final report generation and cleanup
@@ -3227,6 +3247,10 @@ def train(
         finally:
             # Always close the recording session
             recording_session.close()
+
+    if is_primary():
+        print("[DEBUG] About to return from train()")
+        sys.stdout.flush()
 
     return {
         "best_val_loss": best_val_loss,
