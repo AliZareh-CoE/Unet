@@ -30,15 +30,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Suppress PyTorch C++ warnings BEFORE importing torch
+os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+os.environ.setdefault("TORCH_LOGS", "-all")
+os.environ.setdefault("TORCH_SHOW_CPP_STACKTRACES", "0")
+os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "0")
+
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset, DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 
+# Disable PyTorch's internal warnings
+torch.set_warn_always(False)
+
 # Suppress harmless warnings
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*FSDP.state_dict_type.*")
 warnings.filterwarnings("ignore", message=".*Both mixed precision and an auto_wrap_policy.*")
+warnings.filterwarnings("ignore", message=".*Deallocating Tensor.*")
 
 # FSDP imports
 try:
