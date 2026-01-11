@@ -1175,6 +1175,11 @@ def save_checkpoint(
     """Save checkpoint with FSDP support (includes all models)."""
     if is_fsdp and isinstance(model, FSDP):
         # FSDP models need special handling - use context manager for each FSDP model
+        # Ensure model is in train mode to avoid inference mode restrictions
+        model.train()
+        if reverse_model is not None:
+            reverse_model.train()
+
         checkpoint = {
             "epoch": epoch,
             "optimizer": optimizer.state_dict(),
