@@ -691,26 +691,45 @@ class Trainer:
         y_pred = torch.cat(all_preds, dim=0)
         y_true = torch.cat(all_targets, dim=0)
 
-        # Gather predictions from all processes if distributed
+        # Gather metrics from all processes if distributed
         if self.use_fsdp:
-            # Gather loss
+            # Reduce loss
             loss_tensor = torch.tensor([total_loss, n_batches], device=self.device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             total_loss, n_batches = loss_tensor[0].item(), loss_tensor[1].item()
 
-            # Gather predictions and targets for R2/MAE computation
-            # Use all_gather to collect tensors from all ranks
-            world_size = self.world_size
-            gathered_preds = [torch.zeros_like(y_pred) for _ in range(world_size)]
-            gathered_targets = [torch.zeros_like(y_true) for _ in range(world_size)]
-            dist.all_gather(gathered_preds, y_pred)
-            dist.all_gather(gathered_targets, y_true)
-            y_pred = torch.cat(gathered_preds, dim=0)
-            y_true = torch.cat(gathered_targets, dim=0)
+            # Compute R2 components locally then reduce
+            # R2 = 1 - SS_res / SS_tot
+            # SS_res = sum((y_true - y_pred)^2)
+            # SS_tot = sum((y_true - mean(y_true))^2)
+            pred_flat = y_pred.reshape(-1)
+            true_flat = y_true.reshape(-1)
+            local_n = torch.tensor([len(true_flat)], dtype=torch.float64, device=self.device)
+            local_sum = torch.tensor([true_flat.sum().item()], dtype=torch.float64, device=self.device)
+            local_ss_res = torch.tensor([((true_flat - pred_flat) ** 2).sum().item()], dtype=torch.float64, device=self.device)
+            local_mae_sum = torch.tensor([torch.abs(true_flat - pred_flat).sum().item()], dtype=torch.float64, device=self.device)
+            local_sum_sq = torch.tensor([(true_flat ** 2).sum().item()], dtype=torch.float64, device=self.device)
 
-        loss = total_loss / max(n_batches, 1)
-        r2 = compute_r2(y_pred, y_true)
-        mae = compute_mae(y_pred, y_true)
+            # All-reduce to get global values
+            dist.all_reduce(local_n, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_ss_res, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_mae_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_sum_sq, op=dist.ReduceOp.SUM)
+
+            global_n = local_n.item()
+            global_mean = local_sum.item() / max(global_n, 1)
+            global_ss_res = local_ss_res.item()
+            # SS_tot = sum(y^2) - n * mean^2 = sum(y^2) - (sum(y))^2 / n
+            global_ss_tot = local_sum_sq.item() - (local_sum.item() ** 2) / max(global_n, 1)
+
+            r2 = 1.0 - global_ss_res / max(global_ss_tot, 1e-8)
+            mae = local_mae_sum.item() / max(global_n, 1)
+            loss = total_loss / max(n_batches, 1)
+        else:
+            loss = total_loss / max(n_batches, 1)
+            r2 = compute_r2(y_pred, y_true)
+            mae = compute_mae(y_pred, y_true)
 
         return loss, r2, mae
 
