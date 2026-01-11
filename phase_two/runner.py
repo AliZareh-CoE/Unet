@@ -457,6 +457,11 @@ def run_phase2(
             if not result.completed_successfully:
                 print(f"  Error: {result.error_message}")
 
+            # Clean up GPU memory between folds/architectures
+            del model, trainer, train_loader, val_loader
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     # Aggregate results per architecture (across CV folds)
     aggregated = {}
     for arch_name in config.architectures:

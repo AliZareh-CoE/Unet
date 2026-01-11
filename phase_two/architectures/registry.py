@@ -92,11 +92,11 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "dropout": 0.1,
     },
     "mamba": {
-        "d_model": 256,
-        "d_state": 16,
+        "d_model": 128,  # Reduced from 256 to fit in GPU memory
+        "d_state": 8,    # Reduced from 16 to fit in GPU memory
         "d_conv": 4,
-        "expand": 2,
-        "n_layers": 4,
+        "expand": 1,     # Reduced from 2 to fit in GPU memory
+        "n_layers": 6,   # Increased to compensate for smaller model
     },
     "condunet": {
         "base_channels": 64,

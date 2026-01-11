@@ -66,9 +66,11 @@ class CondUNet1D(nn.Module):
             self.model = FullCondUNet(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                base_channels=base_channels,
+                base=base_channels,  # models.py uses 'base' not 'base_channels'
                 n_downsample=n_downsample,
                 attention_type=attention_type,
+                cond_mode="none",  # Phase 2 doesn't use conditioning
+                dropout=dropout,
             )
             self._using_full = True
         except ImportError:
