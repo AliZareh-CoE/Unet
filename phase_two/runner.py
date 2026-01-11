@@ -124,6 +124,109 @@ def load_phase1_classical_r2(phase1_dir: Path = None) -> Optional[float]:
 
 
 # =============================================================================
+# Checkpoint/Resume Support
+# =============================================================================
+
+def get_checkpoint_path(output_dir: Path) -> Path:
+    """Get the checkpoint file path for incremental saving."""
+    return output_dir / "phase2_checkpoint.pkl"
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    all_results: List,
+    arch_r2s: Dict[str, List[float]],
+    all_models: Dict[str, Any],
+    completed_runs: set,
+) -> None:
+    """Save checkpoint after each fold for resume capability.
+
+    Args:
+        checkpoint_path: Path to save checkpoint
+        all_results: List of TrainingResult objects
+        arch_r2s: Dict mapping arch -> list of R2 values
+        all_models: Dict mapping arch -> best model info
+        completed_runs: Set of (arch_name, fold_idx) tuples that are done
+    """
+    checkpoint = {
+        "all_results": [r.to_dict() for r in all_results],
+        "arch_r2s": arch_r2s,
+        "all_models": all_models,
+        "completed_runs": list(completed_runs),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # Save atomically (write to temp file, then rename)
+    temp_path = checkpoint_path.with_suffix('.tmp')
+    with open(temp_path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    temp_path.rename(checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    """Load checkpoint if it exists.
+
+    Returns:
+        Checkpoint dict or None if no checkpoint exists
+    """
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint = pickle.load(f)
+        print(f"\n*** RESUMING FROM CHECKPOINT ***")
+        print(f"    Found {len(checkpoint['completed_runs'])} completed runs")
+        print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        return checkpoint
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint: {e}")
+        return None
+
+
+def reconstruct_results_from_checkpoint(
+    checkpoint: Dict[str, Any]
+) -> Tuple[List, Dict[str, List[float]], Dict[str, Any], set]:
+    """Reconstruct state from checkpoint.
+
+    Returns:
+        Tuple of (all_results, arch_r2s, all_models, completed_runs)
+    """
+    from phase_two.trainer import TrainingResult
+
+    # Reconstruct TrainingResult objects
+    all_results = []
+    for r_dict in checkpoint["all_results"]:
+        result = TrainingResult(
+            architecture=r_dict["architecture"],
+            fold=r_dict["fold"],
+            best_val_r2=r_dict["best_val_r2"],
+            best_val_mae=r_dict["best_val_mae"],
+            best_epoch=r_dict["best_epoch"],
+            train_losses=r_dict["train_losses"],
+            val_losses=r_dict["val_losses"],
+            val_r2s=r_dict["val_r2s"],
+            total_time=r_dict["total_time"],
+            epochs_trained=r_dict["epochs_trained"],
+            n_parameters=r_dict["n_parameters"],
+            nan_detected=r_dict.get("nan_detected", False),
+            nan_recovery_count=r_dict.get("nan_recovery_count", 0),
+            early_stopped=r_dict.get("early_stopped", False),
+            error_message=r_dict.get("error_message"),
+            peak_gpu_memory_mb=r_dict.get("peak_gpu_memory_mb"),
+            completed_successfully=r_dict.get("completed_successfully", True),
+            dsp_metrics=r_dict.get("dsp_metrics"),
+        )
+        all_results.append(result)
+
+    arch_r2s = checkpoint["arch_r2s"]
+    all_models = checkpoint["all_models"]
+    completed_runs = set(tuple(x) for x in checkpoint["completed_runs"])
+
+    return all_results, arch_r2s, all_models, completed_runs
+
+
+# =============================================================================
 # Phase 2 Result
 # =============================================================================
 
@@ -367,12 +470,27 @@ def run_phase2(
     cv_splits = create_cv_splits(n_samples, config.n_folds, config.cv_seed)
     print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
 
-    all_results = []
-    arch_r2s = {arch: [] for arch in config.architectures}
-    all_models = {}  # Store best model for each architecture
+    # Setup checkpoint for resume capability
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_results, arch_r2s, all_models, completed_runs = reconstruct_results_from_checkpoint(checkpoint)
+        # Ensure all architectures have entries in arch_r2s
+        for arch in config.architectures:
+            if arch not in arch_r2s:
+                arch_r2s[arch] = []
+    else:
+        all_results = []
+        arch_r2s = {arch: [] for arch in config.architectures}
+        all_models = {}  # Store best model for each architecture
+        completed_runs = set()
 
     run_idx = 0
     total_runs = config.total_runs
+    skipped_runs = 0
 
     for arch_name in config.architectures:
         print(f"\n{'='*60}")
@@ -381,6 +499,13 @@ def run_phase2(
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             run_idx += 1
+
+            # Check if this run was already completed
+            if (arch_name, fold_idx) in completed_runs:
+                skipped_runs += 1
+                print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds}) - SKIPPED (already completed)")
+                continue
+
             print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds})")
 
             # Get fold data
@@ -461,6 +586,15 @@ def run_phase2(
             del model, trainer, train_loader, val_loader
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            # Mark this run as completed and save checkpoint
+            completed_runs.add((arch_name, fold_idx))
+            save_checkpoint(checkpoint_path, all_results, arch_r2s, all_models, completed_runs)
+            print(f"  Checkpoint saved ({len(completed_runs)}/{total_runs} runs completed)")
+
+    # Print resume summary if any runs were skipped
+    if skipped_runs > 0:
+        print(f"\n*** Resumed run: skipped {skipped_runs} already-completed runs ***")
 
     # Aggregate results per architecture (across CV folds)
     aggregated = {}
@@ -654,6 +788,8 @@ Examples:
                        help="Directory containing Phase 1 results for auto-loading")
     parser.add_argument("--load-results", type=str, default=None,
                        help="Load previous results and regenerate figures (path to JSON)")
+    parser.add_argument("--fresh", action="store_true",
+                       help="Start fresh, ignoring any existing checkpoint")
     parser.add_argument("--figure-format", type=str, default="pdf",
                        choices=["pdf", "png", "svg", "eps"],
                        help="Output format for figures")
@@ -748,6 +884,13 @@ Examples:
             print(f"Warning: Could not load data ({e}). Using synthetic.")
             X, y = create_synthetic_data()
 
+    # Handle --fresh flag: delete existing checkpoint
+    if args.fresh:
+        checkpoint_path = get_checkpoint_path(config.output_dir)
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            print("Deleted existing checkpoint (--fresh mode)")
+
     # Run with 5-fold cross-validation
     result = run_phase2(
         config=config,
@@ -755,6 +898,12 @@ Examples:
         y=y,
         classical_r2=classical_r2,
     )
+
+    # Clean up checkpoint after successful completion
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Checkpoint cleaned up after successful completion")
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
