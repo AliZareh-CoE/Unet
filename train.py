@@ -2538,6 +2538,11 @@ def train(
     # =========================================================================
     recording_session = None
     if config.get("enable_recording", False) and RECORDING_AVAILABLE and is_primary():
+        # Warn about FSDP limitations with recording
+        if is_fsdp_wrapped:
+            print("WARNING: Recording with FSDP is limited - saliency and neuroscience "
+                  "analyses are disabled (would cause NCCL deadlock). "
+                  "Basic loss/metric logging is still available.")
         recording_config = RecordingConfig(
             record_losses=True,
             record_gradients=True,
@@ -2612,6 +2617,15 @@ def train(
             # Skip validation this epoch - use cached metrics
             val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
             per_session_metrics = {}
+
+        # Restore model to train mode after validation
+        # IMPORTANT: evaluate() puts model in eval mode; we must restore train mode
+        # to ensure consistent FSDP state across all ranks before any further operations
+        model.train()
+        if reverse_model is not None:
+            reverse_model.train()
+        if cond_encoder is not None:
+            cond_encoder.train()
 
         # Sync val_loss across ranks (for early stopping)
         val_loss = val_metrics.get("loss", val_metrics.get("mae", float("inf")))  # fallback to mae if no composite
@@ -2700,7 +2714,10 @@ def train(
                     )
 
                 # Periodic saliency and Grad-CAM analysis
-                if recording_session.should_compute_saliency(epoch):
+                # NOTE: Skip saliency computation when FSDP is active - forward passes
+                # only on rank 0 would cause NCCL deadlock (other ranks don't participate
+                # in the required all-gather operations)
+                if recording_session.should_compute_saliency(epoch) and not is_fsdp_wrapped:
                     try:
                         base_model = model.module if hasattr(model, 'module') else model
                         base_model.eval()
@@ -2759,7 +2776,9 @@ def train(
                             print(f"    [Recording] Saliency computation failed: {e}")
 
                 # Periodic neuroscience analysis (less frequent)
-                if recording_session.should_compute_neuroscience(epoch):
+                # NOTE: Skip neuroscience analysis when FSDP is active - forward passes
+                # only on rank 0 would cause NCCL deadlock
+                if recording_session.should_compute_neuroscience(epoch) and not is_fsdp_wrapped:
                     try:
                         base_model = model.module if hasattr(model, 'module') else model
                         base_model.eval()
