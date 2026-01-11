@@ -1401,7 +1401,9 @@ def evaluate(
     ob_stds, pcx_stds = [], []
     raw_corrs = []
 
-    with torch.inference_mode():  # Faster than no_grad() - disables view tracking
+    # Use no_grad instead of inference_mode for FSDP compatibility
+    # inference_mode marks tensors as "inference tensors" which breaks FSDP checkpoint saving
+    with torch.no_grad():
         for ob, pcx, odor in loader:
             ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
