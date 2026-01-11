@@ -3404,6 +3404,18 @@ def parse_args():
                              "'huber_wavelet' (Huber + Wavelet combined). "
                              "If not specified, uses config default (huber_wavelet)")
 
+    # Phase 2 cross-validation integration
+    parser.add_argument("--fold-indices-file", type=str, default=None,
+                        help="Pickle file with train/val indices for CV fold (used by Phase 2 runner). "
+                             "File should contain dict with 'train_idx' and 'val_idx' numpy arrays.")
+    parser.add_argument("--output-results-file", type=str, default=None,
+                        help="JSON file to save training results (used by Phase 2 runner). "
+                             "Contains best_r2, best_mae, best_epoch, train_losses, val_r2s, etc.")
+    parser.add_argument("--fold", type=int, default=None,
+                        help="Fold number for Phase 2 CV logging (0-indexed)")
+    parser.add_argument("--checkpoint-prefix", type=str, default=None,
+                        help="Prefix for checkpoint file names (e.g., 'wavenet_fold0')")
+
     return parser.parse_args()
 
 
@@ -3732,6 +3744,18 @@ def main():
         config["out_channels"] = 32  # PCx channels
         config["sampling_rate"] = SAMPLING_RATE_HZ
 
+        # Phase 2 CV integration: override train/val indices if fold file provided
+        if args.fold_indices_file is not None:
+            import pickle
+            with open(args.fold_indices_file, 'rb') as f:
+                fold_data = pickle.load(f)
+            data["train_idx"] = fold_data["train_idx"]
+            data["val_idx"] = fold_data["val_idx"]
+            data["test_idx"] = np.array([], dtype=int)  # No test set in CV
+            if is_primary():
+                fold_num = args.fold if args.fold is not None else "?"
+                print(f"Phase 2 CV mode: fold {fold_num}, train={len(data['train_idx'])}, val={len(data['val_idx'])}")
+
     # Conditioning from CLI
     if args.cond_mode is not None:
         config["cond_mode"] = args.cond_mode
@@ -3870,6 +3894,56 @@ def main():
             print(f"RESULT_SPLIT_TYPE=session_holdout")
             if data['split_info'].get('test_sessions'):
                 print(f"RESULT_TEST_SESSIONS={data['split_info']['test_sessions']}")
+
+        # Phase 2 CV integration: save results to JSON file
+        if args.output_results_file is not None:
+            import json
+            # Extract metrics from history
+            history = results.get("history", [])
+            train_losses = [h.get("loss", 0.0) for h in history]
+            val_losses = [h.get("val_loss", 0.0) for h in history]
+            val_r2s = [h.get("val_r2", 0.0) for h in history]
+            val_corrs = [h.get("val_corr", 0.0) for h in history]
+            val_maes = [h.get("val_mae", 0.0) for h in history]
+
+            # Get best validation R2 from best epoch
+            best_epoch = results["best_epoch"]
+            best_val_r2 = val_r2s[best_epoch - 1] if best_epoch > 0 and len(val_r2s) >= best_epoch else 0.0
+            best_val_mae = val_maes[best_epoch - 1] if best_epoch > 0 and len(val_maes) >= best_epoch else 0.0
+            best_val_corr = val_corrs[best_epoch - 1] if best_epoch > 0 and len(val_corrs) >= best_epoch else 0.0
+
+            # Count model parameters
+            model_obj = results.get("model")
+            if model_obj is not None:
+                if hasattr(model_obj, 'module'):
+                    n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
+                else:
+                    n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+            else:
+                n_params = 0
+
+            output_results = {
+                "architecture": args.arch,
+                "fold": args.fold if args.fold is not None else 0,
+                "best_val_r2": best_val_r2,
+                "best_val_mae": best_val_mae,
+                "best_val_corr": best_val_corr,
+                "best_val_loss": results["best_val_loss"],
+                "best_epoch": best_epoch,
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "val_r2s": val_r2s,
+                "val_corrs": val_corrs,
+                "total_time": results.get("total_time", 0.0),
+                "epochs_trained": len(history),
+                "n_parameters": n_params,
+                "completed_successfully": True,
+            }
+            output_path = Path(args.output_results_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w') as f:
+                json.dump(output_results, f, indent=2, default=str)
+            print(f"Phase 2 results saved to: {output_path}")
 
     # Final synchronization and cleanup for distributed training
     # This prevents NCCL timeout by ensuring all ranks sync before exit

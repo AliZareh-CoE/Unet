@@ -95,6 +95,145 @@ from utils import (
 
 
 # =============================================================================
+# train.py Subprocess Integration
+# =============================================================================
+
+def run_train_py(
+    arch_name: str,
+    fold_idx: int,
+    fold_indices_file: Path,
+    output_results_file: Path,
+    epochs: int = 80,
+    batch_size: int = 64,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    seed: int = 42,
+    verbose: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Run train.py as subprocess for a single architecture/fold.
+
+    This ensures Phase 2 uses the EXACT same training loop as train.py,
+    including all augmentations, loss functions, and hyperparameters.
+
+    Args:
+        arch_name: Architecture name (e.g., 'wavenet', 'vit')
+        fold_idx: CV fold index (0-indexed)
+        fold_indices_file: Path to pickle file with train/val indices
+        output_results_file: Path to JSON file for results output
+        epochs: Number of training epochs
+        batch_size: Batch size (total, will be divided by num GPUs)
+        use_fsdp: Whether to use FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+        seed: Random seed
+        verbose: Print subprocess output
+
+    Returns:
+        Results dict from train.py, or None on failure
+    """
+    import subprocess
+    import shutil
+
+    # Build command
+    if use_fsdp:
+        # Use torchrun for distributed training
+        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={nproc}",
+            str(PROJECT_ROOT / "train.py"),
+        ]
+    else:
+        cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
+
+    # Add arguments
+    cmd.extend([
+        "--arch", arch_name,
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--seed", str(seed + fold_idx),  # Different seed per fold
+        "--fold-indices-file", str(fold_indices_file),
+        "--output-results-file", str(output_results_file),
+        "--fold", str(fold_idx),
+        "--no-bidirectional",  # Disable for fair comparison
+        "--no-plots",  # Skip plot generation for speed
+    ])
+
+    if use_fsdp:
+        cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
+
+    # Run subprocess
+    start_time = time.time()
+    try:
+        if verbose:
+            # Stream output in real-time
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                check=True,
+                text=True,
+            )
+        else:
+            # Capture output silently
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: train.py failed for {arch_name} fold {fold_idx}")
+        print(f"  Return code: {e.returncode}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr[:500]}...")
+        return None
+
+    elapsed = time.time() - start_time
+
+    # Load results from JSON file
+    if output_results_file.exists():
+        with open(output_results_file, 'r') as f:
+            results = json.load(f)
+        results["total_time"] = elapsed
+        return results
+    else:
+        print(f"WARNING: Results file not found: {output_results_file}")
+        return None
+
+
+def save_fold_indices(
+    output_dir: Path,
+    arch_name: str,
+    fold_idx: int,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+) -> Path:
+    """Save fold indices to pickle file for train.py.
+
+    Args:
+        output_dir: Directory to save indices
+        arch_name: Architecture name
+        fold_idx: Fold index
+        train_idx: Training sample indices
+        val_idx: Validation sample indices
+
+    Returns:
+        Path to saved pickle file
+    """
+    fold_dir = output_dir / "fold_indices"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    indices_file = fold_dir / f"{arch_name}_fold{fold_idx}_indices.pkl"
+    with open(indices_file, 'wb') as f:
+        pickle.dump({
+            "train_idx": train_idx,
+            "val_idx": val_idx,
+        }, f)
+
+    return indices_file
+
+
+# =============================================================================
 # Phase 1 Result Loading
 # =============================================================================
 
@@ -475,6 +614,7 @@ def run_phase2(
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     fsdp_cpu_offload: bool = False,
+    use_train_py: bool = False,
 ) -> Phase2Result:
     """Run Phase 2 architecture screening with 5-fold cross-validation.
 
@@ -486,12 +626,16 @@ def run_phase2(
         use_fsdp: Enable FSDP for distributed training
         fsdp_strategy: FSDP sharding strategy ('full', 'grad_op', 'no_shard', 'hybrid')
         fsdp_cpu_offload: Enable CPU offloading for FSDP
+        use_train_py: Use train.py subprocess for exact training consistency
 
     Returns:
         Phase2Result with all metrics
 
     FSDP Usage:
         torchrun --nproc_per_node=8 -m phase_two.runner --fsdp --epochs 80 --batch-size 64
+
+    train.py Integration:
+        python -m phase_two.runner --use-train-py --fsdp --epochs 80
     """
     # Only print on main process
     _is_main = is_main_process()
@@ -505,7 +649,11 @@ def run_phase2(
         print(f"Cross-validation: {config.n_folds} folds")
         print(f"Total runs: {config.total_runs}")
         print(f"Device: {config.device}")
-        if use_fsdp:
+        if use_train_py:
+            print(f"Training mode: train.py subprocess (exact consistency)")
+            if use_fsdp:
+                print(f"  FSDP passed to train.py: strategy={fsdp_strategy}")
+        elif use_fsdp:
             print(f"FSDP: Enabled (strategy={fsdp_strategy}, cpu_offload={fsdp_cpu_offload})")
         print()
 
@@ -574,95 +722,187 @@ def run_phase2(
             if _is_main:
                 print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds})")
 
-            # Get fold data
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+            # ================================================================
+            # Training: use train.py subprocess OR internal trainer
+            # ================================================================
+            if use_train_py:
+                # Use train.py subprocess for EXACT training consistency
+                # This ensures Phase 2 uses the same training loop as train.py
 
-            # Set seed for reproducibility (use fold index as seed offset)
-            seed = config.cv_seed + fold_idx
-            torch.manual_seed(seed)
-            np.random.seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
+                # Save fold indices for train.py
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, arch_name, fold_idx, train_idx, val_idx
+                )
 
-            # Create model
-            model = create_architecture(
-                arch_name,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                time_steps=time_steps,
-            )
+                # Output file for results
+                results_dir = config.output_dir / "train_results"
+                results_dir.mkdir(parents=True, exist_ok=True)
+                output_results_file = results_dir / f"{arch_name}_fold{fold_idx}_results.json"
 
-            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            if _is_main:
-                print(f"  Parameters: {n_params:,}")
-                print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
-                if use_fsdp:
-                    print(f"  FSDP: Enabled with strategy={fsdp_strategy}")
+                if _is_main:
+                    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+                    print(f"  Running train.py subprocess...")
 
-            # Create data loaders (with distributed sampler if using FSDP)
-            train_loader, val_loader = create_dataloaders(
-                X_train, y_train, X_val, y_val,
-                batch_size=config.training.batch_size,
-                n_workers=config.n_workers,
-                use_distributed=use_fsdp,
-            )
+                # Run train.py
+                train_results = run_train_py(
+                    arch_name=arch_name,
+                    fold_idx=fold_idx,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    epochs=config.training.epochs,
+                    batch_size=config.training.batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=config.verbose > 0,
+                )
 
-            # Create trainer with logging (FSDP-aware)
-            trainer = Trainer(
-                model=model,
-                config=config.training,
-                device=config.device,
-                checkpoint_dir=config.checkpoint_dir / arch_name / f"fold{fold_idx}" if config.save_checkpoints else None,
-                log_dir=config.log_dir if hasattr(config, 'log_dir') else None,
-                use_fsdp=use_fsdp,
-                fsdp_strategy=fsdp_strategy,
-                fsdp_cpu_offload=fsdp_cpu_offload,
-            )
+                if train_results is None:
+                    # Training failed
+                    result = TrainingResult(
+                        architecture=arch_name,
+                        fold=fold_idx,
+                        best_val_r2=float('nan'),
+                        best_val_mae=float('nan'),
+                        best_epoch=0,
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        total_time=0.0,
+                        epochs_trained=0,
+                        n_parameters=0,
+                        completed_successfully=False,
+                        error_message="train.py subprocess failed",
+                    )
+                else:
+                    # Convert train.py results to TrainingResult
+                    result = TrainingResult(
+                        architecture=train_results.get("architecture", arch_name),
+                        fold=train_results.get("fold", fold_idx),
+                        best_val_r2=train_results.get("best_val_r2", 0.0),
+                        best_val_mae=train_results.get("best_val_mae", 0.0),
+                        best_epoch=train_results.get("best_epoch", 0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        total_time=train_results.get("total_time", 0.0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        completed_successfully=train_results.get("completed_successfully", True),
+                    )
 
-            # Train with robustness features
-            result = trainer.fit(
-                train_loader=train_loader,
-                val_loader=val_loader,
-                arch_name=arch_name,
-                fold=fold_idx,
-                verbose=config.verbose > 0,
-                checkpoint_every=config.training.checkpoint_every,
-            )
+                n_params = result.n_parameters
+                all_results.append(result)
+                arch_r2s[arch_name].append(result.best_val_r2)
 
-            all_results.append(result)
-            arch_r2s[arch_name].append(result.best_val_r2)
-
-            # Store best model for this architecture (keep the best across folds)
-            # For FSDP, trainer._best_model_state already has the full state dict on rank 0
-            if _is_main:
-                if arch_name not in all_models or result.best_val_r2 > all_models[arch_name]['r2']:
-                    if hasattr(trainer, '_best_model_state') and trainer._best_model_state is not None:
+                # Note: model state not saved in train.py mode (models saved separately by train.py)
+                if _is_main:
+                    if arch_name not in all_models or result.best_val_r2 > all_models.get(arch_name, {}).get('r2', float('-inf')):
                         all_models[arch_name] = {
-                            'state_dict': {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in trainer._best_model_state.items()},
                             'r2': result.best_val_r2,
                             'fold': fold_idx,
                             'n_parameters': n_params,
+                            'checkpoint': str(PROJECT_ROOT / "artifacts" / "checkpoints" / "best_model.pt"),
                         }
 
-            if _is_main:
-                print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
-                print(f"  Time: {result.total_time:.1f}s")
-                if result.dsp_metrics:
-                    print(f"  DSP: PLV={result.dsp_metrics.get('plv_mean', 0):.4f}, "
-                          f"Coh={result.dsp_metrics.get('coherence_mean', 0):.4f}, "
-                          f"SNR={result.dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB")
+                if _is_main:
+                    print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
+                    print(f"  Time: {result.total_time:.1f}s")
+                    if not result.completed_successfully:
+                        print(f"  Error: {result.error_message}")
 
-                # Show robustness info if any issues
-                if result.nan_detected:
-                    print(f"  Warning: {result.nan_recovery_count} NaN batches recovered")
-                if not result.completed_successfully:
-                    print(f"  Error: {result.error_message}")
+            else:
+                # Use internal trainer (original code path)
 
-            # Clean up GPU memory between folds/architectures
-            del model, trainer, train_loader, val_loader
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Get fold data
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y[train_idx], y[val_idx]
+
+                # Set seed for reproducibility (use fold index as seed offset)
+                seed = config.cv_seed + fold_idx
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+
+                # Create model
+                model = create_architecture(
+                    arch_name,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    time_steps=time_steps,
+                )
+
+                n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                if _is_main:
+                    print(f"  Parameters: {n_params:,}")
+                    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+                    if use_fsdp:
+                        print(f"  FSDP: Enabled with strategy={fsdp_strategy}")
+
+                # Create data loaders (with distributed sampler if using FSDP)
+                train_loader, val_loader = create_dataloaders(
+                    X_train, y_train, X_val, y_val,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                    use_distributed=use_fsdp,
+                )
+
+                # Create trainer with logging (FSDP-aware)
+                trainer = Trainer(
+                    model=model,
+                    config=config.training,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / arch_name / f"fold{fold_idx}" if config.save_checkpoints else None,
+                    log_dir=config.log_dir if hasattr(config, 'log_dir') else None,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    fsdp_cpu_offload=fsdp_cpu_offload,
+                )
+
+                # Train with robustness features
+                result = trainer.fit(
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    arch_name=arch_name,
+                    fold=fold_idx,
+                    verbose=config.verbose > 0,
+                    checkpoint_every=config.training.checkpoint_every,
+                )
+
+                all_results.append(result)
+                arch_r2s[arch_name].append(result.best_val_r2)
+
+                # Store best model for this architecture (keep the best across folds)
+                # For FSDP, trainer._best_model_state already has the full state dict on rank 0
+                if _is_main:
+                    if arch_name not in all_models or result.best_val_r2 > all_models[arch_name]['r2']:
+                        if hasattr(trainer, '_best_model_state') and trainer._best_model_state is not None:
+                            all_models[arch_name] = {
+                                'state_dict': {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in trainer._best_model_state.items()},
+                                'r2': result.best_val_r2,
+                                'fold': fold_idx,
+                                'n_parameters': n_params,
+                            }
+
+                if _is_main:
+                    print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
+                    print(f"  Time: {result.total_time:.1f}s")
+                    if result.dsp_metrics:
+                        print(f"  DSP: PLV={result.dsp_metrics.get('plv_mean', 0):.4f}, "
+                              f"Coh={result.dsp_metrics.get('coherence_mean', 0):.4f}, "
+                              f"SNR={result.dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB")
+
+                    # Show robustness info if any issues
+                    if result.nan_detected:
+                        print(f"  Warning: {result.nan_recovery_count} NaN batches recovered")
+                    if not result.completed_successfully:
+                        print(f"  Error: {result.error_message}")
+
+                # Clean up GPU memory between folds/architectures
+                del model, trainer, train_loader, val_loader
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Mark this run as completed and save checkpoint (only main process)
             completed_runs.add((arch_name, fold_idx))
@@ -887,10 +1127,23 @@ Examples:
     parser.add_argument("--fsdp-cpu-offload", action="store_true",
                        help="Enable CPU offloading for FSDP (saves GPU memory)")
 
+    # train.py integration (for exact training consistency)
+    parser.add_argument("--use-train-py", action="store_true",
+                       help="Use train.py via subprocess for EXACT same training loop. "
+                            "This ensures Phase 2 results are perfectly comparable to train.py. "
+                            "When enabled, --fsdp is passed to train.py subprocess.")
+
     args = parser.parse_args()
 
-    # Initialize distributed training if using FSDP
-    if args.fsdp:
+    # When using --use-train-py, the runner runs as single process
+    # and calls train.py subprocess with FSDP if requested
+    if args.use_train_py:
+        if args.fsdp:
+            print("Note: --use-train-py mode passes FSDP to train.py subprocess")
+            print("      Runner itself runs as single process")
+        rank, world_size = 0, 1
+    elif args.fsdp:
+        # Direct FSDP mode (runner handles FSDP internally)
         if not FSDP_AVAILABLE:
             print("Error: FSDP not available. Please install PyTorch >= 1.12")
             sys.exit(1)
@@ -1018,6 +1271,7 @@ Examples:
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
             fsdp_cpu_offload=args.fsdp_cpu_offload,
+            use_train_py=args.use_train_py,
         )
 
         # Only main process handles file I/O
