@@ -526,6 +526,8 @@ def run_phase2(
 
     # Try to load checkpoint for resume (only main process loads, then broadcasts state)
     checkpoint = None
+    completed_runs = set()
+
     if _is_main:
         checkpoint = load_checkpoint(checkpoint_path)
 
@@ -540,6 +542,14 @@ def run_phase2(
         arch_r2s = {arch: [] for arch in config.architectures}
         all_models = {}  # Store best model for each architecture
         completed_runs = set()
+
+    # Broadcast completed_runs to all ranks so they all skip the same runs
+    if use_fsdp and is_distributed():
+        import torch.distributed as dist
+        # Convert to list for broadcasting
+        completed_runs_list = [list(completed_runs)]
+        dist.broadcast_object_list(completed_runs_list, src=0)
+        completed_runs = set(tuple(x) for x in completed_runs_list[0])
 
     run_idx = 0
     total_runs = config.total_runs
