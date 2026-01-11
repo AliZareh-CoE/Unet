@@ -55,7 +55,16 @@ from phase_two.config import (
     check_gate_threshold,
 )
 from phase_two.architectures import create_architecture, list_architectures
-from phase_two.trainer import Trainer, TrainingResult, create_dataloaders
+from phase_two.trainer import (
+    Trainer,
+    TrainingResult,
+    create_dataloaders,
+    setup_distributed,
+    cleanup_distributed,
+    is_main_process,
+    is_distributed,
+    FSDP_AVAILABLE,
+)
 
 # Import shared statistical utilities
 from utils import (
@@ -439,6 +448,9 @@ def run_phase2(
     X: np.ndarray,
     y: np.ndarray,
     classical_r2: float = 0.35,  # From Phase 1
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    fsdp_cpu_offload: bool = False,
 ) -> Phase2Result:
     """Run Phase 2 architecture screening with 5-fold cross-validation.
 
@@ -447,19 +459,31 @@ def run_phase2(
         X: Input signals [N, C, T]
         y: Target signals [N, C, T]
         classical_r2: Best R² from Phase 1 (for gate check)
+        use_fsdp: Enable FSDP for distributed training
+        fsdp_strategy: FSDP sharding strategy ('full', 'grad_op', 'no_shard', 'hybrid')
+        fsdp_cpu_offload: Enable CPU offloading for FSDP
 
     Returns:
         Phase2Result with all metrics
+
+    FSDP Usage:
+        torchrun --nproc_per_node=8 -m phase_two.runner --fsdp --epochs 80 --batch-size 64
     """
-    print("\n" + "=" * 70)
-    print("PHASE 2: Architecture Screening (5-Fold Cross-Validation)")
-    print("=" * 70)
-    print(f"Dataset: {config.dataset}")
-    print(f"Architectures: {', '.join(config.architectures)}")
-    print(f"Cross-validation: {config.n_folds} folds")
-    print(f"Total runs: {config.total_runs}")
-    print(f"Device: {config.device}")
-    print()
+    # Only print on main process
+    _is_main = is_main_process()
+
+    if _is_main:
+        print("\n" + "=" * 70)
+        print("PHASE 2: Architecture Screening (5-Fold Cross-Validation)")
+        print("=" * 70)
+        print(f"Dataset: {config.dataset}")
+        print(f"Architectures: {', '.join(config.architectures)}")
+        print(f"Cross-validation: {config.n_folds} folds")
+        print(f"Total runs: {config.total_runs}")
+        print(f"Device: {config.device}")
+        if use_fsdp:
+            print(f"FSDP: Enabled (strategy={fsdp_strategy}, cpu_offload={fsdp_cpu_offload})")
+        print()
 
     n_samples = X.shape[0]
     in_channels = X.shape[1]
@@ -468,14 +492,19 @@ def run_phase2(
 
     # Create CV splits
     cv_splits = create_cv_splits(n_samples, config.n_folds, config.cv_seed)
-    print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
+    if _is_main:
+        print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
 
-    # Setup checkpoint for resume capability
+    # Setup checkpoint for resume capability (only main process)
     checkpoint_path = get_checkpoint_path(config.output_dir)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    if _is_main:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try to load checkpoint for resume
-    checkpoint = load_checkpoint(checkpoint_path)
+    # Try to load checkpoint for resume (only main process loads, then broadcasts state)
+    checkpoint = None
+    if _is_main:
+        checkpoint = load_checkpoint(checkpoint_path)
+
     if checkpoint is not None:
         all_results, arch_r2s, all_models, completed_runs = reconstruct_results_from_checkpoint(checkpoint)
         # Ensure all architectures have entries in arch_r2s
@@ -493,9 +522,10 @@ def run_phase2(
     skipped_runs = 0
 
     for arch_name in config.architectures:
-        print(f"\n{'='*60}")
-        print(f"Architecture: {arch_name.upper()}")
-        print("=" * 60)
+        if _is_main:
+            print(f"\n{'='*60}")
+            print(f"Architecture: {arch_name.upper()}")
+            print("=" * 60)
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             run_idx += 1
@@ -503,10 +533,12 @@ def run_phase2(
             # Check if this run was already completed
             if (arch_name, fold_idx) in completed_runs:
                 skipped_runs += 1
-                print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds}) - SKIPPED (already completed)")
+                if _is_main:
+                    print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds}) - SKIPPED (already completed)")
                 continue
 
-            print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds})")
+            if _is_main:
+                print(f"\n[{run_idx}/{total_runs}] {arch_name} (fold {fold_idx + 1}/{config.n_folds})")
 
             # Get fold data
             X_train, X_val = X[train_idx], X[val_idx]
@@ -528,23 +560,30 @@ def run_phase2(
             )
 
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"  Parameters: {n_params:,}")
-            print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+            if _is_main:
+                print(f"  Parameters: {n_params:,}")
+                print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+                if use_fsdp:
+                    print(f"  FSDP: Enabled with strategy={fsdp_strategy}")
 
-            # Create data loaders
+            # Create data loaders (with distributed sampler if using FSDP)
             train_loader, val_loader = create_dataloaders(
                 X_train, y_train, X_val, y_val,
                 batch_size=config.training.batch_size,
                 n_workers=config.n_workers,
+                use_distributed=use_fsdp,
             )
 
-            # Create trainer with logging
+            # Create trainer with logging (FSDP-aware)
             trainer = Trainer(
                 model=model,
                 config=config.training,
                 device=config.device,
                 checkpoint_dir=config.checkpoint_dir / arch_name / f"fold{fold_idx}" if config.save_checkpoints else None,
                 log_dir=config.log_dir if hasattr(config, 'log_dir') else None,
+                use_fsdp=use_fsdp,
+                fsdp_strategy=fsdp_strategy,
+                fsdp_cpu_offload=fsdp_cpu_offload,
             )
 
             # Train with robustness features
@@ -561,39 +600,44 @@ def run_phase2(
             arch_r2s[arch_name].append(result.best_val_r2)
 
             # Store best model for this architecture (keep the best across folds)
-            if arch_name not in all_models or result.best_val_r2 > all_models[arch_name]['r2']:
-                all_models[arch_name] = {
-                    'state_dict': {k: v.cpu() for k, v in model.state_dict().items()},
-                    'r2': result.best_val_r2,
-                    'fold': fold_idx,
-                    'n_parameters': n_params,
-                }
+            # For FSDP, trainer._best_model_state already has the full state dict on rank 0
+            if _is_main:
+                if arch_name not in all_models or result.best_val_r2 > all_models[arch_name]['r2']:
+                    if hasattr(trainer, '_best_model_state') and trainer._best_model_state is not None:
+                        all_models[arch_name] = {
+                            'state_dict': {k: v.cpu() if hasattr(v, 'cpu') else v for k, v in trainer._best_model_state.items()},
+                            'r2': result.best_val_r2,
+                            'fold': fold_idx,
+                            'n_parameters': n_params,
+                        }
 
-            print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
-            print(f"  Time: {result.total_time:.1f}s")
-            if result.dsp_metrics:
-                print(f"  DSP: PLV={result.dsp_metrics.get('plv_mean', 0):.4f}, "
-                      f"Coh={result.dsp_metrics.get('coherence_mean', 0):.4f}, "
-                      f"SNR={result.dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB")
+            if _is_main:
+                print(f"  Best R²: {result.best_val_r2:.4f} (epoch {result.best_epoch})")
+                print(f"  Time: {result.total_time:.1f}s")
+                if result.dsp_metrics:
+                    print(f"  DSP: PLV={result.dsp_metrics.get('plv_mean', 0):.4f}, "
+                          f"Coh={result.dsp_metrics.get('coherence_mean', 0):.4f}, "
+                          f"SNR={result.dsp_metrics.get('reconstruction_snr_db', 0):.1f}dB")
 
-            # Show robustness info if any issues
-            if result.nan_detected:
-                print(f"  Warning: {result.nan_recovery_count} NaN batches recovered")
-            if not result.completed_successfully:
-                print(f"  Error: {result.error_message}")
+                # Show robustness info if any issues
+                if result.nan_detected:
+                    print(f"  Warning: {result.nan_recovery_count} NaN batches recovered")
+                if not result.completed_successfully:
+                    print(f"  Error: {result.error_message}")
 
             # Clean up GPU memory between folds/architectures
             del model, trainer, train_loader, val_loader
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Mark this run as completed and save checkpoint
+            # Mark this run as completed and save checkpoint (only main process)
             completed_runs.add((arch_name, fold_idx))
-            save_checkpoint(checkpoint_path, all_results, arch_r2s, all_models, completed_runs)
-            print(f"  Checkpoint saved ({len(completed_runs)}/{total_runs} runs completed)")
+            if _is_main:
+                save_checkpoint(checkpoint_path, all_results, arch_r2s, all_models, completed_runs)
+                print(f"  Checkpoint saved ({len(completed_runs)}/{total_runs} runs completed)")
 
     # Print resume summary if any runs were skipped
-    if skipped_runs > 0:
+    if skipped_runs > 0 and _is_main:
         print(f"\n*** Resumed run: skipped {skipped_runs} already-completed runs ***")
 
     # Aggregate results per architecture (across CV folds)
@@ -636,7 +680,8 @@ def run_phase2(
     assumption_checks = {}
 
     if len(valid_archs) >= 2:
-        print("\nComputing comprehensive statistical analysis...")
+        if _is_main:
+            print("\nComputing comprehensive statistical analysis...")
 
         best_r2s = aggregated[best_arch].get("fold_r2s", [])
 
@@ -687,59 +732,60 @@ def run_phase2(
         models=all_models if all_models else None,
     )
 
-    # Print summary
-    print("\n" + "=" * 70)
-    print("PHASE 2 RESULTS SUMMARY (5-Fold Cross-Validation)")
-    print("=" * 70)
-
-    print("\n{:<15} {:>10} {:>10} {:>12}".format(
-        "Architecture", "R² Mean", "R² Std", "Parameters"
-    ))
-    print("-" * 50)
-
-    # Sort by R²
-    sorted_archs = sorted(aggregated.keys(), key=lambda k: aggregated[k]["r2_mean"], reverse=True)
-    for arch in sorted_archs:
-        stats = aggregated[arch]
-        # Find params from results
-        arch_results = [r for r in all_results if r.architecture == arch]
-        n_params = arch_results[0].n_parameters if arch_results else 0
-        marker = " *" if arch == best_arch else ""
-        print(f"{arch:<15} {stats['r2_mean']:>10.4f} {stats['r2_std']:>10.4f} {n_params:>12,}{marker}")
-
-    print("-" * 50)
-
-    # Gate check
-    print(f"\nClassical baseline R²: {classical_r2:.4f}")
-    print(f"Gate threshold: {classical_r2 + 0.10:.4f}")
-    print(f"Best neural R²: {best_r2:.4f} ({best_arch})")
-
-    if gate_passed:
-        print(f"\n✓ GATE PASSED: {best_arch} beats classical by {best_r2 - classical_r2:.4f}")
-    else:
-        print(f"\n✗ GATE FAILED: Best neural ({best_r2:.4f}) did not beat classical + 0.10")
-
-    # Print comprehensive statistics summary
-    if comprehensive_stats:
+    # Print summary (only on main process)
+    if _is_main:
         print("\n" + "=" * 70)
-        print("STATISTICAL ANALYSIS (vs best architecture)")
+        print("PHASE 2 RESULTS SUMMARY (5-Fold Cross-Validation)")
         print("=" * 70)
-        print("{:<15}{:<12}{:<12}{:<12}{:<8}{:<8}".format("Architecture", "t-test p", "Wilcoxon p", "Cohen's d", "Holm", "FDR"))
-        print("-" * 70)
-        for arch_name, stats in comprehensive_stats.items():
-            t_p = stats["parametric_test"]["p_value"]
-            w_p = stats["nonparametric_test"]["p_value"]
-            d = stats["parametric_test"]["effect_size"] or 0
-            holm_sig = "Yes" if stats.get("significant_holm", False) else "No"
-            fdr_sig = "Yes" if stats.get("significant_fdr", False) else "No"
-            print(f"{arch_name:<15}{t_p:<12.4f}{w_p:<12.4f}{d:<12.3f}{holm_sig:<8}{fdr_sig:<8}")
 
-        # Assumption check summary
-        print("\nAssumption Checks (Normality of differences):")
-        for arch_name, checks in assumption_checks.items():
-            norm_ok = "OK" if checks["normality_diff"]["ok"] else "VIOLATED"
-            rec = checks["recommendation"]
-            print(f"  {arch_name}: {norm_ok} (recommended: {rec})")
+        print("\n{:<15} {:>10} {:>10} {:>12}".format(
+            "Architecture", "R² Mean", "R² Std", "Parameters"
+        ))
+        print("-" * 50)
+
+        # Sort by R²
+        sorted_archs = sorted(aggregated.keys(), key=lambda k: aggregated[k]["r2_mean"], reverse=True)
+        for arch in sorted_archs:
+            stats = aggregated[arch]
+            # Find params from results
+            arch_results = [r for r in all_results if r.architecture == arch]
+            n_params = arch_results[0].n_parameters if arch_results else 0
+            marker = " *" if arch == best_arch else ""
+            print(f"{arch:<15} {stats['r2_mean']:>10.4f} {stats['r2_std']:>10.4f} {n_params:>12,}{marker}")
+
+        print("-" * 50)
+
+        # Gate check
+        print(f"\nClassical baseline R²: {classical_r2:.4f}")
+        print(f"Gate threshold: {classical_r2 + 0.10:.4f}")
+        print(f"Best neural R²: {best_r2:.4f} ({best_arch})")
+
+        if gate_passed:
+            print(f"\n✓ GATE PASSED: {best_arch} beats classical by {best_r2 - classical_r2:.4f}")
+        else:
+            print(f"\n✗ GATE FAILED: Best neural ({best_r2:.4f}) did not beat classical + 0.10")
+
+        # Print comprehensive statistics summary
+        if comprehensive_stats:
+            print("\n" + "=" * 70)
+            print("STATISTICAL ANALYSIS (vs best architecture)")
+            print("=" * 70)
+            print("{:<15}{:<12}{:<12}{:<12}{:<8}{:<8}".format("Architecture", "t-test p", "Wilcoxon p", "Cohen's d", "Holm", "FDR"))
+            print("-" * 70)
+            for arch_name, stats in comprehensive_stats.items():
+                t_p = stats["parametric_test"]["p_value"]
+                w_p = stats["nonparametric_test"]["p_value"]
+                d = stats["parametric_test"]["effect_size"] or 0
+                holm_sig = "Yes" if stats.get("significant_holm", False) else "No"
+                fdr_sig = "Yes" if stats.get("significant_fdr", False) else "No"
+                print(f"{arch_name:<15}{t_p:<12.4f}{w_p:<12.4f}{d:<12.3f}{holm_sig:<8}{fdr_sig:<8}")
+
+            # Assumption check summary
+            print("\nAssumption Checks (Normality of differences):")
+            for arch_name, checks in assumption_checks.items():
+                norm_ok = "OK" if checks["normality_diff"]["ok"] else "VIOLATED"
+                rec = checks["recommendation"]
+                print(f"  {arch_name}: {norm_ok} (recommended: {rec})")
 
     return result
 
@@ -796,7 +842,27 @@ Examples:
     parser.add_argument("--figure-dpi", type=int, default=300,
                        help="DPI for raster figures (png)")
 
+    # FSDP arguments
+    parser.add_argument("--fsdp", action="store_true",
+                       help="Enable FSDP for distributed multi-GPU training")
+    parser.add_argument("--fsdp-strategy", type=str, default="grad_op",
+                       choices=["full", "grad_op", "no_shard", "hybrid"],
+                       help="FSDP sharding strategy (default: grad_op)")
+    parser.add_argument("--fsdp-cpu-offload", action="store_true",
+                       help="Enable CPU offloading for FSDP (saves GPU memory)")
+
     args = parser.parse_args()
+
+    # Initialize distributed training if using FSDP
+    if args.fsdp:
+        if not FSDP_AVAILABLE:
+            print("Error: FSDP not available. Please install PyTorch >= 1.12")
+            sys.exit(1)
+        rank, world_size = setup_distributed()
+        if is_main_process():
+            print(f"FSDP: Initialized {world_size} processes (rank={rank})")
+    else:
+        rank, world_size = 0, 1
 
     # Handle result loading mode (figures only)
     if args.load_results:
@@ -866,14 +932,17 @@ Examples:
 
         if classical_r2 is None:
             classical_r2 = 0.35  # Fallback default
-            print(f"Warning: Could not auto-load Phase 1 results. Using default R²={classical_r2}")
-            print("  Run Phase 1 first, or specify --classical-r2 manually")
+            if is_main_process():
+                print(f"Warning: Could not auto-load Phase 1 results. Using default R²={classical_r2}")
+                print("  Run Phase 1 first, or specify --classical-r2 manually")
     else:
-        print(f"Using specified classical R²: {classical_r2:.4f}")
+        if is_main_process():
+            print(f"Using specified classical R²: {classical_r2:.4f}")
 
     # Load data (full dataset for cross-validation)
     if args.dry_run:
-        print("[DRY-RUN] Using synthetic data")
+        if is_main_process():
+            print("[DRY-RUN] Using synthetic data")
         X, y = create_synthetic_data(
             n_samples=100, time_steps=500
         )
@@ -881,42 +950,55 @@ Examples:
         try:
             X, y = load_olfactory_data()
         except Exception as e:
-            print(f"Warning: Could not load data ({e}). Using synthetic.")
+            if is_main_process():
+                print(f"Warning: Could not load data ({e}). Using synthetic.")
             X, y = create_synthetic_data()
 
-    # Handle --fresh flag: delete existing checkpoint
-    if args.fresh:
+    # Handle --fresh flag: delete existing checkpoint (only main process)
+    if args.fresh and is_main_process():
         checkpoint_path = get_checkpoint_path(config.output_dir)
         if checkpoint_path.exists():
             checkpoint_path.unlink()
             print("Deleted existing checkpoint (--fresh mode)")
 
-    # Run with 5-fold cross-validation
-    result = run_phase2(
-        config=config,
-        X=X,
-        y=y,
-        classical_r2=classical_r2,
-    )
+    try:
+        # Run with 5-fold cross-validation
+        result = run_phase2(
+            config=config,
+            X=X,
+            y=y,
+            classical_r2=classical_r2,
+            use_fsdp=args.fsdp,
+            fsdp_strategy=args.fsdp_strategy,
+            fsdp_cpu_offload=args.fsdp_cpu_offload,
+        )
 
-    # Clean up checkpoint after successful completion
-    checkpoint_path = get_checkpoint_path(config.output_dir)
-    if checkpoint_path.exists():
-        checkpoint_path.unlink()
-        print("Checkpoint cleaned up after successful completion")
+        # Only main process handles file I/O
+        if is_main_process():
+            # Clean up checkpoint after successful completion
+            checkpoint_path = get_checkpoint_path(config.output_dir)
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+                print("Checkpoint cleaned up after successful completion")
 
-    # Save results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = config.output_dir / f"phase2_results_{timestamp}.json"
-    result.save(results_file)
-    print(f"\nResults saved to: {results_file}")
+            # Save results
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            results_file = config.output_dir / f"phase2_results_{timestamp}.json"
+            result.save(results_file)
+            print(f"\nResults saved to: {results_file}")
 
-    # Save models separately
-    if result.models:
-        models_file = config.output_dir / f"phase2_models_{timestamp}.pkl"
-        result.save_models(models_file)
+            # Save models separately
+            if result.models:
+                models_file = config.output_dir / f"phase2_models_{timestamp}.pkl"
+                result.save_models(models_file)
 
-    print("\nPhase 2 complete!")
+            print("\nPhase 2 complete!")
+
+    finally:
+        # Clean up distributed training
+        if args.fsdp:
+            cleanup_distributed()
+
     return result
 
 
