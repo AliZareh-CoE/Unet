@@ -86,22 +86,28 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
 
 
 # =============================================================================
-# Training Configuration
+# Training Configuration (matched to train.py for consistency)
 # =============================================================================
 
 @dataclass
 class TrainingConfig:
-    """Training hyperparameters."""
+    """Training hyperparameters - matched to train.py for fair comparison."""
 
-    epochs: int = 60
-    batch_size: int = 32
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
+    epochs: int = 80
+    batch_size: int = 64  # 64/8 GPUs = 8 per GPU (same as train.py)
+    learning_rate: float = 0.0002  # Same as train.py
+    weight_decay: float = 0.0  # Same as train.py
+
+    # Adam betas (matched to train.py optimized values)
+    beta1: float = 0.7595905764360957
+    beta2: float = 0.920298282605139
+
     warmup_epochs: int = 5
 
-    # Learning rate schedule
-    lr_scheduler: str = "cosine"  # cosine, step, plateau
+    # Learning rate schedule (train.py uses "none" by default)
+    lr_scheduler: str = "none"  # none, cosine, step, plateau
     lr_min: float = 1e-6
+    lr_min_ratio: float = 0.01  # For cosine scheduler
 
     # Early stopping
     patience: int = 15
@@ -110,13 +116,33 @@ class TrainingConfig:
     # Gradient clipping
     grad_clip: float = 1.0
 
-    # Loss function
-    loss_fn: str = "l1"  # l1, mse, huber
+    # Loss function (matched to train.py)
+    loss_fn: str = "l1_wavelet"  # l1, mse, huber, l1_wavelet, huber_wavelet
+    weight_l1: float = 1.0
+    weight_wavelet: float = 3.0  # Same as train.py
 
-    # Data augmentation
+    # Wavelet loss config
+    use_wavelet_loss: bool = True
+    wavelet_family: str = "morlet"
+    wavelet_omega0: float = 3.0
+
+    # Data augmentation (matched to train.py heavy augmentation)
     use_augmentation: bool = True
+    aug_time_shift: bool = True
+    aug_time_shift_max: float = 0.2  # 20% of signal length
+    aug_noise: bool = True
     aug_noise_std: float = 0.1
-    aug_time_shift: int = 50
+    aug_channel_dropout: bool = True
+    aug_channel_dropout_p: float = 0.2
+    aug_amplitude_scale: bool = True
+    aug_amplitude_scale_range: tuple = (0.5, 1.5)
+    aug_time_mask: bool = True
+    aug_time_mask_ratio: float = 0.15
+    aug_mixup: bool = True
+    aug_mixup_alpha: float = 0.4
+    aug_freq_mask: bool = True
+    aug_freq_mask_max_bands: int = 3
+    aug_freq_mask_max_width: int = 20
 
     # Mixed precision
     use_amp: bool = True
@@ -132,12 +158,17 @@ class TrainingConfig:
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
             "warmup_epochs": self.warmup_epochs,
             "lr_scheduler": self.lr_scheduler,
             "lr_min": self.lr_min,
             "patience": self.patience,
             "grad_clip": self.grad_clip,
             "loss_fn": self.loss_fn,
+            "weight_l1": self.weight_l1,
+            "weight_wavelet": self.weight_wavelet,
+            "use_wavelet_loss": self.use_wavelet_loss,
             "use_augmentation": self.use_augmentation,
             "use_amp": self.use_amp,
             "checkpoint_every": self.checkpoint_every,

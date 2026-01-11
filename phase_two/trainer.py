@@ -340,21 +340,44 @@ def get_gpu_memory_mb() -> Optional[float]:
 
 
 # =============================================================================
-# Data Augmentation
+# Data Augmentation (matched to train.py heavy augmentation)
 # =============================================================================
 
 class SignalAugmentation:
-    """Data augmentation for neural signals."""
+    """Data augmentation for neural signals - matched to train.py."""
 
-    def __init__(
-        self,
-        noise_std: float = 0.1,
-        time_shift: int = 50,
-        p: float = 0.5,
-    ):
-        self.noise_std = noise_std
-        self.time_shift = time_shift
-        self.p = p
+    def __init__(self, config):
+        """Initialize augmentation from config."""
+        self.enabled = getattr(config, 'use_augmentation', True)
+
+        # Time shift
+        self.time_shift = getattr(config, 'aug_time_shift', True)
+        self.time_shift_max = getattr(config, 'aug_time_shift_max', 0.2)
+
+        # Gaussian noise
+        self.noise = getattr(config, 'aug_noise', True)
+        self.noise_std = getattr(config, 'aug_noise_std', 0.1)
+
+        # Channel dropout
+        self.channel_dropout = getattr(config, 'aug_channel_dropout', True)
+        self.channel_dropout_p = getattr(config, 'aug_channel_dropout_p', 0.2)
+
+        # Amplitude scaling
+        self.amplitude_scale = getattr(config, 'aug_amplitude_scale', True)
+        self.amplitude_scale_range = getattr(config, 'aug_amplitude_scale_range', (0.5, 1.5))
+
+        # Time masking
+        self.time_mask = getattr(config, 'aug_time_mask', True)
+        self.time_mask_ratio = getattr(config, 'aug_time_mask_ratio', 0.15)
+
+        # Mixup
+        self.mixup = getattr(config, 'aug_mixup', True)
+        self.mixup_alpha = getattr(config, 'aug_mixup_alpha', 0.4)
+
+        # Frequency masking
+        self.freq_mask = getattr(config, 'aug_freq_mask', True)
+        self.freq_mask_max_bands = getattr(config, 'aug_freq_mask_max_bands', 3)
+        self.freq_mask_max_width = getattr(config, 'aug_freq_mask_max_width', 20)
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply augmentation.
@@ -366,19 +389,64 @@ class SignalAugmentation:
         Returns:
             Augmented (x, y)
         """
-        B, C, T = x.shape
+        if not self.enabled:
+            return x, y
 
-        # Gaussian noise
-        if torch.rand(1).item() < self.p:
+        B, C, T = x.shape
+        device = x.device
+
+        # Time shift (circular, same for x and y)
+        if self.time_shift:
+            max_shift = int(T * self.time_shift_max)
+            shifts = torch.randint(-max_shift, max_shift + 1, (B,), device=device)
+            for i in range(B):
+                if shifts[i] != 0:
+                    x[i] = torch.roll(x[i], shifts=shifts[i].item(), dims=-1)
+                    y[i] = torch.roll(y[i], shifts=shifts[i].item(), dims=-1)
+
+        # Gaussian noise (only on input)
+        if self.noise:
             noise = torch.randn_like(x) * self.noise_std
             x = x + noise
 
-        # Time shift (same shift for x and y to maintain alignment)
-        if torch.rand(1).item() < self.p and self.time_shift > 0:
-            shift = torch.randint(-self.time_shift, self.time_shift + 1, (1,)).item()
-            if shift != 0:
-                x = torch.roll(x, shifts=shift, dims=-1)
-                y = torch.roll(y, shifts=shift, dims=-1)
+        # Channel dropout (only on input)
+        if self.channel_dropout:
+            mask = torch.bernoulli(torch.full((B, C, 1), 1 - self.channel_dropout_p, device=device))
+            x = x * mask
+
+        # Amplitude scaling (same scale for x and y per sample)
+        if self.amplitude_scale:
+            min_scale, max_scale = self.amplitude_scale_range
+            scales = torch.empty(B, 1, 1, device=device).uniform_(min_scale, max_scale)
+            x = x * scales
+            y = y * scales
+
+        # Time masking (mask random time segments)
+        if self.time_mask:
+            mask_len = int(T * self.time_mask_ratio)
+            for i in range(B):
+                start = torch.randint(0, T - mask_len, (1,)).item()
+                x[i, :, start:start + mask_len] = 0
+
+        # Mixup (blend random pairs)
+        if self.mixup and B >= 2:
+            # Sample mixup coefficient from Beta distribution
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            # Random permutation for mixing
+            perm = torch.randperm(B, device=device)
+            x = lam * x + (1 - lam) * x[perm]
+            y = lam * y + (1 - lam) * y[perm]
+
+        # Frequency masking (zero out random frequency bands via FFT)
+        if self.freq_mask:
+            x_fft = torch.fft.rfft(x, dim=-1)
+            freq_bins = x_fft.shape[-1]
+            n_bands = torch.randint(1, self.freq_mask_max_bands + 1, (1,)).item()
+            for _ in range(n_bands):
+                width = torch.randint(1, self.freq_mask_max_width + 1, (1,)).item()
+                start = torch.randint(0, max(1, freq_bins - width), (1,)).item()
+                x_fft[:, :, start:start + width] = 0
+            x = torch.fft.irfft(x_fft, n=T, dim=-1)
 
         return x, y
 
@@ -520,19 +588,41 @@ class Trainer:
             self.model = model.to(device)
 
         # Loss function
-        if config.loss_fn == "l1":
+        if config.loss_fn in ("l1", "l1_wavelet"):
             self.criterion = nn.L1Loss()
         elif config.loss_fn == "mse":
             self.criterion = nn.MSELoss()
-        elif config.loss_fn == "huber":
+        elif config.loss_fn in ("huber", "huber_wavelet"):
             self.criterion = nn.HuberLoss()
         else:
             self.criterion = nn.L1Loss()
 
-        # Optimizer (use model.parameters() after FSDP wrapping)
+        # Wavelet loss (if enabled)
+        self.wavelet_loss = None
+        self.use_wavelet_loss = getattr(config, 'use_wavelet_loss', False)
+        self.weight_l1 = getattr(config, 'weight_l1', 1.0)
+        self.weight_wavelet = getattr(config, 'weight_wavelet', 3.0)
+        if self.use_wavelet_loss and config.loss_fn in ("l1_wavelet", "huber_wavelet"):
+            try:
+                from models import build_wavelet_loss
+                self.wavelet_loss = build_wavelet_loss(
+                    family=getattr(config, 'wavelet_family', 'morlet'),
+                    omega0=getattr(config, 'wavelet_omega0', 3.0),
+                ).to(device if not self.use_fsdp else f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}")
+                if self._is_main:
+                    self._log_info(f"Wavelet loss enabled (weight={self.weight_wavelet})")
+            except ImportError:
+                if self._is_main:
+                    self._log_warning("Wavelet loss not available, using L1 only")
+                self.use_wavelet_loss = False
+
+        # Optimizer with custom betas (matched to train.py)
+        beta1 = getattr(config, 'beta1', 0.9)
+        beta2 = getattr(config, 'beta2', 0.999)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
+            betas=(beta1, beta2),
             weight_decay=config.weight_decay,
         )
 
@@ -545,11 +635,8 @@ class Trainer:
             self.scaler = GradScaler() if config.use_amp and device == "cuda" else None
             self.use_amp = config.use_amp and device == "cuda"
 
-        # Augmentation
-        self.augmentation = SignalAugmentation(
-            noise_std=config.aug_noise_std,
-            time_shift=config.aug_time_shift,
-        ) if config.use_augmentation else None
+        # Augmentation (matched to train.py heavy augmentation)
+        self.augmentation = SignalAugmentation(config) if config.use_augmentation else None
 
         # State
         self.best_val_loss = float('inf')
@@ -580,14 +667,21 @@ class Trainer:
 
     def _get_lr_scheduler(self, n_steps: int) -> torch.optim.lr_scheduler._LRScheduler:
         """Create learning rate scheduler."""
+        scheduler_type = getattr(self.config, 'lr_scheduler', 'cosine')
+
+        # No scheduler - constant LR (matched to train.py default)
+        if scheduler_type == "none":
+            return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda step: 1.0)
+
+        # Cosine with warmup
         warmup_steps = self.config.warmup_epochs * (n_steps // self.config.epochs)
+        lr_min_ratio = getattr(self.config, 'lr_min_ratio', 0.01)
 
         def lr_lambda(step):
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             progress = (step - warmup_steps) / max(1, n_steps - warmup_steps)
-            return max(self.config.lr_min / self.config.learning_rate,
-                      0.5 * (1 + np.cos(np.pi * progress)))
+            return max(lr_min_ratio, 0.5 * (1 + np.cos(np.pi * progress)))
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
@@ -617,7 +711,10 @@ class Trainer:
                 if self.use_amp:
                     with autocast():
                         y_pred = self.model(x)
-                        loss = self.criterion(y_pred, y)
+                        # Combined loss: L1/Huber + Wavelet
+                        loss = self.weight_l1 * self.criterion(y_pred, y)
+                        if self.use_wavelet_loss and self.wavelet_loss is not None:
+                            loss = loss + self.weight_wavelet * self.wavelet_loss(y_pred, y)
 
                     # Check for NaN/Inf
                     if check_nan_inf(loss, "loss"):
@@ -635,7 +732,10 @@ class Trainer:
                     self.scaler.update()
                 else:
                     y_pred = self.model(x)
-                    loss = self.criterion(y_pred, y)
+                    # Combined loss: L1/Huber + Wavelet
+                    loss = self.weight_l1 * self.criterion(y_pred, y)
+                    if self.use_wavelet_loss and self.wavelet_loss is not None:
+                        loss = loss + self.weight_wavelet * self.wavelet_loss(y_pred, y)
 
                     # Check for NaN/Inf
                     if check_nan_inf(loss, "loss"):
