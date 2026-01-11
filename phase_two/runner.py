@@ -858,6 +858,8 @@ Examples:
                        help="Directory containing Phase 1 results for auto-loading")
     parser.add_argument("--load-results", type=str, default=None,
                        help="Load previous results and regenerate figures (path to JSON)")
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from checkpoint (default behavior, this flag confirms intent)")
     parser.add_argument("--fresh", action="store_true",
                        help="Start fresh, ignoring any existing checkpoint")
     parser.add_argument("--figure-format", type=str, default="pdf",
@@ -987,6 +989,14 @@ Examples:
         if checkpoint_path.exists():
             checkpoint_path.unlink()
             print("Deleted existing checkpoint (--fresh mode)")
+
+    # Handle --resume flag: check if checkpoint exists
+    if args.resume and _is_main:
+        checkpoint_path = get_checkpoint_path(config.output_dir)
+        if checkpoint_path.exists():
+            print(f"Resume mode: Found checkpoint at {checkpoint_path}")
+        else:
+            print("Resume mode: No checkpoint found, starting fresh")
 
     try:
         # Run with 5-fold cross-validation
