@@ -1538,6 +1538,14 @@ def evaluate(
                     psd_diff_list_rev.append(psd_diff_db_torch(pred_rev_f32, ob_f32, fs=sampling_rate).item())
 
     # Forward results
+    if not mse_list:
+        # No batches processed (can happen with small datasets and many GPUs)
+        return {
+            "mse": 0.0,
+            "mae": 0.0,
+            "corr": 0.0,
+            "r2": 0.0,
+        }
     results = {
         "mse": float(np.mean(mse_list)),
         "mae": float(np.mean(mae_list)),
@@ -2033,6 +2041,12 @@ def train_epoch(
 
     # Convert to floats ONLY at end of epoch (single GPU sync point)
     n_batches = len(loader)
+    if n_batches == 0:
+        # No batches processed (can happen with small datasets and many GPUs)
+        return {
+            "loss": 0.0,
+            **{k: 0.0 for k in loss_components.keys()},
+        }
     total_loss_val = total_loss.item() / n_batches
     return {
         "loss": total_loss_val,
