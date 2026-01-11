@@ -98,11 +98,13 @@ class SelectiveSSM(nn.Module):
         x_ssm = self.x_proj(x_main)  # [B, T, d_state*2 + 1]
         B_param = x_ssm[:, :, :self.d_state]  # [B, T, d_state]
         C_param = x_ssm[:, :, self.d_state:2*self.d_state]  # [B, T, d_state]
-        dt = F.softplus(x_ssm[:, :, -1:])  # [B, T, 1]
+        # Clamp dt for numerical stability
+        dt = F.softplus(x_ssm[:, :, -1:]).clamp(min=1e-4, max=10.0)  # [B, T, 1]
 
-        # Discretize A using dt
+        # Discretize A using dt (clamp exp input to prevent overflow)
         dt_proj = self.dt_proj(dt)  # [B, T, d_inner]
-        A_discrete = torch.exp(self.A.unsqueeze(0).unsqueeze(0) * dt_proj.unsqueeze(-1))  # [B, T, d_inner, d_state]
+        exp_input = (self.A.unsqueeze(0).unsqueeze(0) * dt_proj.unsqueeze(-1)).clamp(min=-20, max=0)
+        A_discrete = torch.exp(exp_input)  # [B, T, d_inner, d_state]
 
         # Selective scan (simplified - parallel implementation)
         # For full efficiency, use CUDA kernel or chunked scan
@@ -122,7 +124,7 @@ class SelectiveSSM(nn.Module):
         C: torch.Tensor,      # [B, T, d_state]
         D: torch.Tensor,      # [d_inner]
     ) -> torch.Tensor:
-        """Simplified selective scan.
+        """Simplified selective scan with numerical stability.
 
         Note: For production, use optimized CUDA implementation.
         This is a sequential fallback for correctness.
@@ -135,8 +137,9 @@ class SelectiveSSM(nn.Module):
 
         outputs = []
         for t in range(T):
-            # State update: h = A * h + B * u
+            # State update: h = A * h + B * u (with clamping for stability)
             h = A[:, t] * h + B[:, t].unsqueeze(1) * u[:, t].unsqueeze(-1)
+            h = h.clamp(min=-100, max=100)  # Prevent state explosion
 
             # Output: y = C * h + D * u
             y = (C[:, t].unsqueeze(1) * h).sum(-1) + D * u[:, t]
@@ -218,15 +221,20 @@ class Mamba1D(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights."""
+        """Initialize weights with smaller values for stability."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                # Use smaller initialization for better numerical stability
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
