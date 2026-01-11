@@ -11,10 +11,14 @@ Simplified implementation focusing on core SSM concepts.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Suppress harmless tensor deallocation warnings under FSDP
+warnings.filterwarnings("ignore", message=".*Deallocating Tensor.*")
 
 
 class SelectiveSSM(nn.Module):
