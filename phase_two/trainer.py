@@ -1121,6 +1121,9 @@ def create_dataloaders(
     val_sampler = None
     shuffle_train = True
 
+    # Reduce workers for distributed training to avoid FSDP issues
+    actual_n_workers = 0 if use_distributed else n_workers
+
     if use_distributed and is_distributed():
         train_sampler = DistributedSampler(
             train_dataset,
@@ -1144,7 +1147,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=shuffle_train,
         sampler=train_sampler,
-        num_workers=n_workers,
+        num_workers=actual_n_workers,
         pin_memory=True,
         drop_last=True,
     )
@@ -1154,7 +1157,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=n_workers,
+        num_workers=actual_n_workers,
         pin_memory=True,
     )
 
