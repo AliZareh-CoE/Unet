@@ -69,6 +69,95 @@ from utils import (
 
 
 # =============================================================================
+# Checkpoint/Resume Support
+# =============================================================================
+
+def get_checkpoint_path(output_dir: Path) -> Path:
+    """Get the checkpoint file path for incremental saving."""
+    return output_dir / "phase1_checkpoint.pkl"
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    all_metrics: List,
+    all_predictions: Dict,
+    all_models: Dict,
+    method_fold_r2s: Dict,
+    completed_methods: set,
+) -> None:
+    """Save checkpoint after each method for resume capability."""
+    checkpoint = {
+        "all_metrics": [m.to_dict() if hasattr(m, 'to_dict') else m for m in all_metrics],
+        "all_predictions": {},  # Don't save predictions (large arrays)
+        "all_models": {},  # Don't save models (handled separately)
+        "method_fold_r2s": method_fold_r2s,
+        "completed_methods": list(completed_methods),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # Save atomically
+    temp_path = checkpoint_path.with_suffix('.tmp')
+    with open(temp_path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    temp_path.rename(checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    """Load checkpoint if it exists."""
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint = pickle.load(f)
+        print(f"\n*** RESUMING FROM CHECKPOINT ***")
+        print(f"    Found {len(checkpoint['completed_methods'])} completed methods")
+        print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        return checkpoint
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint: {e}")
+        return None
+
+
+def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, Dict, Dict, Dict, set]:
+    """Reconstruct state from checkpoint."""
+    # Reconstruct Phase1Metrics objects
+    all_metrics = []
+    for m_dict in checkpoint["all_metrics"]:
+        if isinstance(m_dict, dict):
+            metrics = Phase1Metrics(
+                method=m_dict["method"],
+                r2_mean=m_dict["r2_mean"],
+                r2_std=m_dict["r2_std"],
+                r2_ci=tuple(m_dict["r2_ci"]),
+                mae_mean=m_dict["mae_mean"],
+                mae_std=m_dict["mae_std"],
+                pearson_mean=m_dict["pearson_mean"],
+                spearman_mean=m_dict["spearman_mean"],
+                band_r2=m_dict.get("band_r2", {}),
+                psd_error_db=m_dict.get("psd_error_db", 0.0),
+                fold_r2s=m_dict.get("fold_r2s", []),
+                plv_mean=m_dict.get("plv_mean", 0.0),
+                plv_std=m_dict.get("plv_std", 0.0),
+                pli_mean=m_dict.get("pli_mean", 0.0),
+                wpli_mean=m_dict.get("wpli_mean", 0.0),
+                coherence_mean=m_dict.get("coherence_mean", 0.0),
+                coherence_std=m_dict.get("coherence_std", 0.0),
+                envelope_corr_mean=m_dict.get("envelope_corr_mean", 0.0),
+                mutual_info_mean=m_dict.get("mutual_info_mean", 0.0),
+                reconstruction_snr_db=m_dict.get("reconstruction_snr_db", 0.0),
+                fold_plv=m_dict.get("fold_plv", []),
+                fold_coherence=m_dict.get("fold_coherence", []),
+            )
+            all_metrics.append(metrics)
+
+    method_fold_r2s = checkpoint["method_fold_r2s"]
+    completed_methods = set(checkpoint["completed_methods"])
+
+    return all_metrics, {}, {}, method_fold_r2s, completed_methods
+
+
+# =============================================================================
 # Result Dataclass
 # =============================================================================
 
@@ -544,13 +633,31 @@ def run_phase1(
     print(f"CV folds: {config.n_folds}")
     print()
 
-    all_metrics = []
-    all_predictions = {}
-    all_models = {}
-    method_fold_r2s = {}
+    # Setup checkpoint for resume capability
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_metrics, all_predictions, all_models, method_fold_r2s, completed_methods = reconstruct_from_checkpoint(checkpoint)
+    else:
+        all_metrics = []
+        all_predictions = {}
+        all_models = {}
+        method_fold_r2s = {}
+        completed_methods = set()
+
+    skipped_methods = 0
 
     # Evaluate each baseline
     for i, baseline_name in enumerate(config.baselines):
+        # Check if already completed
+        if baseline_name in completed_methods:
+            skipped_methods += 1
+            print(f"[{i+1}/{len(config.baselines)}] {baseline_name} - SKIPPED (already completed)")
+            continue
+
         print(f"[{i+1}/{len(config.baselines)}] Evaluating {baseline_name}...")
         start_time = time.time()
 
@@ -570,6 +677,14 @@ def run_phase1(
         print(f"    R² = {result.r2_mean:.4f} ± {result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
         # Print key DSP metrics
         print(f"    PLV = {result.plv_mean:.4f}, Coherence = {result.coherence_mean:.4f}, SNR = {result.reconstruction_snr_db:.1f} dB")
+
+        # Save checkpoint after each method
+        completed_methods.add(baseline_name)
+        save_checkpoint(checkpoint_path, all_metrics, all_predictions, all_models, method_fold_r2s, completed_methods)
+        print(f"    Checkpoint saved ({len(completed_methods)}/{len(config.baselines)} methods completed)")
+
+    if skipped_methods > 0:
+        print(f"\n*** Resumed run: skipped {skipped_methods} already-completed methods ***")
 
     # Find best method
     valid_metrics = [m for m in all_metrics if not np.isnan(m.r2_mean)]
@@ -781,6 +896,11 @@ Examples:
         default=300,
         help="DPI for raster figures (png)",
     )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start fresh, ignoring any existing checkpoint",
+    )
 
     args = parser.parse_args()
 
@@ -863,8 +983,21 @@ Examples:
             X, y = create_synthetic_data()
             ground_truth = y
 
+    # Handle --fresh flag: delete existing checkpoint
+    if args.fresh:
+        checkpoint_path = get_checkpoint_path(config.output_dir)
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            print("Deleted existing checkpoint (--fresh mode)")
+
     # Run evaluation
     result = run_phase1(config, X, y)
+
+    # Clean up checkpoint after successful completion
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Checkpoint cleaned up after successful completion")
 
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -42,6 +42,96 @@ from utils import (
     confidence_interval,
 )
 
+import pickle
+
+
+# =============================================================================
+# Checkpoint/Resume Support
+# =============================================================================
+
+def get_checkpoint_path(output_dir: Path) -> Path:
+    """Get the checkpoint file path for incremental saving."""
+    return output_dir / "phase3_checkpoint.pkl"
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    all_results: List,
+    baseline_results: List,
+    completed_studies: set,
+    baseline_completed: bool,
+) -> None:
+    """Save checkpoint after each study for resume capability."""
+    checkpoint = {
+        "all_results": [r.to_dict() if hasattr(r, 'to_dict') else vars(r) for r in all_results],
+        "baseline_results": [r.to_dict() if hasattr(r, 'to_dict') else vars(r) for r in baseline_results],
+        "completed_studies": list(completed_studies),
+        "baseline_completed": baseline_completed,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    temp_path = checkpoint_path.with_suffix('.tmp')
+    with open(temp_path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    temp_path.rename(checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    """Load checkpoint if it exists."""
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        with open(checkpoint_path, 'rb') as f:
+            checkpoint = pickle.load(f)
+        print(f"\n*** RESUMING FROM CHECKPOINT ***")
+        print(f"    Baseline completed: {checkpoint['baseline_completed']}")
+        print(f"    Completed studies: {len(checkpoint['completed_studies'])}")
+        print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        return checkpoint
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint: {e}")
+        return None
+
+
+def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, List, set, bool]:
+    """Reconstruct state from checkpoint."""
+    # Reconstruct AblationResult objects
+    all_results = []
+    for r_dict in checkpoint["all_results"]:
+        result = AblationResult(
+            study=r_dict["study"],
+            variant=r_dict["variant"],
+            fold=r_dict["fold"],
+            best_r2=r_dict["best_r2"],
+            best_loss=r_dict["best_loss"],
+            train_history=r_dict.get("train_history", []),
+            val_r2_history=r_dict.get("val_r2_history", []),
+            n_parameters=r_dict.get("n_parameters", 0),
+            training_time=r_dict.get("training_time", 0.0),
+        )
+        all_results.append(result)
+
+    baseline_results = []
+    for r_dict in checkpoint["baseline_results"]:
+        result = AblationResult(
+            study=r_dict["study"],
+            variant=r_dict["variant"],
+            fold=r_dict["fold"],
+            best_r2=r_dict["best_r2"],
+            best_loss=r_dict["best_loss"],
+            train_history=r_dict.get("train_history", []),
+            val_r2_history=r_dict.get("val_r2_history", []),
+            n_parameters=r_dict.get("n_parameters", 0),
+            training_time=r_dict.get("training_time", 0.0),
+        )
+        baseline_results.append(result)
+
+    completed_studies = set(checkpoint["completed_studies"])
+    baseline_completed = checkpoint["baseline_completed"]
+
+    return all_results, baseline_results, completed_studies, baseline_completed
+
 
 # =============================================================================
 # Result Classes
@@ -423,6 +513,20 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
     print(f"Total runs: {config.total_runs}")
     print("=" * 60)
 
+    # Setup checkpoint for resume capability
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_results, baseline_results, completed_studies, baseline_completed = reconstruct_from_checkpoint(checkpoint)
+    else:
+        all_results = []
+        baseline_results = []
+        completed_studies = set()
+        baseline_completed = False
+
     # Load raw data for CV
     X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
 
@@ -430,42 +534,71 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
     cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
     print(f"CV splits: {[len(s[1]) for s in cv_splits]} validation samples per fold")
 
-    # First, run baseline across all folds
-    print("\n[Baseline] Running full CondUNet configuration...")
+    # First, run baseline across all folds (if not already done)
     baseline_config = get_baseline_config()
-    baseline_results = []
 
-    for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
-        train_loader, val_loader = create_dataloaders_from_indices(
-            X, y, odor_ids, train_idx, val_idx,
-            batch_size=config.training.batch_size,
-            n_workers=config.n_workers,
-        )
+    if baseline_completed:
+        print("\n[Baseline] SKIPPED (already completed)")
+        baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
+        baseline_std = np.std([r.best_r2 for r in baseline_results])
+        print(f"Baseline R²: {baseline_r2:.4f} ± {baseline_std:.4f}")
+    else:
+        print("\n[Baseline] Running full CondUNet configuration...")
+        baseline_results = []
 
-        result = run_single_ablation(
-            ablation_config=baseline_config,
-            training_config=config.training,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            fold=fold_idx,
-            cv_seed=config.cv_seed,
-            device=config.device,
-            checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
-            verbose=config.verbose,
-        )
-        baseline_results.append(result)
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
+            train_loader, val_loader = create_dataloaders_from_indices(
+                X, y, odor_ids, train_idx, val_idx,
+                batch_size=config.training.batch_size,
+                n_workers=config.n_workers,
+            )
 
-    baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
-    baseline_std = np.std([r.best_r2 for r in baseline_results])
-    print(f"\nBaseline R²: {baseline_r2:.4f} ± {baseline_std:.4f}")
+            result = run_single_ablation(
+                ablation_config=baseline_config,
+                training_config=config.training,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                fold=fold_idx,
+                cv_seed=config.cv_seed,
+                device=config.device,
+                checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
+                verbose=config.verbose,
+            )
+            baseline_results.append(result)
+
+        baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
+        baseline_std = np.std([r.best_r2 for r in baseline_results])
+        print(f"\nBaseline R²: {baseline_r2:.4f} ± {baseline_std:.4f}")
+
+        # Save checkpoint after baseline
+        baseline_completed = True
+        all_results = baseline_results.copy()
+        save_checkpoint(checkpoint_path, all_results, baseline_results, completed_studies, baseline_completed)
+        print("Checkpoint saved after baseline")
 
     # Run ablation studies (one ablated variant per study)
-    all_results = baseline_results.copy()
+    if not baseline_completed:
+        # Already set above
+        pass
+    else:
+        # When resuming, start with loaded results
+        if len(all_results) == 0:
+            all_results = baseline_results.copy()
+
     ablation_configs = config.get_ablation_configs()  # One per study
+    skipped_studies = 0
 
     for ablation_config in ablation_configs:
+        study_name = ablation_config.study
+
+        # Check if already completed
+        if study_name in completed_studies:
+            skipped_studies += 1
+            print(f"\n[{study_name}] SKIPPED (already completed)")
+            continue
+
         print(f"\n{'=' * 40}")
         print(f"Study: {ABLATION_STUDIES[ablation_config.study]['description']}")
         print(f"Ablated variant: {ablation_config.variant}")
@@ -492,6 +625,14 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
                 verbose=config.verbose,
             )
             all_results.append(result)
+
+        # Save checkpoint after each study
+        completed_studies.add(study_name)
+        save_checkpoint(checkpoint_path, all_results, baseline_results, completed_studies, baseline_completed)
+        print(f"Checkpoint saved ({len(completed_studies)}/{len(ablation_configs)} studies completed)")
+
+    if skipped_studies > 0:
+        print(f"\n*** Resumed run: skipped {skipped_studies} already-completed studies ***")
 
     # Aggregate results
     aggregated = aggregate_results(all_results)
@@ -747,6 +888,11 @@ def main():
         help="Quick run with minimal epochs",
     )
     parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Start fresh, ignoring any existing checkpoint",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="Run only attention ablation for quick testing",
@@ -788,8 +934,21 @@ def main():
         n_workers=args.workers,
     )
 
+    # Handle --fresh flag: delete existing checkpoint
+    if args.fresh:
+        checkpoint_path = get_checkpoint_path(config.output_dir)
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            print("Deleted existing checkpoint (--fresh mode)")
+
     # Run ablations
     result = run_phase3(config)
+
+    # Clean up checkpoint after successful completion
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Checkpoint cleaned up after successful completion")
 
     # Generate figures
     from .visualization import Phase3Visualizer
