@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -42,6 +44,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+
+# Suppress harmless warnings
+warnings.filterwarnings("ignore", message=".*found in sys.modules after import.*")
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*FSDP.state_dict_type.*")
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
@@ -82,7 +88,7 @@ from utils import (
 # Phase 1 Result Loading
 # =============================================================================
 
-def load_phase1_classical_r2(phase1_dir: Path = None) -> Optional[float]:
+def load_phase1_classical_r2(phase1_dir: Path = None, verbose: bool = True) -> Optional[float]:
     """Auto-load best classical R² from Phase 1 results.
 
     Searches for Phase 1 result files and extracts the best R².
@@ -90,6 +96,7 @@ def load_phase1_classical_r2(phase1_dir: Path = None) -> Optional[float]:
     Args:
         phase1_dir: Directory containing Phase 1 results.
                     Defaults to results/phase1/
+        verbose: Whether to print loading messages (set False for non-main ranks)
 
     Returns:
         Best R² value from Phase 1, or None if not found.
@@ -123,11 +130,13 @@ def load_phase1_classical_r2(phase1_dir: Path = None) -> Optional[float]:
         best_method = data.get("best_method", "unknown")
 
         if best_r2 is not None:
-            print(f"[Auto-loaded] Phase 1 best R²: {best_r2:.4f} ({best_method})")
-            print(f"  Source: {result_file}")
+            if verbose:
+                print(f"[Auto-loaded] Phase 1 best R²: {best_r2:.4f} ({best_method})")
+                print(f"  Source: {result_file}")
             return float(best_r2)
     except Exception as e:
-        print(f"Warning: Could not load Phase 1 results from {result_file}: {e}")
+        if verbose:
+            print(f"Warning: Could not load Phase 1 results from {result_file}: {e}")
 
     return None
 
@@ -353,8 +362,11 @@ class Phase2Result:
 # Data Loading
 # =============================================================================
 
-def load_olfactory_data():
+def load_olfactory_data(verbose: bool = True):
     """Load olfactory dataset (full data for cross-validation).
+
+    Args:
+        verbose: Whether to print loading messages (set False for non-main ranks)
 
     Returns:
         X: Input signals [N, C, T]
@@ -362,7 +374,8 @@ def load_olfactory_data():
     """
     from data import prepare_data
 
-    print("Loading olfactory dataset...")
+    if verbose:
+        print("Loading olfactory dataset...")
     data = prepare_data()
 
     ob = data["ob"]    # [N, C, T]
@@ -376,7 +389,8 @@ def load_olfactory_data():
     X = ob[all_idx]
     y = pcx[all_idx]
 
-    print(f"  Loaded: {X.shape} samples for cross-validation")
+    if verbose:
+        print(f"  Loaded: {X.shape} samples for cross-validation")
 
     return X, y
 
@@ -924,38 +938,41 @@ Examples:
         save_checkpoints=not args.no_checkpoints,
     )
 
+    # Determine if this is the main process for printing
+    _is_main = is_main_process()
+
     # Auto-load classical R² from Phase 1 if not specified
     classical_r2 = args.classical_r2
     if classical_r2 is None:
         phase1_dir = Path(args.phase1_dir) if args.phase1_dir else None
-        classical_r2 = load_phase1_classical_r2(phase1_dir)
+        classical_r2 = load_phase1_classical_r2(phase1_dir, verbose=_is_main)
 
         if classical_r2 is None:
             classical_r2 = 0.35  # Fallback default
-            if is_main_process():
+            if _is_main:
                 print(f"Warning: Could not auto-load Phase 1 results. Using default R²={classical_r2}")
                 print("  Run Phase 1 first, or specify --classical-r2 manually")
     else:
-        if is_main_process():
+        if _is_main:
             print(f"Using specified classical R²: {classical_r2:.4f}")
 
     # Load data (full dataset for cross-validation)
     if args.dry_run:
-        if is_main_process():
+        if _is_main:
             print("[DRY-RUN] Using synthetic data")
         X, y = create_synthetic_data(
             n_samples=100, time_steps=500
         )
     else:
         try:
-            X, y = load_olfactory_data()
+            X, y = load_olfactory_data(verbose=_is_main)
         except Exception as e:
-            if is_main_process():
+            if _is_main:
                 print(f"Warning: Could not load data ({e}). Using synthetic.")
             X, y = create_synthetic_data()
 
     # Handle --fresh flag: delete existing checkpoint (only main process)
-    if args.fresh and is_main_process():
+    if args.fresh and _is_main:
         checkpoint_path = get_checkpoint_path(config.output_dir)
         if checkpoint_path.exists():
             checkpoint_path.unlink()
@@ -974,7 +991,7 @@ Examples:
         )
 
         # Only main process handles file I/O
-        if is_main_process():
+        if _is_main:
             # Clean up checkpoint after successful completion
             checkpoint_path = get_checkpoint_path(config.output_dir)
             if checkpoint_path.exists():

@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import traceback
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset, DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
+
+# Suppress harmless warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*FSDP.state_dict_type.*")
+warnings.filterwarnings("ignore", message=".*Both mixed precision and an auto_wrap_policy.*")
 
 # FSDP imports
 try:
