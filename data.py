@@ -1820,7 +1820,7 @@ def create_dataloaders(
         sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False,  # Don't drop for val - we want all samples evaluated
+        drop_last=distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
         persistent_workers=persistent,
         prefetch_factor=2 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
@@ -1833,7 +1833,7 @@ def create_dataloaders(
         sampler=test_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False,  # Don't drop for test - we want all samples evaluated
+        drop_last=distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
         persistent_workers=persistent,
         prefetch_factor=2 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
@@ -2036,7 +2036,7 @@ def create_pfc_dataloaders(
         sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False,  # Don't drop for val - we want all samples evaluated
+        drop_last=distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
         persistent_workers=persistent,
         prefetch_factor=2 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
@@ -2049,7 +2049,7 @@ def create_pfc_dataloaders(
         sampler=test_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False,  # Don't drop for test - we want all samples evaluated
+        drop_last=distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
         persistent_workers=persistent,
         prefetch_factor=2 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,

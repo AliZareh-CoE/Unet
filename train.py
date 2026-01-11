@@ -2161,7 +2161,7 @@ def train(
                 batch_size=batch_size,
                 shuffle=False,
                 sampler=val_sampler,
-                drop_last=False,
+                drop_last=is_distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
                 **loader_kwargs,
             ),
         }
@@ -2173,7 +2173,7 @@ def train(
                 batch_size=batch_size,
                 shuffle=False,
                 sampler=test_sampler,
-                drop_last=False,
+                drop_last=is_distributed,  # Must drop_last with FSDP to prevent deadlocks from uneven batch counts
                 **loader_kwargs,
             )
 
@@ -2565,6 +2565,7 @@ def train(
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
+    last_val_metrics = {"loss": float("inf"), "corr": 0, "r2": 0}  # Cached for non-validation epochs
     history = []
 
     for epoch in range(1, num_epochs + 1):
@@ -2610,7 +2611,7 @@ def train(
                     per_session_metrics[sess_name] = sess_metrics
         else:
             # Skip validation this epoch - use cached metrics
-            val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
+            val_metrics = last_val_metrics  # Use cached metrics from previous validation
             per_session_metrics = {}
 
         # Sync val_loss across ranks (for early stopping)
