@@ -119,6 +119,13 @@ from data import (
     _DANDI_DATA_DIR,
 )
 
+# Phase 2 architecture imports (for --arch flag)
+try:
+    from phase_two.architectures import create_architecture
+    PHASE2_ARCHS_AVAILABLE = True
+except ImportError:
+    PHASE2_ARCHS_AVAILABLE = False
+
 # Recording system imports (for comprehensive analysis)
 try:
     from recording import (
@@ -1413,11 +1420,18 @@ def evaluate(
                     # At eval time, only use input (no target needed for embedding)
                     cond_emb, _ = cond_encoder(ob, None)
 
-            # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-            if cond_emb is not None:
-                pred = model(ob, cond_emb=cond_emb)
+            # Forward: OB → PCx
+            # For CondUNet: use cond_emb if available, otherwise odor_ids
+            # For other architectures: just pass input directly
+            arch = config.get("arch", "condunet") if config else "condunet"
+            if arch == "condunet":
+                if cond_emb is not None:
+                    pred = model(ob, cond_emb=cond_emb)
+                else:
+                    pred = model(ob, odor)
             else:
-                pred = model(ob, odor)
+                # Other architectures: just pass input
+                pred = model(ob)
 
             # Apply envelope histogram matching (closed-form correction for amplitude dynamics)
             # This corrects bursty vs smooth characteristics
@@ -1774,29 +1788,36 @@ def train_epoch(
             if cond_encoder_training:
                 cond_encoder.train()
 
-        # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-        # If contrastive learning enabled, also get bottleneck features
-        # Note: For temporal CEBRA, projection heads are None but contrastive learning is still used
+        # Forward: OB → PCx
+        # For CondUNet: use cond_emb if available, otherwise odor_ids
+        # For other architectures: just pass input directly
+        arch = config.get("arch", "condunet")
         contrastive_mode = config.get("contrastive_mode", "temporal")  # "temporal" (true CEBRA) or "label"
         use_contrastive = config.get("use_contrastive", False)
         # For label mode, require projection heads; for temporal mode, no projection heads needed
         if contrastive_mode == "label" and projection_head_fwd is None:
             use_contrastive = False
         use_temporal_cebra = use_contrastive and contrastive_mode == "temporal"
-        if cond_emb is not None:
-            fwd_result = model(
-                ob, cond_emb=cond_emb,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
-        else:
-            fwd_result = model(
-                ob, odor,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
 
-        if use_contrastive:
+        if arch == "condunet":
+            # CondUNet with conditioning
+            if cond_emb is not None:
+                fwd_result = model(
+                    ob, cond_emb=cond_emb,
+                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
+                    return_bottleneck_temporal=use_temporal_cebra
+                )
+            else:
+                fwd_result = model(
+                    ob, odor,
+                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
+                    return_bottleneck_temporal=use_temporal_cebra
+                )
+        else:
+            # Other architectures: just pass input
+            fwd_result = model(ob)
+
+        if use_contrastive and arch == "condunet":
             pred_raw, bottleneck_fwd = fwd_result
         else:
             pred_raw = fwd_result
@@ -2203,35 +2224,61 @@ def train(
     out_channels = config.get("out_channels", 32)
     attention_type = config.get("attention_type", "basic")
     conv_type = config.get("conv_type", "standard")
+    arch = config.get("arch", "condunet")  # Architecture selection
 
     if is_primary():
+        print(f"Architecture: {arch.upper()}")
         print(f"Model: {in_channels} input channels → {out_channels} output channels")
-        print(f"Conditions: {n_odors} classes")
+        if arch == "condunet":
+            print(f"Conditions: {n_odors} classes")
 
-    model = CondUNet1D(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        base=config.get("base_channels", 128),
-        n_odors=n_odors,
-        dropout=config.get("dropout", 0.0),
-        use_attention=config.get("use_attention", True),
-        attention_type=attention_type,
-        norm_type=config.get("norm_type", "batch"),
-        cond_mode=config.get("cond_mode", "film"),
-        # U-Net depth for frequency resolution
-        n_downsample=config.get("n_downsample", 2),
-        # Modern convolution options
-        conv_type=conv_type,
-        use_se=config.get("use_se", True),
-        conv_kernel_size=config.get("conv_kernel_size", 7),
-        dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-        # Output scaling correction
-        use_output_scaling=config.get("use_output_scaling", True),
-    )
+    # Create model based on architecture
+    if arch == "condunet":
+        # CondUNet with all its features
+        model = CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base=config.get("base_channels", 128),
+            n_odors=n_odors,
+            dropout=config.get("dropout", 0.0),
+            use_attention=config.get("use_attention", True),
+            attention_type=attention_type,
+            norm_type=config.get("norm_type", "batch"),
+            cond_mode=config.get("cond_mode", "film"),
+            # U-Net depth for frequency resolution
+            n_downsample=config.get("n_downsample", 2),
+            # Modern convolution options
+            conv_type=conv_type,
+            use_se=config.get("use_se", True),
+            conv_kernel_size=config.get("conv_kernel_size", 7),
+            dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+            # Output scaling correction
+            use_output_scaling=config.get("use_output_scaling", True),
+        )
+    else:
+        # Use Phase 2 architectures for comparison
+        if not PHASE2_ARCHS_AVAILABLE:
+            raise RuntimeError(f"Phase 2 architectures not available. Cannot use --arch {arch}")
+
+        # Get time_steps from data
+        time_steps = data.get("time_steps", 5000)
+        if "ob" in data:
+            time_steps = data["ob"].shape[-1]
+
+        model = create_architecture(
+            arch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            time_steps=time_steps,
+        )
+        if is_primary():
+            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Parameters: {n_params:,}")
 
     # Create reverse model (target → source) for bidirectional training
+    # Only for CondUNet - other architectures don't support conditioning
     reverse_model = None
-    if config.get("use_bidirectional", False):
+    if config.get("use_bidirectional", False) and arch == "condunet":
         reverse_model = CondUNet1D(
             in_channels=out_channels,  # Reverse: target → source
             out_channels=in_channels,
@@ -2256,13 +2303,17 @@ def train(
             print("Bidirectional training ENABLED")
             if conv_type == "modern":
                 print(f"Using MODERN convolutions: dilations={config.get('conv_dilations', (1, 4, 16, 32))}, kernel_size={config.get('conv_kernel_size', 7)}, SE={config.get('use_se', True)}")
+    elif config.get("use_bidirectional", False) and arch != "condunet":
+        if is_primary():
+            print("Warning: Bidirectional training only supported for CondUNet, disabling")
 
     # Create conditioning encoder for auto-conditioning modes
+    # Only for CondUNet - other architectures don't support conditioning
     cond_source = config.get("conditioning_source", "odor_onehot")
     cond_encoder = None
     emb_dim = 128  # Must match model's emb_dim
 
-    if cond_source != "odor_onehot":
+    if cond_source != "odor_onehot" and arch == "condunet":
         if is_primary():
             print(f"Using auto-conditioning: {cond_source}")
 
@@ -3191,7 +3242,12 @@ def train(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CondUNet1D for neural signal translation")
-    
+
+    # Architecture selection (for Phase 2 comparison)
+    parser.add_argument("--arch", type=str, default="condunet",
+                        choices=["condunet", "linear", "simplecnn", "wavenet", "fnet", "vit", "performer", "mamba"],
+                        help="Architecture to train (default: condunet). Other options for Phase 2 comparison.")
+
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
                         choices=["olfactory", "pfc", "pcx1", "dandi"],
@@ -3381,6 +3437,10 @@ def main():
 
     # Build config FIRST - only override from args if explicitly provided
     config = DEFAULT_CONFIG.copy()
+
+    # Architecture selection (for Phase 2 comparison)
+    config["arch"] = args.arch
+
     if args.epochs is not None:
         config["num_epochs"] = args.epochs
     if args.batch_size is not None:
