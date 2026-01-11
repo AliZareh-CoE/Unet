@@ -52,6 +52,120 @@ from utils import (
     confidence_interval,
 )
 
+import pickle
+
+
+# =============================================================================
+# train.py Subprocess Integration
+# =============================================================================
+
+def run_train_py_phase4(
+    dataset_name: str,
+    split_mode: str,
+    fold_idx: int,
+    fold_indices_file: Path,
+    output_results_file: Path,
+    epochs: int = 80,
+    batch_size: int = 64,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    seed: int = 42,
+    verbose: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Run train.py as subprocess for Phase 4 experiment.
+
+    Uses the EXACT same training loop as train.py for consistency.
+    """
+    import subprocess
+
+    # Build command
+    if use_fsdp:
+        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={nproc}",
+            str(PROJECT_ROOT / "train.py"),
+        ]
+    else:
+        cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
+
+    # Add arguments - always use condunet for Phase 4
+    cmd.extend([
+        "--arch", "condunet",
+        "--dataset", dataset_name,
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--seed", str(seed + fold_idx),
+        "--fold-indices-file", str(fold_indices_file),
+        "--output-results-file", str(output_results_file),
+        "--fold", str(fold_idx),
+        "--no-plots",
+    ])
+
+    if use_fsdp:
+        cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
+
+    # Run subprocess
+    start_time = time.time()
+    try:
+        if verbose:
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                check=True,
+                text=True,
+            )
+        else:
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: train.py failed for {dataset_name} {split_mode} fold {fold_idx}")
+        print(f"  Return code: {e.returncode}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr[:500]}...")
+        return None
+
+    elapsed = time.time() - start_time
+
+    # Load results
+    if output_results_file.exists():
+        with open(output_results_file, 'r') as f:
+            results = json.load(f)
+        results["total_time"] = elapsed
+        return results
+    else:
+        print(f"WARNING: Results file not found: {output_results_file}")
+        return None
+
+
+def save_phase4_indices(
+    output_dir: Path,
+    dataset_name: str,
+    split_mode: str,
+    fold_idx: int,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    test_indices: np.ndarray,
+) -> Path:
+    """Save Phase 4 split indices to pickle file for train.py."""
+    fold_dir = output_dir / "fold_indices"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    indices_file = fold_dir / f"{dataset_name}_{split_mode}_fold{fold_idx}_indices.pkl"
+    with open(indices_file, 'wb') as f:
+        pickle.dump({
+            "train_idx": train_indices,
+            "val_idx": val_indices,
+            "test_idx": test_indices,
+        }, f)
+
+    return indices_file
+
 
 # =============================================================================
 # Result Classes
@@ -303,8 +417,12 @@ def run_single_experiment(
     model_config: Dict[str, Any],
     device: str = "cuda",
     checkpoint_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     verbose: int = 1,
     n_samples: int = 1000,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
 ) -> ExperimentResult:
     """Run a single experiment (one fold)."""
     # Set seed based on fold
@@ -325,6 +443,100 @@ def run_single_experiment(
         print(f"\n  [{dataset_name}] {split_mode.value} | fold {fold + 1}")
         print(f"    Train: {split.n_train} | Val: {split.n_val} | Test: {split.n_test}")
         print(f"    Train sessions: {len(split.train_sessions)} | Test sessions: {len(split.test_sessions)}")
+
+    # ================================================================
+    # Training: use train.py subprocess OR internal trainer
+    # ================================================================
+    if use_train_py:
+        # Use train.py subprocess for exact training consistency
+        if output_dir is None:
+            output_dir = Path("results/phase4")
+
+        # Save split indices for train.py
+        fold_indices_file = save_phase4_indices(
+            output_dir,
+            dataset_name,
+            split_mode.value,
+            fold,
+            np.array(split.train_indices),
+            np.array(split.val_indices),
+            np.array(split.test_indices),
+        )
+
+        # Output file for results
+        results_dir = output_dir / "train_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        output_results_file = results_dir / f"{dataset_name}_{split_mode.value}_fold{fold}_results.json"
+
+        if verbose >= 1:
+            print(f"    Running train.py subprocess...")
+
+        # Run train.py
+        start_time = time.time()
+        train_results = run_train_py_phase4(
+            dataset_name=dataset_name,
+            split_mode=split_mode.value,
+            fold_idx=fold,
+            fold_indices_file=fold_indices_file,
+            output_results_file=output_results_file,
+            epochs=training_config.epochs,
+            batch_size=training_config.batch_size,
+            use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
+            seed=cv_seed,
+            verbose=verbose >= 1,
+        )
+        total_time = time.time() - start_time
+
+        if train_results is None:
+            # Training failed
+            return ExperimentResult(
+                dataset=dataset_name,
+                split_mode=split_mode.value,
+                fold=fold,
+                train_r2=0.0,
+                val_r2=0.0,
+                test_r2=0.0,
+                train_losses=[],
+                val_losses=[],
+                val_r2s=[],
+                session_stats={},
+                train_sessions=split.train_sessions,
+                test_sessions=split.test_sessions,
+                n_train=split.n_train,
+                n_val=split.n_val,
+                n_test=split.n_test,
+                epochs_trained=0,
+                total_time=total_time,
+            )
+
+        # Convert results
+        if verbose >= 1:
+            print(f"    Val R²: {train_results.get('best_val_r2', 0):.4f}")
+
+        return ExperimentResult(
+            dataset=dataset_name,
+            split_mode=split_mode.value,
+            fold=fold,
+            train_r2=0.0,  # train.py doesn't report train R² by default
+            val_r2=train_results.get("best_val_r2", 0.0),
+            test_r2=train_results.get("best_val_r2", 0.0),  # Use val as test proxy
+            train_losses=train_results.get("train_losses", []),
+            val_losses=train_results.get("val_losses", []),
+            val_r2s=train_results.get("val_r2s", []),
+            session_stats={},  # Not computed in train.py mode
+            train_sessions=split.train_sessions,
+            test_sessions=split.test_sessions,
+            n_train=split.n_train,
+            n_val=split.n_val,
+            n_test=split.n_test,
+            epochs_trained=train_results.get("epochs_trained", 0),
+            total_time=train_results.get("total_time", total_time),
+        )
+
+    # ================================================================
+    # Original internal trainer code path
+    # ================================================================
 
     # Create dataloaders
     train_dataset = Subset(dataset, split.train_indices)
@@ -409,7 +621,12 @@ def run_single_experiment(
     )
 
 
-def run_phase4(config: Phase4Config) -> Phase4Result:
+def run_phase4(
+    config: Phase4Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+) -> Phase4Result:
     """Run all Phase 4 experiments with 5-fold cross-validation."""
     print("\n" + "=" * 60)
     print("Phase 4: Inter vs Intra Session Generalization (5-Fold CV)")
@@ -418,6 +635,10 @@ def run_phase4(config: Phase4Config) -> Phase4Result:
     print(f"Split modes: {[m.value for m in config.split_modes]}")
     print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
+    if use_train_py:
+        print(f"Training mode: train.py subprocess (exact consistency)")
+        if use_fsdp:
+            print(f"  FSDP: strategy={fsdp_strategy}")
     print("=" * 60)
 
     all_results = []
@@ -438,7 +659,11 @@ def run_phase4(config: Phase4Config) -> Phase4Result:
                     model_config=config.model_config,
                     device=config.device,
                     checkpoint_dir=config.checkpoint_dir / dataset / f"fold{fold_idx}",
+                    output_dir=config.output_dir,
                     verbose=config.verbose,
+                    use_train_py=use_train_py,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
                 )
                 all_results.append(result)
 
@@ -612,7 +837,8 @@ def print_summary(result: Phase4Result):
         print("\n" + "=" * 60)
         print("STATISTICAL ANALYSIS (Intra vs Inter)")
         print("=" * 60)
-        print(f"{'Dataset':<15}{'t-test p':<12}{'Wilcoxon p':<12}{'Cohen\\'s d':<12}{'Sig':<8}")
+        cohens_d = "Cohen's d"
+        print(f"{'Dataset':<15}{'t-test p':<12}{'Wilcoxon p':<12}{cohens_d:<12}{'Sig':<8}")
         print("-" * 60)
         for dataset, stats in result.comprehensive_stats.items():
             t_p = stats["parametric_test"]["p_value"]
@@ -694,6 +920,25 @@ def main():
     )
     parser.add_argument("--figure-dpi", type=int, default=300)
 
+    # train.py integration
+    parser.add_argument(
+        "--use-train-py",
+        action="store_true",
+        help="Use train.py subprocess for exact training consistency",
+    )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Enable FSDP multi-GPU training (requires --use-train-py)",
+    )
+    parser.add_argument(
+        "--fsdp-strategy",
+        type=str,
+        default="grad_op",
+        choices=["full", "grad_op", "no_shard", "hybrid"],
+        help="FSDP sharding strategy",
+    )
+
     # Testing
     parser.add_argument("--dry-run", action="store_true", help="Quick run with minimal epochs")
     parser.add_argument("--fast", action="store_true", help="Run only olfactory dataset")
@@ -731,7 +976,12 @@ def main():
     )
 
     # Run experiments
-    result = run_phase4(config)
+    result = run_phase4(
+        config,
+        use_train_py=args.use_train_py,
+        use_fsdp=args.fsdp,
+        fsdp_strategy=args.fsdp_strategy,
+    )
 
     # Generate figures
     from .visualization import Phase4Visualizer

@@ -3746,17 +3746,23 @@ def main():
         config["out_channels"] = 32  # PCx channels
         config["sampling_rate"] = SAMPLING_RATE_HZ
 
-        # Phase 2 CV integration: override train/val indices if fold file provided
+        # Phase integration: override train/val/test indices if fold file provided
         if args.fold_indices_file is not None:
             import pickle
             with open(args.fold_indices_file, 'rb') as f:
                 fold_data = pickle.load(f)
             data["train_idx"] = fold_data["train_idx"]
             data["val_idx"] = fold_data["val_idx"]
-            data["test_idx"] = np.array([], dtype=int)  # No test set in CV
+            # Support test_idx if provided (Phase 4), otherwise empty for CV (Phase 2)
+            if "test_idx" in fold_data:
+                data["test_idx"] = fold_data["test_idx"]
+            else:
+                data["test_idx"] = np.array([], dtype=int)
             if is_primary():
                 fold_num = args.fold if args.fold is not None else "?"
-                print(f"Phase 2 CV mode: fold {fold_num}, train={len(data['train_idx'])}, val={len(data['val_idx'])}")
+                n_test = len(data["test_idx"])
+                test_str = f", test={n_test}" if n_test > 0 else ""
+                print(f"Custom split mode: fold {fold_num}, train={len(data['train_idx'])}, val={len(data['val_idx'])}{test_str}")
 
     # Conditioning from CLI
     if args.cond_mode is not None:
