@@ -25,7 +25,7 @@ ARCHITECTURE_LIST: List[str] = [
     "fnet",         # Fourier-based mixing
     "vit",          # Vision Transformer 1D
     "performer",    # Linear attention transformer
-    "mamba",        # State-space model
+    # "mamba",      # State-space model - disabled (FSDP incompatible, numerical instability)
     "condunet",     # Conditional U-Net (our method)
 ]
 
