@@ -101,11 +101,30 @@ class FAVORPlusAttention(nn.Module):
         )
 
     def _create_projection_matrix(self) -> torch.Tensor:
-        """Create orthogonal random projection matrix."""
-        # Use orthogonal initialization for better approximation
-        proj = torch.randn(self.n_features, self.head_dim)
-        # Normalize rows
-        proj = proj / proj.norm(dim=-1, keepdim=True)
+        """Create orthogonal random projection matrix.
+
+        Uses QR decomposition for proper orthogonalization as recommended
+        in Choromanski et al., 2020 for better kernel approximation quality.
+        """
+        # Create random matrix and orthogonalize via QR decomposition
+        # If n_features > head_dim, we need multiple orthogonal blocks
+        n_full_blocks = self.n_features // self.head_dim
+        remainder = self.n_features % self.head_dim
+
+        blocks = []
+        for _ in range(n_full_blocks):
+            q, _ = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim))
+            blocks.append(q)
+
+        if remainder > 0:
+            q, _ = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim))
+            blocks.append(q[:remainder])
+
+        proj = torch.cat(blocks, dim=0)
+
+        # Scale by sqrt(head_dim) for proper normalization (from paper)
+        proj = proj * math.sqrt(self.head_dim)
+
         return proj
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
