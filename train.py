@@ -2780,7 +2780,10 @@ def train(
                     )
 
                 # Periodic saliency and Grad-CAM analysis
-                if recording_session.should_compute_saliency(epoch):
+                # NOTE: Skip saliency computation when FSDP is active - forward passes
+                # only on rank 0 would cause NCCL deadlock (other ranks don't participate
+                # in the required all-gather operations)
+                if recording_session.should_compute_saliency(epoch) and not is_fsdp_wrapped:
                     try:
                         base_model = model.module if hasattr(model, 'module') else model
                         base_model.eval()
@@ -2839,7 +2842,9 @@ def train(
                             print(f"    [Recording] Saliency computation failed: {e}")
 
                 # Periodic neuroscience analysis (less frequent)
-                if recording_session.should_compute_neuroscience(epoch):
+                # NOTE: Skip neuroscience analysis when FSDP is active - forward passes
+                # only on rank 0 would cause NCCL deadlock
+                if recording_session.should_compute_neuroscience(epoch) and not is_fsdp_wrapped:
                     try:
                         base_model = model.module if hasattr(model, 'module') else model
                         base_model.eval()
@@ -3140,7 +3145,9 @@ def train(
     # =========================================================================
     # Generate Validation Plots (galleries, per-session, per-odor)
     # =========================================================================
-    if is_primary() and VALIDATION_PLOTS_AVAILABLE and config.get("generate_plots", True):
+    # Skip when FSDP is active - plot generation does model forward passes which
+    # require all ranks to participate, but this block only runs on primary
+    if is_primary() and VALIDATION_PLOTS_AVAILABLE and config.get("generate_plots", True) and not is_fsdp_wrapped:
         try:
             plots_dir = CHECKPOINT_DIR / "validation_plots"
 
@@ -3186,6 +3193,8 @@ def train(
         except Exception as e:
             print(f"\nWarning: Failed to generate validation plots: {e}")
             traceback.print_exc()
+    elif is_primary() and is_fsdp_wrapped and VALIDATION_PLOTS_AVAILABLE and config.get("generate_plots", True):
+        print("\n[Info] Skipping validation plot generation with FSDP (requires all-rank forward passes)")
 
     # =========================================================================
     # Recording: Final report generation and cleanup
@@ -3203,42 +3212,46 @@ def train(
             if loss_curves:
                 visualizer.plot_loss_curves(loss_curves, save_name='final_loss_curves')
 
-            # Final saliency analysis
-            base_model = model.module if hasattr(model, 'module') else model
-            base_model.eval()
+            # Final saliency and neuroscience analysis
+            # Skip model forward passes when FSDP is active (would cause deadlock)
+            if not is_fsdp_wrapped:
+                base_model = model.module if hasattr(model, 'module') else model
+                base_model.eval()
 
-            sample_ob, sample_pcx, sample_odor = next(iter(loaders["val"]))
-            sample_ob = sample_ob[:8].to(device)
-            sample_pcx = sample_pcx[:8].to(device)
-            sample_odor = sample_odor[:8].to(device)
+                sample_ob, sample_pcx, sample_odor = next(iter(loaders["val"]))
+                sample_ob = sample_ob[:8].to(device)
+                sample_pcx = sample_pcx[:8].to(device)
+                sample_odor = sample_odor[:8].to(device)
 
-            saliency = recording_session.saliency_analyzer.compute_input_saliency(
-                base_model, sample_ob, sample_odor, sample_pcx
-            )
-            mean_saliency = saliency.mean(dim=0).cpu().numpy()
+                saliency = recording_session.saliency_analyzer.compute_input_saliency(
+                    base_model, sample_ob, sample_odor, sample_pcx
+                )
+                mean_saliency = saliency.mean(dim=0).cpu().numpy()
 
-            visualizer.plot_saliency_heatmap(mean_saliency, save_name='final_saliency')
+                visualizer.plot_saliency_heatmap(mean_saliency, save_name='final_saliency')
 
-            # Final importance analysis
-            channel_imp = recording_session.importance_analyzer.compute_channel_importance(saliency)
-            freq_imp = recording_session.importance_analyzer.compute_frequency_importance(sample_ob, saliency)
+                # Final importance analysis
+                channel_imp = recording_session.importance_analyzer.compute_channel_importance(saliency)
+                freq_imp = recording_session.importance_analyzer.compute_frequency_importance(sample_ob, saliency)
 
-            visualizer.plot_channel_importance(channel_imp.cpu().numpy(), save_name='final_channel_importance')
-            visualizer.plot_frequency_importance(freq_imp, save_name='final_frequency_importance')
+                visualizer.plot_channel_importance(channel_imp.cpu().numpy(), save_name='final_channel_importance')
+                visualizer.plot_frequency_importance(freq_imp, save_name='final_frequency_importance')
 
-            # Final neuroscience analysis
-            neuro_results = recording_session.neuro_analyzer.compute_full_analysis(
-                base_model, sample_ob, sample_odor, sample_pcx
-            )
+                # Final neuroscience analysis
+                neuro_results = recording_session.neuro_analyzer.compute_full_analysis(
+                    base_model, sample_ob, sample_odor, sample_pcx
+                )
 
-            if 'pac' in neuro_results and 'error' not in neuro_results['pac']:
-                visualizer.plot_pac_analysis(neuro_results['pac'], save_name='final_pac_analysis')
+                if 'pac' in neuro_results and 'error' not in neuro_results['pac']:
+                    visualizer.plot_pac_analysis(neuro_results['pac'], save_name='final_pac_analysis')
 
-            if 'coherence' in neuro_results and 'error' not in neuro_results['coherence']:
-                visualizer.plot_coherence_matrix(neuro_results['coherence'], save_name='final_coherence')
+                if 'coherence' in neuro_results and 'error' not in neuro_results['coherence']:
+                    visualizer.plot_coherence_matrix(neuro_results['coherence'], save_name='final_coherence')
 
-            if 'erp' in neuro_results and 'error' not in neuro_results['erp']:
-                visualizer.plot_erp_components(neuro_results['erp'], save_name='final_erp')
+                if 'erp' in neuro_results and 'error' not in neuro_results['erp']:
+                    visualizer.plot_erp_components(neuro_results['erp'], save_name='final_erp')
+            else:
+                print("\n[Recording] Skipping final saliency/neuroscience analysis with FSDP (requires all ranks)")
 
             visualizer.close_all()
 
