@@ -143,11 +143,6 @@ class FNet1D(nn.Module):
         # Residual
         self.use_residual = in_channels == out_channels
 
-        # Output scaling: learnable per-channel scale and bias
-        # Critical for matching target distribution (fixes high-r, low-R² issue)
-        self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
-        self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
-
         self._init_weights()
 
     def _init_weights(self):
@@ -192,9 +187,6 @@ class FNet1D(nn.Module):
         # Residual
         if self.use_residual:
             x = x + identity
-
-        # Apply output scaling (critical for matching target distribution)
-        x = x * self.output_scale + self.output_bias
 
         return x
 
