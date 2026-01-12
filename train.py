@@ -3896,6 +3896,16 @@ def main():
         compile_model=args.compile,
     )
 
+    # Synchronize all ranks after training completes
+    # This ensures all ranks are in sync before any rank-specific cleanup
+    # Prevents NCCL timeout when non-primary ranks exit before primary finishes logging
+    if dist.is_available() and dist.is_initialized():
+        try:
+            dist.barrier()
+        except Exception as e:
+            if is_primary():
+                print(f"Warning: Post-training barrier failed: {e}")
+
     if is_primary():
         print("\n" + "="*50)
         print("TRAINING COMPLETE")
@@ -3983,10 +3993,11 @@ def main():
                 json.dump(output_results, f, indent=2, default=str)
             print(f"Phase 2 results saved to: {output_path}")
 
-    # Final synchronization and cleanup for distributed training
-    # This prevents NCCL timeout by ensuring all ranks sync before exit
+    # Final cleanup for distributed training
+    # Note: Synchronization is done after train() returns (before logging).
+    # This just cleans up the process group - no barrier needed here since
+    # all ranks were already synchronized and the is_primary() block only does logging.
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
