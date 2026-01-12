@@ -119,6 +119,13 @@ from data import (
     _DANDI_DATA_DIR,
 )
 
+# Phase 2 architecture imports (for --arch flag)
+try:
+    from phase_two.architectures import create_architecture
+    PHASE2_ARCHS_AVAILABLE = True
+except ImportError:
+    PHASE2_ARCHS_AVAILABLE = False
+
 # Recording system imports (for comprehensive analysis)
 try:
     from recording import (
@@ -1124,13 +1131,15 @@ def load_checkpoint(
             )
 
     # Load UNet (forward) - handle FSDP
+    # Wrap in inference_mode(False) for consistency with save_checkpoint
     if isinstance(model, FSDP):
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-        ):
-            model.load_state_dict(checkpoint["model"])
+        with torch.inference_mode(False):
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            ):
+                model.load_state_dict(checkpoint["model"])
     else:
         if hasattr(model, 'module'):
             model.module.load_state_dict(checkpoint["model"])
@@ -1140,12 +1149,13 @@ def load_checkpoint(
     # Load reverse UNet - handle FSDP
     if reverse_model is not None and "reverse_model" in checkpoint:
         if isinstance(reverse_model, FSDP):
-            with FSDP.state_dict_type(
-                reverse_model,
-                StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
-            ):
-                reverse_model.load_state_dict(checkpoint["reverse_model"])
+            with torch.inference_mode(False):
+                with FSDP.state_dict_type(
+                    reverse_model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+                ):
+                    reverse_model.load_state_dict(checkpoint["reverse_model"])
         else:
             if hasattr(reverse_model, 'module'):
                 reverse_model.module.load_state_dict(checkpoint["reverse_model"])
@@ -1168,6 +1178,11 @@ def save_checkpoint(
     """Save checkpoint with FSDP support (includes all models)."""
     if is_fsdp and isinstance(model, FSDP):
         # FSDP models need special handling - use context manager for each FSDP model
+        # Ensure model is in train mode to avoid inference mode restrictions
+        model.train()
+        if reverse_model is not None:
+            reverse_model.train()
+
         checkpoint = {
             "epoch": epoch,
             "optimizer": optimizer.state_dict(),
@@ -1193,21 +1208,24 @@ def save_checkpoint(
             checkpoint["split_info"] = split_info
 
         # Save forward model
-        with FSDP.state_dict_type(
-            model,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-        ):
-            checkpoint["model"] = model.state_dict()
-
-        # Save reverse model if exists (also FSDP)
-        if reverse_model is not None and isinstance(reverse_model, FSDP):
+        # Wrap in inference_mode(False) to avoid "Inplace update to inference tensor" errors
+        # that can occur when FSDP gathers and offloads state dict to CPU
+        with torch.inference_mode(False):
             with FSDP.state_dict_type(
-                reverse_model,
+                model,
                 StateDictType.FULL_STATE_DICT,
                 FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
             ):
-                checkpoint["reverse_model"] = reverse_model.state_dict()
+                checkpoint["model"] = model.state_dict()
+
+            # Save reverse model if exists (also FSDP)
+            if reverse_model is not None and isinstance(reverse_model, FSDP):
+                with FSDP.state_dict_type(
+                    reverse_model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                ):
+                    checkpoint["reverse_model"] = reverse_model.state_dict()
 
         if is_primary():
             torch.save(checkpoint, path)
@@ -1383,7 +1401,9 @@ def evaluate(
     ob_stds, pcx_stds = [], []
     raw_corrs = []
 
-    with torch.inference_mode():  # Faster than no_grad() - disables view tracking
+    # Use no_grad instead of inference_mode for FSDP compatibility
+    # inference_mode marks tensors as "inference tensors" which breaks FSDP checkpoint saving
+    with torch.no_grad():
         for ob, pcx, odor in loader:
             ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
@@ -1413,11 +1433,18 @@ def evaluate(
                     # At eval time, only use input (no target needed for embedding)
                     cond_emb, _ = cond_encoder(ob, None)
 
-            # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-            if cond_emb is not None:
-                pred = model(ob, cond_emb=cond_emb)
+            # Forward: OB → PCx
+            # For CondUNet: use cond_emb if available, otherwise odor_ids
+            # For other architectures: just pass input directly
+            arch = config.get("arch", "condunet") if config else "condunet"
+            if arch == "condunet":
+                if cond_emb is not None:
+                    pred = model(ob, cond_emb=cond_emb)
+                else:
+                    pred = model(ob, odor)
             else:
-                pred = model(ob, odor)
+                # Other architectures: just pass input
+                pred = model(ob)
 
             # Apply envelope histogram matching (closed-form correction for amplitude dynamics)
             # This corrects bursty vs smooth characteristics
@@ -1524,6 +1551,14 @@ def evaluate(
                     psd_diff_list_rev.append(psd_diff_db_torch(pred_rev_f32, ob_f32, fs=sampling_rate).item())
 
     # Forward results
+    if not mse_list:
+        # No batches processed (can happen with small datasets and many GPUs)
+        return {
+            "mse": 0.0,
+            "mae": 0.0,
+            "corr": 0.0,
+            "r2": 0.0,
+        }
     results = {
         "mse": float(np.mean(mse_list)),
         "mae": float(np.mean(mae_list)),
@@ -1774,29 +1809,36 @@ def train_epoch(
             if cond_encoder_training:
                 cond_encoder.train()
 
-        # Forward: OB → PCx (use cond_emb if available, otherwise odor_ids)
-        # If contrastive learning enabled, also get bottleneck features
-        # Note: For temporal CEBRA, projection heads are None but contrastive learning is still used
+        # Forward: OB → PCx
+        # For CondUNet: use cond_emb if available, otherwise odor_ids
+        # For other architectures: just pass input directly
+        arch = config.get("arch", "condunet")
         contrastive_mode = config.get("contrastive_mode", "temporal")  # "temporal" (true CEBRA) or "label"
         use_contrastive = config.get("use_contrastive", False)
         # For label mode, require projection heads; for temporal mode, no projection heads needed
         if contrastive_mode == "label" and projection_head_fwd is None:
             use_contrastive = False
         use_temporal_cebra = use_contrastive and contrastive_mode == "temporal"
-        if cond_emb is not None:
-            fwd_result = model(
-                ob, cond_emb=cond_emb,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
-        else:
-            fwd_result = model(
-                ob, odor,
-                return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                return_bottleneck_temporal=use_temporal_cebra
-            )
 
-        if use_contrastive:
+        if arch == "condunet":
+            # CondUNet with conditioning
+            if cond_emb is not None:
+                fwd_result = model(
+                    ob, cond_emb=cond_emb,
+                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
+                    return_bottleneck_temporal=use_temporal_cebra
+                )
+            else:
+                fwd_result = model(
+                    ob, odor,
+                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
+                    return_bottleneck_temporal=use_temporal_cebra
+                )
+        else:
+            # Other architectures: just pass input
+            fwd_result = model(ob)
+
+        if use_contrastive and arch == "condunet":
             pred_raw, bottleneck_fwd = fwd_result
         else:
             pred_raw = fwd_result
@@ -2012,6 +2054,12 @@ def train_epoch(
 
     # Convert to floats ONLY at end of epoch (single GPU sync point)
     n_batches = len(loader)
+    if n_batches == 0:
+        # No batches processed (can happen with small datasets and many GPUs)
+        return {
+            "loss": 0.0,
+            **{k: 0.0 for k in loss_components.keys()},
+        }
     total_loss_val = total_loss.item() / n_batches
     return {
         "loss": total_loss_val,
@@ -2203,35 +2251,61 @@ def train(
     out_channels = config.get("out_channels", 32)
     attention_type = config.get("attention_type", "basic")
     conv_type = config.get("conv_type", "standard")
+    arch = config.get("arch", "condunet")  # Architecture selection
 
     if is_primary():
+        print(f"Architecture: {arch.upper()}")
         print(f"Model: {in_channels} input channels → {out_channels} output channels")
-        print(f"Conditions: {n_odors} classes")
+        if arch == "condunet":
+            print(f"Conditions: {n_odors} classes")
 
-    model = CondUNet1D(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        base=config.get("base_channels", 128),
-        n_odors=n_odors,
-        dropout=config.get("dropout", 0.0),
-        use_attention=config.get("use_attention", True),
-        attention_type=attention_type,
-        norm_type=config.get("norm_type", "batch"),
-        cond_mode=config.get("cond_mode", "film"),
-        # U-Net depth for frequency resolution
-        n_downsample=config.get("n_downsample", 2),
-        # Modern convolution options
-        conv_type=conv_type,
-        use_se=config.get("use_se", True),
-        conv_kernel_size=config.get("conv_kernel_size", 7),
-        dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-        # Output scaling correction
-        use_output_scaling=config.get("use_output_scaling", True),
-    )
+    # Create model based on architecture
+    if arch == "condunet":
+        # CondUNet with all its features
+        model = CondUNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base=config.get("base_channels", 128),
+            n_odors=n_odors,
+            dropout=config.get("dropout", 0.0),
+            use_attention=config.get("use_attention", True),
+            attention_type=attention_type,
+            norm_type=config.get("norm_type", "batch"),
+            cond_mode=config.get("cond_mode", "film"),
+            # U-Net depth for frequency resolution
+            n_downsample=config.get("n_downsample", 2),
+            # Modern convolution options
+            conv_type=conv_type,
+            use_se=config.get("use_se", True),
+            conv_kernel_size=config.get("conv_kernel_size", 7),
+            dilations=config.get("conv_dilations", (1, 4, 16, 32)),
+            # Output scaling correction
+            use_output_scaling=config.get("use_output_scaling", True),
+        )
+    else:
+        # Use Phase 2 architectures for comparison
+        if not PHASE2_ARCHS_AVAILABLE:
+            raise RuntimeError(f"Phase 2 architectures not available. Cannot use --arch {arch}")
+
+        # Get time_steps from data
+        time_steps = data.get("time_steps", 5000)
+        if "ob" in data:
+            time_steps = data["ob"].shape[-1]
+
+        model = create_architecture(
+            arch,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            time_steps=time_steps,
+        )
+        if is_primary():
+            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Parameters: {n_params:,}")
 
     # Create reverse model (target → source) for bidirectional training
+    # Only for CondUNet - other architectures don't support conditioning
     reverse_model = None
-    if config.get("use_bidirectional", False):
+    if config.get("use_bidirectional", False) and arch == "condunet":
         reverse_model = CondUNet1D(
             in_channels=out_channels,  # Reverse: target → source
             out_channels=in_channels,
@@ -2256,13 +2330,17 @@ def train(
             print("Bidirectional training ENABLED")
             if conv_type == "modern":
                 print(f"Using MODERN convolutions: dilations={config.get('conv_dilations', (1, 4, 16, 32))}, kernel_size={config.get('conv_kernel_size', 7)}, SE={config.get('use_se', True)}")
+    elif config.get("use_bidirectional", False) and arch != "condunet":
+        if is_primary():
+            print("Warning: Bidirectional training only supported for CondUNet, disabling")
 
     # Create conditioning encoder for auto-conditioning modes
+    # Only for CondUNet - other architectures don't support conditioning
     cond_source = config.get("conditioning_source", "odor_onehot")
     cond_encoder = None
     emb_dim = 128  # Must match model's emb_dim
 
-    if cond_source != "odor_onehot":
+    if cond_source != "odor_onehot" and arch == "condunet":
         if is_primary():
             print(f"Using auto-conditioning: {cond_source}")
 
@@ -2299,24 +2377,26 @@ def train(
             cond_params = sum(p.numel() for p in cond_encoder.parameters())
             print(f"Conditioning encoder parameters: {cond_params:,}")
 
-    # Log U-Net depth and frequency resolution
-    n_downsample = config.get("n_downsample", 2)
-    base_ch = config.get("base_channels", 128)
-    downsample_factor = 2 ** n_downsample
-    nyquist_hz = 1000 / (2 * downsample_factor)  # 1000 Hz sample rate
-    
-    # Calculate channel progression for logging
-    channels = [base_ch]
-    for i in range(n_downsample):
-        channels.append(min(base_ch * (2 ** (i + 1)), base_ch * 8))
-    
     # Count actual parameters
     model_params = sum(p.numel() for p in model.parameters())
     rev_params = sum(p.numel() for p in reverse_model.parameters()) if reverse_model else 0
-    
-    if is_primary():
+
+    # Log U-Net depth and frequency resolution (only for CondUNet)
+    if arch == "condunet" and is_primary():
+        n_downsample = config.get("n_downsample", 2)
+        base_ch = config.get("base_channels", 128)
+        downsample_factor = 2 ** n_downsample
+        nyquist_hz = 1000 / (2 * downsample_factor)  # 1000 Hz sample rate
+
+        # Calculate channel progression for logging
+        channels = [base_ch]
+        for i in range(n_downsample):
+            channels.append(min(base_ch * (2 ** (i + 1)), base_ch * 8))
+
         print(f"U-Net depth: {n_downsample} levels → {downsample_factor}x downsample → bottleneck Nyquist = {nyquist_hz:.0f} Hz")
         print(f"Channel progression: {' → '.join(map(str, channels))} (bottleneck={channels[-1]})")
+
+    if is_primary():
         print(f"Model parameters: {model_params:,} (forward) + {rev_params:,} (reverse) = {model_params + rev_params:,} total")
 
     # Enable gradient checkpointing if requested (reduces memory, allows larger batches)
@@ -2902,6 +2982,7 @@ def train(
             print("NO TEST SET (all held-out sessions used for validation)")
             print("="*60)
             print("Final evaluation uses per-session validation metrics above.")
+            sys.stdout.flush()
 
     if is_primary() and has_test_set:
         print("\n" + "="*60)
@@ -3191,7 +3272,12 @@ def train(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CondUNet1D for neural signal translation")
-    
+
+    # Architecture selection (for Phase 2 comparison)
+    parser.add_argument("--arch", type=str, default="condunet",
+                        choices=["condunet", "linear", "simplecnn", "wavenet", "fnet", "vit", "performer", "mamba"],
+                        help="Architecture to train (default: condunet). Other options for Phase 2 comparison.")
+
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
                         choices=["olfactory", "pfc", "pcx1", "dandi"],
@@ -3348,6 +3434,18 @@ def parse_args():
                              "'huber_wavelet' (Huber + Wavelet combined). "
                              "If not specified, uses config default (huber_wavelet)")
 
+    # Phase 2 cross-validation integration
+    parser.add_argument("--fold-indices-file", type=str, default=None,
+                        help="Pickle file with train/val indices for CV fold (used by Phase 2 runner). "
+                             "File should contain dict with 'train_idx' and 'val_idx' numpy arrays.")
+    parser.add_argument("--output-results-file", type=str, default=None,
+                        help="JSON file to save training results (used by Phase 2 runner). "
+                             "Contains best_r2, best_mae, best_epoch, train_losses, val_r2s, etc.")
+    parser.add_argument("--fold", type=int, default=None,
+                        help="Fold number for Phase 2 CV logging (0-indexed)")
+    parser.add_argument("--checkpoint-prefix", type=str, default=None,
+                        help="Prefix for checkpoint file names (e.g., 'wavenet_fold0')")
+
     return parser.parse_args()
 
 
@@ -3381,6 +3479,10 @@ def main():
 
     # Build config FIRST - only override from args if explicitly provided
     config = DEFAULT_CONFIG.copy()
+
+    # Architecture selection (for Phase 2 comparison)
+    config["arch"] = args.arch
+
     if args.epochs is not None:
         config["num_epochs"] = args.epochs
     if args.batch_size is not None:
@@ -3672,6 +3774,24 @@ def main():
         config["out_channels"] = 32  # PCx channels
         config["sampling_rate"] = SAMPLING_RATE_HZ
 
+        # Phase integration: override train/val/test indices if fold file provided
+        if args.fold_indices_file is not None:
+            import pickle
+            with open(args.fold_indices_file, 'rb') as f:
+                fold_data = pickle.load(f)
+            data["train_idx"] = fold_data["train_idx"]
+            data["val_idx"] = fold_data["val_idx"]
+            # Support test_idx if provided (Phase 4), otherwise empty for CV (Phase 2)
+            if "test_idx" in fold_data:
+                data["test_idx"] = fold_data["test_idx"]
+            else:
+                data["test_idx"] = np.array([], dtype=int)
+            if is_primary():
+                fold_num = args.fold if args.fold is not None else "?"
+                n_test = len(data["test_idx"])
+                test_str = f", test={n_test}" if n_test > 0 else ""
+                print(f"Custom split mode: fold {fold_num}, train={len(data['train_idx'])}, val={len(data['val_idx'])}{test_str}")
+
     # Conditioning from CLI
     if args.cond_mode is not None:
         config["cond_mode"] = args.cond_mode
@@ -3755,12 +3875,14 @@ def main():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
 
     if is_primary():
-        print(f"\nTraining CondUNet1D for {config['num_epochs']} epochs...")
-        print(f"Attention type: {config['attention_type']}")
-        print(f"Convolution type: {config['conv_type']}")
-        if config['conv_type'] == 'modern':
-            print(f"  -> Multi-scale dilated depthwise separable + SE attention")
-            print(f"  -> Dilations: {config['conv_dilations']}, Kernel: {config['conv_kernel_size']}")
+        arch_name = config.get('arch', 'condunet').upper()
+        print(f"\nTraining {arch_name} for {config['num_epochs']} epochs...")
+        if config.get('arch', 'condunet') == 'condunet':
+            print(f"Attention type: {config['attention_type']}")
+            print(f"Convolution type: {config['conv_type']}")
+            if config['conv_type'] == 'modern':
+                print(f"  -> Multi-scale dilated depthwise separable + SE attention")
+                print(f"  -> Dilations: {config['conv_dilations']}, Kernel: {config['conv_kernel_size']}")
         print(f"Config: {config}")
         print()
 
@@ -3810,6 +3932,56 @@ def main():
             print(f"RESULT_SPLIT_TYPE=session_holdout")
             if data['split_info'].get('test_sessions'):
                 print(f"RESULT_TEST_SESSIONS={data['split_info']['test_sessions']}")
+
+        # Phase 2 CV integration: save results to JSON file
+        if args.output_results_file is not None:
+            import json
+            # Extract metrics from history
+            history = results.get("history", [])
+            train_losses = [h.get("loss", 0.0) for h in history]
+            val_losses = [h.get("val_loss", 0.0) for h in history]
+            val_r2s = [h.get("val_r2", 0.0) for h in history]
+            val_corrs = [h.get("val_corr", 0.0) for h in history]
+            val_maes = [h.get("val_mae", 0.0) for h in history]
+
+            # Get best validation R2 from best epoch
+            best_epoch = results["best_epoch"]
+            best_val_r2 = val_r2s[best_epoch - 1] if best_epoch > 0 and len(val_r2s) >= best_epoch else 0.0
+            best_val_mae = val_maes[best_epoch - 1] if best_epoch > 0 and len(val_maes) >= best_epoch else 0.0
+            best_val_corr = val_corrs[best_epoch - 1] if best_epoch > 0 and len(val_corrs) >= best_epoch else 0.0
+
+            # Count model parameters
+            model_obj = results.get("model")
+            if model_obj is not None:
+                if hasattr(model_obj, 'module'):
+                    n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
+                else:
+                    n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
+            else:
+                n_params = 0
+
+            output_results = {
+                "architecture": args.arch,
+                "fold": args.fold if args.fold is not None else 0,
+                "best_val_r2": best_val_r2,
+                "best_val_mae": best_val_mae,
+                "best_val_corr": best_val_corr,
+                "best_val_loss": results["best_val_loss"],
+                "best_epoch": best_epoch,
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "val_r2s": val_r2s,
+                "val_corrs": val_corrs,
+                "total_time": results.get("total_time", 0.0),
+                "epochs_trained": len(history),
+                "n_parameters": n_params,
+                "completed_successfully": True,
+            }
+            output_path = Path(args.output_results_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w') as f:
+                json.dump(output_results, f, indent=2, default=str)
+            print(f"Phase 2 results saved to: {output_path}")
 
     # Final synchronization and cleanup for distributed training
     # This prevents NCCL timeout by ensuring all ranks sync before exit
