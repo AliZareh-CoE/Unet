@@ -2,11 +2,11 @@
 
 ## Overview
 
-Phase 2 compares **8 neural network architectures** on the olfactory dataset to identify the top performers. Each architecture is evaluated with 3 random seeds for statistical validity.
+Phase 2 compares **6 neural network architectures** on the olfactory dataset to identify the top performers. Each architecture is evaluated with 5-fold cross-validation for statistical validity.
 
 **Key Question**: Which neural architecture performs best for neural signal translation?
 
-## Architectures (8 Total)
+## Architectures (6 Total)
 
 | Architecture | Type | Key Feature | Complexity |
 |-------------|------|-------------|------------|
@@ -15,24 +15,22 @@ Phase 2 compares **8 neural network architectures** on the olfactory dataset to 
 | `wavenet` | Dilated CNN | Exponentially increasing dilation | O(T log T) |
 | `fnet` | Fourier | FFT-based token mixing | O(T log T) |
 | `vit` | Transformer | Full self-attention | O(T²) |
-| `performer` | Efficient Trans. | FAVOR+ linear attention | O(T) |
-| `mamba` | State-Space | Selective SSM (S4/Mamba) | O(T) |
 | `condunet` | **U-Net** | **Skip connections + conditioning** | O(T) |
 
 ## Quick Start
 
 ```bash
-# Full screening (8 architectures × 3 seeds = 24 runs)
+# Full screening (6 architectures × 5 folds = 30 runs)
 python -m phase_two.runner --dataset olfactory --epochs 60
 
 # Quick test
 python -m phase_two.runner --dry-run
 
 # Run specific architectures
-python -m phase_two.runner --arch condunet wavenet mamba
+python -m phase_two.runner --arch condunet wavenet vit
 
-# Custom seeds
-python -m phase_two.runner --seeds 42 43 44 45 46
+# With FSDP multi-GPU
+python -m phase_two.runner --use-train-py --fsdp
 ```
 
 ## Directory Structure
@@ -52,8 +50,6 @@ phase_two/
     ├── wavenet.py           # WaveNet1D
     ├── fnet.py              # FNet1D
     ├── vit.py               # Vision Transformer 1D
-    ├── performer.py         # Performer (FAVOR+)
-    ├── mamba.py             # Mamba (SSM)
     └── condunet.py          # Conditional U-Net
 ```
 
@@ -110,7 +106,7 @@ from phase_two.architectures import create_architecture, list_architectures
 
 # List available architectures
 print(list_architectures())
-# ['linear', 'simplecnn', 'wavenet', 'fnet', 'vit', 'performer', 'mamba', 'condunet']
+# ['linear', 'simplecnn', 'wavenet', 'fnet', 'vit', 'condunet']
 
 # Create model
 model = create_architecture(
@@ -141,12 +137,6 @@ Replaces attention with FFT-based mixing. O(N log N) complexity.
 ### ViT1D
 Vision Transformer adapted for 1D. Patches signal into segments, applies full self-attention.
 
-### Performer1D
-Linear attention using FAVOR+ random features. O(N) complexity.
-
-### Mamba1D
-Selective state-space model. Input-dependent state transitions.
-
 ### CondUNet1D
 Our proposed architecture:
 - U-Net encoder-decoder with skip connections
@@ -162,18 +152,16 @@ Typical ranking on olfactory dataset:
 |------|-------------|-------------|
 | 1 | condunet | 0.50-0.55 |
 | 2 | wavenet | 0.45-0.50 |
-| 3 | mamba | 0.42-0.48 |
-| 4 | performer | 0.40-0.45 |
-| 5 | vit | 0.38-0.43 |
-| 6 | fnet | 0.35-0.40 |
-| 7 | simplecnn | 0.32-0.38 |
-| 8 | linear | 0.25-0.30 |
+| 3 | vit | 0.38-0.43 |
+| 4 | fnet | 0.35-0.40 |
+| 5 | simplecnn | 0.32-0.38 |
+| 6 | linear | 0.25-0.30 |
 
 ## Hardware Requirements
 
 - **GPU**: NVIDIA GPU with 8GB+ VRAM recommended
 - **RAM**: 16GB+ system memory
-- **Time**: ~2-4 hours for full screening (24 runs)
+- **Time**: ~2-4 hours for full screening (30 runs)
 
 ## Citation
 

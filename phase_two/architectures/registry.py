@@ -16,8 +16,6 @@ from .simplecnn import SimpleCNN
 from .wavenet import WaveNet1D
 from .fnet import FNet1D
 from .vit import ViT1D
-from .performer import Performer1D
-from .mamba import Mamba1D
 from .condunet import CondUNet1D
 
 
@@ -31,8 +29,6 @@ ARCHITECTURE_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "wavenet": WaveNet1D,
     "fnet": FNet1D,
     "vit": ViT1D,
-    "performer": Performer1D,
-    "mamba": Mamba1D,
     "condunet": CondUNet1D,
 }
 
@@ -47,8 +43,6 @@ ARCHITECTURE_DESCRIPTIONS: Dict[str, str] = {
     "wavenet": "Dilated causal convolutions (WaveNet-style)",
     "fnet": "Fourier-based token mixing (no attention)",
     "vit": "Vision Transformer adapted for 1D signals",
-    "performer": "Linear attention via FAVOR+ mechanism",
-    "mamba": "Selective state-space model (Mamba)",
     "condunet": "Conditional U-Net with skip connections",
 }
 
@@ -83,20 +77,6 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "n_layers": 4,
         "patch_size": 50,
         "dropout": 0.1,
-    },
-    "performer": {
-        "embed_dim": 256,
-        "n_heads": 8,
-        "n_layers": 4,
-        "n_features": 64,
-        "dropout": 0.1,
-    },
-    "mamba": {
-        "d_model": 128,  # Reduced from 256 to fit in GPU memory
-        "d_state": 8,    # Reduced from 16 to fit in GPU memory
-        "d_conv": 4,
-        "expand": 1,     # Reduced from 2 to fit in GPU memory
-        "n_layers": 6,   # Increased to compensate for smaller model
     },
     "condunet": {
         "base_channels": 64,

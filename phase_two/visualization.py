@@ -92,8 +92,6 @@ ARCH_COLORS = {
     "wavenet": "#2E86AB",
     "fnet": "#1B5583",
     "vit": "#A23B72",
-    "performer": "#7D2C5A",
-    "mamba": "#F18F01",
     "condunet": "#2CA58D",
 }
 
