@@ -43,6 +43,175 @@ from utils import (
 )
 
 import pickle
+import subprocess
+
+
+# =============================================================================
+# train.py Subprocess Support (for FSDP)
+# =============================================================================
+
+def save_fold_indices(
+    output_dir: Path,
+    study: str,
+    variant: str,
+    fold_idx: int,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+) -> Path:
+    """Save fold indices to pickle file for train.py.
+
+    Args:
+        output_dir: Directory to save indices
+        study: Ablation study name
+        variant: Ablation variant name
+        fold_idx: Fold index
+        train_idx: Training sample indices
+        val_idx: Validation sample indices
+
+    Returns:
+        Path to saved pickle file
+    """
+    fold_dir = output_dir / "fold_indices"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+
+    indices_file = fold_dir / f"{study}_{variant}_fold{fold_idx}_indices.pkl"
+    with open(indices_file, 'wb') as f:
+        pickle.dump({
+            'train_idx': train_idx,
+            'val_idx': val_idx,
+        }, f)
+
+    return indices_file
+
+
+def run_train_subprocess(
+    study: str,
+    variant: str,
+    fold_idx: int,
+    fold_indices_file: Path,
+    output_results_file: Path,
+    ablation_config: "AblationConfig",
+    epochs: int = 60,
+    batch_size: int = 32,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    seed: int = 42,
+    verbose: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Run train.py as subprocess for a single ablation experiment.
+
+    This ensures Phase 3 uses the EXACT same training loop as train.py,
+    including all augmentations, loss functions, and hyperparameters.
+
+    Args:
+        study: Ablation study name
+        variant: Ablation variant name
+        fold_idx: CV fold index (0-indexed)
+        fold_indices_file: Path to pickle file with train/val indices
+        output_results_file: Path to JSON file for results output
+        ablation_config: Ablation configuration with model parameters
+        epochs: Number of training epochs
+        batch_size: Batch size (total, will be divided by num GPUs)
+        use_fsdp: Whether to use FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+        seed: Random seed
+        verbose: Print subprocess output
+
+    Returns:
+        Results dict from train.py, or None on failure
+    """
+    # Build command
+    if use_fsdp:
+        # Use torchrun for distributed training
+        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={nproc}",
+            str(PROJECT_ROOT / "train.py"),
+        ]
+    else:
+        cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
+
+    # Add base arguments (always condunet for ablation studies)
+    cmd.extend([
+        "--arch", "condunet",
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--seed", str(seed + fold_idx),  # Different seed per fold
+        "--fold-indices-file", str(fold_indices_file),
+        "--output-results-file", str(output_results_file),
+        "--fold", str(fold_idx),
+        "--no-bidirectional",  # Disable for consistent comparison
+        "--no-plots",  # Skip plot generation for speed
+    ])
+
+    # Add ablation-specific parameters
+    config = ablation_config.to_dict()
+
+    # Attention type
+    if "attention_type" in config:
+        cmd.extend(["--attention-type", config["attention_type"]])
+
+    # Conditioning mode
+    if "cond_mode" in config:
+        cmd.extend(["--cond-mode", config["cond_mode"]])
+
+    # Base channels (capacity)
+    if "base_channels" in config:
+        cmd.extend(["--base-channels", str(config["base_channels"])])
+
+    # Loss type
+    if "loss_type" in config:
+        loss_type = config["loss_type"]
+        if loss_type in ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]:
+            cmd.extend(["--loss", loss_type])
+
+    # Augmentation
+    if config.get("aug_enabled") is False:
+        cmd.append("--no-aug")
+
+    # FSDP flags
+    if use_fsdp:
+        cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
+
+    # Run subprocess
+    start_time = time.time()
+    try:
+        if verbose:
+            # Stream output in real-time
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                check=True,
+                text=True,
+            )
+        else:
+            # Capture output silently
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: train.py failed for {study}/{variant} fold {fold_idx}")
+        print(f"  Return code: {e.returncode}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr[:500]}...")
+        return None
+
+    elapsed = time.time() - start_time
+
+    # Load results from JSON file
+    if output_results_file.exists():
+        with open(output_results_file, 'r') as f:
+            results = json.load(f)
+        results["total_time"] = elapsed
+        return results
+    else:
+        print(f"WARNING: Results file not found: {output_results_file}")
+        return None
 
 
 # =============================================================================
@@ -495,11 +664,19 @@ def run_single_ablation(
     )
 
 
-def run_phase3(config: Phase3Config) -> Phase3Result:
+def run_phase3(
+    config: Phase3Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+) -> Phase3Result:
     """Run all Phase 3 ablation studies with 5-fold cross-validation.
 
     Args:
         config: Phase 3 configuration
+        use_train_py: Use train.py subprocess for exact training consistency
+        use_fsdp: Enable FSDP distributed training (requires use_train_py)
+        fsdp_strategy: FSDP sharding strategy
 
     Returns:
         Phase3Result with all ablation results
@@ -511,6 +688,10 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
     print(f"Studies: {config.studies}")
     print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
+    if use_train_py:
+        print(f"Training mode: train.py subprocess (exact consistency)")
+        if use_fsdp:
+            print(f"  FSDP passed to train.py: strategy={fsdp_strategy}")
     print("=" * 60)
 
     # Setup checkpoint for resume capability
@@ -547,25 +728,87 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
         baseline_results = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
-            train_loader, val_loader = create_dataloaders_from_indices(
-                X, y, odor_ids, train_idx, val_idx,
-                batch_size=config.training.batch_size,
-                n_workers=config.n_workers,
-            )
+            if use_train_py:
+                # Use train.py subprocess for FSDP support
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, "baseline", "full", fold_idx, train_idx, val_idx
+                )
+                output_results_file = config.output_dir / "train_results" / f"baseline_full_fold{fold_idx}_results.json"
+                output_results_file.parent.mkdir(parents=True, exist_ok=True)
 
-            result = run_single_ablation(
-                ablation_config=baseline_config,
-                training_config=config.training,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                fold=fold_idx,
-                cv_seed=config.cv_seed,
-                device=config.device,
-                checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
-                verbose=config.verbose,
-            )
+                print(f"\n  [baseline] full (fold {fold_idx + 1}/{config.n_folds})")
+                print(f"    Train: {len(train_idx)}, Val: {len(val_idx)}")
+                print(f"    Running train.py subprocess...")
+
+                train_results = run_train_subprocess(
+                    study="baseline",
+                    variant="full",
+                    fold_idx=fold_idx,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    ablation_config=baseline_config,
+                    epochs=config.training.epochs,
+                    batch_size=config.training.batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=True,
+                )
+
+                if train_results is not None:
+                    result = AblationResult(
+                        study="baseline",
+                        variant="full",
+                        fold=fold_idx,
+                        best_r2=train_results.get("best_val_r2", 0.0),
+                        best_loss=train_results.get("best_val_loss", 0.0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        total_time=train_results.get("total_time", 0.0),
+                        config=baseline_config.to_dict(),
+                    )
+                    print(f"    Best R²: {result.best_r2:.4f}")
+                else:
+                    # Failed - create placeholder result
+                    result = AblationResult(
+                        study="baseline",
+                        variant="full",
+                        fold=fold_idx,
+                        best_r2=0.0,
+                        best_loss=float('inf'),
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        n_parameters=0,
+                        epochs_trained=0,
+                        total_time=0.0,
+                        config=baseline_config.to_dict(),
+                    )
+                    print(f"    FAILED")
+            else:
+                # Use internal trainer
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, train_idx, val_idx,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                )
+
+                result = run_single_ablation(
+                    ablation_config=baseline_config,
+                    training_config=config.training,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    fold=fold_idx,
+                    cv_seed=config.cv_seed,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
+                    verbose=config.verbose,
+                )
             baseline_results.append(result)
 
         baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
@@ -605,25 +848,87 @@ def run_phase3(config: Phase3Config) -> Phase3Result:
         print(f"{'=' * 40}")
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
-            train_loader, val_loader = create_dataloaders_from_indices(
-                X, y, odor_ids, train_idx, val_idx,
-                batch_size=config.training.batch_size,
-                n_workers=config.n_workers,
-            )
+            if use_train_py:
+                # Use train.py subprocess for FSDP support
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, study_name, ablation_config.variant, fold_idx, train_idx, val_idx
+                )
+                output_results_file = config.output_dir / "train_results" / f"{study_name}_{ablation_config.variant}_fold{fold_idx}_results.json"
+                output_results_file.parent.mkdir(parents=True, exist_ok=True)
 
-            result = run_single_ablation(
-                ablation_config=ablation_config,
-                training_config=config.training,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                fold=fold_idx,
-                cv_seed=config.cv_seed,
-                device=config.device,
-                checkpoint_dir=config.checkpoint_dir / ablation_config.study / f"fold{fold_idx}",
-                verbose=config.verbose,
-            )
+                print(f"\n  [{study_name}] {ablation_config.variant} (fold {fold_idx + 1}/{config.n_folds})")
+                print(f"    Train: {len(train_idx)}, Val: {len(val_idx)}")
+                print(f"    Running train.py subprocess...")
+
+                train_results = run_train_subprocess(
+                    study=study_name,
+                    variant=ablation_config.variant,
+                    fold_idx=fold_idx,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    ablation_config=ablation_config,
+                    epochs=config.training.epochs,
+                    batch_size=config.training.batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=True,
+                )
+
+                if train_results is not None:
+                    result = AblationResult(
+                        study=study_name,
+                        variant=ablation_config.variant,
+                        fold=fold_idx,
+                        best_r2=train_results.get("best_val_r2", 0.0),
+                        best_loss=train_results.get("best_val_loss", 0.0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        total_time=train_results.get("total_time", 0.0),
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    Best R²: {result.best_r2:.4f}")
+                else:
+                    # Failed - create placeholder result
+                    result = AblationResult(
+                        study=study_name,
+                        variant=ablation_config.variant,
+                        fold=fold_idx,
+                        best_r2=0.0,
+                        best_loss=float('inf'),
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        n_parameters=0,
+                        epochs_trained=0,
+                        total_time=0.0,
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    FAILED")
+            else:
+                # Use internal trainer
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, train_idx, val_idx,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                )
+
+                result = run_single_ablation(
+                    ablation_config=ablation_config,
+                    training_config=config.training,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    fold=fold_idx,
+                    cv_seed=config.cv_seed,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / ablation_config.study / f"fold{fold_idx}",
+                    verbose=config.verbose,
+                )
             all_results.append(result)
 
         # Save checkpoint after each study
@@ -898,7 +1203,39 @@ def main():
         help="Run only attention ablation for quick testing",
     )
 
+    # train.py integration (for FSDP multi-GPU support)
+    parser.add_argument(
+        "--use-train-py",
+        action="store_true",
+        help="Use train.py via subprocess for EXACT same training loop. "
+             "This ensures Phase 3 results are perfectly comparable to train.py. "
+             "When enabled, --fsdp is passed to train.py subprocess.",
+    )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help="Enable FSDP distributed training (requires --use-train-py)",
+    )
+    parser.add_argument(
+        "--fsdp-strategy",
+        type=str,
+        default="grad_op",
+        choices=["full", "grad_op", "no_shard", "hybrid"],
+        help="FSDP sharding strategy (default: grad_op)",
+    )
+
     args = parser.parse_args()
+
+    # Validate FSDP requires --use-train-py
+    if args.fsdp and not args.use_train_py:
+        print("Note: --fsdp requires --use-train-py, enabling it automatically")
+        args.use_train_py = True
+
+    # When using --use-train-py, runner runs as single process
+    if args.use_train_py:
+        if args.fsdp:
+            print("Note: --use-train-py mode passes FSDP to train.py subprocess")
+            print("      Runner itself runs as single process")
 
     # Handle result loading
     if args.load_results:
@@ -942,7 +1279,12 @@ def main():
             print("Deleted existing checkpoint (--fresh mode)")
 
     # Run ablations
-    result = run_phase3(config)
+    result = run_phase3(
+        config,
+        use_train_py=args.use_train_py,
+        use_fsdp=args.fsdp,
+        fsdp_strategy=args.fsdp_strategy,
+    )
 
     # Clean up checkpoint after successful completion
     checkpoint_path = get_checkpoint_path(config.output_dir)

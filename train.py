@@ -3396,6 +3396,12 @@ def parse_args():
                         choices=COND_MODES,
                         help="Override conditioning mode")
 
+    # Attention type override (for ablation studies)
+    ATTENTION_TYPES = ["none", "basic", "cross_freq", "cross_freq_v2"]
+    parser.add_argument("--attention-type", type=str, default=None,
+                        choices=ATTENTION_TYPES,
+                        help="Override attention type (for Phase 3 ablation studies)")
+
     # Conditioning source: how conditioning embeddings are derived
     COND_SOURCES = ["odor_onehot", "spectro_temporal", "cpc", "vqvae", "freq_disentangled", "cycle_consistent"]
     parser.add_argument("--conditioning", type=str, default="spectro_temporal",
@@ -3796,6 +3802,12 @@ def main():
     if args.cond_mode is not None:
         config["cond_mode"] = args.cond_mode
     config["conditioning_source"] = args.conditioning  # odor_onehot, spectro_temporal, etc.
+
+    # Attention type from CLI (for Phase 3 ablation studies)
+    if args.attention_type is not None:
+        config["attention_type"] = args.attention_type
+        if is_primary():
+            print(f"Attention type override: {args.attention_type}")
 
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
