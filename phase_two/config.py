@@ -24,7 +24,7 @@ ARCHITECTURE_LIST: List[str] = [
     "wavenet",      # WaveNet with dilated convolutions
     "fnet",         # Fourier-based mixing
     "vit",          # Vision Transformer 1D
-    "performer",    # Linear attention transformer
+    # "performer",  # Disabled - FSDP NCCL timeouts with FAVOR+ attention
     # "mamba",      # Disabled - incompatible with FSDP (sequential scan deadlocks)
     "condunet",     # Conditional U-Net (our method)
 ]
