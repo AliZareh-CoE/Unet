@@ -573,6 +573,9 @@ class Trainer:
             self.logger = logging.getLogger("phase2_trainer_null")
             self.logger.addHandler(logging.NullHandler())
 
+        # Count parameters BEFORE FSDP wrapping (FSDP shards params across ranks)
+        self._n_params_original = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
         # Wrap model with FSDP if enabled
         if self.use_fsdp:
             self._log_info(f"Initializing FSDP with strategy={fsdp_strategy}, world_size={self.world_size}")
@@ -969,7 +972,7 @@ class Trainer:
             TrainingResult with all metrics
         """
         self._log_info(f"Starting training for {arch_name} (fold={fold})")
-        self._log_info(f"Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
+        self._log_info(f"Model parameters: {self._n_params_original:,}")
         if self.use_fsdp:
             self._log_info(f"Using FSDP with {self.world_size} GPUs")
 
@@ -1083,8 +1086,9 @@ class Trainer:
 
         total_time = time.time() - start_time
 
-        # Count parameters
-        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # Use pre-computed parameter count (set before FSDP wrapping)
+        # FSDP shards parameters across ranks, so counting from wrapped model gives wrong result
+        n_params = self._n_params_original
 
         # Restore best model if available (not done for FSDP as state is sharded)
         if self._best_model_state is not None and completed_successfully and not self.use_fsdp:

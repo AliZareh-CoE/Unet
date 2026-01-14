@@ -2298,9 +2298,12 @@ def train(
             out_channels=out_channels,
             time_steps=time_steps,
         )
+        # Count parameters BEFORE FSDP wrapping (FSDP shards params across ranks)
+        # Store in config for later use in results output
+        model_n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        config["model_n_params"] = model_n_params
         if is_primary():
-            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"  Parameters: {n_params:,}")
+            print(f"  Parameters: {model_n_params:,}")
 
     # Create reverse model (target → source) for bidirectional training
     # Only for CondUNet - other architectures don't support conditioning
@@ -3263,6 +3266,7 @@ def train(
         "history": history,
         "model": model,
         "reverse_model": reverse_model,
+        "n_parameters": config.get("model_n_params", 0),  # Pre-FSDP param count
     }
 
 
@@ -3972,15 +3976,17 @@ def main():
             best_val_mae = val_maes[best_epoch - 1] if best_epoch > 0 and len(val_maes) >= best_epoch else 0.0
             best_val_corr = val_corrs[best_epoch - 1] if best_epoch > 0 and len(val_corrs) >= best_epoch else 0.0
 
-            # Count model parameters
-            model_obj = results.get("model")
-            if model_obj is not None:
-                if hasattr(model_obj, 'module'):
-                    n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
-                else:
-                    n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
-            else:
-                n_params = 0
+            # Get parameter count - prefer pre-computed value (works correctly with FSDP)
+            # FSDP shards parameters across ranks, so counting from wrapped model gives wrong result
+            n_params = results.get("n_parameters", 0)
+            if n_params == 0:
+                # Fallback: try to count from model (may be inaccurate with FSDP)
+                model_obj = results.get("model")
+                if model_obj is not None:
+                    if hasattr(model_obj, 'module'):
+                        n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
+                    else:
+                        n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
 
             output_results = {
                 "architecture": args.arch,
