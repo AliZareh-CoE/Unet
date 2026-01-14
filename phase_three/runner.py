@@ -28,7 +28,10 @@ from .config import (
     AblationConfig,
     TrainingConfig,
     ABLATION_STUDIES,
+    INCREMENTAL_STAGES,
     get_baseline_config,
+    get_simple_baseline_config,
+    print_protocol_summary,
 )
 from .trainer import AblationTrainer
 from .model_builder import build_condunet, count_parameters
@@ -679,6 +682,10 @@ def run_phase3(
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies with 5-fold cross-validation.
 
+    Supports two protocols:
+    - ADDITIVE (build-up): Start with simple baseline, add components incrementally
+    - SUBTRACTIVE (traditional): Start with full model, remove components
+
     Args:
         config: Phase 3 configuration
         use_train_py: Use train.py subprocess for exact training consistency
@@ -691,8 +698,12 @@ def run_phase3(
     print("\n" + "=" * 60)
     print("Phase 3: CondUNet Ablation Studies (5-Fold Cross-Validation)")
     print("=" * 60)
+    print(f"Protocol: {config.protocol.upper()}")
     print(f"Dataset: {config.dataset}")
-    print(f"Studies: {config.studies}")
+    if config.protocol == "additive":
+        print(f"Stages: {config.stages} ({len(config.stages)} stages)")
+    else:
+        print(f"Studies: {config.studies}")
     print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     if use_train_py:
@@ -700,6 +711,317 @@ def run_phase3(
         if use_fsdp:
             print(f"  FSDP passed to train.py: strategy={fsdp_strategy}")
     print("=" * 60)
+
+    # Route to appropriate protocol handler
+    if config.protocol == "additive":
+        return _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+    else:
+        return _run_subtractive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+
+
+def _run_additive_protocol(
+    config: Phase3Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+) -> Phase3Result:
+    """Run ADDITIVE (build-up) ablation protocol.
+
+    Starts with simple baseline (Stage 0) and incrementally adds components.
+    Each stage is compared to the previous stage to show incremental gain.
+    """
+    # Setup checkpoint for resume capability
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_results, baseline_results, completed_studies, _ = reconstruct_from_checkpoint(checkpoint)
+    else:
+        all_results = []
+        baseline_results = []  # For additive: Stage 0 results
+        completed_studies = set()  # stage names like "stage0", "stage1", etc.
+
+    # Load raw data for CV
+    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
+
+    # Create CV splits
+    cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
+    print(f"CV splits: {[len(s[1]) for s in cv_splits]} validation samples per fold")
+
+    # Get ablation configs (one per stage)
+    ablation_configs = config.get_ablation_configs()
+    skipped_stages = 0
+
+    for ablation_config in ablation_configs:
+        stage_name = ablation_config.study  # e.g., "stage0", "stage1"
+        stage_info = INCREMENTAL_STAGES[ablation_config.stage]
+
+        # Check if already completed
+        if stage_name in completed_studies:
+            skipped_stages += 1
+            print(f"\n[{stage_name}] SKIPPED (already completed)")
+            continue
+
+        print(f"\n{'=' * 50}")
+        print(f"Stage {ablation_config.stage}: {stage_info['name']}")
+        print(f"  {stage_info['description']}")
+        print(f"{'=' * 50}")
+
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
+            if use_train_py:
+                # Use train.py subprocess for FSDP support
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, stage_name, ablation_config.variant, fold_idx, train_idx, val_idx
+                )
+                output_results_file = config.output_dir / "train_results" / f"{stage_name}_{ablation_config.variant}_fold{fold_idx}_results.json"
+                output_results_file.parent.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n  [{stage_name}] {ablation_config.variant} (fold {fold_idx + 1}/{config.n_folds})")
+                print(f"    Train: {len(train_idx)}, Val: {len(val_idx)}")
+                print(f"    Running train.py subprocess...")
+
+                train_results = run_train_subprocess(
+                    study=stage_name,
+                    variant=ablation_config.variant,
+                    fold_idx=fold_idx,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    ablation_config=ablation_config,
+                    epochs=config.training.epochs,
+                    batch_size=config.training.batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=True,
+                )
+
+                if train_results is not None:
+                    result = AblationResult(
+                        study=stage_name,
+                        variant=ablation_config.variant,
+                        fold=fold_idx,
+                        best_r2=train_results.get("best_val_r2", 0.0),
+                        best_loss=train_results.get("best_val_loss", 0.0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        total_time=train_results.get("total_time", 0.0),
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    Best R²: {result.best_r2:.4f}")
+                else:
+                    result = AblationResult(
+                        study=stage_name,
+                        variant=ablation_config.variant,
+                        fold=fold_idx,
+                        best_r2=0.0,
+                        best_loss=float('inf'),
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        n_parameters=0,
+                        epochs_trained=0,
+                        total_time=0.0,
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    FAILED")
+            else:
+                # Use internal trainer
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, train_idx, val_idx,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                )
+
+                result = run_single_ablation(
+                    ablation_config=ablation_config,
+                    training_config=config.training,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    fold=fold_idx,
+                    cv_seed=config.cv_seed,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / stage_name / f"fold{fold_idx}",
+                    verbose=config.verbose,
+                )
+
+            all_results.append(result)
+
+            # Keep track of baseline (stage 0) results for stats
+            if ablation_config.stage == 0:
+                baseline_results.append(result)
+
+        # Save checkpoint after each stage
+        completed_studies.add(stage_name)
+        save_checkpoint(checkpoint_path, all_results, baseline_results, completed_studies, True)
+        print(f"Checkpoint saved ({len(completed_studies)}/{len(ablation_configs)} stages completed)")
+
+    if skipped_stages > 0:
+        print(f"\n*** Resumed run: skipped {skipped_stages} already-completed stages ***")
+
+    # Aggregate results
+    aggregated = aggregate_results(all_results)
+
+    # For additive: baseline is Stage 0
+    baseline_r2 = 0.0
+    if baseline_results:
+        baseline_r2 = np.mean([r.best_r2 for r in baseline_results])
+    elif "stage0" in aggregated:
+        baseline_r2 = aggregated["stage0"]["simple_baseline"]["r2_mean"]
+
+    # Compute incremental statistics (each stage vs previous stage)
+    comprehensive_stats = _compute_incremental_stats(aggregated, all_results)
+
+    # Determine optimal config (for additive: final stage is optimal)
+    optimal_config = {"final_stage": len(config.stages) - 1}
+
+    # Create final result
+    phase3_result = Phase3Result(
+        results=all_results,
+        aggregated=aggregated,
+        baseline_r2=baseline_r2,
+        optimal_config=optimal_config,
+        config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
+    )
+
+    # Print summary
+    _print_additive_summary(phase3_result, config)
+
+    # Save results
+    output_path = config.output_dir / "phase3_results.json"
+    phase3_result.save(output_path)
+
+    return phase3_result
+
+
+def _compute_incremental_stats(
+    aggregated: Dict[str, Dict[str, Dict[str, float]]],
+    all_results: List[AblationResult],
+) -> Dict[str, Any]:
+    """Compute statistics comparing each stage to the previous stage."""
+    comprehensive_stats = {}
+
+    # Group results by stage
+    stage_results = {}
+    for result in all_results:
+        stage = result.study  # e.g., "stage0"
+        if stage not in stage_results:
+            stage_results[stage] = []
+        stage_results[stage].append(result)
+
+    # Get ordered stage names
+    stage_names = sorted([s for s in stage_results.keys() if s.startswith("stage")],
+                        key=lambda x: int(x.replace("stage", "")))
+
+    # Compare consecutive stages
+    for i in range(1, len(stage_names)):
+        prev_stage = stage_names[i - 1]
+        curr_stage = stage_names[i]
+
+        prev_r2s = [r.best_r2 for r in stage_results.get(prev_stage, [])]
+        curr_r2s = [r.best_r2 for r in stage_results.get(curr_stage, [])]
+
+        if len(prev_r2s) >= 2 and len(curr_r2s) >= 2:
+            try:
+                comp = compare_methods(
+                    np.array(prev_r2s),
+                    np.array(curr_r2s),
+                    name_a=prev_stage,
+                    name_b=curr_stage,
+                    paired=True,
+                    alpha=0.05
+                )
+                comprehensive_stats[f"{curr_stage}_vs_{prev_stage}"] = comp.to_dict()
+            except Exception:
+                pass
+
+    # Also compare each stage vs stage0 (baseline)
+    if "stage0" in stage_results:
+        baseline_r2s = [r.best_r2 for r in stage_results["stage0"]]
+        for stage_name in stage_names[1:]:
+            curr_r2s = [r.best_r2 for r in stage_results.get(stage_name, [])]
+            if len(curr_r2s) >= 2 and len(baseline_r2s) >= 2:
+                try:
+                    comp = compare_methods(
+                        np.array(baseline_r2s),
+                        np.array(curr_r2s),
+                        name_a="stage0",
+                        name_b=stage_name,
+                        paired=True,
+                        alpha=0.05
+                    )
+                    comprehensive_stats[f"{stage_name}_vs_stage0"] = comp.to_dict()
+                except Exception:
+                    pass
+
+    return comprehensive_stats
+
+
+def _print_additive_summary(result: Phase3Result, config: Phase3Config):
+    """Print summary for additive protocol."""
+    print("\n" + "=" * 70)
+    print("INCREMENTAL COMPONENT ANALYSIS RESULTS")
+    print("=" * 70)
+
+    print(f"\nBaseline (Stage 0) R²: {result.baseline_r2:.4f}")
+    print("\nProgressive Component Addition:")
+    print("-" * 70)
+    print(f"{'Stage':<8}{'Component':<25}{'R² Mean ± Std':<20}{'Δ from prev':<15}")
+    print("-" * 70)
+
+    prev_r2 = None
+    for stage_idx in sorted(config.stages):
+        stage_name = f"stage{stage_idx}"
+        stage_info = INCREMENTAL_STAGES[stage_idx]
+
+        if stage_name in result.aggregated:
+            variant_name = stage_info["name"]
+            if variant_name in result.aggregated[stage_name]:
+                stats = result.aggregated[stage_name][variant_name]
+                r2_mean = stats["r2_mean"]
+                r2_std = stats["r2_std"]
+
+                if prev_r2 is not None:
+                    delta = r2_mean - prev_r2
+                    delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
+                else:
+                    delta_str = "baseline"
+
+                print(f"{stage_idx:<8}{stage_info['name']:<25}{r2_mean:.4f} ± {r2_std:.4f}    {delta_str:<15}")
+                prev_r2 = r2_mean
+
+    print("-" * 70)
+
+    # Final improvement over baseline
+    final_stage = max(config.stages)
+    final_name = f"stage{final_stage}"
+    if final_name in result.aggregated:
+        final_info = INCREMENTAL_STAGES[final_stage]
+        if final_info["name"] in result.aggregated[final_name]:
+            final_r2 = result.aggregated[final_name][final_info["name"]]["r2_mean"]
+            total_gain = final_r2 - result.baseline_r2
+            print(f"\nTOTAL IMPROVEMENT: {result.baseline_r2:.4f} → {final_r2:.4f} (Δ = +{total_gain:.4f})")
+
+    print("=" * 70 + "\n")
+
+
+def _run_subtractive_protocol(
+    config: Phase3Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+) -> Phase3Result:
+    """Run SUBTRACTIVE (traditional) ablation protocol.
+
+    Starts with full model (baseline) and removes components one at a time.
+    """
 
     # Setup checkpoint for resume capability
     checkpoint_path = get_checkpoint_path(config.output_dir)
@@ -1130,13 +1452,31 @@ def main():
         "--dataset", type=str, default="olfactory", help="Dataset name"
     )
 
-    # Studies to run
+    # Ablation protocol
+    parser.add_argument(
+        "--protocol",
+        type=str,
+        default="additive",
+        choices=["additive", "subtractive"],
+        help="Ablation protocol: 'additive' (build-up, recommended) or 'subtractive' (traditional)",
+    )
+
+    # Studies to run (for subtractive protocol)
     parser.add_argument(
         "--studies",
         type=str,
         nargs="+",
         default=None,
-        help="Ablation studies to run (default: all)",
+        help="Ablation studies to run for subtractive protocol (default: all)",
+    )
+
+    # Stages to run (for additive protocol)
+    parser.add_argument(
+        "--stages",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Stages to run for additive protocol (0-6, default: all)",
     )
 
     # Training
@@ -1265,11 +1605,22 @@ def main():
         patience=3 if args.dry_run else args.patience,
     )
 
-    studies = ["attention"] if args.fast else (args.studies or list(ABLATION_STUDIES.keys()))
+    # Handle protocol-specific options
+    if args.protocol == "additive":
+        if args.fast:
+            stages = [0, 1]  # Just baseline and first addition for quick test
+        else:
+            stages = args.stages if args.stages else list(range(len(INCREMENTAL_STAGES)))
+        studies = list(ABLATION_STUDIES.keys())  # Not used in additive, but required
+    else:
+        stages = list(range(len(INCREMENTAL_STAGES)))  # Not used in subtractive
+        studies = ["attention"] if args.fast else (args.studies or list(ABLATION_STUDIES.keys()))
 
     config = Phase3Config(
         dataset=args.dataset,
+        protocol=args.protocol,
         studies=studies,
+        stages=stages,
         n_folds=2 if args.dry_run else args.n_folds,
         cv_seed=args.cv_seed,
         training=training_config,
@@ -1277,6 +1628,9 @@ def main():
         device=args.device,
         n_workers=args.workers,
     )
+
+    # Print protocol summary
+    print_protocol_summary(args.protocol)
 
     # Handle --fresh flag: delete existing checkpoint
     if args.fresh:

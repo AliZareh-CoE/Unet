@@ -2,7 +2,14 @@
 Configuration for Phase 3: CondUNet Ablation Studies
 =====================================================
 
-Defines configuration for systematic ablation experiments.
+Supports two ablation protocols:
+1. SUBTRACTIVE (traditional): Start with full model, remove components
+2. ADDITIVE (build-up): Start with simple baseline, add components incrementally
+
+The ADDITIVE protocol is recommended based on literature review:
+- Avoids "compensatory masquerade" problem
+- Clearer attribution of component contributions
+- Aligned with nnU-Net (Nature Methods) and Transformer paper methodology
 """
 
 from __future__ import annotations
@@ -14,8 +21,147 @@ from typing import Dict, List, Optional, Any, Tuple
 import torch
 
 # =============================================================================
-# Ablation Variants
+# Ablation Protocol Selection
 # =============================================================================
+
+ABLATION_PROTOCOLS = ["additive", "subtractive"]
+
+# =============================================================================
+# ADDITIVE PROTOCOL: Incremental Component Analysis
+# =============================================================================
+# Start with simple baseline, add one component at a time
+# Based on: nnU-Net (Nature Methods), Transformer paper methodology
+
+# Ordered list of components to add incrementally
+# Each stage adds ONE component on top of previous stage
+INCREMENTAL_STAGES: List[Dict[str, Any]] = [
+    {
+        "stage": 0,
+        "name": "simple_baseline",
+        "description": "Plain U-Net: standard conv, no attention, no conditioning, L1 loss",
+        "config": {
+            "conv_type": "standard",
+            "attention_type": "none",
+            "cond_mode": "none",
+            "use_odor_embedding": False,
+            "loss_type": "l1",
+            "use_augmentation": False,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 1,
+        "name": "modern_conv",
+        "description": "+ Modern convolutions (dilated depthwise separable + SE)",
+        "adds": "conv_type",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "none",
+            "cond_mode": "none",
+            "use_odor_embedding": False,
+            "loss_type": "l1",
+            "use_augmentation": False,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 2,
+        "name": "attention",
+        "description": "+ Cross-frequency attention mechanism",
+        "adds": "attention_type",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "cross_freq_v2",
+            "cond_mode": "none",
+            "use_odor_embedding": False,
+            "loss_type": "l1",
+            "use_augmentation": False,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 3,
+        "name": "conditioning",
+        "description": "+ Spectro-temporal auto-conditioning",
+        "adds": "cond_mode",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "cross_freq_v2",
+            "cond_mode": "cross_attn_gated",
+            "use_odor_embedding": True,
+            "loss_type": "l1",
+            "use_augmentation": False,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 4,
+        "name": "wavelet_loss",
+        "description": "+ Wavelet multi-scale loss",
+        "adds": "loss_type",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "cross_freq_v2",
+            "cond_mode": "cross_attn_gated",
+            "use_odor_embedding": True,
+            "loss_type": "l1_wavelet",
+            "use_augmentation": False,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 5,
+        "name": "augmentation",
+        "description": "+ Data augmentation suite",
+        "adds": "use_augmentation",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "cross_freq_v2",
+            "cond_mode": "cross_attn_gated",
+            "use_odor_embedding": True,
+            "loss_type": "l1_wavelet",
+            "use_augmentation": True,
+            "bidirectional": False,
+            "base_channels": 64,
+        },
+    },
+    {
+        "stage": 6,
+        "name": "bidirectional",
+        "description": "+ Bidirectional training (cycle consistency)",
+        "adds": "bidirectional",
+        "config": {
+            "conv_type": "modern",
+            "attention_type": "cross_freq_v2",
+            "cond_mode": "cross_attn_gated",
+            "use_odor_embedding": True,
+            "loss_type": "l1_wavelet",
+            "use_augmentation": True,
+            "bidirectional": True,
+            "base_channels": 64,
+        },
+    },
+]
+
+# Component order for reference (matches stage order)
+COMPONENT_ORDER = [
+    "conv_type",        # Stage 1: standard -> modern
+    "attention_type",   # Stage 2: none -> cross_freq_v2
+    "cond_mode",        # Stage 3: none -> cross_attn_gated
+    "loss_type",        # Stage 4: l1 -> l1_wavelet
+    "use_augmentation", # Stage 5: False -> True
+    "bidirectional",    # Stage 6: False -> True
+]
+
+# =============================================================================
+# SUBTRACTIVE PROTOCOL: Traditional Ablation (legacy)
+# =============================================================================
+# Start with full model, remove components one at a time
 
 ATTENTION_VARIANTS: Dict[str, str] = {
     "none": "none",
@@ -32,7 +178,7 @@ CONDITIONING_VARIANTS: Dict[str, Dict[str, Any]] = {
 
 LOSS_VARIANTS: Dict[str, Dict[str, Any]] = {
     "l1": {"loss_type": "l1", "loss_weights": None},
-    "l1_wavelet": {"loss_type": "l1_wavelet", "loss_weights": None},  # Baseline
+    "l1_wavelet": {"loss_type": "l1_wavelet", "loss_weights": None},
     "huber": {"loss_type": "huber", "loss_weights": None},
     "huber_wavelet": {"loss_type": "huber_wavelet", "loss_weights": None},
 }
@@ -55,28 +201,19 @@ AUGMENTATION_VARIANTS: Dict[str, bool] = {
 
 CONV_TYPE_VARIANTS: Dict[str, str] = {
     "standard": "standard",
-    "modern": "modern",  # Dilated depthwise separable + SE
+    "modern": "modern",
 }
 
-# =============================================================================
-# Simplified Ablation Configuration (One variant per study)
-# =============================================================================
-
-# For each study, select the "ablated" variant (feature removed/reduced)
-# Baseline has all features ON, ablated versions remove one feature each
+# For subtractive: which variant to use when "ablating" (removing) each component
 ABLATION_VARIANTS_SIMPLE: Dict[str, str] = {
-    "attention": "none",           # Remove attention
-    "conditioning": "none",        # Remove conditioning
-    "loss": "l1",                  # L1 only (no wavelet)
-    "capacity": "small",           # Reduced capacity
-    "bidirectional": "unidirectional",  # Remove bidirectional
-    "augmentation": "none",        # No augmentation
-    "conv_type": "standard",       # Standard convs (no dilated/SE)
+    "attention": "none",
+    "conditioning": "none",
+    "loss": "l1",
+    "capacity": "small",
+    "bidirectional": "unidirectional",
+    "augmentation": "none",
+    "conv_type": "standard",
 }
-
-# =============================================================================
-# Ablation Study Definitions
-# =============================================================================
 
 ABLATION_STUDIES: Dict[str, Dict[str, Any]] = {
     "attention": {
@@ -132,22 +269,19 @@ ABLATION_STUDIES: Dict[str, Dict[str, Any]] = {
 class AblationConfig:
     """Configuration for a single ablation experiment.
 
-    Attributes:
-        study: Name of the ablation study (attention, conditioning, etc.)
-        variant: Specific variant being tested
-        base_config: Base CondUNet configuration
+    Works with both additive and subtractive protocols.
     """
 
     study: str
     variant: str
 
-    # CondUNet base configuration (defaults to optimal from Phase 2)
+    # CondUNet configuration
     attention_type: str = "cross_freq_v2"
     cond_mode: str = "cross_attn_gated"
     use_odor_embedding: bool = True
     base_channels: int = 64
     n_downsample: int = 2
-    conv_type: str = "modern"  # modern = dilated depthwise separable + SE
+    conv_type: str = "modern"
 
     # Loss configuration
     loss_type: str = "l1_wavelet"
@@ -161,8 +295,16 @@ class AblationConfig:
     aug_noise_std: float = 0.1
     aug_time_shift: int = 50
 
+    # Stage info for additive protocol
+    stage: int = -1  # -1 = subtractive protocol
+
     def __post_init__(self):
-        """Apply ablation variant modifications."""
+        """Apply ablation variant modifications for subtractive protocol."""
+        if self.stage >= 0:
+            # Additive protocol: config already set from INCREMENTAL_STAGES
+            return
+
+        # Subtractive protocol: modify based on study/variant
         if self.study == "attention":
             self.attention_type = ATTENTION_VARIANTS[self.variant]
         elif self.study == "conditioning":
@@ -186,6 +328,7 @@ class AblationConfig:
         return {
             "study": self.study,
             "variant": self.variant,
+            "stage": self.stage,
             "attention_type": self.attention_type,
             "cond_mode": self.cond_mode,
             "use_odor_embedding": self.use_odor_embedding,
@@ -201,7 +344,32 @@ class AblationConfig:
     @property
     def name(self) -> str:
         """Experiment name for logging."""
+        if self.stage >= 0:
+            return f"stage{self.stage}_{self.variant}"
         return f"{self.study}_{self.variant}"
+
+    @classmethod
+    def from_stage(cls, stage_idx: int) -> "AblationConfig":
+        """Create config from incremental stage definition."""
+        if stage_idx < 0 or stage_idx >= len(INCREMENTAL_STAGES):
+            raise ValueError(f"Invalid stage index: {stage_idx}")
+
+        stage = INCREMENTAL_STAGES[stage_idx]
+        cfg = stage["config"]
+
+        return cls(
+            study=f"stage{stage_idx}",
+            variant=stage["name"],
+            stage=stage_idx,
+            conv_type=cfg["conv_type"],
+            attention_type=cfg["attention_type"],
+            cond_mode=cfg["cond_mode"],
+            use_odor_embedding=cfg["use_odor_embedding"],
+            loss_type=cfg["loss_type"],
+            use_augmentation=cfg["use_augmentation"],
+            bidirectional=cfg["bidirectional"],
+            base_channels=cfg["base_channels"],
+        )
 
 
 @dataclass
@@ -254,21 +422,21 @@ class TrainingConfig:
 class Phase3Config:
     """Configuration for Phase 3 ablation studies.
 
-    Attributes:
-        dataset: Dataset name ('olfactory')
-        studies: Which ablation studies to run
-        n_folds: Number of cross-validation folds
-        cv_seed: Random seed for CV splits
-        training: Training configuration
-        output_dir: Directory for results
+    Supports both ADDITIVE (build-up) and SUBTRACTIVE (traditional) protocols.
     """
 
     # Dataset (Phase 3 uses olfactory only)
     dataset: str = "olfactory"
     sample_rate: float = 1000.0
 
-    # Which ablation studies to run
+    # Ablation protocol: "additive" (recommended) or "subtractive"
+    protocol: str = "additive"
+
+    # For subtractive protocol: which studies to run
     studies: List[str] = field(default_factory=lambda: list(ABLATION_STUDIES.keys()))
+
+    # For additive protocol: which stages to run (default: all)
+    stages: List[int] = field(default_factory=lambda: list(range(len(INCREMENTAL_STAGES))))
 
     # Cross-validation settings
     n_folds: int = 5
@@ -308,16 +476,37 @@ class Phase3Config:
         self.log_dir = Path(self.log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Validate studies
+        if self.protocol not in ABLATION_PROTOCOLS:
+            raise ValueError(f"Unknown protocol: {self.protocol}. Use 'additive' or 'subtractive'")
+
+        # Validate studies (for subtractive protocol)
         for study in self.studies:
             if study not in ABLATION_STUDIES:
                 raise ValueError(f"Unknown ablation study: {study}")
 
+        # Validate stages (for additive protocol)
+        for stage in self.stages:
+            if stage < 0 or stage >= len(INCREMENTAL_STAGES):
+                raise ValueError(f"Invalid stage: {stage}. Valid: 0-{len(INCREMENTAL_STAGES)-1}")
+
     def get_ablation_configs(self) -> List[AblationConfig]:
-        """Generate ablation configurations (one ablated variant per study)."""
+        """Generate ablation configurations based on selected protocol."""
+        if self.protocol == "additive":
+            return self._get_additive_configs()
+        else:
+            return self._get_subtractive_configs()
+
+    def _get_additive_configs(self) -> List[AblationConfig]:
+        """Generate configs for additive (build-up) protocol."""
+        configs = []
+        for stage_idx in self.stages:
+            configs.append(AblationConfig.from_stage(stage_idx))
+        return configs
+
+    def _get_subtractive_configs(self) -> List[AblationConfig]:
+        """Generate configs for subtractive (traditional) protocol."""
         configs = []
         for study in self.studies:
-            # Use simplified variant (one per study)
             variant = ABLATION_VARIANTS_SIMPLE[study]
             configs.append(AblationConfig(study=study, variant=variant))
         return configs
@@ -326,7 +515,9 @@ class Phase3Config:
         return {
             "dataset": self.dataset,
             "sample_rate": self.sample_rate,
+            "protocol": self.protocol,
             "studies": self.studies,
+            "stages": self.stages,
             "n_folds": self.n_folds,
             "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
@@ -337,26 +528,56 @@ class Phase3Config:
 
     @property
     def total_runs(self) -> int:
-        """Total number of runs: (1 baseline + n_studies ablations) × n_folds."""
-        # 1 baseline + 6 ablation studies = 7 configs × 5 folds = 35
-        return (1 + len(self.studies)) * self.n_folds
+        """Total number of training runs."""
+        if self.protocol == "additive":
+            # All stages × n_folds
+            return len(self.stages) * self.n_folds
+        else:
+            # (1 baseline + n_studies ablations) × n_folds
+            return (1 + len(self.studies)) * self.n_folds
 
 
 def get_baseline_config() -> AblationConfig:
-    """Get the baseline (optimal) configuration.
+    """Get the baseline configuration.
 
-    This represents the full CondUNet with all features enabled.
+    For ADDITIVE protocol: Stage 0 (simple baseline)
+    For SUBTRACTIVE protocol: Full model (all features enabled)
     """
-    return AblationConfig(
-        study="baseline",
-        variant="full",
-        attention_type="cross_freq_v2",
-        cond_mode="cross_attn_gated",
-        use_odor_embedding=True,
-        base_channels=64,
-        n_downsample=2,
-        loss_type="combined",
-        loss_weights={"huber": 1.0, "wavelet": 0.5},
-        use_augmentation=True,
-        bidirectional=True,
-    )
+    # Return full model config (Stage 6 = final stage with all components)
+    return AblationConfig.from_stage(len(INCREMENTAL_STAGES) - 1)
+
+
+def get_simple_baseline_config() -> AblationConfig:
+    """Get the simple baseline configuration (Stage 0)."""
+    return AblationConfig.from_stage(0)
+
+
+def print_protocol_summary(protocol: str = "additive"):
+    """Print summary of the ablation protocol."""
+    print("\n" + "=" * 70)
+    print(f"ABLATION PROTOCOL: {protocol.upper()}")
+    print("=" * 70)
+
+    if protocol == "additive":
+        print("\nINCREMENTAL COMPONENT ANALYSIS (Build-Up Approach)")
+        print("Based on: nnU-Net (Nature Methods), Transformer paper methodology")
+        print("-" * 70)
+        print(f"{'Stage':<8}{'Name':<20}{'Description':<42}")
+        print("-" * 70)
+        for stage in INCREMENTAL_STAGES:
+            print(f"{stage['stage']:<8}{stage['name']:<20}{stage['description']:<42}")
+        print("-" * 70)
+        print("\nEach stage adds ONE component on top of previous stage.")
+        print("This shows the incremental contribution of each component.")
+    else:
+        print("\nTRADITIONAL ABLATION (Subtractive Approach)")
+        print("-" * 70)
+        print("Start with full model, remove one component at a time.")
+        print(f"{'Study':<15}{'Ablated Variant':<20}{'Description':<35}")
+        print("-" * 70)
+        for study, info in ABLATION_STUDIES.items():
+            variant = ABLATION_VARIANTS_SIMPLE[study]
+            print(f"{study:<15}{variant:<20}{info['description']:<35}")
+        print("-" * 70)
+
+    print("=" * 70 + "\n")
