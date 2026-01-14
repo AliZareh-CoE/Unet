@@ -2031,6 +2031,11 @@ def train_epoch(
                 print(f"  Total loss (with contrastive): {loss.item():.4f}")
                 print(f"{'='*60}\n")
 
+        # NaN detection before backward to prevent silent failures
+        # Local check is cheap; if NaN detected, raise immediately
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise ValueError(f"NaN/Inf loss detected at epoch {epoch}, batch {batch_idx}. Training aborted.")
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
