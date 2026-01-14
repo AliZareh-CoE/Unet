@@ -275,19 +275,22 @@ def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
 
 def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, List, set, bool]:
     """Reconstruct state from checkpoint."""
-    # Reconstruct AblationResult objects
+    # Reconstruct AblationResult objects (handle both old and new field names)
     all_results = []
     for r_dict in checkpoint["all_results"]:
         result = AblationResult(
             study=r_dict["study"],
             variant=r_dict["variant"],
-            fold=r_dict["fold"],
+            fold=r_dict.get("fold", 0),
             best_r2=r_dict["best_r2"],
             best_loss=r_dict["best_loss"],
-            train_history=r_dict.get("train_history", []),
-            val_r2_history=r_dict.get("val_r2_history", []),
+            train_losses=r_dict.get("train_losses", r_dict.get("train_history", [])),
+            val_losses=r_dict.get("val_losses", []),
+            val_r2s=r_dict.get("val_r2s", r_dict.get("val_r2_history", [])),
             n_parameters=r_dict.get("n_parameters", 0),
-            training_time=r_dict.get("training_time", 0.0),
+            epochs_trained=r_dict.get("epochs_trained", len(r_dict.get("train_losses", r_dict.get("train_history", [])))),
+            total_time=r_dict.get("total_time", r_dict.get("training_time", 0.0)),
+            config=r_dict.get("config", {}),
         )
         all_results.append(result)
 
@@ -296,13 +299,16 @@ def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, List,
         result = AblationResult(
             study=r_dict["study"],
             variant=r_dict["variant"],
-            fold=r_dict["fold"],
+            fold=r_dict.get("fold", 0),
             best_r2=r_dict["best_r2"],
             best_loss=r_dict["best_loss"],
-            train_history=r_dict.get("train_history", []),
-            val_r2_history=r_dict.get("val_r2_history", []),
+            train_losses=r_dict.get("train_losses", r_dict.get("train_history", [])),
+            val_losses=r_dict.get("val_losses", []),
+            val_r2s=r_dict.get("val_r2s", r_dict.get("val_r2_history", [])),
             n_parameters=r_dict.get("n_parameters", 0),
-            training_time=r_dict.get("training_time", 0.0),
+            epochs_trained=r_dict.get("epochs_trained", len(r_dict.get("train_losses", r_dict.get("train_history", [])))),
+            total_time=r_dict.get("total_time", r_dict.get("training_time", 0.0)),
+            config=r_dict.get("config", {}),
         )
         baseline_results.append(result)
 
