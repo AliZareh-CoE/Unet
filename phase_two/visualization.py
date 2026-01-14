@@ -90,7 +90,6 @@ ARCH_COLORS = {
     "linear": "#6B7280",
     "simplecnn": "#9CA3AF",
     "wavenet": "#2E86AB",
-    "fnet": "#1B5583",
     "vit": "#A23B72",
     "condunet": "#2CA58D",
 }

@@ -22,7 +22,6 @@ ARCHITECTURE_LIST: List[str] = [
     "linear",       # Linear baseline
     "simplecnn",    # Simple CNN
     "wavenet",      # WaveNet with dilated convolutions
-    "fnet",         # Fourier-based mixing
     "vit",          # Vision Transformer 1D
     "condunet",     # Conditional U-Net (our method)
 ]
@@ -48,11 +47,6 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "skip_channels": 128,
         "n_layers": 8,
         "kernel_size": 3,
-    },
-    "fnet": {
-        "hidden_dim": 256,
-        "n_layers": 4,
-        "dropout": 0.1,
     },
     "vit": {
         "embed_dim": 256,

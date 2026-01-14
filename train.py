@@ -3279,7 +3279,7 @@ def parse_args():
 
     # Architecture selection (for Phase 2 comparison)
     parser.add_argument("--arch", type=str, default="condunet",
-                        choices=["condunet", "linear", "simplecnn", "wavenet", "fnet", "vit"],
+                        choices=["condunet", "linear", "simplecnn", "wavenet", "vit"],
                         help="Architecture to train (default: condunet). Other options for Phase 2 comparison.")
 
     # Dataset selection

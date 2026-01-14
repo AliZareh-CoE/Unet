@@ -14,7 +14,6 @@ import torch.nn as nn
 from .linear import LinearBaseline
 from .simplecnn import SimpleCNN
 from .wavenet import WaveNet1D
-from .fnet import FNet1D
 from .vit import ViT1D
 from .condunet import CondUNet1D
 
@@ -27,7 +26,6 @@ ARCHITECTURE_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "linear": LinearBaseline,
     "simplecnn": SimpleCNN,
     "wavenet": WaveNet1D,
-    "fnet": FNet1D,
     "vit": ViT1D,
     "condunet": CondUNet1D,
 }
@@ -41,7 +39,6 @@ ARCHITECTURE_DESCRIPTIONS: Dict[str, str] = {
     "linear": "Simple linear mapping (MLP per time point)",
     "simplecnn": "Basic convolutional neural network",
     "wavenet": "Dilated causal convolutions (WaveNet-style)",
-    "fnet": "Fourier-based token mixing (no attention)",
     "vit": "Vision Transformer adapted for 1D signals",
     "condunet": "Conditional U-Net with skip connections",
 }
@@ -65,11 +62,6 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "skip_channels": 128,
         "n_layers": 8,
         "kernel_size": 3,
-    },
-    "fnet": {
-        "hidden_dim": 256,
-        "n_layers": 4,
-        "dropout": 0.1,
     },
     "vit": {
         "embed_dim": 256,
