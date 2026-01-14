@@ -313,6 +313,21 @@ def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, List,
 
 
 # =============================================================================
+# JSON Serialization Helper
+# =============================================================================
+
+def _json_serializer(obj):
+    """Custom JSON serializer for numpy types."""
+    if isinstance(obj, (np.bool_, np.integer)):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+# =============================================================================
 # Result Classes
 # =============================================================================
 
@@ -384,7 +399,7 @@ class Phase3Result:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
-            json.dump(self.to_dict(), f, indent=2)
+            json.dump(self.to_dict(), f, indent=2, default=_json_serializer)
         print(f"Results saved to {path}")
 
     @classmethod
