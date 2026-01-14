@@ -344,7 +344,11 @@ def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
             checkpoint = pickle.load(f)
         print(f"\n*** RESUMING FROM CHECKPOINT ***")
         print(f"    Found {len(checkpoint['completed_runs'])} completed runs")
-        print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        # Handle checkpoints created by create_checkpoint_from_results.py (no timestamp)
+        if 'timestamp' in checkpoint:
+            print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        else:
+            print(f"    Checkpoint reconstructed from existing results")
         return checkpoint
     except Exception as e:
         print(f"Warning: Could not load checkpoint: {e}")
