@@ -2882,13 +2882,27 @@ def train(
                 if epoch % 5 == 0:
                     recording_session.flush()
 
-            # Step the lr scheduler
+            # Step the lr scheduler (only primary has it)
             scheduler.step()
 
-            if patience_counter >= early_stop_patience:
-                if is_primary():
-                    print(f"Early stopping at epoch {epoch} (Stage 1 complete)")
-                break
+        # =====================================================================
+        # Early stopping check - MUST be outside is_primary() block
+        # All ranks must break together to avoid NCCL hangs
+        # =====================================================================
+        should_stop = patience_counter >= early_stop_patience
+
+        # Broadcast early stopping decision to all ranks
+        if dist.is_initialized():
+            stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.int32, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = stop_tensor.item() == 1
+
+        if should_stop:
+            if is_primary():
+                print(f"Early stopping at epoch {epoch} (patience {early_stop_patience} exceeded)")
+            # Barrier before break to ensure all ranks are synchronized
+            barrier()
+            break
 
         # Stage 1 evaluation (if enabled)
         # NOTE: ALL ranks must participate in evaluate() because model is sharded with FSDP
