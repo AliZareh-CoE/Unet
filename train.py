@@ -3406,6 +3406,12 @@ def parse_args():
                         choices=ATTENTION_TYPES,
                         help="Override attention type (for Phase 3 ablation studies)")
 
+    # Convolution type override (for ablation studies)
+    CONV_TYPES = ["standard", "modern"]
+    parser.add_argument("--conv-type", type=str, default=None,
+                        choices=CONV_TYPES,
+                        help="Override convolution type: 'standard' (basic Conv1d) or 'modern' (dilated depthwise separable + SE)")
+
     # Conditioning source: how conditioning embeddings are derived
     COND_SOURCES = ["odor_onehot", "spectro_temporal", "cpc", "vqvae", "freq_disentangled", "cycle_consistent"]
     parser.add_argument("--conditioning", type=str, default="spectro_temporal",
@@ -3812,6 +3818,12 @@ def main():
         config["attention_type"] = args.attention_type
         if is_primary():
             print(f"Attention type override: {args.attention_type}")
+
+    # Convolution type from CLI (for Phase 3 ablation studies)
+    if args.conv_type is not None:
+        config["conv_type"] = args.conv_type
+        if is_primary():
+            print(f"Convolution type override: {args.conv_type}")
 
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:

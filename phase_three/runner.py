@@ -141,7 +141,6 @@ def run_train_subprocess(
         "--fold-indices-file", str(fold_indices_file),
         "--output-results-file", str(output_results_file),
         "--fold", str(fold_idx),
-        "--no-bidirectional",  # Disable for consistent comparison
         "--no-plots",  # Skip plot generation for speed
     ])
 
@@ -166,9 +165,17 @@ def run_train_subprocess(
         if loss_type in ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]:
             cmd.extend(["--loss", loss_type])
 
+    # Convolution type
+    if "conv_type" in config:
+        cmd.extend(["--conv-type", config["conv_type"]])
+
     # Augmentation
-    if config.get("aug_enabled") is False:
+    if config.get("use_augmentation") is False:
         cmd.append("--no-aug")
+
+    # Bidirectional training
+    if config.get("bidirectional") is False:
+        cmd.append("--no-bidirectional")
 
     # FSDP flags
     if use_fsdp:

@@ -32,9 +32,9 @@ CONDITIONING_VARIANTS: Dict[str, Dict[str, Any]] = {
 
 LOSS_VARIANTS: Dict[str, Dict[str, Any]] = {
     "l1": {"loss_type": "l1", "loss_weights": None},
+    "l1_wavelet": {"loss_type": "l1_wavelet", "loss_weights": None},  # Baseline
     "huber": {"loss_type": "huber", "loss_weights": None},
-    "wavelet": {"loss_type": "wavelet", "loss_weights": None},
-    "combined": {"loss_type": "combined", "loss_weights": {"huber": 1.0, "wavelet": 0.5}},
+    "huber_wavelet": {"loss_type": "huber_wavelet", "loss_weights": None},
 }
 
 CAPACITY_VARIANTS: Dict[str, int] = {
@@ -53,6 +53,11 @@ AUGMENTATION_VARIANTS: Dict[str, bool] = {
     "full": True,
 }
 
+CONV_TYPE_VARIANTS: Dict[str, str] = {
+    "standard": "standard",
+    "modern": "modern",  # Dilated depthwise separable + SE
+}
+
 # =============================================================================
 # Simplified Ablation Configuration (One variant per study)
 # =============================================================================
@@ -62,10 +67,11 @@ AUGMENTATION_VARIANTS: Dict[str, bool] = {
 ABLATION_VARIANTS_SIMPLE: Dict[str, str] = {
     "attention": "none",           # Remove attention
     "conditioning": "none",        # Remove conditioning
-    "loss": "l1",                  # Alternative loss (L1 instead of Huber)
+    "loss": "l1",                  # L1 only (no wavelet)
     "capacity": "small",           # Reduced capacity
     "bidirectional": "unidirectional",  # Remove bidirectional
     "augmentation": "none",        # No augmentation
+    "conv_type": "standard",       # Standard convs (no dilated/SE)
 }
 
 # =============================================================================
@@ -109,6 +115,12 @@ ABLATION_STUDIES: Dict[str, Dict[str, Any]] = {
         "parameter": "use_augmentation",
         "n_variants": 2,
     },
+    "conv_type": {
+        "description": "Convolution type comparison",
+        "variants": list(CONV_TYPE_VARIANTS.keys()),
+        "parameter": "conv_type",
+        "n_variants": 2,
+    },
 }
 
 
@@ -135,9 +147,10 @@ class AblationConfig:
     use_odor_embedding: bool = True
     base_channels: int = 64
     n_downsample: int = 2
+    conv_type: str = "modern"  # modern = dilated depthwise separable + SE
 
     # Loss configuration
-    loss_type: str = "huber"
+    loss_type: str = "l1_wavelet"
     loss_weights: Optional[Dict[str, float]] = None
 
     # Training options
@@ -166,6 +179,8 @@ class AblationConfig:
             self.bidirectional = BIDIRECTIONAL_VARIANTS[self.variant]
         elif self.study == "augmentation":
             self.use_augmentation = AUGMENTATION_VARIANTS[self.variant]
+        elif self.study == "conv_type":
+            self.conv_type = CONV_TYPE_VARIANTS[self.variant]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -176,6 +191,7 @@ class AblationConfig:
             "use_odor_embedding": self.use_odor_embedding,
             "base_channels": self.base_channels,
             "n_downsample": self.n_downsample,
+            "conv_type": self.conv_type,
             "loss_type": self.loss_type,
             "loss_weights": self.loss_weights,
             "use_augmentation": self.use_augmentation,
