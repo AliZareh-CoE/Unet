@@ -36,7 +36,12 @@ class FourierMixing(nn.Module):
         """
         # 2D FFT over sequence and hidden dimensions
         # Take only real part for simplicity
-        return torch.fft.fft2(x, dim=(-2, -1)).real
+        # NOTE: FFT doesn't support BFloat16, so cast to float32 for FSDP compatibility
+        orig_dtype = x.dtype
+        if x.dtype == torch.bfloat16:
+            x = x.float()
+        result = torch.fft.fft2(x, dim=(-2, -1)).real
+        return result.to(orig_dtype)
 
 
 class FNetBlock(nn.Module):
