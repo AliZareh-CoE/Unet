@@ -2089,11 +2089,19 @@ def main():
         return
 
     # Build configuration
+    # Set epochs: 1 for fast, 5 for dry_run, otherwise use args.epochs (default 80)
+    if args.fast:
+        epochs = 1
+    elif args.dry_run:
+        epochs = 5
+    else:
+        epochs = args.epochs
+
     training_config = TrainingConfig(
-        epochs=5 if args.dry_run else args.epochs,
+        epochs=epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
-        patience=3 if args.dry_run else args.patience,
+        patience=3 if (args.dry_run or args.fast) else args.patience,
     )
 
     # Handle protocol-specific options
