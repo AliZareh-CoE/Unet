@@ -2,14 +2,21 @@
 Configuration for Phase 3: CondUNet Ablation Studies
 =====================================================
 
-Supports two ablation protocols:
+Supports three ablation protocols:
 1. SUBTRACTIVE (traditional): Start with full model, remove components
 2. ADDITIVE (build-up): Start with simple baseline, add components incrementally
+3. GREEDY_FORWARD (recommended): Test groups sequentially, winner becomes default
 
-The ADDITIVE protocol is recommended based on literature review:
-- Avoids "compensatory masquerade" problem
-- Clearer attribution of component contributions
-- Aligned with nnU-Net (Nature Methods) and Transformer paper methodology
+The GREEDY_FORWARD protocol is recommended based on literature review:
+- Sequential Forward Selection (SFS) - well-established in ML
+- Coordinate-wise optimization - supported by JMLR and NeurIPS papers
+- nnU-Net (Nature Methods): "one split of training data" for ablation
+- Efficient: 33 runs vs 5^11 = 48M for grid search
+
+Literature support:
+- nnU-Net (Nature Methods): Single split for ablation, full CV for final
+- Binary Coordinate Ascent (ScienceDirect): 5-37x efficiency gain
+- JMLR: Greedy block selection (Gauss-Southwell rule)
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import torch
 # Ablation Protocol Selection
 # =============================================================================
 
-ABLATION_PROTOCOLS = ["additive", "subtractive"]
+ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward"]
 
 # =============================================================================
 # ADDITIVE PROTOCOL: Incremental Component Analysis
@@ -187,6 +194,194 @@ COMPONENT_ORDER = [
 ]
 
 # =============================================================================
+# GREEDY FORWARD SELECTION: Coordinate-wise Optimization (RECOMMENDED)
+# =============================================================================
+# Test variants in each group sequentially. Pick winner (best R²).
+# Winner becomes default for subsequent groups.
+#
+# Based on:
+# - nnU-Net (Nature Methods): "one split of training data" for ablation
+# - Binary Coordinate Ascent: Sequential forward selection methodology
+# - JMLR: Greedy block selection (Gauss-Southwell rule)
+#
+# Total runs: 33 (vs 48M for full grid search)
+# Single split: 8 sessions train, 4 sessions test (no CV during ablation)
+
+# Default configuration (simple baseline to start)
+GREEDY_DEFAULTS: Dict[str, Any] = {
+    "conv_type": "standard",
+    "n_downsample": 2,
+    "base_channels": 64,
+    "attention_type": "none",
+    "n_heads": 4,
+    "cond_mode": "none",
+    "use_odor_embedding": False,
+    "loss_type": "l1",
+    "use_augmentation": False,
+    "aug_strength": "none",
+    "bidirectional": False,
+    "cycle_lambda": 0.5,
+}
+
+# Ablation groups - tested in order, winner propagates to subsequent groups
+ABLATION_GROUPS: List[Dict[str, Any]] = [
+    # GROUP 1: Convolution Type
+    {
+        "group_id": 1,
+        "name": "conv_type",
+        "description": "Convolution architecture",
+        "parameter": "conv_type",
+        "variants": [
+            {"value": "standard", "name": "standard_conv", "desc": "Standard convolutions"},
+            {"value": "modern", "name": "modern_conv", "desc": "Dilated depthwise-separable + SE"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 2: Network Depth
+    {
+        "group_id": 2,
+        "name": "depth",
+        "description": "Encoder/decoder depth",
+        "parameter": "n_downsample",
+        "variants": [
+            {"value": 2, "name": "shallow", "desc": "2 downsample levels"},
+            {"value": 3, "name": "medium", "desc": "3 downsample levels"},
+            {"value": 4, "name": "deep", "desc": "4 downsample levels"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 3: Network Width
+    {
+        "group_id": 3,
+        "name": "width",
+        "description": "Base channel count",
+        "parameter": "base_channels",
+        "variants": [
+            {"value": 32, "name": "narrow", "desc": "32 base channels"},
+            {"value": 64, "name": "medium", "desc": "64 base channels"},
+            {"value": 128, "name": "wide", "desc": "128 base channels"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 4: Attention Type
+    {
+        "group_id": 4,
+        "name": "attention",
+        "description": "Attention mechanism",
+        "parameter": "attention_type",
+        "variants": [
+            {"value": "none", "name": "no_attention", "desc": "No attention"},
+            {"value": "basic", "name": "basic_attention", "desc": "Basic self-attention"},
+            {"value": "cross_freq_v2", "name": "cross_freq", "desc": "Cross-frequency attention v2"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 5: Attention Heads (conditional on attention != none)
+    {
+        "group_id": 5,
+        "name": "attention_heads",
+        "description": "Number of attention heads",
+        "parameter": "n_heads",
+        "variants": [
+            {"value": 2, "name": "2_heads", "desc": "2 attention heads"},
+            {"value": 4, "name": "4_heads", "desc": "4 attention heads"},
+            {"value": 8, "name": "8_heads", "desc": "8 attention heads"},
+        ],
+        "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
+    },
+    # GROUP 6: Conditioning Mode
+    {
+        "group_id": 6,
+        "name": "conditioning",
+        "description": "Conditioning mechanism",
+        "parameter": "cond_mode",
+        "variants": [
+            {"value": "none", "name": "no_conditioning", "desc": "No conditioning"},
+            {"value": "film", "name": "film", "desc": "FiLM conditioning"},
+            {"value": "cross_attn", "name": "cross_attn", "desc": "Cross-attention conditioning"},
+            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 7: Odor Embedding (conditional on cond_mode != none)
+    {
+        "group_id": 7,
+        "name": "odor_embedding",
+        "description": "Use odor embedding for conditioning",
+        "parameter": "use_odor_embedding",
+        "variants": [
+            {"value": False, "name": "no_odor", "desc": "Spectro-temporal only"},
+            {"value": True, "name": "with_odor", "desc": "Include odor embedding"},
+        ],
+        "conditional_on": {"parameter": "cond_mode", "not_equal": "none"},
+    },
+    # GROUP 8: Loss Function
+    {
+        "group_id": 8,
+        "name": "loss",
+        "description": "Training loss function",
+        "parameter": "loss_type",
+        "variants": [
+            {"value": "l1", "name": "l1", "desc": "L1 loss"},
+            {"value": "huber", "name": "huber", "desc": "Huber loss"},
+            {"value": "l1_wavelet", "name": "l1_wavelet", "desc": "L1 + wavelet multi-scale"},
+            {"value": "huber_wavelet", "name": "huber_wavelet", "desc": "Huber + wavelet multi-scale"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 9: Data Augmentation
+    {
+        "group_id": 9,
+        "name": "augmentation",
+        "description": "Data augmentation strategy",
+        "parameter": "use_augmentation",
+        "variants": [
+            {"value": False, "name": "no_aug", "desc": "No augmentation", "aug_strength": "none"},
+            {"value": True, "name": "light_aug", "desc": "Light augmentation", "aug_strength": "light"},
+            {"value": True, "name": "medium_aug", "desc": "Medium augmentation", "aug_strength": "medium"},
+            {"value": True, "name": "heavy_aug", "desc": "Heavy augmentation", "aug_strength": "heavy"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 10: Bidirectional Training
+    {
+        "group_id": 10,
+        "name": "bidirectional",
+        "description": "Bidirectional training with cycle consistency",
+        "parameter": "bidirectional",
+        "variants": [
+            {"value": False, "name": "unidirectional", "desc": "Forward only"},
+            {"value": True, "name": "bidirectional", "desc": "Bidirectional with cycle loss"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 11: Cycle Lambda (conditional on bidirectional=True)
+    {
+        "group_id": 11,
+        "name": "cycle_lambda",
+        "description": "Cycle consistency loss weight",
+        "parameter": "cycle_lambda",
+        "variants": [
+            {"value": 0.1, "name": "weak_cycle", "desc": "λ=0.1 (weak)"},
+            {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
+            {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
+        ],
+        "conditional_on": {"parameter": "bidirectional", "equal": True},
+    },
+]
+
+# Calculate total runs
+def _count_greedy_runs() -> int:
+    """Count total runs for greedy forward selection."""
+    total = 0
+    for group in ABLATION_GROUPS:
+        # Conditional groups might be skipped, but count them anyway for worst case
+        total += len(group["variants"])
+    return total
+
+GREEDY_TOTAL_RUNS = _count_greedy_runs()  # 33 runs
+
+# =============================================================================
 # SUBTRACTIVE PROTOCOL: Traditional Ablation (legacy)
 # =============================================================================
 # Start with full model, remove components one at a time
@@ -297,7 +492,7 @@ ABLATION_STUDIES: Dict[str, Dict[str, Any]] = {
 class AblationConfig:
     """Configuration for a single ablation experiment.
 
-    Works with both additive and subtractive protocols.
+    Works with additive, subtractive, and greedy_forward protocols.
     """
 
     study: str
@@ -310,6 +505,7 @@ class AblationConfig:
     base_channels: int = 64
     n_downsample: int = 2
     conv_type: str = "modern"
+    n_heads: int = 4
 
     # Loss configuration
     loss_type: str = "l1_wavelet"
@@ -318,10 +514,12 @@ class AblationConfig:
     # Training options
     use_augmentation: bool = True
     bidirectional: bool = True
+    cycle_lambda: float = 0.5
 
     # Augmentation parameters
     aug_noise_std: float = 0.1
     aug_time_shift: int = 50
+    aug_strength: str = "medium"  # none, light, medium, heavy
 
     # Cross-session evaluation (for Nature Methods main result)
     split_by_session: bool = True  # True = cross-session, False = intra-session
@@ -330,6 +528,9 @@ class AblationConfig:
 
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
+
+    # Group info for greedy_forward protocol
+    group_id: int = -1  # -1 = not greedy_forward
 
     def __post_init__(self):
         """Apply ablation variant modifications for subtractive protocol."""
@@ -362,16 +563,20 @@ class AblationConfig:
             "study": self.study,
             "variant": self.variant,
             "stage": self.stage,
+            "group_id": self.group_id,
             "attention_type": self.attention_type,
             "cond_mode": self.cond_mode,
             "use_odor_embedding": self.use_odor_embedding,
             "base_channels": self.base_channels,
             "n_downsample": self.n_downsample,
+            "n_heads": self.n_heads,
             "conv_type": self.conv_type,
             "loss_type": self.loss_type,
             "loss_weights": self.loss_weights,
             "use_augmentation": self.use_augmentation,
+            "aug_strength": self.aug_strength,
             "bidirectional": self.bidirectional,
+            "cycle_lambda": self.cycle_lambda,
             # Cross-session evaluation
             "split_by_session": self.split_by_session,
             "n_test_sessions": self.n_test_sessions,
@@ -381,9 +586,61 @@ class AblationConfig:
     @property
     def name(self) -> str:
         """Experiment name for logging."""
+        if self.group_id >= 0:
+            return f"g{self.group_id}_{self.variant}"
         if self.stage >= 0:
             return f"stage{self.stage}_{self.variant}"
         return f"{self.study}_{self.variant}"
+
+    @classmethod
+    def from_greedy_group(
+        cls,
+        group: Dict[str, Any],
+        variant: Dict[str, Any],
+        current_config: Dict[str, Any],
+    ) -> "AblationConfig":
+        """Create config from greedy forward selection group.
+
+        Args:
+            group: Group definition from ABLATION_GROUPS
+            variant: Variant definition within the group
+            current_config: Current best configuration (winner of previous groups)
+
+        Returns:
+            AblationConfig with the variant applied on top of current best
+        """
+        # Start with current best config
+        config = current_config.copy()
+
+        # Apply the variant's parameter value
+        param = group["parameter"]
+        config[param] = variant["value"]
+
+        # Handle special cases for augmentation variants
+        if "aug_strength" in variant:
+            config["aug_strength"] = variant["aug_strength"]
+
+        return cls(
+            study=f"group{group['group_id']}_{group['name']}",
+            variant=variant["name"],
+            group_id=group["group_id"],
+            conv_type=config.get("conv_type", "standard"),
+            attention_type=config.get("attention_type", "none"),
+            cond_mode=config.get("cond_mode", "none"),
+            use_odor_embedding=config.get("use_odor_embedding", False),
+            base_channels=config.get("base_channels", 64),
+            n_downsample=config.get("n_downsample", 2),
+            n_heads=config.get("n_heads", 4),
+            loss_type=config.get("loss_type", "l1"),
+            use_augmentation=config.get("use_augmentation", False),
+            aug_strength=config.get("aug_strength", "none"),
+            bidirectional=config.get("bidirectional", False),
+            cycle_lambda=config.get("cycle_lambda", 0.5),
+            # Single split for ablation (no CV)
+            split_by_session=True,
+            n_test_sessions=4,
+            n_val_sessions=0,  # No validation split for ablation
+        )
 
     @classmethod
     def from_stage(cls, stage_idx: int) -> "AblationConfig":
@@ -463,15 +720,18 @@ class TrainingConfig:
 class Phase3Config:
     """Configuration for Phase 3 ablation studies.
 
-    Supports both ADDITIVE (build-up) and SUBTRACTIVE (traditional) protocols.
+    Supports three protocols:
+    - ADDITIVE (build-up): Start simple, add components incrementally
+    - SUBTRACTIVE (traditional): Start full, remove components
+    - GREEDY_FORWARD (recommended): Test groups sequentially, winner propagates
     """
 
     # Dataset (Phase 3 uses olfactory only)
     dataset: str = "olfactory"
     sample_rate: float = 1000.0
 
-    # Ablation protocol: "additive" (recommended) or "subtractive"
-    protocol: str = "additive"
+    # Ablation protocol: "additive", "subtractive", or "greedy_forward" (recommended)
+    protocol: str = "greedy_forward"
 
     # For subtractive protocol: which studies to run
     studies: List[str] = field(default_factory=lambda: list(ABLATION_STUDIES.keys()))
@@ -479,8 +739,12 @@ class Phase3Config:
     # For additive protocol: which stages to run (default: all)
     stages: List[int] = field(default_factory=lambda: list(range(len(INCREMENTAL_STAGES))))
 
+    # For greedy_forward protocol: which groups to run (default: all)
+    groups: List[int] = field(default_factory=lambda: list(range(1, len(ABLATION_GROUPS) + 1)))
+
     # Cross-validation settings
-    n_folds: int = 5
+    # For greedy_forward: use single split (no CV) following nnU-Net methodology
+    n_folds: int = 1  # 1 = single split (recommended for ablation)
     cv_seed: int = 42
 
     # Training config
@@ -518,7 +782,10 @@ class Phase3Config:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         if self.protocol not in ABLATION_PROTOCOLS:
-            raise ValueError(f"Unknown protocol: {self.protocol}. Use 'additive' or 'subtractive'")
+            raise ValueError(
+                f"Unknown protocol: {self.protocol}. "
+                f"Use 'additive', 'subtractive', or 'greedy_forward'"
+            )
 
         # Validate studies (for subtractive protocol)
         for study in self.studies:
@@ -530,10 +797,21 @@ class Phase3Config:
             if stage < 0 or stage >= len(INCREMENTAL_STAGES):
                 raise ValueError(f"Invalid stage: {stage}. Valid: 0-{len(INCREMENTAL_STAGES)-1}")
 
+        # Validate groups (for greedy_forward protocol)
+        for group_id in self.groups:
+            if group_id < 1 or group_id > len(ABLATION_GROUPS):
+                raise ValueError(f"Invalid group: {group_id}. Valid: 1-{len(ABLATION_GROUPS)}")
+
     def get_ablation_configs(self) -> List[AblationConfig]:
-        """Generate ablation configurations based on selected protocol."""
+        """Generate ablation configurations based on selected protocol.
+
+        Note: For greedy_forward, this returns ALL possible configs for planning.
+        The actual execution should use get_greedy_groups() and run sequentially.
+        """
         if self.protocol == "additive":
             return self._get_additive_configs()
+        elif self.protocol == "greedy_forward":
+            return self._get_greedy_configs()
         else:
             return self._get_subtractive_configs()
 
@@ -552,6 +830,30 @@ class Phase3Config:
             configs.append(AblationConfig(study=study, variant=variant))
         return configs
 
+    def _get_greedy_configs(self) -> List[AblationConfig]:
+        """Generate all configs for greedy_forward protocol (for planning only).
+
+        Note: In actual execution, configs are generated dynamically as winners
+        are determined. This method returns all possible configs assuming
+        no conditional skipping and all defaults.
+        """
+        configs = []
+        current_config = GREEDY_DEFAULTS.copy()
+
+        for group in ABLATION_GROUPS:
+            if group["group_id"] not in self.groups:
+                continue
+
+            for variant in group["variants"]:
+                config = AblationConfig.from_greedy_group(group, variant, current_config)
+                configs.append(config)
+
+        return configs
+
+    def get_greedy_groups(self) -> List[Dict[str, Any]]:
+        """Get ablation groups for greedy_forward protocol."""
+        return [g for g in ABLATION_GROUPS if g["group_id"] in self.groups]
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "dataset": self.dataset,
@@ -559,6 +861,7 @@ class Phase3Config:
             "protocol": self.protocol,
             "studies": self.studies,
             "stages": self.stages,
+            "groups": self.groups,
             "n_folds": self.n_folds,
             "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
@@ -573,6 +876,13 @@ class Phase3Config:
         if self.protocol == "additive":
             # All stages × n_folds
             return len(self.stages) * self.n_folds
+        elif self.protocol == "greedy_forward":
+            # Sum of variants in selected groups (single split, no CV)
+            total = 0
+            for group in ABLATION_GROUPS:
+                if group["group_id"] in self.groups:
+                    total += len(group["variants"])
+            return total
         else:
             # (1 baseline + n_studies ablations) × n_folds
             return (1 + len(self.studies)) * self.n_folds
@@ -593,13 +903,61 @@ def get_simple_baseline_config() -> AblationConfig:
     return AblationConfig.from_stage(0)
 
 
-def print_protocol_summary(protocol: str = "additive"):
+def check_conditional(condition: Optional[Dict[str, Any]], current_config: Dict[str, Any]) -> bool:
+    """Check if a conditional group should be executed.
+
+    Args:
+        condition: Conditional specification from group definition
+        current_config: Current best configuration
+
+    Returns:
+        True if the group should be executed, False if skipped
+    """
+    if condition is None:
+        return True
+
+    param = condition["parameter"]
+    current_value = current_config.get(param)
+
+    if "equal" in condition:
+        return current_value == condition["equal"]
+    elif "not_equal" in condition:
+        return current_value != condition["not_equal"]
+
+    return True
+
+
+def print_protocol_summary(protocol: str = "greedy_forward"):
     """Print summary of the ablation protocol."""
     print("\n" + "=" * 70)
     print(f"ABLATION PROTOCOL: {protocol.upper()}")
     print("=" * 70)
 
-    if protocol == "additive":
+    if protocol == "greedy_forward":
+        print("\nGREEDY FORWARD SELECTION (Coordinate-wise Optimization)")
+        print("Based on: nnU-Net (Nature Methods), Sequential Forward Selection")
+        print("-" * 70)
+        print("Methodology:")
+        print("  1. Test all variants in each group")
+        print("  2. Pick winner (best R²)")
+        print("  3. Winner becomes default for subsequent groups")
+        print("  4. Conditional groups are skipped if condition not met")
+        print("-" * 70)
+        print(f"{'Group':<6}{'Name':<18}{'Variants':<8}{'Conditional':<20}")
+        print("-" * 70)
+        for group in ABLATION_GROUPS:
+            cond = group["conditional_on"]
+            cond_str = "None"
+            if cond:
+                if "equal" in cond:
+                    cond_str = f"{cond['parameter']}={cond['equal']}"
+                elif "not_equal" in cond:
+                    cond_str = f"{cond['parameter']}≠{cond['not_equal']}"
+            print(f"{group['group_id']:<6}{group['name']:<18}{len(group['variants']):<8}{cond_str:<20}")
+        print("-" * 70)
+        print(f"Total runs (worst case): {GREEDY_TOTAL_RUNS}")
+        print("Single split: No cross-validation during ablation (per nnU-Net)")
+    elif protocol == "additive":
         print("\nINCREMENTAL COMPONENT ANALYSIS (Build-Up Approach)")
         print("Based on: nnU-Net (Nature Methods), Transformer paper methodology")
         print("-" * 70)

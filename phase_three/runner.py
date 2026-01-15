@@ -29,6 +29,9 @@ from .config import (
     TrainingConfig,
     ABLATION_STUDIES,
     INCREMENTAL_STAGES,
+    ABLATION_GROUPS,
+    GREEDY_DEFAULTS,
+    check_conditional,
     get_baseline_config,
     get_simple_baseline_config,
     print_protocol_summary,
@@ -712,11 +715,12 @@ def run_phase3(
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
 ) -> Phase3Result:
-    """Run all Phase 3 ablation studies with 5-fold cross-validation.
+    """Run all Phase 3 ablation studies.
 
-    Supports two protocols:
+    Supports three protocols:
     - ADDITIVE (build-up): Start with simple baseline, add components incrementally
     - SUBTRACTIVE (traditional): Start with full model, remove components
+    - GREEDY_FORWARD (recommended): Test groups sequentially, winner propagates
 
     Args:
         config: Phase 3 configuration
@@ -727,28 +731,401 @@ def run_phase3(
     Returns:
         Phase3Result with all ablation results
     """
-    print("\n" + "=" * 60)
-    print("Phase 3: CondUNet Ablation Studies (5-Fold Cross-Validation)")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("Phase 3: CondUNet Ablation Studies")
+    print("=" * 70)
     print(f"Protocol: {config.protocol.upper()}")
     print(f"Dataset: {config.dataset}")
-    if config.protocol == "additive":
+    if config.protocol == "greedy_forward":
+        print(f"Groups: {config.groups} ({len(config.groups)} groups)")
+        print(f"Evaluation: Single split (no CV) - per nnU-Net methodology")
+    elif config.protocol == "additive":
         print(f"Stages: {config.stages} ({len(config.stages)} stages)")
+        print(f"Cross-validation: {config.n_folds} folds")
     else:
         print(f"Studies: {config.studies}")
-    print(f"Cross-validation: {config.n_folds} folds")
+        print(f"Cross-validation: {config.n_folds} folds")
     print(f"Total runs: {config.total_runs}")
     if use_train_py:
         print(f"Training mode: train.py subprocess (exact consistency)")
         if use_fsdp:
             print(f"  FSDP passed to train.py: strategy={fsdp_strategy}")
-    print("=" * 60)
+    print("=" * 70)
 
     # Route to appropriate protocol handler
-    if config.protocol == "additive":
+    if config.protocol == "greedy_forward":
+        return _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+    elif config.protocol == "additive":
         return _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
     else:
         return _run_subtractive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+
+
+def _run_greedy_forward_protocol(
+    config: Phase3Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+) -> Phase3Result:
+    """Run GREEDY FORWARD SELECTION ablation protocol.
+
+    Tests variants in each group sequentially. Winner (best R²) becomes
+    default for subsequent groups. Conditional groups are skipped if
+    the condition is not met.
+
+    Single split (no CV) following nnU-Net methodology:
+    - 8 sessions for training, 4 sessions for test
+    - Statistical robustness comes from multiple groups, not CV
+
+    Literature support:
+    - nnU-Net (Nature Methods): "one split of training data" for ablation
+    - Binary Coordinate Ascent: Sequential forward selection
+    - JMLR: Greedy block selection (Gauss-Southwell rule)
+    """
+    # Setup checkpoint for resume capability
+    checkpoint_path = get_checkpoint_path(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_results, _, completed_groups, _ = reconstruct_from_checkpoint(checkpoint)
+        # Load current config from checkpoint if available
+        current_config = checkpoint.get("current_config", GREEDY_DEFAULTS.copy())
+        group_winners = checkpoint.get("group_winners", {})
+    else:
+        all_results = []
+        completed_groups = set()
+        current_config = GREEDY_DEFAULTS.copy()
+        group_winners = {}  # group_id -> {"variant": name, "r2": value, "config": {...}}
+
+    # Load raw data
+    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
+
+    # Create single split (no CV for ablation per nnU-Net)
+    # Use first "fold" as the single train/test split
+    cv_splits = create_cv_splits(len(X), n_folds=1, seed=config.cv_seed)
+    train_idx, val_idx = cv_splits[0]
+    print(f"Single split: {len(train_idx)} train, {len(val_idx)} test samples")
+
+    # Get groups to run
+    groups = config.get_greedy_groups()
+    run_count = 0
+    skipped_groups = 0
+
+    for group in groups:
+        group_id = group["group_id"]
+        group_name = group["name"]
+
+        # Check if already completed
+        if str(group_id) in completed_groups or group_id in completed_groups:
+            skipped_groups += 1
+            # Restore winner to current config
+            if str(group_id) in group_winners:
+                winner = group_winners[str(group_id)]
+                current_config[group["parameter"]] = winner["config"][group["parameter"]]
+                if "aug_strength" in winner["config"]:
+                    current_config["aug_strength"] = winner["config"]["aug_strength"]
+            print(f"\n[Group {group_id}] {group_name} - SKIPPED (already completed)")
+            continue
+
+        # Check conditional
+        if not check_conditional(group["conditional_on"], current_config):
+            print(f"\n[Group {group_id}] {group_name} - SKIPPED (condition not met)")
+            completed_groups.add(str(group_id))
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"GROUP {group_id}: {group['description']}")
+        print(f"Parameter: {group['parameter']}")
+        print(f"Variants: {len(group['variants'])}")
+        print(f"{'=' * 60}")
+
+        group_results = []
+
+        for variant in group["variants"]:
+            run_count += 1
+            variant_name = variant["name"]
+
+            # Create config for this variant
+            ablation_config = AblationConfig.from_greedy_group(group, variant, current_config)
+
+            if use_train_py:
+                # Use train.py subprocess for FSDP support
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, f"g{group_id}", variant_name, 0, train_idx, val_idx
+                )
+                output_results_file = config.output_dir / "train_results" / f"g{group_id}_{variant_name}_results.json"
+                output_results_file.parent.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n  [{group_name}] {variant_name}: {variant['desc']}")
+                print(f"    Running train.py subprocess...")
+
+                train_results = run_train_subprocess(
+                    study=f"g{group_id}",
+                    variant=variant_name,
+                    fold_idx=0,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    ablation_config=ablation_config,
+                    epochs=config.training.epochs,
+                    batch_size=config.training.batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=True,
+                )
+
+                if train_results is not None:
+                    result = AblationResult(
+                        study=f"group{group_id}_{group_name}",
+                        variant=variant_name,
+                        fold=0,
+                        best_r2=train_results.get("best_val_r2", 0.0),
+                        best_loss=train_results.get("best_val_loss", 0.0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        total_time=train_results.get("total_time", 0.0),
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    R²: {result.best_r2:.4f}")
+                else:
+                    result = AblationResult(
+                        study=f"group{group_id}_{group_name}",
+                        variant=variant_name,
+                        fold=0,
+                        best_r2=0.0,
+                        best_loss=float('inf'),
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        n_parameters=0,
+                        epochs_trained=0,
+                        total_time=0.0,
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    FAILED")
+            else:
+                # Use internal trainer
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, train_idx, val_idx,
+                    batch_size=config.training.batch_size,
+                    n_workers=config.n_workers,
+                )
+
+                result = run_single_ablation(
+                    ablation_config=ablation_config,
+                    training_config=config.training,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    fold=0,
+                    cv_seed=config.cv_seed,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / f"g{group_id}" / variant_name,
+                    verbose=config.verbose,
+                )
+                print(f"    R²: {result.best_r2:.4f}")
+
+            all_results.append(result)
+            group_results.append((variant, result))
+
+        # Determine winner for this group
+        winner_variant, winner_result = max(group_results, key=lambda x: x[1].best_r2)
+        winner_value = winner_variant["value"]
+
+        print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) ***")
+
+        # Update current config with winner's value
+        current_config[group["parameter"]] = winner_value
+        if "aug_strength" in winner_variant:
+            current_config["aug_strength"] = winner_variant["aug_strength"]
+
+        # Store winner info
+        group_winners[str(group_id)] = {
+            "variant": winner_variant["name"],
+            "value": winner_value,
+            "r2": winner_result.best_r2,
+            "config": winner_result.config,
+        }
+
+        # Mark group as completed and save checkpoint
+        completed_groups.add(str(group_id))
+        # Save extended checkpoint with current_config and winners
+        _save_greedy_checkpoint(
+            checkpoint_path, all_results, completed_groups,
+            current_config, group_winners
+        )
+        print(f"Checkpoint saved ({len(completed_groups)}/{len(groups)} groups completed)")
+
+    if skipped_groups > 0:
+        print(f"\n*** Resumed run: skipped {skipped_groups} already-completed groups ***")
+
+    # Print final configuration
+    print("\n" + "=" * 60)
+    print("FINAL OPTIMAL CONFIGURATION (from greedy selection)")
+    print("=" * 60)
+    for group in groups:
+        param = group["parameter"]
+        value = current_config.get(param)
+        winner_info = group_winners.get(str(group["group_id"]), {})
+        r2 = winner_info.get("r2", "N/A")
+        r2_str = f"{r2:.4f}" if isinstance(r2, float) else r2
+        print(f"  {param:<20}: {value} (R² = {r2_str})")
+    print("=" * 60)
+
+    # Aggregate results
+    aggregated = aggregate_results(all_results)
+
+    # Compute comprehensive statistics
+    comprehensive_stats = _compute_greedy_stats(all_results, groups, group_winners)
+
+    # Create final result
+    phase3_result = Phase3Result(
+        results=all_results,
+        aggregated=aggregated,
+        baseline_r2=0.0,  # No explicit baseline in greedy forward
+        optimal_config=current_config,
+        config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
+    )
+
+    # Print summary
+    _print_greedy_summary(phase3_result, groups, group_winners)
+
+    # Save results
+    output_path = config.output_dir / "phase3_results.json"
+    phase3_result.save(output_path)
+
+    return phase3_result
+
+
+def _save_greedy_checkpoint(
+    checkpoint_path: Path,
+    all_results: List,
+    completed_groups: set,
+    current_config: Dict[str, Any],
+    group_winners: Dict[str, Any],
+) -> None:
+    """Save checkpoint for greedy forward selection with additional state."""
+    checkpoint = {
+        "all_results": [r.to_dict() if hasattr(r, 'to_dict') else vars(r) for r in all_results],
+        "baseline_results": [],
+        "completed_studies": list(completed_groups),  # Reuse field name for compatibility
+        "baseline_completed": True,
+        "current_config": current_config,
+        "group_winners": group_winners,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    temp_path = checkpoint_path.with_suffix('.tmp')
+    with open(temp_path, 'wb') as f:
+        pickle.dump(checkpoint, f)
+    temp_path.rename(checkpoint_path)
+
+
+def _compute_greedy_stats(
+    all_results: List[AblationResult],
+    groups: List[Dict[str, Any]],
+    group_winners: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compute statistics for greedy forward selection results."""
+    stats = {
+        "group_summaries": {},
+        "cumulative_improvement": [],
+        "total_runs": len(all_results),
+    }
+
+    # Group results by group_id
+    for group in groups:
+        group_id = str(group["group_id"])
+        group_name = group["name"]
+
+        # Find results for this group
+        group_results = [r for r in all_results if f"group{group_id}" in r.study]
+
+        if group_results:
+            r2_values = [r.best_r2 for r in group_results]
+            stats["group_summaries"][group_name] = {
+                "n_variants": len(group_results),
+                "r2_min": min(r2_values),
+                "r2_max": max(r2_values),
+                "r2_range": max(r2_values) - min(r2_values),
+                "winner": group_winners.get(group_id, {}).get("variant", "N/A"),
+                "winner_r2": group_winners.get(group_id, {}).get("r2", 0.0),
+            }
+
+    # Track cumulative improvement
+    prev_r2 = None
+    for group in groups:
+        group_id = str(group["group_id"])
+        winner_info = group_winners.get(group_id, {})
+        if winner_info:
+            r2 = winner_info.get("r2", 0.0)
+            improvement = r2 - prev_r2 if prev_r2 is not None else 0.0
+            stats["cumulative_improvement"].append({
+                "group": group["name"],
+                "winner_r2": r2,
+                "improvement_from_prev": improvement,
+            })
+            prev_r2 = r2
+
+    return stats
+
+
+def _print_greedy_summary(
+    result: Phase3Result,
+    groups: List[Dict[str, Any]],
+    group_winners: Dict[str, Any],
+):
+    """Print summary for greedy forward selection protocol."""
+    print("\n" + "=" * 70)
+    print("GREEDY FORWARD SELECTION RESULTS")
+    print("=" * 70)
+
+    print("\nSequential Group Results:")
+    print("-" * 70)
+    print(f"{'Group':<6}{'Name':<18}{'Winner':<20}{'R²':<10}{'Δ from prev':<12}")
+    print("-" * 70)
+
+    prev_r2 = None
+    for group in groups:
+        group_id = str(group["group_id"])
+        winner_info = group_winners.get(group_id, {})
+
+        if winner_info:
+            r2 = winner_info.get("r2", 0.0)
+            variant = winner_info.get("variant", "N/A")
+
+            if prev_r2 is not None:
+                delta = r2 - prev_r2
+                delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
+            else:
+                delta_str = "baseline"
+
+            print(f"{group['group_id']:<6}{group['name']:<18}{variant:<20}{r2:.4f}    {delta_str:<12}")
+            prev_r2 = r2
+        else:
+            print(f"{group['group_id']:<6}{group['name']:<18}{'SKIPPED':<20}{'-':<10}{'-':<12}")
+
+    print("-" * 70)
+
+    # Final improvement summary
+    if group_winners:
+        first_r2 = list(group_winners.values())[0].get("r2", 0.0)
+        last_r2 = list(group_winners.values())[-1].get("r2", 0.0)
+        total_gain = last_r2 - first_r2
+        print(f"\nTOTAL IMPROVEMENT: {first_r2:.4f} → {last_r2:.4f} (Δ = +{total_gain:.4f})")
+
+    print("\nOptimal Configuration:")
+    for key, value in result.optimal_config.items():
+        print(f"  {key}: {value}")
+
+    print("=" * 70 + "\n")
 
 
 def _run_additive_protocol(
@@ -1488,9 +1865,9 @@ def main():
     parser.add_argument(
         "--protocol",
         type=str,
-        default="additive",
-        choices=["additive", "subtractive"],
-        help="Ablation protocol: 'additive' (build-up, recommended) or 'subtractive' (traditional)",
+        default="greedy_forward",
+        choices=["additive", "subtractive", "greedy_forward"],
+        help="Ablation protocol: 'greedy_forward' (recommended), 'additive', or 'subtractive'",
     )
 
     # Studies to run (for subtractive protocol)
@@ -1509,6 +1886,15 @@ def main():
         nargs="+",
         default=None,
         help="Stages to run for additive protocol (0-6, default: all)",
+    )
+
+    # Groups to run (for greedy_forward protocol)
+    parser.add_argument(
+        "--groups",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Groups to run for greedy_forward protocol (1-11, default: all)",
     )
 
     # Training
@@ -1638,22 +2024,35 @@ def main():
     )
 
     # Handle protocol-specific options
-    if args.protocol == "additive":
+    if args.protocol == "greedy_forward":
+        if args.fast:
+            groups = [1, 2]  # Just conv_type and depth for quick test
+        else:
+            groups = args.groups if args.groups else list(range(1, len(ABLATION_GROUPS) + 1))
+        stages = list(range(len(INCREMENTAL_STAGES)))  # Not used
+        studies = list(ABLATION_STUDIES.keys())  # Not used
+        n_folds = 1  # Single split for greedy_forward (per nnU-Net)
+    elif args.protocol == "additive":
         if args.fast:
             stages = [0, 1]  # Just baseline and first addition for quick test
         else:
             stages = args.stages if args.stages else list(range(len(INCREMENTAL_STAGES)))
         studies = list(ABLATION_STUDIES.keys())  # Not used in additive, but required
+        groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
+        n_folds = 2 if args.dry_run else args.n_folds
     else:
         stages = list(range(len(INCREMENTAL_STAGES)))  # Not used in subtractive
         studies = ["attention"] if args.fast else (args.studies or list(ABLATION_STUDIES.keys()))
+        groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
+        n_folds = 2 if args.dry_run else args.n_folds
 
     config = Phase3Config(
         dataset=args.dataset,
         protocol=args.protocol,
         studies=studies,
         stages=stages,
-        n_folds=2 if args.dry_run else args.n_folds,
+        groups=groups,
+        n_folds=n_folds,
         cv_seed=args.cv_seed,
         training=training_config,
         output_dir=Path(args.output_dir),
