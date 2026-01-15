@@ -254,17 +254,25 @@ def run_train_subprocess(
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
-    # Run subprocess
+    # Run subprocess with live output capture (goes through TeeLogger)
     start_time = time.time()
     try:
         if verbose:
-            # Stream output in real-time
-            result = subprocess.run(
+            # Stream output in real-time through sys.stdout (TeeLogger)
+            process = subprocess.Popen(
                 cmd,
                 cwd=str(PROJECT_ROOT),
-                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,  # Line buffered
             )
+            # Read and print each line as it comes (captured by TeeLogger)
+            for line in process.stdout:
+                print(line, end='', flush=True)
+            process.wait()
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, cmd)
         else:
             # Capture output silently
             result = subprocess.run(
