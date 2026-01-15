@@ -156,6 +156,7 @@ def run_train_subprocess(
     # For cross-session evaluation: use session-based splits instead of fold indices
     if use_session_split:
         cmd.append("--split-by-session")
+        cmd.append("--with-test-set")  # Override default no_test_set=True
         n_test = config.get("n_test_sessions", 4)
         n_val = config.get("n_val_sessions", 1)
         cmd.extend(["--n-test-sessions", str(n_test)])
