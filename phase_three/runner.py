@@ -157,6 +157,7 @@ def run_train_subprocess(
     if use_session_split:
         cmd.append("--split-by-session")
         cmd.append("--with-test-set")  # Override default no_test_set=True
+        cmd.append("--force-recreate-splits")  # Force new splits (avoid cached empty test_idx)
         n_test = config.get("n_test_sessions", 4)
         n_val = config.get("n_val_sessions", 1)
         cmd.extend(["--n-test-sessions", str(n_test)])
