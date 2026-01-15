@@ -48,6 +48,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": False,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -64,6 +68,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": False,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -80,6 +88,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": False,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -96,6 +108,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": False,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -112,6 +128,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": False,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -128,6 +148,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": True,
             "bidirectional": False,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
     {
@@ -144,6 +168,10 @@ INCREMENTAL_STAGES: List[Dict[str, Any]] = [
             "use_augmentation": True,
             "bidirectional": True,
             "base_channels": 64,
+            # Cross-session evaluation (main result)
+            "split_by_session": True,
+            "n_test_sessions": 4,
+            "n_val_sessions": 1,
         },
     },
 ]
@@ -295,6 +323,11 @@ class AblationConfig:
     aug_noise_std: float = 0.1
     aug_time_shift: int = 50
 
+    # Cross-session evaluation (for Nature Methods main result)
+    split_by_session: bool = True  # True = cross-session, False = intra-session
+    n_test_sessions: int = 4  # Sessions held out for testing
+    n_val_sessions: int = 1  # Sessions held out for validation
+
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
 
@@ -339,6 +372,10 @@ class AblationConfig:
             "loss_weights": self.loss_weights,
             "use_augmentation": self.use_augmentation,
             "bidirectional": self.bidirectional,
+            # Cross-session evaluation
+            "split_by_session": self.split_by_session,
+            "n_test_sessions": self.n_test_sessions,
+            "n_val_sessions": self.n_val_sessions,
         }
 
     @property
@@ -369,6 +406,10 @@ class AblationConfig:
             use_augmentation=cfg["use_augmentation"],
             bidirectional=cfg["bidirectional"],
             base_channels=cfg["base_channels"],
+            # Cross-session evaluation parameters
+            split_by_session=cfg.get("split_by_session", True),
+            n_test_sessions=cfg.get("n_test_sessions", 4),
+            n_val_sessions=cfg.get("n_val_sessions", 1),
         )
 
 

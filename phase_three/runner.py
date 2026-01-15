@@ -135,20 +135,31 @@ def run_train_subprocess(
     else:
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
+    # Get ablation config dict early to check for session-based splitting
+    config = ablation_config.to_dict()
+    use_session_split = config.get("split_by_session", False)
+
     # Add base arguments (always condunet for ablation studies)
     cmd.extend([
         "--arch", "condunet",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--seed", str(seed + fold_idx),  # Different seed per fold
-        "--fold-indices-file", str(fold_indices_file),
         "--output-results-file", str(output_results_file),
         "--fold", str(fold_idx),
         "--no-plots",  # Skip plot generation for speed
     ])
 
-    # Add ablation-specific parameters
-    config = ablation_config.to_dict()
+    # For cross-session evaluation: use session-based splits instead of fold indices
+    if use_session_split:
+        cmd.append("--split-by-session")
+        n_test = config.get("n_test_sessions", 4)
+        n_val = config.get("n_val_sessions", 1)
+        cmd.extend(["--n-test-sessions", str(n_test)])
+        cmd.extend(["--n-val-sessions", str(n_val)])
+    else:
+        # Intra-session: use explicit fold indices
+        cmd.extend(["--fold-indices-file", str(fold_indices_file)])
 
     # Attention type
     if "attention_type" in config:
