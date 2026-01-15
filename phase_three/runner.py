@@ -2105,25 +2105,20 @@ def main():
     )
 
     # Handle protocol-specific options
+    # --fast runs ALL groups/stages but with 1 epoch (quick full validation)
     if args.protocol == "greedy_forward":
-        if args.fast:
-            groups = [1, 2]  # Just conv_type and depth for quick test
-        else:
-            groups = args.groups if args.groups else list(range(1, len(ABLATION_GROUPS) + 1))
+        groups = args.groups if args.groups else list(range(1, len(ABLATION_GROUPS) + 1))
         stages = list(range(len(INCREMENTAL_STAGES)))  # Not used
         studies = list(ABLATION_STUDIES.keys())  # Not used
         n_folds = 1  # Single split for greedy_forward (per nnU-Net)
     elif args.protocol == "additive":
-        if args.fast:
-            stages = [0, 1]  # Just baseline and first addition for quick test
-        else:
-            stages = args.stages if args.stages else list(range(len(INCREMENTAL_STAGES)))
+        stages = args.stages if args.stages else list(range(len(INCREMENTAL_STAGES)))
         studies = list(ABLATION_STUDIES.keys())  # Not used in additive, but required
         groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
         n_folds = 2 if args.dry_run else args.n_folds
     else:
         stages = list(range(len(INCREMENTAL_STAGES)))  # Not used in subtractive
-        studies = ["attention"] if args.fast else (args.studies or list(ABLATION_STUDIES.keys()))
+        studies = args.studies or list(ABLATION_STUDIES.keys())
         groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
         n_folds = 2 if args.dry_run else args.n_folds
 
