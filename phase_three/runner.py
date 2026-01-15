@@ -1971,7 +1971,7 @@ def main():
     )
 
     # Training
-    parser.add_argument("--epochs", type=int, default=60, help="Training epochs")
+    parser.add_argument("--epochs", type=int, default=80, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
