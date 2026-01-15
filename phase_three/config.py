@@ -636,10 +636,11 @@ class AblationConfig:
             aug_strength=config.get("aug_strength", "none"),
             bidirectional=config.get("bidirectional", False),
             cycle_lambda=config.get("cycle_lambda", 0.5),
-            # Single split: 4 test, 1 val, 7 train (from 12 sessions)
+            # Multi-session validation: 8 train, 4 val, NO test
+            # Winner = best mean R² across all 4 validation sessions
             split_by_session=True,
-            n_test_sessions=4,
-            n_val_sessions=1,  # Need at least 1 for training loop
+            n_test_sessions=0,  # No separate test set
+            n_val_sessions=4,   # All held-out sessions for validation
         )
 
     @classmethod

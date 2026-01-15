@@ -210,11 +210,14 @@ def run_train_subprocess(
     # For cross-session evaluation: use session-based splits instead of fold indices
     if use_session_split:
         cmd.append("--split-by-session")
-        cmd.append("--with-test-set")  # Override default no_test_set=True
-        cmd.append("--force-recreate-splits")  # Force new splits (avoid cached empty test_idx)
-        n_test = config.get("n_test_sessions", 4)
-        n_val = config.get("n_val_sessions", 1)
-        cmd.extend(["--n-test-sessions", str(n_test)])
+        cmd.append("--force-recreate-splits")  # Force new splits (avoid cached splits)
+        n_test = config.get("n_test_sessions", 0)  # Default: no separate test set
+        n_val = config.get("n_val_sessions", 4)    # Default: 4 val sessions
+        # Only add --with-test-set if we actually want a test set
+        if n_test > 0:
+            cmd.append("--with-test-set")
+            cmd.extend(["--n-test-sessions", str(n_test)])
+        # Always pass n_val_sessions
         cmd.extend(["--n-val-sessions", str(n_val)])
     else:
         # Intra-session: use explicit fold indices
