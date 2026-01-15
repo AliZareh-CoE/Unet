@@ -50,6 +50,60 @@ from utils import (
 
 import pickle
 import subprocess
+import logging
+
+
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
+class TeeLogger:
+    """Duplicate stdout to both console and log file."""
+
+    def __init__(self, log_file: Path):
+        self.terminal = sys.stdout
+        self.log_file = log_file
+        self.log = open(log_file, 'w', buffering=1)  # Line buffered
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
+
+def setup_logging(output_dir: Path) -> Tuple[Path, TeeLogger]:
+    """Setup logging to capture all output to a log file.
+
+    Args:
+        output_dir: Directory to save log file
+
+    Returns:
+        Tuple of (log_path, tee_logger)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = output_dir / f"phase3_run_{timestamp}.log"
+
+    tee = TeeLogger(log_path)
+    sys.stdout = tee
+
+    print(f"Logging to: {log_path}")
+    print(f"Started at: {datetime.now().isoformat()}")
+    print(f"Python: {sys.version}")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"CUDA Available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print()
+
+    return log_path, tee
 
 
 # =============================================================================
@@ -716,6 +770,7 @@ def run_phase3(
     use_train_py: bool = False,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
+    enable_logging: bool = True,
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies.
 
@@ -729,10 +784,16 @@ def run_phase3(
         use_train_py: Use train.py subprocess for exact training consistency
         use_fsdp: Enable FSDP distributed training (requires use_train_py)
         fsdp_strategy: FSDP sharding strategy
+        enable_logging: Save full output to log file (default: True)
 
     Returns:
         Phase3Result with all ablation results
     """
+    # Setup logging to capture all output
+    tee_logger = None
+    if enable_logging:
+        log_path, tee_logger = setup_logging(config.output_dir)
+
     print("\n" + "=" * 70)
     print("Phase 3: CondUNet Ablation Studies")
     print("=" * 70)
@@ -755,12 +816,22 @@ def run_phase3(
     print("=" * 70)
 
     # Route to appropriate protocol handler
-    if config.protocol == "greedy_forward":
-        return _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
-    elif config.protocol == "additive":
-        return _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
-    else:
-        return _run_subtractive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+    try:
+        if config.protocol == "greedy_forward":
+            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+        elif config.protocol == "additive":
+            result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+        else:
+            result = _run_subtractive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+
+        print(f"\nCompleted at: {datetime.now().isoformat()}")
+        return result
+    finally:
+        # Close the log file and restore stdout
+        if tee_logger is not None:
+            print(f"\nFull log saved to: {log_path}")
+            sys.stdout = tee_logger.terminal
+            tee_logger.close()
 
 
 def _run_greedy_forward_protocol(
