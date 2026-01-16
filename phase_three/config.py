@@ -221,6 +221,15 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "aug_strength": "none",
     "bidirectional": False,
     "cycle_lambda": 0.5,
+    # New architectural choices
+    "norm_type": "batch",           # Normalization type
+    "skip_type": "add",             # Skip connection type
+    "activation": "relu",           # Activation function
+    "dropout": 0.0,                 # Dropout rate
+    # New training choices
+    "optimizer": "adamw",           # Optimizer
+    "lr_schedule": "cosine",        # Learning rate schedule
+    "weight_decay": 1e-4,           # Weight decay
 }
 
 # Ablation groups - tested in order, winner propagates to subsequent groups
@@ -367,6 +376,122 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
         ],
         "conditional_on": {"parameter": "bidirectional", "equal": True},
+    },
+    # =========================================================================
+    # NEW GROUPS: Critical Architectural & Training Choices for Nature Methods
+    # =========================================================================
+    # GROUP 12: Normalization Type (THE most critical component!)
+    # Literature: BatchNorm (2015), LayerNorm (2016), GroupNorm (2018), RMSNorm (2019)
+    {
+        "group_id": 12,
+        "name": "normalization",
+        "description": "Normalization layer type - critical for training stability",
+        "parameter": "norm_type",
+        "variants": [
+            {"value": "batch", "name": "batch_norm", "desc": "Batch Normalization - standard, batch-dependent"},
+            {"value": "layer", "name": "layer_norm", "desc": "Layer Normalization - batch-independent, good for attention"},
+            {"value": "instance", "name": "instance_norm", "desc": "Instance Normalization - per-sample, style transfer origin"},
+            {"value": "group", "name": "group_norm", "desc": "Group Normalization - compromise, groups of channels"},
+            {"value": "rms", "name": "rms_norm", "desc": "RMS Normalization - simpler, used in LLaMA/modern transformers"},
+            {"value": "none", "name": "no_norm", "desc": "No normalization - baseline"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 13: Skip Connection Type (core U-Net design)
+    # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
+    {
+        "group_id": 13,
+        "name": "skip_connection",
+        "description": "Skip connection type in U-Net architecture",
+        "parameter": "skip_type",
+        "variants": [
+            {"value": "add", "name": "residual_add", "desc": "Additive residual (ResNet style)"},
+            {"value": "concat", "name": "concat", "desc": "Concatenation (original U-Net)"},
+            {"value": "attention", "name": "attention_gate", "desc": "Attention-gated skip (Attention U-Net)"},
+            {"value": "dense", "name": "dense", "desc": "Dense connections (all previous layers)"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 14: Activation Function
+    # Literature: ReLU (2010), GELU (2016), SiLU/Swish (2017), Mish (2019)
+    {
+        "group_id": 14,
+        "name": "activation",
+        "description": "Activation function - affects gradient flow and expressivity",
+        "parameter": "activation",
+        "variants": [
+            {"value": "relu", "name": "relu", "desc": "ReLU - simple, sparse activations"},
+            {"value": "leaky_relu", "name": "leaky_relu", "desc": "Leaky ReLU - no dead neurons"},
+            {"value": "gelu", "name": "gelu", "desc": "GELU - smooth, used in BERT/GPT/ViT"},
+            {"value": "silu", "name": "silu_swish", "desc": "SiLU/Swish - self-gated, used in EfficientNet"},
+            {"value": "mish", "name": "mish", "desc": "Mish - smooth, non-monotonic"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 15: Dropout Strategy
+    # Literature: Dropout (2014), Spatial Dropout (2015), DropBlock (2018)
+    {
+        "group_id": 15,
+        "name": "dropout",
+        "description": "Dropout regularization strategy",
+        "parameter": "dropout",
+        "variants": [
+            {"value": 0.0, "name": "no_dropout", "desc": "No dropout"},
+            {"value": 0.1, "name": "light_dropout", "desc": "Light dropout (p=0.1)"},
+            {"value": 0.2, "name": "medium_dropout", "desc": "Medium dropout (p=0.2)"},
+            {"value": 0.3, "name": "heavy_dropout", "desc": "Heavy dropout (p=0.3)"},
+            {"value": 0.5, "name": "aggressive_dropout", "desc": "Aggressive dropout (p=0.5)"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 16: Optimizer
+    # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
+    {
+        "group_id": 16,
+        "name": "optimizer",
+        "description": "Optimization algorithm",
+        "parameter": "optimizer",
+        "variants": [
+            {"value": "adamw", "name": "adamw", "desc": "AdamW - decoupled weight decay, standard"},
+            {"value": "adam", "name": "adam", "desc": "Adam - original adaptive moments"},
+            {"value": "sgd", "name": "sgd_momentum", "desc": "SGD + Momentum - classic, often better generalization"},
+            {"value": "lion", "name": "lion", "desc": "Lion - Google 2023, memory efficient"},
+            {"value": "adafactor", "name": "adafactor", "desc": "Adafactor - memory efficient, used in T5"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 17: Learning Rate Schedule
+    # Literature: Step decay, Cosine annealing (2016), Warmup (2017), OneCycle (2018)
+    {
+        "group_id": 17,
+        "name": "lr_schedule",
+        "description": "Learning rate scheduling strategy",
+        "parameter": "lr_schedule",
+        "variants": [
+            {"value": "cosine", "name": "cosine", "desc": "Cosine annealing - smooth decay"},
+            {"value": "cosine_warmup", "name": "cosine_warmup", "desc": "Cosine with linear warmup"},
+            {"value": "step", "name": "step_decay", "desc": "Step decay - reduce at milestones"},
+            {"value": "plateau", "name": "reduce_on_plateau", "desc": "Reduce on plateau - adaptive"},
+            {"value": "onecycle", "name": "one_cycle", "desc": "OneCycleLR - super-convergence"},
+            {"value": "constant", "name": "constant", "desc": "Constant LR - baseline"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 18: Weight Decay
+    # Literature: L2 regularization, decoupled weight decay (AdamW paper)
+    {
+        "group_id": 18,
+        "name": "weight_decay",
+        "description": "Weight decay (L2 regularization) strength",
+        "parameter": "weight_decay",
+        "variants": [
+            {"value": 0.0, "name": "no_wd", "desc": "No weight decay"},
+            {"value": 1e-5, "name": "very_light_wd", "desc": "Very light (1e-5)"},
+            {"value": 1e-4, "name": "light_wd", "desc": "Light (1e-4) - common default"},
+            {"value": 1e-3, "name": "medium_wd", "desc": "Medium (1e-3)"},
+            {"value": 1e-2, "name": "heavy_wd", "desc": "Heavy (1e-2) - strong regularization"},
+        ],
+        "conditional_on": None,
     },
 ]
 
@@ -521,6 +646,17 @@ class AblationConfig:
     aug_time_shift: int = 50
     aug_strength: str = "medium"  # none, light, medium, heavy
 
+    # NEW: Architectural choices (Nature Methods level ablation)
+    norm_type: str = "batch"        # batch, layer, instance, group, rms, none
+    skip_type: str = "add"          # add, concat, attention, dense
+    activation: str = "relu"        # relu, leaky_relu, gelu, silu, mish
+    dropout: float = 0.0            # Dropout rate
+
+    # NEW: Training choices (Nature Methods level ablation)
+    optimizer: str = "adamw"        # adamw, adam, sgd, lion, adafactor
+    lr_schedule: str = "cosine"     # cosine, cosine_warmup, step, plateau, onecycle, constant
+    weight_decay: float = 1e-4      # L2 regularization strength
+
     # Cross-session evaluation (for Nature Methods main result)
     split_by_session: bool = True  # True = cross-session, False = intra-session
     n_test_sessions: int = 4  # Sessions held out for testing
@@ -577,6 +713,15 @@ class AblationConfig:
             "aug_strength": self.aug_strength,
             "bidirectional": self.bidirectional,
             "cycle_lambda": self.cycle_lambda,
+            # NEW: Architectural choices
+            "norm_type": self.norm_type,
+            "skip_type": self.skip_type,
+            "activation": self.activation,
+            "dropout": self.dropout,
+            # NEW: Training choices
+            "optimizer": self.optimizer,
+            "lr_schedule": self.lr_schedule,
+            "weight_decay": self.weight_decay,
             # Cross-session evaluation
             "split_by_session": self.split_by_session,
             "n_test_sessions": self.n_test_sessions,
@@ -636,6 +781,15 @@ class AblationConfig:
             aug_strength=config.get("aug_strength", "none"),
             bidirectional=config.get("bidirectional", False),
             cycle_lambda=config.get("cycle_lambda", 0.5),
+            # NEW: Architectural choices
+            norm_type=config.get("norm_type", "batch"),
+            skip_type=config.get("skip_type", "add"),
+            activation=config.get("activation", "relu"),
+            dropout=config.get("dropout", 0.0),
+            # NEW: Training choices
+            optimizer=config.get("optimizer", "adamw"),
+            lr_schedule=config.get("lr_schedule", "cosine"),
+            weight_decay=config.get("weight_decay", 1e-4),
             # Multi-session validation: 8 train, 4 val, NO test
             # Winner = best mean R² across all 4 validation sessions
             split_by_session=True,

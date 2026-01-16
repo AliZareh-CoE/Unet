@@ -253,6 +253,29 @@ def run_train_subprocess(
     if config.get("bidirectional") is False:
         cmd.append("--no-bidirectional")
 
+    # NEW: Architectural choices (Nature Methods level ablation)
+    if "norm_type" in config:
+        cmd.extend(["--norm-type", config["norm_type"]])
+
+    if "skip_type" in config:
+        cmd.extend(["--skip-type", config["skip_type"]])
+
+    if "activation" in config:
+        cmd.extend(["--activation", config["activation"]])
+
+    if "dropout" in config:
+        cmd.extend(["--dropout", str(config["dropout"])])
+
+    # NEW: Training choices (Nature Methods level ablation)
+    if "optimizer" in config:
+        cmd.extend(["--optimizer", config["optimizer"]])
+
+    if "lr_schedule" in config:
+        cmd.extend(["--lr-schedule", config["lr_schedule"]])
+
+    if "weight_decay" in config:
+        cmd.extend(["--weight-decay", str(config["weight_decay"])])
+
     # FSDP flags
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
