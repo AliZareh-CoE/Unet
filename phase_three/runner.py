@@ -269,6 +269,12 @@ def run_train_subprocess(
     if "dropout" in config:
         cmd.extend(["--dropout", str(config["dropout"])])
 
+    if "n_heads" in config:
+        cmd.extend(["--n-heads", str(config["n_heads"])])
+
+    if "n_downsample" in config:
+        cmd.extend(["--n-downsample", str(config["n_downsample"])])
+
     # NEW: Training choices (Nature Methods level ablation)
     if "optimizer" in config:
         cmd.extend(["--optimizer", config["optimizer"]])

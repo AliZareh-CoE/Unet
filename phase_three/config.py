@@ -358,6 +358,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
     },
     # GROUP 9: Conditioning Mode
+    # NOTE: train.py only supports 'none' and 'cross_attn_gated' currently
     {
         "group_id": 9,
         "name": "conditioning",
@@ -365,9 +366,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "parameter": "cond_mode",
         "variants": [
             {"value": "none", "name": "no_conditioning", "desc": "No conditioning"},
-            {"value": "film", "name": "film", "desc": "FiLM conditioning"},
-            {"value": "cross_attn", "name": "cross_attn", "desc": "Cross-attention conditioning"},
-            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention"},
+            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention conditioning"},
         ],
         "conditional_on": None,
     },

@@ -3455,6 +3455,52 @@ def parse_args():
                              "'medium' = + channel dropout + amplitude scale, "
                              "'heavy' = all augmentations (default)")
 
+    # =========================================================================
+    # Phase 3 Ablation Study Arguments (Nature Methods level)
+    # =========================================================================
+
+    # Normalization type
+    NORM_TYPES = ["batch", "layer", "instance", "group", "rms", "none"]
+    parser.add_argument("--norm-type", type=str, default=None,
+                        choices=NORM_TYPES,
+                        help="Normalization layer type for ablation studies")
+
+    # Skip connection type
+    SKIP_TYPES = ["add", "concat", "attention", "dense"]
+    parser.add_argument("--skip-type", type=str, default=None,
+                        choices=SKIP_TYPES,
+                        help="Skip connection type: 'add' (residual), 'concat' (U-Net), 'attention' (gated), 'dense'")
+
+    # Activation function
+    ACTIVATION_TYPES = ["relu", "leaky_relu", "gelu", "silu", "mish"]
+    parser.add_argument("--activation", type=str, default=None,
+                        choices=ACTIVATION_TYPES,
+                        help="Activation function for ablation studies")
+
+    # Dropout rate
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Dropout rate (0.0 to 0.5) for ablation studies")
+
+    # Optimizer
+    OPTIMIZER_TYPES = ["adamw", "adam", "sgd", "lion", "adafactor"]
+    parser.add_argument("--optimizer", type=str, default=None,
+                        choices=OPTIMIZER_TYPES,
+                        help="Optimizer for ablation studies")
+
+    # Learning rate schedule (alias for --lr-scheduler)
+    LR_SCHEDULE_TYPES = ["cosine", "cosine_warmup", "step", "plateau", "onecycle", "constant"]
+    parser.add_argument("--lr-schedule", type=str, default=None,
+                        choices=LR_SCHEDULE_TYPES,
+                        help="Learning rate schedule (alias for --lr-scheduler)")
+
+    # Number of attention heads
+    parser.add_argument("--n-heads", type=int, default=None,
+                        help="Number of attention heads for ablation studies")
+
+    # Network depth (number of downsample levels)
+    parser.add_argument("--n-downsample", type=int, default=None,
+                        help="Number of encoder/decoder downsample levels (depth) for ablation studies")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
