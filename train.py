@@ -3447,6 +3447,13 @@ def parse_args():
     # Data augmentation
     parser.add_argument("--no-aug", action="store_true",
                         help="Disable all data augmentations")
+    parser.add_argument("--aug-strength", type=str, default=None,
+                        choices=["none", "light", "medium", "heavy"],
+                        help="Augmentation strength level: "
+                             "'none' = no augmentation, "
+                             "'light' = time shift + noise only, "
+                             "'medium' = + channel dropout + amplitude scale, "
+                             "'heavy' = all augmentations (default)")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3850,9 +3857,47 @@ def main():
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
 
-    # Data augmentation - simple toggle
-    if args.no_aug:
+    # Data augmentation - strength levels
+    if args.no_aug or args.aug_strength == "none":
         config["aug_enabled"] = False
+    elif args.aug_strength is not None:
+        # Apply augmentation strength presets
+        config["aug_enabled"] = True
+        if args.aug_strength == "light":
+            # Light: only time shift + noise (minimal but effective)
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = False
+            config["aug_amplitude_scale"] = False
+            config["aug_time_mask"] = False
+            config["aug_mixup"] = False
+            config["aug_freq_mask"] = False
+            config["aug_channel_scale"] = False
+            config["aug_dc_offset"] = False
+        elif args.aug_strength == "medium":
+            # Medium: + channel dropout + amplitude scale
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = True
+            config["aug_amplitude_scale"] = True
+            config["aug_time_mask"] = False
+            config["aug_mixup"] = False
+            config["aug_freq_mask"] = False
+            config["aug_channel_scale"] = True
+            config["aug_dc_offset"] = False
+        elif args.aug_strength == "heavy":
+            # Heavy: all augmentations (default config behavior)
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = True
+            config["aug_amplitude_scale"] = True
+            config["aug_time_mask"] = True
+            config["aug_mixup"] = True
+            config["aug_freq_mask"] = True
+            config["aug_channel_scale"] = True
+            config["aug_dc_offset"] = True
+        if is_primary():
+            print(f"Augmentation strength: {args.aug_strength.upper()}")
 
     # Plot generation config
     if args.generate_plots is not None:

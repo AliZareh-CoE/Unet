@@ -245,8 +245,11 @@ def run_train_subprocess(
     if "conv_type" in config:
         cmd.extend(["--conv-type", config["conv_type"]])
 
-    # Augmentation
-    if config.get("use_augmentation") is False:
+    # Augmentation - pass strength level
+    aug_strength = config.get("aug_strength", "none" if not config.get("use_augmentation", True) else None)
+    if aug_strength:
+        cmd.extend(["--aug-strength", aug_strength])
+    elif config.get("use_augmentation") is False:
         cmd.append("--no-aug")
 
     # Bidirectional training
