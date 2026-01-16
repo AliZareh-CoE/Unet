@@ -23,7 +23,7 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from .config import (
+from phase_three.config import (
     Phase3Config,
     AblationConfig,
     TrainingConfig,
@@ -36,8 +36,8 @@ from .config import (
     get_simple_baseline_config,
     print_protocol_summary,
 )
-from .trainer import AblationTrainer
-from .model_builder import build_condunet, count_parameters
+from phase_three.trainer import AblationTrainer
+from phase_three.model_builder import build_condunet, count_parameters
 
 # Import shared statistical utilities
 from utils import (
