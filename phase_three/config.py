@@ -232,158 +232,19 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "weight_decay": 1e-4,           # Weight decay
 }
 
-# Ablation groups - tested in order, winner propagates to subsequent groups
+# =============================================================================
+# Ablation groups - ORDERED BY IMPORTANCE for greedy forward selection
+# Most critical architectural choices FIRST, then training refinements
+# =============================================================================
 ABLATION_GROUPS: List[Dict[str, Any]] = [
-    # GROUP 1: Convolution Type
-    {
-        "group_id": 1,
-        "name": "conv_type",
-        "description": "Convolution architecture",
-        "parameter": "conv_type",
-        "variants": [
-            {"value": "standard", "name": "standard_conv", "desc": "Standard convolutions"},
-            {"value": "modern", "name": "modern_conv", "desc": "Dilated depthwise-separable + SE"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 2: Network Depth
-    {
-        "group_id": 2,
-        "name": "depth",
-        "description": "Encoder/decoder depth",
-        "parameter": "n_downsample",
-        "variants": [
-            {"value": 2, "name": "shallow", "desc": "2 downsample levels"},
-            {"value": 3, "name": "medium", "desc": "3 downsample levels"},
-            {"value": 4, "name": "deep", "desc": "4 downsample levels"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 3: Network Width
-    {
-        "group_id": 3,
-        "name": "width",
-        "description": "Base channel count",
-        "parameter": "base_channels",
-        "variants": [
-            {"value": 32, "name": "narrow", "desc": "32 base channels"},
-            {"value": 64, "name": "medium", "desc": "64 base channels"},
-            {"value": 128, "name": "wide", "desc": "128 base channels"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 4: Attention Type
-    {
-        "group_id": 4,
-        "name": "attention",
-        "description": "Attention mechanism",
-        "parameter": "attention_type",
-        "variants": [
-            {"value": "none", "name": "no_attention", "desc": "No attention"},
-            {"value": "basic", "name": "basic_attention", "desc": "Basic self-attention"},
-            {"value": "cross_freq_v2", "name": "cross_freq", "desc": "Cross-frequency attention v2"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 5: Attention Heads (conditional on attention != none)
-    {
-        "group_id": 5,
-        "name": "attention_heads",
-        "description": "Number of attention heads",
-        "parameter": "n_heads",
-        "variants": [
-            {"value": 2, "name": "2_heads", "desc": "2 attention heads"},
-            {"value": 4, "name": "4_heads", "desc": "4 attention heads"},
-            {"value": 8, "name": "8_heads", "desc": "8 attention heads"},
-        ],
-        "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
-    },
-    # GROUP 6: Conditioning Mode
-    {
-        "group_id": 6,
-        "name": "conditioning",
-        "description": "Conditioning mechanism",
-        "parameter": "cond_mode",
-        "variants": [
-            {"value": "none", "name": "no_conditioning", "desc": "No conditioning"},
-            {"value": "film", "name": "film", "desc": "FiLM conditioning"},
-            {"value": "cross_attn", "name": "cross_attn", "desc": "Cross-attention conditioning"},
-            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 7: Odor Embedding (conditional on cond_mode != none)
-    {
-        "group_id": 7,
-        "name": "odor_embedding",
-        "description": "Use odor embedding for conditioning",
-        "parameter": "use_odor_embedding",
-        "variants": [
-            {"value": False, "name": "no_odor", "desc": "Spectro-temporal only"},
-            {"value": True, "name": "with_odor", "desc": "Include odor embedding"},
-        ],
-        "conditional_on": {"parameter": "cond_mode", "not_equal": "none"},
-    },
-    # GROUP 8: Loss Function
-    {
-        "group_id": 8,
-        "name": "loss",
-        "description": "Training loss function",
-        "parameter": "loss_type",
-        "variants": [
-            {"value": "l1", "name": "l1", "desc": "L1 loss"},
-            {"value": "huber", "name": "huber", "desc": "Huber loss"},
-            {"value": "l1_wavelet", "name": "l1_wavelet", "desc": "L1 + wavelet multi-scale"},
-            {"value": "huber_wavelet", "name": "huber_wavelet", "desc": "Huber + wavelet multi-scale"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 9: Data Augmentation
-    {
-        "group_id": 9,
-        "name": "augmentation",
-        "description": "Data augmentation strategy",
-        "parameter": "use_augmentation",
-        "variants": [
-            {"value": False, "name": "no_aug", "desc": "No augmentation", "aug_strength": "none"},
-            {"value": True, "name": "light_aug", "desc": "Light augmentation", "aug_strength": "light"},
-            {"value": True, "name": "medium_aug", "desc": "Medium augmentation", "aug_strength": "medium"},
-            {"value": True, "name": "heavy_aug", "desc": "Heavy augmentation", "aug_strength": "heavy"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 10: Bidirectional Training
-    {
-        "group_id": 10,
-        "name": "bidirectional",
-        "description": "Bidirectional training with cycle consistency",
-        "parameter": "bidirectional",
-        "variants": [
-            {"value": False, "name": "unidirectional", "desc": "Forward only"},
-            {"value": True, "name": "bidirectional", "desc": "Bidirectional with cycle loss"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 11: Cycle Lambda (conditional on bidirectional=True)
-    {
-        "group_id": 11,
-        "name": "cycle_lambda",
-        "description": "Cycle consistency loss weight",
-        "parameter": "cycle_lambda",
-        "variants": [
-            {"value": 0.1, "name": "weak_cycle", "desc": "λ=0.1 (weak)"},
-            {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
-            {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
-        ],
-        "conditional_on": {"parameter": "bidirectional", "equal": True},
-    },
     # =========================================================================
-    # NEW GROUPS: Critical Architectural & Training Choices for Nature Methods
+    # PHASE 1: CRITICAL ARCHITECTURAL FOUNDATIONS (Groups 1-6)
+    # These affect EVERYTHING - test first to establish strong baseline
     # =========================================================================
-    # GROUP 12: Normalization Type (THE most critical component!)
+    # GROUP 1: Normalization Type (THE most critical component!)
     # Literature: BatchNorm (2015), LayerNorm (2016), GroupNorm (2018), RMSNorm (2019)
     {
-        "group_id": 12,
+        "group_id": 1,
         "name": "normalization",
         "description": "Normalization layer type - critical for training stability",
         "parameter": "norm_type",
@@ -397,25 +258,10 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 13: Skip Connection Type (core U-Net design)
-    # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
-    {
-        "group_id": 13,
-        "name": "skip_connection",
-        "description": "Skip connection type in U-Net architecture",
-        "parameter": "skip_type",
-        "variants": [
-            {"value": "add", "name": "residual_add", "desc": "Additive residual (ResNet style)"},
-            {"value": "concat", "name": "concat", "desc": "Concatenation (original U-Net)"},
-            {"value": "attention", "name": "attention_gate", "desc": "Attention-gated skip (Attention U-Net)"},
-            {"value": "dense", "name": "dense", "desc": "Dense connections (all previous layers)"},
-        ],
-        "conditional_on": None,
-    },
-    # GROUP 14: Activation Function
+    # GROUP 2: Activation Function
     # Literature: ReLU (2010), GELU (2016), SiLU/Swish (2017), Mish (2019)
     {
-        "group_id": 14,
+        "group_id": 2,
         "name": "activation",
         "description": "Activation function - affects gradient flow and expressivity",
         "parameter": "activation",
@@ -428,10 +274,139 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 15: Dropout Strategy
+    # GROUP 3: Convolution Type
+    {
+        "group_id": 3,
+        "name": "conv_type",
+        "description": "Convolution architecture",
+        "parameter": "conv_type",
+        "variants": [
+            {"value": "standard", "name": "standard_conv", "desc": "Standard convolutions"},
+            {"value": "modern", "name": "modern_conv", "desc": "Dilated depthwise-separable + SE"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 4: Skip Connection Type (core U-Net design)
+    # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
+    {
+        "group_id": 4,
+        "name": "skip_connection",
+        "description": "Skip connection type in U-Net architecture",
+        "parameter": "skip_type",
+        "variants": [
+            {"value": "add", "name": "residual_add", "desc": "Additive residual (ResNet style)"},
+            {"value": "concat", "name": "concat", "desc": "Concatenation (original U-Net)"},
+            {"value": "attention", "name": "attention_gate", "desc": "Attention-gated skip (Attention U-Net)"},
+            {"value": "dense", "name": "dense", "desc": "Dense connections (all previous layers)"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 5: Network Depth
+    {
+        "group_id": 5,
+        "name": "depth",
+        "description": "Encoder/decoder depth",
+        "parameter": "n_downsample",
+        "variants": [
+            {"value": 2, "name": "shallow", "desc": "2 downsample levels"},
+            {"value": 3, "name": "medium", "desc": "3 downsample levels"},
+            {"value": 4, "name": "deep", "desc": "4 downsample levels"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 6: Network Width
+    {
+        "group_id": 6,
+        "name": "width",
+        "description": "Base channel count",
+        "parameter": "base_channels",
+        "variants": [
+            {"value": 32, "name": "narrow", "desc": "32 base channels"},
+            {"value": 64, "name": "medium", "desc": "64 base channels"},
+            {"value": 128, "name": "wide", "desc": "128 base channels"},
+        ],
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 2: ATTENTION & CONDITIONING (Groups 7-9)
+    # Optional enhancements to the base architecture
+    # =========================================================================
+    # GROUP 7: Attention Type
+    {
+        "group_id": 7,
+        "name": "attention",
+        "description": "Attention mechanism",
+        "parameter": "attention_type",
+        "variants": [
+            {"value": "none", "name": "no_attention", "desc": "No attention"},
+            {"value": "basic", "name": "basic_attention", "desc": "Basic self-attention"},
+            {"value": "cross_freq_v2", "name": "cross_freq", "desc": "Cross-frequency attention v2"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 8: Attention Heads (conditional on attention != none)
+    {
+        "group_id": 8,
+        "name": "attention_heads",
+        "description": "Number of attention heads",
+        "parameter": "n_heads",
+        "variants": [
+            {"value": 2, "name": "2_heads", "desc": "2 attention heads"},
+            {"value": 4, "name": "4_heads", "desc": "4 attention heads"},
+            {"value": 8, "name": "8_heads", "desc": "8 attention heads"},
+        ],
+        "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
+    },
+    # GROUP 9: Conditioning Mode
+    {
+        "group_id": 9,
+        "name": "conditioning",
+        "description": "Conditioning mechanism",
+        "parameter": "cond_mode",
+        "variants": [
+            {"value": "none", "name": "no_conditioning", "desc": "No conditioning"},
+            {"value": "film", "name": "film", "desc": "FiLM conditioning"},
+            {"value": "cross_attn", "name": "cross_attn", "desc": "Cross-attention conditioning"},
+            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention"},
+        ],
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 3: LOSS & REGULARIZATION (Groups 10-13)
+    # How we train and prevent overfitting
+    # =========================================================================
+    # GROUP 10: Loss Function
+    {
+        "group_id": 10,
+        "name": "loss",
+        "description": "Training loss function",
+        "parameter": "loss_type",
+        "variants": [
+            {"value": "l1", "name": "l1", "desc": "L1 loss"},
+            {"value": "huber", "name": "huber", "desc": "Huber loss"},
+            {"value": "l1_wavelet", "name": "l1_wavelet", "desc": "L1 + wavelet multi-scale"},
+            {"value": "huber_wavelet", "name": "huber_wavelet", "desc": "Huber + wavelet multi-scale"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 11: Data Augmentation
+    {
+        "group_id": 11,
+        "name": "augmentation",
+        "description": "Data augmentation strategy",
+        "parameter": "use_augmentation",
+        "variants": [
+            {"value": False, "name": "no_aug", "desc": "No augmentation", "aug_strength": "none"},
+            {"value": True, "name": "light_aug", "desc": "Light augmentation", "aug_strength": "light"},
+            {"value": True, "name": "medium_aug", "desc": "Medium augmentation", "aug_strength": "medium"},
+            {"value": True, "name": "heavy_aug", "desc": "Heavy augmentation", "aug_strength": "heavy"},
+        ],
+        "conditional_on": None,
+    },
+    # GROUP 12: Dropout Strategy
     # Literature: Dropout (2014), Spatial Dropout (2015), DropBlock (2018)
     {
-        "group_id": 15,
+        "group_id": 12,
         "name": "dropout",
         "description": "Dropout regularization strategy",
         "parameter": "dropout",
@@ -444,10 +419,30 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 16: Optimizer
+    # GROUP 13: Weight Decay
+    # Literature: L2 regularization, decoupled weight decay (AdamW paper)
+    {
+        "group_id": 13,
+        "name": "weight_decay",
+        "description": "Weight decay (L2 regularization) strength",
+        "parameter": "weight_decay",
+        "variants": [
+            {"value": 0.0, "name": "no_wd", "desc": "No weight decay"},
+            {"value": 1e-5, "name": "very_light_wd", "desc": "Very light (1e-5)"},
+            {"value": 1e-4, "name": "light_wd", "desc": "Light (1e-4) - common default"},
+            {"value": 1e-3, "name": "medium_wd", "desc": "Medium (1e-3)"},
+            {"value": 1e-2, "name": "heavy_wd", "desc": "Heavy (1e-2) - strong regularization"},
+        ],
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 4: TRAINING DYNAMICS (Groups 14-17)
+    # Optimizer and learning rate strategies
+    # =========================================================================
+    # GROUP 14: Optimizer
     # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
     {
-        "group_id": 16,
+        "group_id": 14,
         "name": "optimizer",
         "description": "Optimization algorithm",
         "parameter": "optimizer",
@@ -460,10 +455,10 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 17: Learning Rate Schedule
+    # GROUP 15: Learning Rate Schedule
     # Literature: Step decay, Cosine annealing (2016), Warmup (2017), OneCycle (2018)
     {
-        "group_id": 17,
+        "group_id": 15,
         "name": "lr_schedule",
         "description": "Learning rate scheduling strategy",
         "parameter": "lr_schedule",
@@ -477,21 +472,30 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 18: Weight Decay
-    # Literature: L2 regularization, decoupled weight decay (AdamW paper)
+    # GROUP 16: Bidirectional Training
     {
-        "group_id": 18,
-        "name": "weight_decay",
-        "description": "Weight decay (L2 regularization) strength",
-        "parameter": "weight_decay",
+        "group_id": 16,
+        "name": "bidirectional",
+        "description": "Bidirectional training with cycle consistency",
+        "parameter": "bidirectional",
         "variants": [
-            {"value": 0.0, "name": "no_wd", "desc": "No weight decay"},
-            {"value": 1e-5, "name": "very_light_wd", "desc": "Very light (1e-5)"},
-            {"value": 1e-4, "name": "light_wd", "desc": "Light (1e-4) - common default"},
-            {"value": 1e-3, "name": "medium_wd", "desc": "Medium (1e-3)"},
-            {"value": 1e-2, "name": "heavy_wd", "desc": "Heavy (1e-2) - strong regularization"},
+            {"value": False, "name": "unidirectional", "desc": "Forward only"},
+            {"value": True, "name": "bidirectional", "desc": "Bidirectional with cycle loss"},
         ],
         "conditional_on": None,
+    },
+    # GROUP 17: Cycle Lambda (conditional on bidirectional=True)
+    {
+        "group_id": 17,
+        "name": "cycle_lambda",
+        "description": "Cycle consistency loss weight",
+        "parameter": "cycle_lambda",
+        "variants": [
+            {"value": 0.1, "name": "weak_cycle", "desc": "λ=0.1 (weak)"},
+            {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
+            {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
+        ],
+        "conditional_on": {"parameter": "bidirectional", "equal": True},
     },
 ]
 

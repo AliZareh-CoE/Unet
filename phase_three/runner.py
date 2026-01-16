@@ -2052,7 +2052,7 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Groups to run for greedy_forward protocol (1-11, default: all)",
+        help="Groups to run for greedy_forward protocol (1-17, default: all)",
     )
 
     # Training
