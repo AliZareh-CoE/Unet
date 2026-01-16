@@ -782,6 +782,7 @@ def run_phase3(
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     enable_logging: bool = True,
+    min_improvement: float = 0.01,
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies.
 
@@ -796,6 +797,7 @@ def run_phase3(
         use_fsdp: Enable FSDP distributed training (requires use_train_py)
         fsdp_strategy: FSDP sharding strategy
         enable_logging: Save full output to log file (default: True)
+        min_improvement: Minimum R² improvement required for greedy selection (default: 0.01 = 1%)
 
     Returns:
         Phase3Result with all ablation results
@@ -813,6 +815,7 @@ def run_phase3(
     if config.protocol == "greedy_forward":
         print(f"Groups: {config.groups} ({len(config.groups)} groups)")
         print(f"Evaluation: Single split (no CV) - per nnU-Net methodology")
+        print(f"Min improvement threshold: {min_improvement:.2%} R² (prevents trivial gains)")
     elif config.protocol == "additive":
         print(f"Stages: {config.stages} ({len(config.stages)} stages)")
         print(f"Cross-validation: {config.n_folds} folds")
@@ -829,7 +832,7 @@ def run_phase3(
     # Route to appropriate protocol handler
     try:
         if config.protocol == "greedy_forward":
-            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
+            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement)
         elif config.protocol == "additive":
             result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
         else:
@@ -850,6 +853,7 @@ def _run_greedy_forward_protocol(
     use_train_py: bool = False,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
+    min_improvement: float = 0.01,
 ) -> Phase3Result:
     """Run GREEDY FORWARD SELECTION ablation protocol.
 
@@ -857,14 +861,25 @@ def _run_greedy_forward_protocol(
     default for subsequent groups. Conditional groups are skipped if
     the condition is not met.
 
+    IMPORTANT: A variant only becomes the winner if it beats the current
+    default by at least `min_improvement` (default: 1% R²). This prevents
+    adding complexity for negligible gains (e.g., 40.0 vs 40.1).
+
     Single split (no CV) following nnU-Net methodology:
-    - 8 sessions for training, 4 sessions for test
+    - 8 sessions for training, 4 sessions for validation
     - Statistical robustness comes from multiple groups, not CV
 
     Literature support:
     - nnU-Net (Nature Methods): "one split of training data" for ablation
     - Binary Coordinate Ascent: Sequential forward selection
     - JMLR: Greedy block selection (Gauss-Southwell rule)
+
+    Args:
+        config: Phase3Config with ablation settings
+        use_train_py: Use train.py subprocess for FSDP support
+        use_fsdp: Enable FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+        min_improvement: Minimum R² improvement required to adopt new variant (default: 0.01 = 1%)
     """
     # Setup checkpoint for resume capability
     checkpoint_path = get_checkpoint_path(config.output_dir)
@@ -1018,14 +1033,50 @@ def _run_greedy_forward_protocol(
             all_results.append(result)
             group_results.append((variant, result))
 
-        # Determine winner for this group
-        winner_variant, winner_result = max(group_results, key=lambda x: x[1].best_r2)
+        # Determine winner for this group WITH MINIMUM IMPROVEMENT THRESHOLD
+        # Find the baseline variant (matches current config value)
+        param = group["parameter"]
+        baseline_value = current_config.get(param)
+
+        # Find baseline variant result
+        baseline_variant = None
+        baseline_result = None
+        for v, r in group_results:
+            if v["value"] == baseline_value:
+                baseline_variant = v
+                baseline_result = r
+                break
+
+        # If no baseline found (shouldn't happen), use first variant
+        if baseline_result is None:
+            baseline_variant, baseline_result = group_results[0]
+
+        # Find the best performing variant
+        best_variant, best_result = max(group_results, key=lambda x: x[1].best_r2)
+
+        # Check if improvement is significant enough
+        improvement = best_result.best_r2 - baseline_result.best_r2
+
+        if best_variant["value"] == baseline_value:
+            # Baseline is already the best
+            winner_variant, winner_result = baseline_variant, baseline_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) - baseline remains best ***")
+        elif improvement >= min_improvement:
+            # Significant improvement - adopt new variant
+            winner_variant, winner_result = best_variant, best_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) ***")
+            print(f"      Improvement over baseline: +{improvement:.4f} (threshold: {min_improvement:.4f}) ✓")
+        else:
+            # Improvement too small - stick with baseline (prefer simplicity)
+            winner_variant, winner_result = baseline_variant, baseline_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) - keeping baseline ***")
+            print(f"      Best candidate: {best_variant['name']} (R² = {best_result.best_r2:.4f})")
+            print(f"      Improvement: +{improvement:.4f} < threshold {min_improvement:.4f} - NOT significant")
+
         winner_value = winner_variant["value"]
 
-        print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) ***")
-
         # Update current config with winner's value
-        current_config[group["parameter"]] = winner_value
+        current_config[param] = winner_value
         if "aug_strength" in winner_variant:
             current_config["aug_strength"] = winner_variant["aug_strength"]
 
@@ -2073,6 +2124,16 @@ def main():
         help="FSDP sharding strategy (default: grad_op)",
     )
 
+    # Greedy forward selection settings
+    parser.add_argument(
+        "--min-improvement",
+        type=float,
+        default=0.01,
+        help="Minimum R² improvement required to adopt a new variant in greedy selection. "
+             "If a variant doesn't beat the baseline by this margin, we stick with the simpler option. "
+             "Default: 0.01 (1%%). Example: 0.005 = 0.5%%, 0.02 = 2%%",
+    )
+
     args = parser.parse_args()
 
     # Validate FSDP requires --use-train-py
@@ -2163,6 +2224,7 @@ def main():
         use_train_py=args.use_train_py,
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
+        min_improvement=args.min_improvement,
     )
 
     # Clean up checkpoint after successful completion
