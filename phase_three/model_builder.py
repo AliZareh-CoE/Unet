@@ -51,12 +51,13 @@ def build_condunet(
             cond_mode=config.cond_mode,
             n_downsample=config.n_downsample,
             conv_type=config.conv_type,
-            use_output_scaling=True,
-            # Session conditioning - statistics-based approach
-            # No session IDs needed - computes statistics from input signal
+            use_output_scaling=not config.use_adaptive_scaling,  # Disable if using adaptive
+            # Session adaptation methods
             use_session_stats=config.use_session_stats,
             session_emb_dim=config.session_emb_dim,
             session_use_spectral=config.session_use_spectral,
+            use_adaptive_scaling=config.use_adaptive_scaling,
+            use_revin=config.use_revin,
         )
         return model
 

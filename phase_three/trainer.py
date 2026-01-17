@@ -266,6 +266,19 @@ class AblationTrainer:
         self, x: torch.Tensor, y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply data augmentation."""
+        # Covariance expansion augmentation (session diversity)
+        # Creates synthetic sessions by applying random per-channel scale/shift
+        if getattr(self.ablation_config, 'use_cov_augment', False):
+            prob = getattr(self.ablation_config, 'cov_augment_prob', 0.5)
+            if torch.rand(1).item() < prob:
+                B, C, T = x.shape
+                # Random per-channel scale and shift
+                scale = torch.empty(B, C, 1, device=x.device).uniform_(0.8, 1.2)
+                shift = torch.empty(B, C, 1, device=x.device).uniform_(-0.2, 0.2)
+                # Apply to both input and target (paired transformation)
+                x = x * scale + shift * x.std(dim=-1, keepdim=True)
+                y = y * scale + shift * y.std(dim=-1, keepdim=True)
+
         # Noise augmentation
         if self.ablation_config.aug_noise_std > 0:
             noise_x = torch.randn_like(x) * self.ablation_config.aug_noise_std
