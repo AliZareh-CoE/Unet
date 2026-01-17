@@ -230,10 +230,12 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "optimizer": "adamw",           # Optimizer
     "lr_schedule": "cosine",        # Learning rate schedule
     "weight_decay": 1e-4,           # Weight decay
-    # Session embedding (starts disabled, can be enabled via ablation group)
-    "use_session_embedding": False,
-    "n_sessions": 0,                # Will be auto-set from data
-    "session_emb_dim": 32,
+    # Session conditioning - statistics-based approach (literature-recommended)
+    # Instead of learned embeddings per session ID, computes statistics from
+    # input signal and learns to encode them. Generalizes to unseen sessions.
+    "use_session_stats": False,     # Enable statistics-based session conditioning
+    "session_emb_dim": 32,          # Session statistics embedding dimension
+    "session_use_spectral": False,  # Include spectral features in session stats
 }
 
 # =============================================================================
@@ -503,18 +505,20 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
 
     # =========================================================================
     # PHASE 5: SESSION ADAPTATION (Group 18)
-    # Tests whether session-specific embeddings improve cross-session generalization
+    # Tests whether session-specific conditioning improves cross-session generalization
+    # Uses statistics-based approach: computes statistics from input signal and
+    # learns to encode them, automatically generalizing to unseen sessions.
     # =========================================================================
 
-    # GROUP 18: Session Embedding
+    # GROUP 18: Session Statistics Conditioning
     {
         "group_id": 18,
-        "name": "session_embedding",
-        "description": "Session-specific embedding for cross-session adaptation",
-        "parameter": "use_session_embedding",
+        "name": "session_stats",
+        "description": "Statistics-based session conditioning for cross-session adaptation",
+        "parameter": "use_session_stats",
         "variants": [
-            {"value": False, "name": "no_session_emb", "desc": "No session embedding (baseline)"},
-            {"value": True, "name": "with_session_emb", "desc": "Session embedding enabled"},
+            {"value": False, "name": "no_session_stats", "desc": "No session conditioning (baseline)"},
+            {"value": True, "name": "with_session_stats", "desc": "Session statistics conditioning enabled"},
         ],
         "conditional_on": None,  # Always run - important for cross-session evaluation
     },
@@ -687,10 +691,12 @@ class AblationConfig:
     n_test_sessions: int = 4  # Sessions held out for testing
     n_val_sessions: int = 1  # Sessions held out for validation
 
-    # Session embedding (for session-specific model adaptation)
-    use_session_embedding: bool = False  # Enable session embedding
-    n_sessions: int = 0  # Number of sessions (0 = disabled, auto-detected if not set)
-    session_emb_dim: int = 32  # Session embedding dimension
+    # Session conditioning - statistics-based approach (literature-recommended)
+    # Instead of learned embeddings per session ID, computes statistics from
+    # input signal and learns to encode them. Generalizes to unseen sessions.
+    use_session_stats: bool = False  # Enable statistics-based session conditioning
+    session_emb_dim: int = 32  # Session statistics embedding dimension
+    session_use_spectral: bool = False  # Include spectral features in session stats
 
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
@@ -756,10 +762,10 @@ class AblationConfig:
             "split_by_session": self.split_by_session,
             "n_test_sessions": self.n_test_sessions,
             "n_val_sessions": self.n_val_sessions,
-            # Session embedding
-            "use_session_embedding": self.use_session_embedding,
-            "n_sessions": self.n_sessions,
+            # Session conditioning (statistics-based)
+            "use_session_stats": self.use_session_stats,
             "session_emb_dim": self.session_emb_dim,
+            "session_use_spectral": self.session_use_spectral,
         }
 
     @property
@@ -829,10 +835,10 @@ class AblationConfig:
             split_by_session=True,
             n_test_sessions=0,  # No separate test set
             n_val_sessions=4,   # All held-out sessions for validation
-            # Session embedding
-            use_session_embedding=config.get("use_session_embedding", False),
-            n_sessions=config.get("n_sessions", 0),
+            # Session conditioning (statistics-based)
+            use_session_stats=config.get("use_session_stats", False),
             session_emb_dim=config.get("session_emb_dim", 32),
+            session_use_spectral=config.get("session_use_spectral", False),
         )
 
     @classmethod

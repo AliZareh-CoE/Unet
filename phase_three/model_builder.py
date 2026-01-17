@@ -38,10 +38,6 @@ def build_condunet(
     try:
         from models import CondUNet1D
 
-        # Determine session embedding parameters
-        n_sessions = config.n_sessions if config.use_session_embedding else 0
-        session_emb_dim = config.session_emb_dim if config.use_session_embedding else 32
-
         model = CondUNet1D(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -56,9 +52,11 @@ def build_condunet(
             n_downsample=config.n_downsample,
             conv_type=config.conv_type,
             use_output_scaling=True,
-            # Session embedding parameters
-            n_sessions=n_sessions,
-            session_emb_dim=session_emb_dim,
+            # Session conditioning - statistics-based approach
+            # No session IDs needed - computes statistics from input signal
+            use_session_stats=config.use_session_stats,
+            session_emb_dim=config.session_emb_dim,
+            session_use_spectral=config.session_use_spectral,
         )
         return model
 

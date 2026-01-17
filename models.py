@@ -1774,6 +1774,150 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
 
 
 # =============================================================================
+# Session Statistics Encoder (Literature-Based Approach)
+# =============================================================================
+
+class SessionStatisticsEncoder(nn.Module):
+    """Encode session statistics into a conditioning vector.
+
+    Instead of learning arbitrary embeddings per session ID, this computes
+    statistics from the input signal and learns to encode them. This approach:
+
+    1. Generalizes automatically to new/unseen sessions
+    2. Learns meaningful relationships between statistics and predictions
+    3. Aligns with domain adaptation literature (ReVIN, AdaIN, FiLM)
+
+    Based on:
+    - ReVIN (Reversible Instance Normalization) for cross-subject EEG
+    - Domain-specific batch normalization for EEG transfer learning
+    - FiLM (Feature-wise Linear Modulation) conditioning
+
+    The encoder computes per-channel statistics (mean, std) from the raw input
+    BEFORE normalization, capturing session-specific characteristics like:
+    - Electrode impedance differences
+    - Baseline activity levels
+    - Signal amplitude variations
+    - Recording condition effects
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        emb_dim: int = 32,
+        use_spectral_features: bool = False,
+        hidden_dim: int = 64,
+    ):
+        """Initialize SessionStatisticsEncoder.
+
+        Args:
+            n_channels: Number of input channels (e.g., 32 for OB electrodes)
+            emb_dim: Output embedding dimension
+            use_spectral_features: If True, also include power in frequency bands
+                                   (requires more computation but captures more info)
+            hidden_dim: Hidden layer dimension
+        """
+        super().__init__()
+        self.n_channels = n_channels
+        self.emb_dim = emb_dim
+        self.use_spectral_features = use_spectral_features
+
+        # Basic statistics: mean + std per channel = 2 * n_channels
+        # Optional: add skewness, kurtosis for 4 * n_channels
+        input_dim = n_channels * 2
+
+        if use_spectral_features:
+            # Add power in 5 frequency bands per channel
+            # (delta, theta, alpha, beta, gamma)
+            input_dim += n_channels * 5
+
+        # MLP to encode statistics into embedding
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, emb_dim),
+        )
+
+        # Initialize to produce near-zero embeddings initially
+        # This ensures the model works even without session conditioning at start
+        nn.init.zeros_(self.encoder[-1].weight)
+        nn.init.zeros_(self.encoder[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute session embedding from input statistics.
+
+        Args:
+            x: Raw input signal [B, C, T] BEFORE normalization
+               This is important - we need the original statistics
+
+        Returns:
+            Session embedding [B, emb_dim]
+        """
+        # Compute per-channel statistics
+        mean = x.mean(dim=-1)  # [B, C]
+        std = x.std(dim=-1)    # [B, C]
+
+        # Concatenate statistics
+        stats = torch.cat([mean, std], dim=-1)  # [B, 2*C]
+
+        if self.use_spectral_features:
+            # Compute power in frequency bands (simplified version)
+            # For full implementation, use scipy.signal.welch or torch equivalent
+            # Here we use a simple FFT-based approach
+            power_features = self._compute_band_power(x)  # [B, 5*C]
+            stats = torch.cat([stats, power_features], dim=-1)
+
+        # Encode to embedding
+        return self.encoder(stats)
+
+    def _compute_band_power(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute power in frequency bands.
+
+        Simplified implementation using FFT.
+        Assumes 1000 Hz sampling rate.
+
+        Args:
+            x: Input signal [B, C, T]
+
+        Returns:
+            Band power features [B, 5*C]
+        """
+        B, C, T = x.shape
+
+        # FFT
+        fft = torch.fft.rfft(x, dim=-1)
+        power = (fft.real ** 2 + fft.imag ** 2)  # [B, C, T//2+1]
+
+        # Frequency resolution
+        freq_resolution = 1000.0 / T  # Assumes 1000 Hz sampling
+        n_freqs = power.shape[-1]
+
+        # Frequency bands (in Hz)
+        bands = [
+            (1, 4),    # Delta
+            (4, 8),    # Theta
+            (8, 13),   # Alpha
+            (13, 30),  # Beta
+            (30, 100), # Gamma
+        ]
+
+        band_powers = []
+        for low, high in bands:
+            low_idx = max(1, int(low / freq_resolution))
+            high_idx = min(n_freqs - 1, int(high / freq_resolution))
+            if high_idx > low_idx:
+                band_power = power[:, :, low_idx:high_idx].mean(dim=-1)  # [B, C]
+            else:
+                band_power = torch.zeros(B, C, device=x.device)
+            band_powers.append(band_power)
+
+        return torch.cat(band_powers, dim=-1)  # [B, 5*C]
+
+
+# =============================================================================
 # Main Model: CondUNet1D
 # =============================================================================
 
@@ -1824,9 +1968,14 @@ class CondUNet1D(nn.Module):
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
-        # Session embedding for session-specific adjustments
-        n_sessions: int = 0,  # Number of sessions (0 = disabled)
+        # Session conditioning - statistics-based (literature-recommended approach)
+        # Instead of learned embeddings per session ID, computes statistics from
+        # input signal and learns to encode them. Generalizes to unseen sessions.
+        use_session_stats: bool = False,  # Enable statistics-based session conditioning
         session_emb_dim: int = 32,  # Session embedding dimension
+        session_use_spectral: bool = False,  # Include spectral features in session stats
+        # Legacy parameter for backward compatibility (ignored if use_session_stats=True)
+        n_sessions: int = 0,  # Deprecated: use use_session_stats instead
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -1834,26 +1983,35 @@ class CondUNet1D(nn.Module):
         self.attention_type = attention_type
         self.conv_type = conv_type
         self.n_downsample = n_downsample
-        self.n_sessions = n_sessions
+        self.use_session_stats = use_session_stats
         self.session_emb_dim = session_emb_dim
+        # Legacy compatibility
+        self.n_sessions = n_sessions
 
         if cond_mode != "none":
             self.embed = nn.Embedding(n_odors, emb_dim)
         else:
             self.embed = None
 
-        # Session embedding for session-specific adjustments
-        if n_sessions > 0:
-            self.session_embed = nn.Embedding(n_sessions, session_emb_dim)
-            # Project combined embedding (session + condition) to emb_dim
-            # If no other conditioning, just project session embedding
+        # Session conditioning using statistics-based encoder
+        # This approach:
+        # 1. Computes statistics (mean, std per channel) from raw input
+        # 2. Encodes statistics into a conditioning vector
+        # 3. Automatically generalizes to new/unseen sessions
+        if use_session_stats:
+            self.session_stats_encoder = SessionStatisticsEncoder(
+                n_channels=in_channels,
+                emb_dim=session_emb_dim,
+                use_spectral_features=session_use_spectral,
+            )
+            # Project combined embedding (session stats + condition) to emb_dim
             self.session_proj = nn.Sequential(
                 nn.Linear(session_emb_dim + emb_dim, emb_dim),
                 nn.GELU(),
                 nn.Linear(emb_dim, emb_dim),
             )
         else:
-            self.session_embed = None
+            self.session_stats_encoder = None
             self.session_proj = None
 
         # Channel progression: base -> base*2 -> base*4 -> ... up to base*8 max
@@ -1978,7 +2136,7 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-        session_ids: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,  # Deprecated: kept for API compatibility
         return_bottleneck: bool = False,
         return_bottleneck_temporal: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1989,8 +2147,8 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
-            session_ids: Session indices [B] for session-specific adjustments.
-                        Combined with other conditioning if n_sessions > 0.
+            session_ids: DEPRECATED - Session IDs are no longer needed.
+                        Statistics-based conditioning computes session info from input.
             return_bottleneck: If True, also return pooled bottleneck features [B, bottleneck_ch]
                               for label-based contrastive learning
             return_bottleneck_temporal: If True, return unpooled bottleneck features [B, bottleneck_ch, T']
@@ -2002,6 +2160,20 @@ class CondUNet1D(nn.Module):
             If return_bottleneck=True: (predicted signal, pooled bottleneck features [B, bottleneck_ch])
             If return_bottleneck_temporal=True: (predicted signal, unpooled bottleneck features [B, bottleneck_ch, T'])
         """
+        # =================================================================
+        # SESSION STATISTICS ENCODING (must happen BEFORE normalization!)
+        # =================================================================
+        # Compute session-specific conditioning from RAW input statistics.
+        # This captures session characteristics like:
+        #   - Electrode impedance (affects amplitude)
+        #   - Baseline activity levels
+        #   - Recording condition variations
+        # The model learns HOW to use these statistics for adaptation.
+        # =================================================================
+        session_emb = None
+        if self.session_stats_encoder is not None:
+            session_emb = self.session_stats_encoder(ob)  # [B, session_emb_dim]
+
         # =================================================================
         # INPUT NORMALIZATION - The key to session-agnostic generalization
         # =================================================================
@@ -2022,9 +2194,8 @@ class CondUNet1D(nn.Module):
         else:
             emb = None
 
-        # Combine session embedding with conditioning if enabled
-        if self.session_embed is not None and session_ids is not None:
-            session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+        # Combine session statistics embedding with other conditioning if enabled
+        if session_emb is not None:
             if emb is not None:
                 # Concatenate session embedding with existing conditioning
                 combined = torch.cat([session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]

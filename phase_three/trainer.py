@@ -41,7 +41,6 @@ class AblationTrainer:
         training_config: TrainingConfig,
         device: str = "cuda",
         checkpoint_dir: Optional[Path] = None,
-        session_id_mapping: Optional[Dict[int, int]] = None,
     ):
         self.model = model.to(device)
         self.ablation_config = ablation_config
@@ -49,10 +48,9 @@ class AblationTrainer:
         self.device = device
         self.checkpoint_dir = checkpoint_dir
 
-        # Session ID mapping: maps validation session IDs to closest training session IDs
-        # This is CRITICAL for session embedding - validation sessions have untrained embeddings
-        # so we map them to the closest training session's embedding
-        self.session_id_mapping = session_id_mapping or {}
+        # Note: Session ID mapping is NO LONGER NEEDED with statistics-based conditioning
+        # The model computes session statistics from input signal, automatically
+        # generalizing to unseen sessions without explicit mapping.
 
         # Build loss function based on ablation config
         self.criterion = build_loss(
@@ -114,7 +112,11 @@ class AblationTrainer:
             return optim.lr_scheduler.ConstantLR(self.optimizer, factor=1.0)
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """Train for one epoch."""
+        """Train for one epoch.
+
+        Note: With statistics-based session conditioning, the model automatically
+        computes session statistics from input. No explicit session IDs needed.
+        """
         self.model.train()
         total_loss = 0.0
         n_batches = 0
@@ -124,18 +126,16 @@ class AblationTrainer:
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
-                session_ids = batch[3] if len(batch) > 3 else None
+                # Note: session_ids (batch[3]) are no longer needed
+                # Statistics-based conditioning computes from input signal
             else:
                 x, y = batch, batch
                 odor_ids = None
-                session_ids = None
 
             x = x.to(self.device)
             y = y.to(self.device)
             if odor_ids is not None:
                 odor_ids = odor_ids.to(self.device)
-            if session_ids is not None:
-                session_ids = session_ids.to(self.device)
 
             # Apply augmentation if enabled
             if self.ablation_config.use_augmentation:
@@ -144,18 +144,13 @@ class AblationTrainer:
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
 
-            # Determine what to pass to model
+            # Determine what to pass to model (session stats computed automatically)
             use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
-            use_session = session_ids is not None and self.ablation_config.use_session_embedding
 
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
-                    # Pass conditioning and session_ids if model supports them
                     if use_odor:
-                        pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
-                    elif use_session:
-                        # Session embedding but no odor embedding
-                        pred = self.model(x, session_ids=session_ids)
+                        pred = self.model(x, odor_ids)
                     else:
                         pred = self.model(x)
                     loss, _ = self.criterion(pred, y)
@@ -176,9 +171,7 @@ class AblationTrainer:
                 self.scaler.update()
             else:
                 if use_odor:
-                    pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
-                elif use_session:
-                    pred = self.model(x, session_ids=session_ids)
+                    pred = self.model(x, odor_ids)
                 else:
                     pred = self.model(x)
                 loss, _ = self.criterion(pred, y)
@@ -200,35 +193,13 @@ class AblationTrainer:
 
         return total_loss / max(n_batches, 1)
 
-    def _map_session_ids(self, session_ids: torch.Tensor) -> torch.Tensor:
-        """Map validation session IDs to closest training session IDs.
-
-        This is CRITICAL for session embedding during validation:
-        - Validation sessions have UNTRAINED embeddings (random values)
-        - We map them to the closest training session to use trained embeddings
-
-        Args:
-            session_ids: Original session IDs tensor
-
-        Returns:
-            Mapped session IDs (validation sessions mapped to training sessions)
-        """
-        if not self.session_id_mapping:
-            return session_ids
-
-        # Apply mapping efficiently
-        mapped = session_ids.clone()
-        for val_sid, train_sid in self.session_id_mapping.items():
-            mask = session_ids == val_sid
-            mapped[mask] = train_sid
-        return mapped
-
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> Tuple[float, float]:
         """Validate model and compute R².
 
-        For session embedding: maps validation session IDs to closest training
-        sessions to use trained embeddings instead of random untrained ones.
+        Note: With statistics-based session conditioning, the model automatically
+        handles unseen sessions by computing statistics from the input signal.
+        No explicit session ID mapping is needed.
         """
         self.model.eval()
         total_loss = 0.0
@@ -240,41 +211,30 @@ class AblationTrainer:
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
-                session_ids = batch[3] if len(batch) > 3 else None
+                # Note: session_ids are no longer needed for statistics-based conditioning
+                # The model computes session statistics directly from input
             else:
                 x, y = batch, batch
                 odor_ids = None
-                session_ids = None
 
             x = x.to(self.device)
             y = y.to(self.device)
             if odor_ids is not None:
                 odor_ids = odor_ids.to(self.device)
-            if session_ids is not None:
-                session_ids = session_ids.to(self.device)
-                # CRITICAL: Map validation session IDs to closest training sessions
-                # This ensures we use TRAINED embeddings, not random untrained ones
-                if self.session_id_mapping and self.ablation_config.use_session_embedding:
-                    session_ids = self._map_session_ids(session_ids)
 
-            # Determine what to pass to model
+            # Model forward - session stats computed automatically from input
             use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
-            use_session = session_ids is not None and self.ablation_config.use_session_embedding
 
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
                     if use_odor:
-                        pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
-                    elif use_session:
-                        pred = self.model(x, session_ids=session_ids)
+                        pred = self.model(x, odor_ids)
                     else:
                         pred = self.model(x)
                     loss, _ = self.criterion(pred, y)
             else:
                 if use_odor:
-                    pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
-                elif use_session:
-                    pred = self.model(x, session_ids=session_ids)
+                    pred = self.model(x, odor_ids)
                 else:
                     pred = self.model(x)
                 loss, _ = self.criterion(pred, y)
