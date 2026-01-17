@@ -296,13 +296,17 @@ def run_train_subprocess(
         cmd.append("--session-use-spectral")
     if config.get("use_adaptive_scaling", False):
         cmd.append("--use-adaptive-scaling")
-    if config.get("use_revin", False):
-        cmd.append("--use-revin")
     if config.get("use_cov_augment", False):
         cmd.append("--use-cov-augment")
         # Also pass the probability
         cov_prob = config.get("cov_augment_prob", 0.5)
         cmd.extend(["--cov-augment-prob", str(cov_prob)])
+    # Learnable session embedding (requires n_sessions to be set)
+    if config.get("use_session_embedding", False):
+        cmd.append("--use-session-embedding")
+        n_sessions = config.get("n_sessions", 0)
+        if n_sessions > 0:
+            cmd.extend(["--n-sessions", str(n_sessions)])
 
     # Run subprocess with live output capture (goes through TeeLogger)
     start_time = time.time()
