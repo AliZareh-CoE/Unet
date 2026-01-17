@@ -491,7 +491,11 @@ def load_or_create_session_splits(
 
         # VALIDATION: Check that loaded indices don't exceed data size
         max_idx = len(session_ids) - 1
-        if train_idx.max() > max_idx or val_idx.max() > max_idx or test_idx.max() > max_idx:
+        # Handle empty arrays (e.g., no test set)
+        train_max = train_idx.max() if len(train_idx) > 0 else -1
+        val_max = val_idx.max() if len(val_idx) > 0 else -1
+        test_max = test_idx.max() if len(test_idx) > 0 else -1
+        if train_max > max_idx or val_max > max_idx or test_max > max_idx:
             print(f"WARNING: Cached split indices exceed data size! Recreating splits...")
             # Don't return - fall through to recreate splits
         else:
