@@ -254,7 +254,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 1: Normalization Type (THE most critical component!)
     # Literature: BatchNorm (2015), LayerNorm (2016), GroupNorm (2018), RMSNorm (2019)
     {
-        "group_id": 2,
+        "group_id": 1,
         "name": "normalization",
         "description": "Normalization layer type - critical for training stability",
         "parameter": "norm_type",
@@ -271,7 +271,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 2: Activation Function
     # Literature: ReLU (2010), GELU (2016), SiLU/Swish (2017), Mish (2019)
     {
-        "group_id": 3,
+        "group_id": 7,
         "name": "activation",
         "description": "Activation function - affects gradient flow and expressivity",
         "parameter": "activation",
@@ -286,7 +286,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 3: Convolution Type
     {
-        "group_id": 4,
+        "group_id": 3,
         "name": "conv_type",
         "description": "Convolution architecture",
         "parameter": "conv_type",
@@ -299,7 +299,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 4: Skip Connection Type (core U-Net design)
     # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
     {
-        "group_id": 5,
+        "group_id": 6,
         "name": "skip_connection",
         "description": "Skip connection type in U-Net architecture",
         "parameter": "skip_type",
@@ -313,7 +313,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 5: Network Depth
     {
-        "group_id": 6,
+        "group_id": 4,
         "name": "depth",
         "description": "Encoder/decoder depth",
         "parameter": "n_downsample",
@@ -326,7 +326,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 6: Network Width
     {
-        "group_id": 7,
+        "group_id": 5,
         "name": "width",
         "description": "Base channel count",
         "parameter": "base_channels",
@@ -386,7 +386,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # =========================================================================
     # GROUP 10: Loss Function
     {
-        "group_id": 11,
+        "group_id": 12,
         "name": "loss",
         "description": "Training loss function",
         "parameter": "loss_type",
@@ -400,7 +400,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 11: Data Augmentation
     {
-        "group_id": 12,
+        "group_id": 2,
         "name": "augmentation",
         "description": "Data augmentation strategy",
         "parameter": "use_augmentation",
@@ -415,7 +415,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 12: Dropout Strategy
     # Literature: Dropout (2014), Spatial Dropout (2015), DropBlock (2018)
     {
-        "group_id": 13,
+        "group_id": 15,
         "name": "dropout",
         "description": "Dropout regularization strategy",
         "parameter": "dropout",
@@ -431,7 +431,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 13: Weight Decay
     # Literature: L2 regularization, decoupled weight decay (AdamW paper)
     {
-        "group_id": 14,
+        "group_id": 16,
         "name": "weight_decay",
         "description": "Weight decay (L2 regularization) strength",
         "parameter": "weight_decay",
@@ -451,7 +451,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 14: Optimizer
     # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
     {
-        "group_id": 15,
+        "group_id": 13,
         "name": "optimizer",
         "description": "Optimization algorithm",
         "parameter": "optimizer",
@@ -467,7 +467,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 15: Learning Rate Schedule
     # Literature: Step decay, Cosine annealing (2016), Warmup (2017), OneCycle (2018)
     {
-        "group_id": 16,
+        "group_id": 14,
         "name": "lr_schedule",
         "description": "Learning rate scheduling strategy",
         "parameter": "lr_schedule",
@@ -518,7 +518,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 18: Session Adaptation Methods
     # This is a MULTI-PARAMETER group - each variant sets multiple params
     {
-        "group_id": 1,
+        "group_id": 11,
         "name": "session_adaptation",
         "description": "Session adaptation methods for cross-session generalization",
         "parameter": "_session_method",  # Virtual param - variants set multiple real params
