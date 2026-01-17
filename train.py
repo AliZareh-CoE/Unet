@@ -2902,6 +2902,14 @@ def train(
                     sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
                 print("  Per-session: " + " | ".join(sess_strs))
 
+            # Print session embedding weight stats every 10 epochs
+            if config.get("use_session_embedding", False) and epoch % 10 == 0:
+                unwrapped = model.module if hasattr(model, 'module') else model
+                if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+                    with torch.no_grad():
+                        w = unwrapped.session_embed.weight
+                        print(f"  [Session Embed] norm={w.norm().item():.4f}, mean={w.mean().item():.4f}, std={w.std().item():.4f}")
+
             sys.stdout.flush()
 
             # Build history entry with per-session metrics if available
