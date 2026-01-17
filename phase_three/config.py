@@ -365,7 +365,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 4, "name": "4_heads", "desc": "4 attention heads"},
             {"value": 8, "name": "8_heads", "desc": "8 attention heads"},
         ],
-        "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
+        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
     },
     # GROUP 9: Conditioning Mode
     # NOTE: train.py only supports 'none' and 'cross_attn_gated' currently
@@ -504,7 +504,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
             {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
         ],
-        "conditional_on": {"parameter": "bidirectional", "equal": True},
+        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
     },
 
     # =========================================================================
