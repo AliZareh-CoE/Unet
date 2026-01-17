@@ -157,6 +157,7 @@ def run_train_subprocess(
     fsdp_strategy: str = "grad_op",
     seed: int = 42,
     verbose: bool = True,
+    n_sessions: int = 0,  # Number of sessions for learnable session embedding
 ) -> Optional[Dict[str, Any]]:
     """Run train.py as subprocess for a single ablation experiment.
 
@@ -172,6 +173,7 @@ def run_train_subprocess(
         ablation_config: Ablation configuration with model parameters
         epochs: Number of training epochs
         batch_size: Batch size (total, will be divided by num GPUs)
+        n_sessions: Number of sessions for learnable session embedding
         use_fsdp: Whether to use FSDP distributed training
         fsdp_strategy: FSDP sharding strategy
         seed: Random seed
@@ -304,9 +306,13 @@ def run_train_subprocess(
     # Learnable session embedding (requires n_sessions to be set)
     if config.get("use_session_embedding", False):
         cmd.append("--use-session-embedding")
-        n_sessions = config.get("n_sessions", 0)
+        # n_sessions is passed directly as parameter, not from config
+        # (because AblationConfig.to_dict() doesn't include n_sessions)
         if n_sessions > 0:
             cmd.extend(["--n-sessions", str(n_sessions)])
+        else:
+            print(f"    WARNING: use_session_embedding=True but n_sessions={n_sessions}!")
+            print(f"    Session embedding will FAIL without valid n_sessions.")
 
     # Run subprocess with live output capture (goes through TeeLogger)
     start_time = time.time()
@@ -1102,6 +1108,7 @@ def _run_greedy_forward_protocol(
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
                     verbose=True,
+                    n_sessions=current_config.get("n_sessions", 0),
                 )
 
                 if train_results is not None:
@@ -1469,6 +1476,7 @@ def _run_additive_protocol(
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
                     verbose=True,
+                    n_sessions=n_sessions,
                 )
 
                 if train_results is not None:
@@ -1757,6 +1765,7 @@ def _run_subtractive_protocol(
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
                     verbose=True,
+                    n_sessions=n_sessions,
                 )
 
                 if train_results is not None:
@@ -1877,6 +1886,7 @@ def _run_subtractive_protocol(
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
                     verbose=True,
+                    n_sessions=n_sessions,
                 )
 
                 if train_results is not None:
