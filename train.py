@@ -93,6 +93,8 @@ from models import (
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
     hilbert_torch,
+    # Session matching for inference
+    SessionMatcher,
 )
 from data import (
     prepare_data,
@@ -869,6 +871,26 @@ def apply_augmentations(
         ob = aug_dc_offset(ob, offset_range)
         pcx = aug_dc_offset(pcx, offset_range)
 
+    # Covariance expansion augmentation: create synthetic sessions via random per-channel scale/shift
+    # This helps the model learn session-invariant representations by exposing it to
+    # more diverse covariance structures during training (from statistics literature)
+    if config.get("use_cov_augment", False):
+        cov_prob = config.get("cov_augment_prob", 0.5)
+        if torch.rand(1).item() < cov_prob:
+            batch_size, n_channels_ob, _ = ob.shape
+            _, n_channels_pcx, _ = pcx.shape
+            # Random per-channel scale (simulates different electrode impedances across sessions)
+            scale_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(0.8, 1.2)
+            scale_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(0.8, 1.2)
+            # Random per-channel shift relative to std (simulates baseline drift)
+            shift_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(-0.2, 0.2)
+            shift_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(-0.2, 0.2)
+            # Apply: x_aug = x * scale + shift * std(x)
+            ob_std = ob.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            pcx_std = pcx.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            ob = ob * scale_ob + shift_ob * ob_std
+            pcx = pcx * scale_pcx + shift_pcx * pcx_std
+
     return ob, pcx
 
 
@@ -1227,6 +1249,18 @@ def save_checkpoint(
                 ):
                     checkpoint["reverse_model"] = reverse_model.state_dict()
 
+        # Save session matcher state for inference-time session matching
+        if config is not None and "_session_matcher" in config:
+            session_matcher = config["_session_matcher"]
+            checkpoint["session_matcher_state"] = {
+                "signatures": session_matcher.signatures,
+                "session_names": session_matcher.session_names,
+                "n_channels": session_matcher.n_channels,
+                "n_warmup_samples": session_matcher.n_warmup_samples,
+                "use_power_spectrum": session_matcher.use_power_spectrum,
+                "sample_rate": session_matcher.sample_rate,
+            }
+
         if is_primary():
             torch.save(checkpoint, path)
     else:
@@ -1261,6 +1295,19 @@ def save_checkpoint(
             if reverse_model is not None:
                 rev_state = reverse_model.module.state_dict() if hasattr(reverse_model, 'module') else reverse_model.state_dict()
                 checkpoint["reverse_model"] = rev_state
+
+            # Save session matcher state for inference-time session matching
+            if config is not None and "_session_matcher" in config:
+                session_matcher = config["_session_matcher"]
+                checkpoint["session_matcher_state"] = {
+                    "signatures": session_matcher.signatures,
+                    "session_names": session_matcher.session_names,
+                    "n_channels": session_matcher.n_channels,
+                    "n_warmup_samples": session_matcher.n_warmup_samples,
+                    "use_power_spectrum": session_matcher.use_power_spectrum,
+                    "sample_rate": session_matcher.sample_rate,
+                }
+
             torch.save(checkpoint, path)
 
 
@@ -1404,10 +1451,17 @@ def evaluate(
     # Use no_grad instead of inference_mode for FSDP compatibility
     # inference_mode marks tensors as "inference tensors" which breaks FSDP checkpoint saving
     with torch.no_grad():
-        for ob, pcx, odor in loader:
+        for batch in loader:
+            # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
+            if len(batch) == 4:
+                ob, pcx, odor, session_ids_batch = batch
+            else:
+                ob, pcx, odor = batch
+                session_ids_batch = odor  # Legacy fallback
             ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
+            session_ids_batch = session_ids_batch.to(device, non_blocking=True)
 
             # Normalize target (PCx) for loss computation
             # NOTE: Input (OB) is normalized inside the model's forward()
@@ -1437,8 +1491,8 @@ def evaluate(
             # For CondUNet: use cond_emb if available, otherwise odor_ids
             # For other architectures: just pass input directly
             arch = config.get("arch", "condunet") if config else "condunet"
-            # When using session embedding, 'odor' variable contains session IDs
-            session_ids = odor if config and config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (not odor!)
+            session_ids = session_ids_batch if config and config.get("n_sessions", 0) > 0 else None
             if arch == "condunet":
                 if cond_emb is not None:
                     pred = model(ob, cond_emb=cond_emb, session_ids=session_ids)
@@ -1742,11 +1796,18 @@ def train_epoch(
     use_bf16 = config.get("fsdp_bf16", False)
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    for batch_idx, (ob, pcx, odor) in enumerate(pbar):
+    for batch_idx, batch in enumerate(pbar):
+        # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
+        if len(batch) == 4:
+            ob, pcx, odor, session_ids_batch = batch
+        else:
+            ob, pcx, odor = batch
+            session_ids_batch = odor  # Legacy fallback
         # non_blocking=True enables async CPU->GPU transfer (overlaps with compute)
         ob = ob.to(device, dtype=compute_dtype, non_blocking=True)
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
+        session_ids_batch = session_ids_batch.to(device, non_blocking=True)
 
         # Normalize target (PCx) for loss computation
         # NOTE: Input (OB) is normalized inside the model's forward()
@@ -1824,8 +1885,8 @@ def train_epoch(
 
         if arch == "condunet":
             # CondUNet with conditioning
-            # When using session embedding, 'odor' variable contains session IDs
-            session_ids = odor if config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (not odor!)
+            session_ids = session_ids_batch if config.get("n_sessions", 0) > 0 else None
             if cond_emb is not None:
                 fwd_result = model(
                     ob, cond_emb=cond_emb,
@@ -2189,14 +2250,15 @@ def train(
 
         batch_size = config.get("batch_size", 16)
 
-        # Custom collate function to convert DANDI dict format to (ob, pcx, odor) tuple
+        # Custom collate function to convert DANDI dict format to (ob, pcx, odor, session_id) tuple
         def dandi_collate_fn(batch):
-            """Convert DANDI batch dict to (source, target, label) tuple."""
+            """Convert DANDI batch dict to (source, target, label, session_id) tuple."""
             sources = torch.stack([item["source"] for item in batch])
             targets = torch.stack([item["target"] for item in batch])
-            # DANDI has no odor labels, use zeros as placeholder
+            # DANDI has no odor labels or session IDs, use zeros as placeholder
             labels = torch.zeros(len(batch), dtype=torch.long)
-            return sources, targets, labels
+            session_ids = torch.zeros(len(batch), dtype=torch.long)
+            return sources, targets, labels, session_ids
 
         # Create samplers for distributed training
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
@@ -2280,6 +2342,31 @@ def train(
         if is_primary():
             print(f"Session embedding: auto-detected {config['n_sessions']} sessions")
 
+    # Build session signatures for inference matching if session embedding is enabled
+    session_matcher = None
+    if config.get("n_sessions", 0) > 0 and "session_ids" in data and "ob" in data:
+        session_matcher = SessionMatcher(
+            n_channels=in_channels,
+            n_warmup_samples=100,
+            use_power_spectrum=True,
+            sample_rate=config.get("sampling_rate", 1000.0),
+        )
+        # Register signatures for each unique session in training data
+        session_ids_np = data["session_ids"]
+        ob_data = data["ob"]
+        train_idx = data.get("train_idx", np.arange(len(ob_data)))
+        unique_sessions = np.unique(session_ids_np[train_idx])
+        for sid in unique_sessions:
+            session_mask = session_ids_np == sid
+            session_data = ob_data[session_mask]
+            if len(session_data) > 0:
+                session_name = data.get("idx_to_session", {}).get(int(sid), f"session_{sid}")
+                session_matcher.register_session(int(sid), session_data, session_name=session_name)
+        # Store in config for saving with checkpoint
+        config["_session_matcher"] = session_matcher
+        if is_primary():
+            print(f"Session signatures: computed for {len(unique_sessions)} training sessions")
+
     if is_primary():
         print(f"Architecture: {arch.upper()}")
         print(f"Model: {in_channels} input channels → {out_channels} output channels")
@@ -2308,11 +2395,16 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction
-            use_output_scaling=config.get("use_output_scaling", True),
+            # Output scaling correction (disabled if using adaptive scaling)
+            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Session embedding for session-specific adjustments
             n_sessions=config.get("n_sessions", 0),
             session_emb_dim=config.get("session_emb_dim", 32),
+            # Statistics-based session adaptation (Phase 3 Group 18)
+            use_session_stats=config.get("use_session_stats", False),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_revin=config.get("use_revin", False),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2358,11 +2450,16 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction
-            use_output_scaling=config.get("use_output_scaling", True),
+            # Output scaling correction (disabled if using adaptive scaling)
+            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Session embedding (same as forward model)
             n_sessions=config.get("n_sessions", 0),
             session_emb_dim=config.get("session_emb_dim", 32),
+            # Statistics-based session adaptation (same as forward)
+            use_session_stats=config.get("use_session_stats", False),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_revin=config.get("use_revin", False),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -3539,6 +3636,20 @@ def parse_args():
     parser.add_argument("--session-emb-dim", type=int, default=32,
                         help="Session embedding dimension (default: 32)")
 
+    # NEW: Statistics-based session adaptation (Phase 3 Group 18)
+    parser.add_argument("--use-session-stats", action="store_true",
+                        help="Use statistics-based session conditioning (FiLM style) instead of ID embedding")
+    parser.add_argument("--session-use-spectral", action="store_true",
+                        help="Include spectral features in session statistics encoder")
+    parser.add_argument("--use-adaptive-scaling", action="store_true",
+                        help="Use session-adaptive output scaling (AdaIN style)")
+    parser.add_argument("--use-revin", action="store_true",
+                        help="Use Reversible Instance Normalization (ReVIN)")
+    parser.add_argument("--use-cov-augment", action="store_true",
+                        help="Use covariance expansion augmentation for synthetic sessions")
+    parser.add_argument("--cov-augment-prob", type=float, default=0.5,
+                        help="Probability of applying covariance augmentation (default: 0.5)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3662,6 +3773,14 @@ def main():
     else:
         config["n_sessions"] = 0  # Disabled
         config["session_emb_dim"] = 32
+
+    # NEW: Statistics-based session adaptation (Phase 3 Group 18)
+    config["use_session_stats"] = args.use_session_stats
+    config["session_use_spectral"] = args.session_use_spectral
+    config["use_adaptive_scaling"] = args.use_adaptive_scaling
+    config["use_revin"] = args.use_revin
+    config["use_cov_augment"] = args.use_cov_augment
+    config["cov_augment_prob"] = args.cov_augment_prob
 
     # Print session split info
     if is_primary() and config["split_by_session"]:

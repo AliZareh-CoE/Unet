@@ -230,6 +230,15 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "optimizer": "adamw",           # Optimizer
     "lr_schedule": "cosine",        # Learning rate schedule
     "weight_decay": 1e-4,           # Weight decay
+    # Session adaptation approaches (Group 18)
+    # Multiple methods based on domain adaptation literature:
+    "use_session_stats": False,     # Statistics-based conditioning (FiLM style)
+    "session_emb_dim": 32,          # Session statistics embedding dimension
+    "session_use_spectral": False,  # Include spectral features in session stats
+    "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style)
+    "use_revin": False,             # Reversible Instance Normalization
+    "use_cov_augment": False,       # Covariance expansion augmentation
+    "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
 }
 
 # =============================================================================
@@ -496,6 +505,156 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": {"parameter": "bidirectional", "equal": True},
     },
+
+    # =========================================================================
+    # PHASE 5: SESSION ADAPTATION (Group 18)
+    # Tests multiple approaches for cross-session generalization based on literature:
+    # - Statistics-based conditioning (ReVIN, FiLM)
+    # - Adaptive output scaling (AdaIN)
+    # - Covariance expansion augmentation (domain randomization)
+    # =========================================================================
+
+    # GROUP 18: Session Adaptation Methods
+    # This is a MULTI-PARAMETER group - each variant sets multiple params
+    {
+        "group_id": 18,
+        "name": "session_adaptation",
+        "description": "Session adaptation methods for cross-session generalization",
+        "parameter": "_session_method",  # Virtual param - variants set multiple real params
+        "variants": [
+            # Baseline: no session adaptation
+            {
+                "value": "none",
+                "name": "no_session",
+                "desc": "No session adaptation (baseline)",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 1: Statistics-based conditioning only (FiLM-style)
+            {
+                "value": "stats",
+                "name": "session_stats",
+                "desc": "Session statistics conditioning (mean/std)",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 2: Statistics with spectral features
+            {
+                "value": "stats_spectral",
+                "name": "session_stats_spectral",
+                "desc": "Session stats + spectral features (power bands)",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": True,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 3: Adaptive output scaling only (AdaIN-style)
+            {
+                "value": "adaptive",
+                "name": "adaptive_scaling",
+                "desc": "Session-adaptive output scaling (AdaIN style)",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": True,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 4: ReVIN - Reversible Instance Normalization
+            {
+                "value": "revin",
+                "name": "revin",
+                "desc": "ReVIN: normalize->process->denormalize (preserves session stats)",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": True,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 5: Stats + Adaptive scaling combined
+            {
+                "value": "stats_adaptive",
+                "name": "stats_and_adaptive",
+                "desc": "Session stats + adaptive scaling combined",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": True,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 6: Covariance expansion augmentation only
+            {
+                "value": "cov_augment",
+                "name": "cov_augment",
+                "desc": "Covariance expansion augmentation",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": True,
+                }
+            },
+            # Method 7: Stats + Cov augment combined
+            {
+                "value": "stats_cov",
+                "name": "stats_and_cov",
+                "desc": "Session stats + covariance augmentation",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": True,
+                }
+            },
+            # Method 8: ReVIN + Stats combined
+            {
+                "value": "revin_stats",
+                "name": "revin_and_stats",
+                "desc": "ReVIN + session stats conditioning",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": True,
+                    "use_cov_augment": False,
+                }
+            },
+            # Method 9: Full session adaptation (all methods except ReVIN - incompatible with adaptive scaling)
+            {
+                "value": "full",
+                "name": "full_session",
+                "desc": "Full: stats + spectral + adaptive + cov augment",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": True,
+                    "use_adaptive_scaling": True,
+                    "use_revin": False,  # ReVIN incompatible with adaptive scaling
+                    "use_cov_augment": True,
+                }
+            },
+        ],
+        "conditional_on": None,  # Always run - critical for cross-session evaluation
+    },
 ]
 
 # Calculate total runs
@@ -665,6 +824,16 @@ class AblationConfig:
     n_test_sessions: int = 4  # Sessions held out for testing
     n_val_sessions: int = 1  # Sessions held out for validation
 
+    # Session adaptation methods (Group 18)
+    # Multiple approaches based on domain adaptation literature:
+    use_session_stats: bool = False  # Statistics-based conditioning (FiLM style)
+    session_emb_dim: int = 32  # Session statistics embedding dimension
+    session_use_spectral: bool = False  # Include spectral features in session stats
+    use_adaptive_scaling: bool = False  # Session-adaptive output scaling (AdaIN style)
+    use_revin: bool = False  # Reversible Instance Normalization
+    use_cov_augment: bool = False  # Covariance expansion augmentation
+    cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
+
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
 
@@ -729,6 +898,14 @@ class AblationConfig:
             "split_by_session": self.split_by_session,
             "n_test_sessions": self.n_test_sessions,
             "n_val_sessions": self.n_val_sessions,
+            # Session adaptation methods
+            "use_session_stats": self.use_session_stats,
+            "session_emb_dim": self.session_emb_dim,
+            "session_use_spectral": self.session_use_spectral,
+            "use_adaptive_scaling": self.use_adaptive_scaling,
+            "use_revin": self.use_revin,
+            "use_cov_augment": self.use_cov_augment,
+            "cov_augment_prob": self.cov_augment_prob,
         }
 
     @property
@@ -760,9 +937,17 @@ class AblationConfig:
         # Start with current best config
         config = current_config.copy()
 
-        # Apply the variant's parameter value
-        param = group["parameter"]
-        config[param] = variant["value"]
+        # Apply the variant's parameter(s)
+        # Support both single-parameter and multi-parameter variants
+        if "config" in variant:
+            # Multi-parameter variant (like Group 18 session adaptation)
+            # The variant has a "config" dict with multiple param: value pairs
+            for param, value in variant["config"].items():
+                config[param] = value
+        else:
+            # Single-parameter variant (traditional)
+            param = group["parameter"]
+            config[param] = variant["value"]
 
         # Handle special cases for augmentation variants
         if "aug_strength" in variant:
@@ -798,6 +983,14 @@ class AblationConfig:
             split_by_session=True,
             n_test_sessions=0,  # No separate test set
             n_val_sessions=4,   # All held-out sessions for validation
+            # Session adaptation methods
+            use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_revin=config.get("use_revin", False),
+            use_cov_augment=config.get("use_cov_augment", False),
+            cov_augment_prob=config.get("cov_augment_prob", 0.5),
         )
 
     @classmethod

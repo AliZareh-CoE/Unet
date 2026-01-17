@@ -48,6 +48,10 @@ class AblationTrainer:
         self.device = device
         self.checkpoint_dir = checkpoint_dir
 
+        # Note: Session ID mapping is NO LONGER NEEDED with statistics-based conditioning
+        # The model computes session statistics from input signal, automatically
+        # generalizing to unseen sessions without explicit mapping.
+
         # Build loss function based on ablation config
         self.criterion = build_loss(
             ablation_config.loss_type,
@@ -108,16 +112,22 @@ class AblationTrainer:
             return optim.lr_scheduler.ConstantLR(self.optimizer, factor=1.0)
 
     def train_epoch(self, dataloader: DataLoader) -> float:
-        """Train for one epoch."""
+        """Train for one epoch.
+
+        Note: With statistics-based session conditioning, the model automatically
+        computes session statistics from input. No explicit session IDs needed.
+        """
         self.model.train()
         total_loss = 0.0
         n_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            # Handle different batch formats
+            # Handle different batch formats: 2, 3, or 4 elements
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
+                # Note: session_ids (batch[3]) are no longer needed
+                # Statistics-based conditioning computes from input signal
             else:
                 x, y = batch, batch
                 odor_ids = None
@@ -134,10 +144,12 @@ class AblationTrainer:
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
 
+            # Determine what to pass to model (session stats computed automatically)
+            use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
+
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
-                    # Pass conditioning if model supports it
-                    if odor_ids is not None and self.ablation_config.use_odor_embedding:
+                    if use_odor:
                         pred = self.model(x, odor_ids)
                     else:
                         pred = self.model(x)
@@ -158,7 +170,7 @@ class AblationTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                if odor_ids is not None and self.ablation_config.use_odor_embedding:
+                if use_odor:
                     pred = self.model(x, odor_ids)
                 else:
                     pred = self.model(x)
@@ -183,16 +195,24 @@ class AblationTrainer:
 
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> Tuple[float, float]:
-        """Validate model and compute R²."""
+        """Validate model and compute R².
+
+        Note: With statistics-based session conditioning, the model automatically
+        handles unseen sessions by computing statistics from the input signal.
+        No explicit session ID mapping is needed.
+        """
         self.model.eval()
         total_loss = 0.0
         all_preds = []
         all_targets = []
 
         for batch in dataloader:
+            # Handle different batch formats: 2, 3, or 4 elements
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
+                # Note: session_ids are no longer needed for statistics-based conditioning
+                # The model computes session statistics directly from input
             else:
                 x, y = batch, batch
                 odor_ids = None
@@ -202,15 +222,18 @@ class AblationTrainer:
             if odor_ids is not None:
                 odor_ids = odor_ids.to(self.device)
 
+            # Model forward - session stats computed automatically from input
+            use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
+
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
-                    if odor_ids is not None and self.ablation_config.use_odor_embedding:
+                    if use_odor:
                         pred = self.model(x, odor_ids)
                     else:
                         pred = self.model(x)
                     loss, _ = self.criterion(pred, y)
             else:
-                if odor_ids is not None and self.ablation_config.use_odor_embedding:
+                if use_odor:
                     pred = self.model(x, odor_ids)
                 else:
                     pred = self.model(x)
@@ -243,6 +266,19 @@ class AblationTrainer:
         self, x: torch.Tensor, y: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply data augmentation."""
+        # Covariance expansion augmentation (session diversity)
+        # Creates synthetic sessions by applying random per-channel scale/shift
+        if getattr(self.ablation_config, 'use_cov_augment', False):
+            prob = getattr(self.ablation_config, 'cov_augment_prob', 0.5)
+            if torch.rand(1).item() < prob:
+                B, C, T = x.shape
+                # Random per-channel scale and shift
+                scale = torch.empty(B, C, 1, device=x.device).uniform_(0.8, 1.2)
+                shift = torch.empty(B, C, 1, device=x.device).uniform_(-0.2, 0.2)
+                # Apply to both input and target (paired transformation)
+                x = x * scale + shift * x.std(dim=-1, keepdim=True)
+                y = y * scale + shift * y.std(dim=-1, keepdim=True)
+
         # Noise augmentation
         if self.ablation_config.aug_noise_std > 0:
             noise_x = torch.randn_like(x) * self.ablation_config.aug_noise_std

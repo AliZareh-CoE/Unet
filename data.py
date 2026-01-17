@@ -1363,13 +1363,15 @@ class PairedNeuralDataset(Dataset):
 
 
 class PairedConditionalDataset(Dataset):
-    """Dataset for paired OB-PCx signals with odor conditioning.
+    """Dataset for paired OB-PCx signals with odor conditioning and session info.
 
     Args:
         ob: OB signals array [n_samples, channels, time]
         pcx: PCx signals array [n_samples, channels, time]
         odors: Odor labels array [n_samples]
         indices: Sample indices to use from the arrays
+        session_ids: Optional session IDs array [n_samples] for session embedding.
+                    If None, odor IDs are used as session IDs for backwards compatibility.
         filter_odor_id: If provided, only keep samples with this odor ID
         temporal_ablation: TemporalAblation instance to apply masking
         data_fraction: Fraction of data to use (for data scaling experiments)
@@ -1380,6 +1382,7 @@ class PairedConditionalDataset(Dataset):
         pcx: np.ndarray,
         odors: np.ndarray,
         indices: np.ndarray,
+        session_ids: Optional[np.ndarray] = None,
         filter_odor_id: Optional[int] = None,
         temporal_ablation: Optional[TemporalAblation] = None,
         data_fraction: float = 1.0,
@@ -1401,21 +1404,28 @@ class PairedConditionalDataset(Dataset):
         self.ob = torch.from_numpy(ob[indices]).float()
         self.pcx = torch.from_numpy(pcx[indices]).float()
         self.odors = torch.from_numpy(odors[indices]).long()
+        # Session IDs: use provided session_ids or fall back to odors for backwards compat
+        if session_ids is not None:
+            self.session_ids = torch.from_numpy(session_ids[indices]).long()
+        else:
+            # Backwards compatibility: if no session_ids, use odors (wrong but matches old behavior)
+            self.session_ids = self.odors
         self.temporal_ablation = temporal_ablation
 
     def __len__(self) -> int:
         return self.ob.shape[0]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ob = self.ob[idx]
         pcx = self.pcx[idx]
         odor = self.odors[idx]
+        session_id = self.session_ids[idx]
 
         if self.temporal_ablation is not None:
             ob = self.temporal_ablation.apply_mask(ob)
             pcx = self.temporal_ablation.apply_mask(pcx)
 
-        return ob, pcx, odor
+        return ob, pcx, odor, session_id
 
 
 class UnpairedDataset(Dataset):
@@ -1752,20 +1762,26 @@ def create_dataloaders(
     # Create temporal ablation if specified
     temp_ablation = TemporalAblation(temporal_ablation) if temporal_ablation else None
 
+    # Get session_ids if available (for proper session embedding)
+    session_ids = data.get("session_ids", None)
+
     # Create datasets
     train_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["train_idx"],
+        session_ids=session_ids,
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
         data_fraction=data_fraction,
     )
     val_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["val_idx"],
+        session_ids=session_ids,
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
     )
     test_dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], data["test_idx"],
+        session_ids=session_ids,
         filter_odor_id=filter_odor_id,
         temporal_ablation=temp_ablation,
     )

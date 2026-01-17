@@ -44,14 +44,20 @@ def build_condunet(
             base=config.base_channels,
             n_odors=7,  # Default for olfactory
             emb_dim=128,
-            dropout=0.1,
+            dropout=config.dropout,
             use_attention=config.attention_type != "none",
             attention_type=config.attention_type if config.attention_type != "none" else "basic",
-            norm_type="instance",
+            norm_type=config.norm_type,
             cond_mode=config.cond_mode,
             n_downsample=config.n_downsample,
-            conv_type="standard",
-            use_output_scaling=True,
+            conv_type=config.conv_type,
+            use_output_scaling=not config.use_adaptive_scaling,  # Disable if using adaptive
+            # Session adaptation methods
+            use_session_stats=config.use_session_stats,
+            session_emb_dim=config.session_emb_dim,
+            session_use_spectral=config.session_use_spectral,
+            use_adaptive_scaling=config.use_adaptive_scaling,
+            use_revin=config.use_revin,
         )
         return model
 

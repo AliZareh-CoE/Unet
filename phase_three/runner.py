@@ -289,6 +289,21 @@ def run_train_subprocess(
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
+    # Session adaptation parameters (Phase 3 Group 18)
+    if config.get("use_session_stats", False):
+        cmd.append("--use-session-stats")
+    if config.get("session_use_spectral", False):
+        cmd.append("--session-use-spectral")
+    if config.get("use_adaptive_scaling", False):
+        cmd.append("--use-adaptive-scaling")
+    if config.get("use_revin", False):
+        cmd.append("--use-revin")
+    if config.get("use_cov_augment", False):
+        cmd.append("--use-cov-augment")
+        # Also pass the probability
+        cov_prob = config.get("cov_augment_prob", 0.5)
+        cmd.extend(["--cov-augment-prob", str(cov_prob)])
+
     # Run subprocess with live output capture (goes through TeeLogger)
     start_time = time.time()
     try:
@@ -593,41 +608,65 @@ def create_cv_splits(
 
 def load_dataset_raw(
     dataset_name: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    split_by_session: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, np.ndarray, np.ndarray]:
     """Load dataset as raw tensors for cross-validation.
 
     Args:
         dataset_name: Name of dataset ('olfactory', etc.)
+        split_by_session: If True, load with session info for session embedding
 
     Returns:
-        X, y, odor_ids, in_channels, out_channels
+        X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions,
+        original_train_idx, original_val_idx (indices into the returned arrays)
     """
     try:
         from data import prepare_data
 
         print(f"Loading {dataset_name} dataset...")
-        data = prepare_data()
+        data = prepare_data(split_by_session=split_by_session)
 
         ob = data["ob"]    # [N, C, T]
         pcx = data["pcx"]  # [N, C, T]
 
-        # Combine train+val for CV
-        train_idx = data["train_idx"]
-        val_idx = data["val_idx"]
-        all_idx = np.concatenate([train_idx, val_idx])
+        # Get original train/val indices from session-based splits
+        orig_train_idx = data["train_idx"]
+        orig_val_idx = data["val_idx"]
+
+        # Combine train+val for the data arrays
+        all_idx = np.concatenate([orig_train_idx, orig_val_idx])
 
         X = torch.from_numpy(ob[all_idx]).float()
         y = torch.from_numpy(pcx[all_idx]).float()
 
-        # Create dummy odor IDs if not available
-        odor_ids = torch.zeros(len(all_idx), dtype=torch.long)
+        # Get odor IDs (or create dummy if not available)
+        if "odors" in data:
+            odor_ids = torch.from_numpy(data["odors"][all_idx]).long()
+        else:
+            odor_ids = torch.zeros(len(all_idx), dtype=torch.long)
+
+        # Get session IDs (CRITICAL for session embedding)
+        if "session_ids" in data:
+            session_ids = torch.from_numpy(data["session_ids"][all_idx]).long()
+            n_sessions = len(np.unique(data["session_ids"]))
+            print(f"  Session embedding: {n_sessions} sessions available")
+        else:
+            # Create dummy session IDs (all same session)
+            session_ids = torch.zeros(len(all_idx), dtype=torch.long)
+            n_sessions = 1
+            print(f"  Warning: No session_ids in data, session embedding disabled")
 
         in_channels = X.shape[1]
         out_channels = y.shape[1]
 
-        print(f"  Loaded: {X.shape} samples for cross-validation")
+        # Create new indices relative to the combined array
+        # First len(orig_train_idx) samples are training, rest are validation
+        new_train_idx = np.arange(len(orig_train_idx))
+        new_val_idx = np.arange(len(orig_train_idx), len(all_idx))
 
-        return X, y, odor_ids, in_channels, out_channels
+        print(f"  Loaded: {X.shape} samples ({len(new_train_idx)} train, {len(new_val_idx)} val)")
+
+        return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, new_train_idx, new_val_idx
 
     except (ImportError, FileNotFoundError) as e:
         print(f"Dataset '{dataset_name}' not available ({e}), using synthetic data")
@@ -639,7 +678,8 @@ def create_synthetic_data_raw(
     seq_len: int = 5000,
     in_channels: int = 32,
     out_channels: int = 32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    n_sessions: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, np.ndarray, np.ndarray]:
     """Create synthetic data as raw tensors."""
     X = torch.randn(n_samples, in_channels, seq_len)
     y = X + 0.5 * torch.randn_like(X)
@@ -652,25 +692,36 @@ def create_synthetic_data_raw(
         )
 
     odor_ids = torch.randint(0, 7, (n_samples,))
+    # Create synthetic session IDs (evenly distributed)
+    session_ids = torch.arange(n_samples) % n_sessions
 
-    return X, y, odor_ids, in_channels, out_channels
+    # Create 80/20 train/val split
+    n_train = int(n_samples * 0.8)
+    train_idx = np.arange(n_train)
+    val_idx = np.arange(n_train, n_samples)
+
+    return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, train_idx, val_idx
 
 
 def create_dataloaders_from_indices(
     X: torch.Tensor,
     y: torch.Tensor,
     odor_ids: torch.Tensor,
+    session_ids: torch.Tensor,
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     batch_size: int = 32,
     n_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Create dataloaders from data and indices."""
+    """Create dataloaders from data and indices.
+
+    Returns dataloaders that yield 4-element tuples: (x, y, odor_id, session_id)
+    """
     train_dataset = TensorDataset(
-        X[train_idx], y[train_idx], odor_ids[train_idx]
+        X[train_idx], y[train_idx], odor_ids[train_idx], session_ids[train_idx]
     )
     val_dataset = TensorDataset(
-        X[val_idx], y[val_idx], odor_ids[val_idx]
+        X[val_idx], y[val_idx], odor_ids[val_idx], session_ids[val_idx]
     )
 
     train_loader = DataLoader(
@@ -690,8 +741,12 @@ def create_synthetic_data(
     seq_len: int = 5000,
     in_channels: int = 32,
     out_channels: int = 32,
-) -> Tuple[DataLoader, DataLoader, int, int]:
-    """Create synthetic data for testing."""
+    n_sessions: int = 8,
+) -> Tuple[DataLoader, DataLoader, int, int, int]:
+    """Create synthetic data for testing.
+
+    Returns: train_loader, val_loader, in_channels, out_channels, n_sessions
+    """
     # Training data
     x_train = torch.randn(n_samples, in_channels, seq_len)
     # Create target as smoothed transformation of input
@@ -703,6 +758,7 @@ def create_synthetic_data(
             y_train[:, c:c+1, :], kernel, padding=25
         )
     odor_ids_train = torch.randint(0, 7, (n_samples,))
+    session_ids_train = torch.arange(n_samples) % n_sessions
 
     # Validation data (smaller)
     n_val = n_samples // 5
@@ -713,9 +769,10 @@ def create_synthetic_data(
             y_val[:, c:c+1, :], kernel, padding=25
         )
     odor_ids_val = torch.randint(0, 7, (n_val,))
+    session_ids_val = torch.arange(n_val) % n_sessions
 
-    train_dataset = TensorDataset(x_train, y_train, odor_ids_train)
-    val_dataset = TensorDataset(x_val, y_val, odor_ids_val)
+    train_dataset = TensorDataset(x_train, y_train, odor_ids_train, session_ids_train)
+    val_dataset = TensorDataset(x_val, y_val, odor_ids_val, session_ids_val)
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=n_workers
@@ -724,12 +781,17 @@ def create_synthetic_data(
         val_dataset, batch_size=batch_size, shuffle=False, num_workers=n_workers
     )
 
-    return train_loader, val_loader, in_channels, out_channels
+    return train_loader, val_loader, in_channels, out_channels, n_sessions
 
 
 # =============================================================================
 # Main Runner
 # =============================================================================
+
+# NOTE: Session ID mapping is NO LONGER NEEDED with statistics-based conditioning.
+# The model computes session statistics from the input signal, automatically
+# generalizing to unseen sessions without explicit mapping. This is the
+# literature-recommended approach (ReVIN, domain-specific batch normalization).
 
 def run_single_ablation(
     ablation_config: AblationConfig,
@@ -761,6 +823,10 @@ def run_single_ablation(
 
     Returns:
         AblationResult with training metrics
+
+    Note:
+        Session conditioning uses statistics-based approach that automatically
+        generalizes to unseen sessions. No explicit session ID mapping needed.
     """
     # Set seed based on fold for reproducibility
     seed = cv_seed + fold
@@ -815,6 +881,7 @@ def run_phase3(
     fsdp_strategy: str = "grad_op",
     enable_logging: bool = True,
     min_improvement: float = 0.01,
+    no_skip_conditional: bool = False,
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies.
 
@@ -830,6 +897,7 @@ def run_phase3(
         fsdp_strategy: FSDP sharding strategy
         enable_logging: Save full output to log file (default: True)
         min_improvement: Minimum R² improvement required for greedy selection (default: 0.01 = 1%)
+        no_skip_conditional: If True, run conditional groups even if condition not met
 
     Returns:
         Phase3Result with all ablation results
@@ -864,7 +932,7 @@ def run_phase3(
     # Route to appropriate protocol handler
     try:
         if config.protocol == "greedy_forward":
-            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement)
+            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, no_skip_conditional)
         elif config.protocol == "additive":
             result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
         else:
@@ -886,12 +954,13 @@ def _run_greedy_forward_protocol(
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     min_improvement: float = 0.01,
+    no_skip_conditional: bool = False,
 ) -> Phase3Result:
     """Run GREEDY FORWARD SELECTION ablation protocol.
 
     Tests variants in each group sequentially. Winner (best R²) becomes
     default for subsequent groups. Conditional groups are skipped if
-    the condition is not met.
+    the condition is not met (unless no_skip_conditional=True).
 
     IMPORTANT: A variant only becomes the winner if it beats the current
     default by at least `min_improvement` (default: 1% R²). This prevents
@@ -930,14 +999,19 @@ def _run_greedy_forward_protocol(
         current_config = GREEDY_DEFAULTS.copy()
         group_winners = {}  # group_id -> {"variant": name, "r2": value, "config": {...}}
 
-    # Load raw data
-    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
+    # Load raw data (including session_ids for session embedding)
+    # Also returns session-based train/val split indices
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, train_idx, val_idx = load_dataset_raw(config.dataset)
 
-    # Create single split (no CV for ablation per nnU-Net)
-    # Use first "fold" as the single train/test split
-    cv_splits = create_cv_splits(len(X), n_folds=1, seed=config.cv_seed)
-    train_idx, val_idx = cv_splits[0]
-    print(f"Single split: {len(train_idx)} train, {len(val_idx)} test samples")
+    # Store n_sessions in current_config for use in ablation
+    current_config["n_sessions"] = n_sessions
+
+    # Use the session-based split directly (no CV for ablation per nnU-Net)
+    # This preserves the 8 train / 4 val session split from prepare_data
+    print(f"Session-based split: {len(train_idx)} train, {len(val_idx)} val samples")
+
+    # Note: Session conditioning now uses statistics-based approach
+    # No explicit session ID mapping needed - model computes from input signal
 
     # Get groups to run
     groups = config.get_greedy_groups()
@@ -960,11 +1034,14 @@ def _run_greedy_forward_protocol(
             print(f"\n[Group {group_id}] {group_name} - SKIPPED (already completed)")
             continue
 
-        # Check conditional
+        # Check conditional (skip if condition not met, unless --no-skip-conditional)
         if not check_conditional(group["conditional_on"], current_config):
-            print(f"\n[Group {group_id}] {group_name} - SKIPPED (condition not met)")
-            completed_groups.add(str(group_id))
-            continue
+            if no_skip_conditional:
+                print(f"\n[Group {group_id}] {group_name} - RUNNING (condition not met but --no-skip-conditional set)")
+            else:
+                print(f"\n[Group {group_id}] {group_name} - SKIPPED (condition not met)")
+                completed_groups.add(str(group_id))
+                continue
 
         print(f"\n{'=' * 60}")
         print(f"GROUP {group_id}: {group['description']}")
@@ -1042,7 +1119,7 @@ def _run_greedy_forward_protocol(
             else:
                 # Use internal trainer
                 train_loader, val_loader = create_dataloaders_from_indices(
-                    X, y, odor_ids, train_idx, val_idx,
+                    X, y, odor_ids, session_ids, train_idx, val_idx,
                     batch_size=config.training.batch_size,
                     n_workers=config.n_workers,
                 )
@@ -1320,7 +1397,8 @@ def _run_additive_protocol(
         completed_studies = set()  # stage names like "stage0", "stage1", etc.
 
     # Load raw data for CV
-    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
+    # Load raw data (ignore train/val split, we'll use CV splits instead)
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, _, _ = load_dataset_raw(config.dataset)
 
     # Create CV splits
     cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
@@ -1408,7 +1486,7 @@ def _run_additive_protocol(
             else:
                 # Use internal trainer
                 train_loader, val_loader = create_dataloaders_from_indices(
-                    X, y, odor_ids, train_idx, val_idx,
+                    X, y, odor_ids, session_ids, train_idx, val_idx,
                     batch_size=config.training.batch_size,
                     n_workers=config.n_workers,
                 )
@@ -1614,7 +1692,8 @@ def _run_subtractive_protocol(
         baseline_completed = False
 
     # Load raw data for CV
-    X, y, odor_ids, in_channels, out_channels = load_dataset_raw(config.dataset)
+    # Load raw data (ignore train/val split, we'll use CV splits instead)
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, _, _ = load_dataset_raw(config.dataset)
 
     # Create CV splits
     cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
@@ -1696,7 +1775,7 @@ def _run_subtractive_protocol(
             else:
                 # Use internal trainer
                 train_loader, val_loader = create_dataloaders_from_indices(
-                    X, y, odor_ids, train_idx, val_idx,
+                    X, y, odor_ids, session_ids, train_idx, val_idx,
                     batch_size=config.training.batch_size,
                     n_workers=config.n_workers,
                 )
@@ -1816,7 +1895,7 @@ def _run_subtractive_protocol(
             else:
                 # Use internal trainer
                 train_loader, val_loader = create_dataloaders_from_indices(
-                    X, y, odor_ids, train_idx, val_idx,
+                    X, y, odor_ids, session_ids, train_idx, val_idx,
                     batch_size=config.training.batch_size,
                     n_workers=config.n_workers,
                 )
@@ -2165,6 +2244,14 @@ def main():
              "If a variant doesn't beat the baseline by this margin, we stick with the simpler option. "
              "Default: 0.01 (1%%). Example: 0.005 = 0.5%%, 0.02 = 2%%",
     )
+    parser.add_argument(
+        "--no-skip-conditional",
+        action="store_true",
+        help="Don't skip conditional groups even if their condition isn't met. "
+             "Use this to test attention_heads even when no_attention won, or "
+             "cycle_lambda even when unidirectional won. This explores more of "
+             "the search space at the cost of more compute.",
+    )
 
     args = parser.parse_args()
 
@@ -2257,6 +2344,7 @@ def main():
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
         min_improvement=args.min_improvement,
+        no_skip_conditional=args.no_skip_conditional,
     )
 
     # Clean up checkpoint after successful completion
