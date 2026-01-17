@@ -254,7 +254,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 1: Normalization Type (THE most critical component!)
     # Literature: BatchNorm (2015), LayerNorm (2016), GroupNorm (2018), RMSNorm (2019)
     {
-        "group_id": 1,
+        "group_id": 2,
         "name": "normalization",
         "description": "Normalization layer type - critical for training stability",
         "parameter": "norm_type",
@@ -271,7 +271,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 2: Activation Function
     # Literature: ReLU (2010), GELU (2016), SiLU/Swish (2017), Mish (2019)
     {
-        "group_id": 2,
+        "group_id": 3,
         "name": "activation",
         "description": "Activation function - affects gradient flow and expressivity",
         "parameter": "activation",
@@ -286,7 +286,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 3: Convolution Type
     {
-        "group_id": 3,
+        "group_id": 4,
         "name": "conv_type",
         "description": "Convolution architecture",
         "parameter": "conv_type",
@@ -299,7 +299,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 4: Skip Connection Type (core U-Net design)
     # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
     {
-        "group_id": 4,
+        "group_id": 5,
         "name": "skip_connection",
         "description": "Skip connection type in U-Net architecture",
         "parameter": "skip_type",
@@ -313,7 +313,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 5: Network Depth
     {
-        "group_id": 5,
+        "group_id": 6,
         "name": "depth",
         "description": "Encoder/decoder depth",
         "parameter": "n_downsample",
@@ -326,7 +326,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 6: Network Width
     {
-        "group_id": 6,
+        "group_id": 7,
         "name": "width",
         "description": "Base channel count",
         "parameter": "base_channels",
@@ -343,7 +343,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # =========================================================================
     # GROUP 7: Attention Type
     {
-        "group_id": 7,
+        "group_id": 8,
         "name": "attention",
         "description": "Attention mechanism",
         "parameter": "attention_type",
@@ -356,7 +356,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 8: Attention Heads (conditional on attention != none)
     {
-        "group_id": 8,
+        "group_id": 9,
         "name": "attention_heads",
         "description": "Number of attention heads",
         "parameter": "n_heads",
@@ -370,7 +370,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 9: Conditioning Mode
     # NOTE: train.py only supports 'none' and 'cross_attn_gated' currently
     {
-        "group_id": 9,
+        "group_id": 10,
         "name": "conditioning",
         "description": "Conditioning mechanism",
         "parameter": "cond_mode",
@@ -386,7 +386,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # =========================================================================
     # GROUP 10: Loss Function
     {
-        "group_id": 10,
+        "group_id": 11,
         "name": "loss",
         "description": "Training loss function",
         "parameter": "loss_type",
@@ -400,7 +400,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 11: Data Augmentation
     {
-        "group_id": 11,
+        "group_id": 12,
         "name": "augmentation",
         "description": "Data augmentation strategy",
         "parameter": "use_augmentation",
@@ -415,7 +415,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 12: Dropout Strategy
     # Literature: Dropout (2014), Spatial Dropout (2015), DropBlock (2018)
     {
-        "group_id": 12,
+        "group_id": 13,
         "name": "dropout",
         "description": "Dropout regularization strategy",
         "parameter": "dropout",
@@ -431,7 +431,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 13: Weight Decay
     # Literature: L2 regularization, decoupled weight decay (AdamW paper)
     {
-        "group_id": 13,
+        "group_id": 14,
         "name": "weight_decay",
         "description": "Weight decay (L2 regularization) strength",
         "parameter": "weight_decay",
@@ -451,7 +451,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 14: Optimizer
     # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
     {
-        "group_id": 14,
+        "group_id": 15,
         "name": "optimizer",
         "description": "Optimization algorithm",
         "parameter": "optimizer",
@@ -467,7 +467,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 15: Learning Rate Schedule
     # Literature: Step decay, Cosine annealing (2016), Warmup (2017), OneCycle (2018)
     {
-        "group_id": 15,
+        "group_id": 16,
         "name": "lr_schedule",
         "description": "Learning rate scheduling strategy",
         "parameter": "lr_schedule",
@@ -483,7 +483,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 16: Bidirectional Training
     {
-        "group_id": 16,
+        "group_id": 17,
         "name": "bidirectional",
         "description": "Bidirectional training with cycle consistency",
         "parameter": "bidirectional",
@@ -495,7 +495,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 17: Cycle Lambda (conditional on bidirectional=True)
     {
-        "group_id": 17,
+        "group_id": 18,
         "name": "cycle_lambda",
         "description": "Cycle consistency loss weight",
         "parameter": "cycle_lambda",
@@ -518,7 +518,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 18: Session Adaptation Methods
     # This is a MULTI-PARAMETER group - each variant sets multiple params
     {
-        "group_id": 18,
+        "group_id": 1,
         "name": "session_adaptation",
         "description": "Session adaptation methods for cross-session generalization",
         "parameter": "_session_method",  # Virtual param - variants set multiple real params
@@ -1254,8 +1254,9 @@ class Phase3Config:
         return configs
 
     def get_greedy_groups(self) -> List[Dict[str, Any]]:
-        """Get ablation groups for greedy_forward protocol."""
-        return [g for g in ABLATION_GROUPS if g["group_id"] in self.groups]
+        """Get ablation groups for greedy_forward protocol, sorted by group_id."""
+        groups = [g for g in ABLATION_GROUPS if g["group_id"] in self.groups]
+        return sorted(groups, key=lambda g: g["group_id"])
 
     def to_dict(self) -> Dict[str, Any]:
         return {
