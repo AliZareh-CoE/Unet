@@ -1029,11 +1029,11 @@ class AblationConfig:
             optimizer=config.get("optimizer", "adamw"),
             lr_schedule=config.get("lr_schedule", "cosine"),
             weight_decay=config.get("weight_decay", 1e-4),
-            # Multi-session validation: 8 train, 4 val, NO test
-            # Winner = best mean R² across all 4 validation sessions
+            # Multi-session validation: 6 train, 3 val, NO test
+            # Winner = best mean R² across all 3 validation sessions
             split_by_session=True,
             n_test_sessions=0,  # No separate test set
-            n_val_sessions=4,   # All held-out sessions for validation
+            n_val_sessions=3,   # All held-out sessions for validation
             # Session adaptation methods
             use_session_stats=config.get("use_session_stats", False),
             session_emb_dim=config.get("session_emb_dim", 32),

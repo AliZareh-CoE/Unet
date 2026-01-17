@@ -272,7 +272,7 @@ DEFAULT_CONFIG = {
     # This tests true cross-session generalization (harder but more realistic)
     "split_by_session": False,  # Use session-based holdout instead of random splits
     "n_test_sessions": 1,       # Number of sessions to hold out for testing
-    "n_val_sessions": 4,        # Number of sessions to hold out for validation
+    "n_val_sessions": 3,        # Number of sessions to hold out for validation
     "session_column": "recording_id",  # CSV column containing session/recording IDs
     "no_test_set": True,        # If True, no test set - all held-out sessions for validation
     "separate_val_sessions": True,  # If True, evaluate each val session separately
