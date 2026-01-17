@@ -197,8 +197,7 @@ def load_pretrained_model(
 
     VARIANT_MAP = {
         "linear": "simple", "cnn": "basic", "wavenet": "standard",
-        "fnet": "standard", "vit": "standard", "performer": "standard",
-        "mamba": "standard",
+        "fnet": "standard", "vit": "standard",
     }
 
     if architecture == "unet":

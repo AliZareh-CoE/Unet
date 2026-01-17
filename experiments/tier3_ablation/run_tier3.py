@@ -173,8 +173,6 @@ def create_ablated_model(
         "wavenet": "standard",
         "fnet": "standard",
         "vit": "standard",
-        "performer": "standard",
-        "mamba": "standard",
     }
     variant = VARIANT_MAP.get(base_arch, "standard")
 

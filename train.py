@@ -1437,11 +1437,13 @@ def evaluate(
             # For CondUNet: use cond_emb if available, otherwise odor_ids
             # For other architectures: just pass input directly
             arch = config.get("arch", "condunet") if config else "condunet"
+            # When using session embedding, 'odor' variable contains session IDs
+            session_ids = odor if config and config.get("n_sessions", 0) > 0 else None
             if arch == "condunet":
                 if cond_emb is not None:
-                    pred = model(ob, cond_emb=cond_emb)
+                    pred = model(ob, cond_emb=cond_emb, session_ids=session_ids)
                 else:
-                    pred = model(ob, odor)
+                    pred = model(ob, odor, session_ids=session_ids)
             else:
                 # Other architectures: just pass input
                 pred = model(ob)
@@ -1517,9 +1519,9 @@ def evaluate(
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
                 if cond_emb is not None:
-                    pred_rev = reverse_model(pcx, cond_emb=cond_emb)
+                    pred_rev = reverse_model(pcx, cond_emb=cond_emb, session_ids=session_ids)
                 else:
-                    pred_rev = reverse_model(pcx, odor)
+                    pred_rev = reverse_model(pcx, odor, session_ids=session_ids)
 
                 # Apply envelope histogram matching (reverse direction)
                 if envelope_matcher_rev is not None:
@@ -1822,15 +1824,19 @@ def train_epoch(
 
         if arch == "condunet":
             # CondUNet with conditioning
+            # When using session embedding, 'odor' variable contains session IDs
+            session_ids = odor if config.get("n_sessions", 0) > 0 else None
             if cond_emb is not None:
                 fwd_result = model(
                     ob, cond_emb=cond_emb,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
             else:
                 fwd_result = model(
                     ob, odor,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
@@ -1881,12 +1887,14 @@ def train_epoch(
             if cond_emb_rev is not None:
                 rev_result = reverse_model(
                     pcx, cond_emb=cond_emb_rev,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
             else:
                 rev_result = reverse_model(
                     pcx, odor,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
@@ -1920,9 +1928,9 @@ def train_epoch(
 
             # Cycle consistency: OB → PCx → OB
             if cond_emb_rev is not None:
-                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev)
+                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev, session_ids=session_ids)
             else:
-                cycle_ob = reverse_model(pred_raw.detach(), odor)
+                cycle_ob = reverse_model(pred_raw.detach(), odor, session_ids=session_ids)
             cycle_ob_c = crop_to_target_torch(cycle_ob)
             cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
             loss = loss + cycle_loss_ob
@@ -2030,6 +2038,11 @@ def train_epoch(
             if is_primary() and batch_idx == 0 and epoch == 1:
                 print(f"  Total loss (with contrastive): {loss.item():.4f}")
                 print(f"{'='*60}\n")
+
+        # NaN detection before backward to prevent silent failures
+        # Local check is cheap; if NaN detected, raise immediately
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise ValueError(f"NaN/Inf loss detected at epoch {epoch}, batch {batch_idx}. Training aborted.")
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -2253,11 +2266,27 @@ def train(
     conv_type = config.get("conv_type", "standard")
     arch = config.get("arch", "condunet")  # Architecture selection
 
+    # Auto-detect number of sessions for session embedding if not specified
+    if config.get("use_session_embedding", False) and config.get("n_sessions") is None:
+        # Try to get number of sessions from data
+        if "train_sessions" in data and "val_sessions" in data:
+            all_sessions = list(set(data["train_sessions"]) | set(data.get("val_sessions", [])))
+            config["n_sessions"] = len(all_sessions)
+        elif "session_to_idx" in data:
+            config["n_sessions"] = len(data["session_to_idx"])
+        else:
+            # Default fallback - can be overridden with --n-sessions
+            config["n_sessions"] = 15  # Reasonable default for olfactory data
+        if is_primary():
+            print(f"Session embedding: auto-detected {config['n_sessions']} sessions")
+
     if is_primary():
         print(f"Architecture: {arch.upper()}")
         print(f"Model: {in_channels} input channels → {out_channels} output channels")
         if arch == "condunet":
             print(f"Conditions: {n_odors} classes")
+            if config.get("n_sessions", 0) > 0:
+                print(f"Session embedding: {config['n_sessions']} sessions, dim={config['session_emb_dim']}")
 
     # Create model based on architecture
     if arch == "condunet":
@@ -2281,6 +2310,9 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction
             use_output_scaling=config.get("use_output_scaling", True),
+            # Session embedding for session-specific adjustments
+            n_sessions=config.get("n_sessions", 0),
+            session_emb_dim=config.get("session_emb_dim", 32),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2298,9 +2330,12 @@ def train(
             out_channels=out_channels,
             time_steps=time_steps,
         )
+        # Count parameters BEFORE FSDP wrapping (FSDP shards params across ranks)
+        # Store in config for later use in results output
+        model_n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        config["model_n_params"] = model_n_params
         if is_primary():
-            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"  Parameters: {n_params:,}")
+            print(f"  Parameters: {model_n_params:,}")
 
     # Create reverse model (target → source) for bidirectional training
     # Only for CondUNet - other architectures don't support conditioning
@@ -2325,6 +2360,9 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction
             use_output_scaling=config.get("use_output_scaling", True),
+            # Session embedding (same as forward model)
+            n_sessions=config.get("n_sessions", 0),
+            session_emb_dim=config.get("session_emb_dim", 32),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2879,13 +2917,27 @@ def train(
                 if epoch % 5 == 0:
                     recording_session.flush()
 
-            # Step the lr scheduler
+            # Step the lr scheduler (only primary has it)
             scheduler.step()
 
-            if patience_counter >= early_stop_patience:
-                if is_primary():
-                    print(f"Early stopping at epoch {epoch} (Stage 1 complete)")
-                break
+        # =====================================================================
+        # Early stopping check - MUST be outside is_primary() block
+        # All ranks must break together to avoid NCCL hangs
+        # =====================================================================
+        should_stop = patience_counter >= early_stop_patience
+
+        # Broadcast early stopping decision to all ranks
+        if dist.is_initialized():
+            stop_tensor = torch.tensor([1 if should_stop else 0], dtype=torch.int32, device=device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = stop_tensor.item() == 1
+
+        if should_stop:
+            if is_primary():
+                print(f"Early stopping at epoch {epoch} (patience {early_stop_patience} exceeded)")
+            # Barrier before break to ensure all ranks are synchronized
+            barrier()
+            break
 
         # Stage 1 evaluation (if enabled)
         # NOTE: ALL ranks must participate in evaluate() because model is sharded with FSDP
@@ -3263,6 +3315,7 @@ def train(
         "history": history,
         "model": model,
         "reverse_model": reverse_model,
+        "n_parameters": config.get("model_n_params", 0),  # Pre-FSDP param count
     }
 
 
@@ -3275,7 +3328,7 @@ def parse_args():
 
     # Architecture selection (for Phase 2 comparison)
     parser.add_argument("--arch", type=str, default="condunet",
-                        choices=["condunet", "linear", "simplecnn", "wavenet", "fnet", "vit", "performer", "mamba"],
+                        choices=["condunet", "linear", "simplecnn", "wavenet", "vit"],
                         help="Architecture to train (default: condunet). Other options for Phase 2 comparison.")
 
     # Dataset selection
@@ -3396,6 +3449,18 @@ def parse_args():
                         choices=COND_MODES,
                         help="Override conditioning mode")
 
+    # Attention type override (for ablation studies)
+    ATTENTION_TYPES = ["none", "basic", "cross_freq", "cross_freq_v2"]
+    parser.add_argument("--attention-type", type=str, default=None,
+                        choices=ATTENTION_TYPES,
+                        help="Override attention type (for Phase 3 ablation studies)")
+
+    # Convolution type override (for ablation studies)
+    CONV_TYPES = ["standard", "modern"]
+    parser.add_argument("--conv-type", type=str, default=None,
+                        choices=CONV_TYPES,
+                        help="Override convolution type: 'standard' (basic Conv1d) or 'modern' (dilated depthwise separable + SE)")
+
     # Conditioning source: how conditioning embeddings are derived
     COND_SOURCES = ["odor_onehot", "spectro_temporal", "cpc", "vqvae", "freq_disentangled", "cycle_consistent"]
     parser.add_argument("--conditioning", type=str, default="spectro_temporal",
@@ -3412,6 +3477,67 @@ def parse_args():
     # Data augmentation
     parser.add_argument("--no-aug", action="store_true",
                         help="Disable all data augmentations")
+    parser.add_argument("--aug-strength", type=str, default=None,
+                        choices=["none", "light", "medium", "heavy"],
+                        help="Augmentation strength level: "
+                             "'none' = no augmentation, "
+                             "'light' = time shift + noise only, "
+                             "'medium' = + channel dropout + amplitude scale, "
+                             "'heavy' = all augmentations (default)")
+
+    # =========================================================================
+    # Phase 3 Ablation Study Arguments (Nature Methods level)
+    # =========================================================================
+
+    # Normalization type
+    NORM_TYPES = ["batch", "layer", "instance", "group", "rms", "none"]
+    parser.add_argument("--norm-type", type=str, default=None,
+                        choices=NORM_TYPES,
+                        help="Normalization layer type for ablation studies")
+
+    # Skip connection type
+    SKIP_TYPES = ["add", "concat", "attention", "dense"]
+    parser.add_argument("--skip-type", type=str, default=None,
+                        choices=SKIP_TYPES,
+                        help="Skip connection type: 'add' (residual), 'concat' (U-Net), 'attention' (gated), 'dense'")
+
+    # Activation function
+    ACTIVATION_TYPES = ["relu", "leaky_relu", "gelu", "silu", "mish"]
+    parser.add_argument("--activation", type=str, default=None,
+                        choices=ACTIVATION_TYPES,
+                        help="Activation function for ablation studies")
+
+    # Dropout rate
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Dropout rate (0.0 to 0.5) for ablation studies")
+
+    # Optimizer
+    OPTIMIZER_TYPES = ["adamw", "adam", "sgd", "lion", "adafactor"]
+    parser.add_argument("--optimizer", type=str, default=None,
+                        choices=OPTIMIZER_TYPES,
+                        help="Optimizer for ablation studies")
+
+    # Learning rate schedule (alias for --lr-scheduler)
+    LR_SCHEDULE_TYPES = ["cosine", "cosine_warmup", "step", "plateau", "onecycle", "constant"]
+    parser.add_argument("--lr-schedule", type=str, default=None,
+                        choices=LR_SCHEDULE_TYPES,
+                        help="Learning rate schedule (alias for --lr-scheduler)")
+
+    # Number of attention heads
+    parser.add_argument("--n-heads", type=int, default=None,
+                        help="Number of attention heads for ablation studies")
+
+    # Network depth (number of downsample levels)
+    parser.add_argument("--n-downsample", type=int, default=None,
+                        help="Number of encoder/decoder downsample levels (depth) for ablation studies")
+
+    # Session embedding for session-specific adjustments
+    parser.add_argument("--use-session-embedding", action="store_true",
+                        help="Enable session embedding for session-specific model adjustments")
+    parser.add_argument("--n-sessions", type=int, default=None,
+                        help="Number of sessions for session embedding (auto-detected if not specified)")
+    parser.add_argument("--session-emb-dim", type=int, default=32,
+                        help="Session embedding dimension (default: 32)")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3524,6 +3650,18 @@ def main():
         config["no_test_set"] = args.no_test_set
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
+
+    # Session embedding configuration
+    if args.use_session_embedding:
+        # n_sessions will be auto-detected from data if not specified
+        config["use_session_embedding"] = True
+        if args.n_sessions is not None:
+            config["n_sessions"] = args.n_sessions
+        # session_emb_dim is set via CLI (default 32)
+        config["session_emb_dim"] = args.session_emb_dim
+    else:
+        config["n_sessions"] = 0  # Disabled
+        config["session_emb_dim"] = 32
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -3797,15 +3935,65 @@ def main():
         config["cond_mode"] = args.cond_mode
     config["conditioning_source"] = args.conditioning  # odor_onehot, spectro_temporal, etc.
 
+    # Attention type from CLI (for Phase 3 ablation studies)
+    if args.attention_type is not None:
+        config["attention_type"] = args.attention_type
+        if is_primary():
+            print(f"Attention type override: {args.attention_type}")
+
+    # Convolution type from CLI (for Phase 3 ablation studies)
+    if args.conv_type is not None:
+        config["conv_type"] = args.conv_type
+        if is_primary():
+            print(f"Convolution type override: {args.conv_type}")
+
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
         config["use_bidirectional"] = False
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
 
-    # Data augmentation - simple toggle
-    if args.no_aug:
+    # Data augmentation - strength levels
+    if args.no_aug or args.aug_strength == "none":
         config["aug_enabled"] = False
+    elif args.aug_strength is not None:
+        # Apply augmentation strength presets
+        config["aug_enabled"] = True
+        if args.aug_strength == "light":
+            # Light: only time shift + noise (minimal but effective)
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = False
+            config["aug_amplitude_scale"] = False
+            config["aug_time_mask"] = False
+            config["aug_mixup"] = False
+            config["aug_freq_mask"] = False
+            config["aug_channel_scale"] = False
+            config["aug_dc_offset"] = False
+        elif args.aug_strength == "medium":
+            # Medium: + channel dropout + amplitude scale
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = True
+            config["aug_amplitude_scale"] = True
+            config["aug_time_mask"] = False
+            config["aug_mixup"] = False
+            config["aug_freq_mask"] = False
+            config["aug_channel_scale"] = True
+            config["aug_dc_offset"] = False
+        elif args.aug_strength == "heavy":
+            # Heavy: all augmentations (default config behavior)
+            config["aug_time_shift"] = True
+            config["aug_noise"] = True
+            config["aug_channel_dropout"] = True
+            config["aug_amplitude_scale"] = True
+            config["aug_time_mask"] = True
+            config["aug_mixup"] = True
+            config["aug_freq_mask"] = True
+            config["aug_channel_scale"] = True
+            config["aug_dc_offset"] = True
+        if is_primary():
+            print(f"Augmentation strength: {args.aug_strength.upper()}")
 
     # Plot generation config
     if args.generate_plots is not None:
@@ -3896,6 +4084,16 @@ def main():
         compile_model=args.compile,
     )
 
+    # Synchronize all ranks after training completes
+    # This ensures all ranks are in sync before any rank-specific cleanup
+    # Prevents NCCL timeout when non-primary ranks exit before primary finishes logging
+    if dist.is_available() and dist.is_initialized():
+        try:
+            dist.barrier()
+        except Exception as e:
+            if is_primary():
+                print(f"Warning: Post-training barrier failed: {e}")
+
     if is_primary():
         print("\n" + "="*50)
         print("TRAINING COMPLETE")
@@ -3950,15 +4148,17 @@ def main():
             best_val_mae = val_maes[best_epoch - 1] if best_epoch > 0 and len(val_maes) >= best_epoch else 0.0
             best_val_corr = val_corrs[best_epoch - 1] if best_epoch > 0 and len(val_corrs) >= best_epoch else 0.0
 
-            # Count model parameters
-            model_obj = results.get("model")
-            if model_obj is not None:
-                if hasattr(model_obj, 'module'):
-                    n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
-                else:
-                    n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
-            else:
-                n_params = 0
+            # Get parameter count - prefer pre-computed value (works correctly with FSDP)
+            # FSDP shards parameters across ranks, so counting from wrapped model gives wrong result
+            n_params = results.get("n_parameters", 0)
+            if n_params == 0:
+                # Fallback: try to count from model (may be inaccurate with FSDP)
+                model_obj = results.get("model")
+                if model_obj is not None:
+                    if hasattr(model_obj, 'module'):
+                        n_params = sum(p.numel() for p in model_obj.module.parameters() if p.requires_grad)
+                    else:
+                        n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
 
             output_results = {
                 "architecture": args.arch,
@@ -3983,10 +4183,11 @@ def main():
                 json.dump(output_results, f, indent=2, default=str)
             print(f"Phase 2 results saved to: {output_path}")
 
-    # Final synchronization and cleanup for distributed training
-    # This prevents NCCL timeout by ensuring all ranks sync before exit
+    # Final cleanup for distributed training
+    # Note: Synchronization is done after train() returns (before logging).
+    # This just cleans up the process group - no barrier needed here since
+    # all ranks were already synchronized and the is_primary() block only does logging.
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 

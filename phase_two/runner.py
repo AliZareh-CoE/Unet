@@ -344,7 +344,11 @@ def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
             checkpoint = pickle.load(f)
         print(f"\n*** RESUMING FROM CHECKPOINT ***")
         print(f"    Found {len(checkpoint['completed_runs'])} completed runs")
-        print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        # Handle checkpoints created by create_checkpoint_from_results.py (no timestamp)
+        if 'timestamp' in checkpoint:
+            print(f"    Checkpoint from: {checkpoint['timestamp']}")
+        else:
+            print(f"    Checkpoint reconstructed from existing results")
         return checkpoint
     except Exception as e:
         print(f"Warning: Could not load checkpoint: {e}")
@@ -363,28 +367,35 @@ def reconstruct_results_from_checkpoint(
 
     # Reconstruct TrainingResult objects
     all_results = []
-    for r_dict in checkpoint["all_results"]:
-        result = TrainingResult(
-            architecture=r_dict["architecture"],
-            fold=r_dict["fold"],
-            best_val_r2=r_dict["best_val_r2"],
-            best_val_mae=r_dict["best_val_mae"],
-            best_epoch=r_dict["best_epoch"],
-            train_losses=r_dict["train_losses"],
-            val_losses=r_dict["val_losses"],
-            val_r2s=r_dict["val_r2s"],
-            total_time=r_dict["total_time"],
-            epochs_trained=r_dict["epochs_trained"],
-            n_parameters=r_dict["n_parameters"],
-            nan_detected=r_dict.get("nan_detected", False),
-            nan_recovery_count=r_dict.get("nan_recovery_count", 0),
-            early_stopped=r_dict.get("early_stopped", False),
-            error_message=r_dict.get("error_message"),
-            peak_gpu_memory_mb=r_dict.get("peak_gpu_memory_mb"),
-            completed_successfully=r_dict.get("completed_successfully", True),
-            dsp_metrics=r_dict.get("dsp_metrics"),
-        )
-        all_results.append(result)
+    for r_item in checkpoint["all_results"]:
+        # Handle both TrainingResult objects and dicts
+        if isinstance(r_item, TrainingResult):
+            # Already a TrainingResult (from create_checkpoint_from_results.py)
+            all_results.append(r_item)
+        else:
+            # Dict format (from original checkpoint saving)
+            r_dict = r_item
+            result = TrainingResult(
+                architecture=r_dict["architecture"],
+                fold=r_dict["fold"],
+                best_val_r2=r_dict["best_val_r2"],
+                best_val_mae=r_dict["best_val_mae"],
+                best_epoch=r_dict["best_epoch"],
+                train_losses=r_dict["train_losses"],
+                val_losses=r_dict["val_losses"],
+                val_r2s=r_dict["val_r2s"],
+                total_time=r_dict["total_time"],
+                epochs_trained=r_dict["epochs_trained"],
+                n_parameters=r_dict["n_parameters"],
+                nan_detected=r_dict.get("nan_detected", False),
+                nan_recovery_count=r_dict.get("nan_recovery_count", 0),
+                early_stopped=r_dict.get("early_stopped", False),
+                error_message=r_dict.get("error_message"),
+                peak_gpu_memory_mb=r_dict.get("peak_gpu_memory_mb"),
+                completed_successfully=r_dict.get("completed_successfully", True),
+                dsp_metrics=r_dict.get("dsp_metrics"),
+            )
+            all_results.append(result)
 
     arch_r2s = checkpoint["arch_r2s"]
     all_models = checkpoint["all_models"]

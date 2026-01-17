@@ -7,8 +7,6 @@ All architectures for neural signal translation comparison:
 - WaveNet (dilated causal convolutions)
 - FNet (FFT-based mixing)
 - ViT (transformer with attention)
-- Performer (linear attention)
-- Mamba (state-space model)
 """
 
 from __future__ import annotations
@@ -18,8 +16,6 @@ from .simple_cnn import SimpleCNN, SimpleCNNWithPooling, create_simple_cnn
 from .wavenet_1d import WaveNet1D, WaveNetBidirectional, create_wavenet
 from .fnet_1d import FNet1D, FNetWithConv, create_fnet
 from .vit_1d import ViT1D, ViT1DWithConvStem, create_vit
-from .performer_1d import Performer1D, create_performer
-from .mamba_1d import Mamba1D, create_mamba
 
 __all__ = [
     # Linear baselines
@@ -42,12 +38,6 @@ __all__ = [
     "ViT1D",
     "ViT1DWithConvStem",
     "create_vit",
-    # Performer
-    "Performer1D",
-    "create_performer",
-    # Mamba
-    "Mamba1D",
-    "create_mamba",
     # Registry
     "ARCHITECTURE_REGISTRY",
     "create_architecture",
@@ -60,8 +50,6 @@ ARCHITECTURE_REGISTRY = {
     "wavenet": create_wavenet,
     "fnet": create_fnet,
     "vit": create_vit,
-    "performer": create_performer,
-    "mamba": create_mamba,
 }
 
 
@@ -69,7 +57,7 @@ def create_architecture(name: str, variant: str = "standard", **kwargs):
     """Create architecture by name.
 
     Args:
-        name: Architecture name (linear, cnn, wavenet, fnet, vit, performer, mamba)
+        name: Architecture name (linear, cnn, wavenet, fnet, vit)
         variant: Architecture variant
         **kwargs: Additional arguments
 

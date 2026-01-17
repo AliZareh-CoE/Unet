@@ -6,6 +6,7 @@ This module contains the main model architecture for OB->PCx neural signal trans
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -1823,6 +1824,9 @@ class CondUNet1D(nn.Module):
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
+        # Session embedding for session-specific adjustments
+        n_sessions: int = 0,  # Number of sessions (0 = disabled)
+        session_emb_dim: int = 32,  # Session embedding dimension
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -1830,11 +1834,27 @@ class CondUNet1D(nn.Module):
         self.attention_type = attention_type
         self.conv_type = conv_type
         self.n_downsample = n_downsample
+        self.n_sessions = n_sessions
+        self.session_emb_dim = session_emb_dim
 
         if cond_mode != "none":
             self.embed = nn.Embedding(n_odors, emb_dim)
         else:
             self.embed = None
+
+        # Session embedding for session-specific adjustments
+        if n_sessions > 0:
+            self.session_embed = nn.Embedding(n_sessions, session_emb_dim)
+            # Project combined embedding (session + condition) to emb_dim
+            # If no other conditioning, just project session embedding
+            self.session_proj = nn.Sequential(
+                nn.Linear(session_emb_dim + emb_dim, emb_dim),
+                nn.GELU(),
+                nn.Linear(emb_dim, emb_dim),
+            )
+        else:
+            self.session_embed = None
+            self.session_proj = None
 
         # Channel progression: base -> base*2 -> base*4 -> ... up to base*8 max
         # For n_downsample=2: [base, base*2, base*4]
@@ -1958,6 +1978,7 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,
         return_bottleneck: bool = False,
         return_bottleneck_temporal: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -1968,6 +1989,8 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
+            session_ids: Session indices [B] for session-specific adjustments.
+                        Combined with other conditioning if n_sessions > 0.
             return_bottleneck: If True, also return pooled bottleneck features [B, bottleneck_ch]
                               for label-based contrastive learning
             return_bottleneck_temporal: If True, return unpooled bottleneck features [B, bottleneck_ch, T']
@@ -1998,6 +2021,19 @@ class CondUNet1D(nn.Module):
             emb = self.embed(odor_ids)
         else:
             emb = None
+
+        # Combine session embedding with conditioning if enabled
+        if self.session_embed is not None and session_ids is not None:
+            session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+            if emb is not None:
+                # Concatenate session embedding with existing conditioning
+                combined = torch.cat([session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]
+                emb = self.session_proj(combined)  # [B, emb_dim]
+            else:
+                # No other conditioning - pad session embedding to emb_dim and project
+                padding = torch.zeros(session_emb.size(0), self.emb_dim, device=session_emb.device)
+                combined = torch.cat([session_emb, padding], dim=-1)
+                emb = self.session_proj(combined)
 
         # Encoder path with skip connections
         # Use gradient checkpointing if enabled (saves memory, costs ~30% more compute)
@@ -2145,6 +2181,217 @@ class CondUNet1D(nn.Module):
             if hasattr(module, 'coupling_weights'):
                 return module
         return None
+
+
+# =============================================================================
+# Session Matching for Inference
+# =============================================================================
+
+class SessionMatcher:
+    """Automatic session matching for inference with session-conditioned models.
+
+    During training, stores a "session signature" for each session - a statistical
+    fingerprint computed from samples (mean/std per channel).
+
+    At inference time with a new session:
+    1. Take first N samples as warmup
+    2. Compute signature from warmup samples
+    3. Find nearest neighbor among known session signatures
+    4. Use that session's embedding for all subsequent inference
+
+    Example usage:
+        # During training - register signatures
+        matcher = SessionMatcher(n_channels=32)
+        for session_id, data in training_data:
+            matcher.register_session(session_id, data)
+        matcher.save("session_signatures.pt")
+
+        # At inference
+        matcher = SessionMatcher.load("session_signatures.pt")
+        matched_session_id = matcher.warmup(new_session_data[:100])
+        # Use matched_session_id for all inference on this session
+    """
+
+    def __init__(
+        self,
+        n_channels: int = 32,
+        n_warmup_samples: int = 100,
+        use_power_spectrum: bool = False,
+        sample_rate: float = 1000.0,
+    ):
+        """Initialize SessionMatcher.
+
+        Args:
+            n_channels: Number of signal channels
+            n_warmup_samples: Number of samples to use for warmup matching
+            use_power_spectrum: If True, also include power spectrum features
+            sample_rate: Sampling rate in Hz (for power spectrum bands)
+        """
+        self.n_channels = n_channels
+        self.n_warmup_samples = n_warmup_samples
+        self.use_power_spectrum = use_power_spectrum
+        self.sample_rate = sample_rate
+
+        # Store signatures: session_id -> signature vector
+        self.signatures: Dict[int, np.ndarray] = {}
+        self.session_names: Dict[int, str] = {}  # Optional: human-readable names
+
+    def compute_signature(self, data: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+        """Compute session signature from data samples.
+
+        Args:
+            data: Signal data [N, C, T] or [C, T] where N=samples, C=channels, T=time
+
+        Returns:
+            Signature vector (mean and std per channel, optionally power bands)
+        """
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+
+        # Handle single sample vs batch
+        if data.ndim == 2:
+            data = data[np.newaxis, ...]  # [1, C, T]
+
+        # Compute per-channel statistics across all samples and time
+        # data: [N, C, T]
+        mean_per_channel = data.mean(axis=(0, 2))  # [C]
+        std_per_channel = data.std(axis=(0, 2))    # [C]
+
+        signature_parts = [mean_per_channel, std_per_channel]
+
+        if self.use_power_spectrum:
+            # Compute mean power in frequency bands (theta, beta, gamma)
+            # This requires scipy, so keep it optional
+            try:
+                from scipy import signal as scipy_signal
+
+                # Define frequency bands
+                bands = {
+                    'theta': (4, 8),
+                    'alpha': (8, 13),
+                    'beta': (13, 30),
+                    'low_gamma': (30, 50),
+                    'high_gamma': (50, 100),
+                }
+
+                band_powers = []
+                for band_name, (low, high) in bands.items():
+                    # Compute power spectral density
+                    freqs, psd = scipy_signal.welch(
+                        data.mean(axis=0),  # Average across samples: [C, T]
+                        fs=self.sample_rate,
+                        nperseg=min(256, data.shape[-1]),
+                        axis=-1,
+                    )
+                    # Get power in band
+                    band_mask = (freqs >= low) & (freqs <= high)
+                    band_power = psd[:, band_mask].mean(axis=-1)  # [C]
+                    band_powers.append(band_power)
+
+                signature_parts.extend(band_powers)
+            except ImportError:
+                pass  # Skip power spectrum if scipy not available
+
+        return np.concatenate(signature_parts)
+
+    def register_session(
+        self,
+        session_id: int,
+        data: Union[torch.Tensor, np.ndarray],
+        session_name: Optional[str] = None,
+    ):
+        """Register a session's signature from training data.
+
+        Args:
+            session_id: Integer session ID (0-indexed)
+            data: Sample data from this session [N, C, T]
+            session_name: Optional human-readable session name
+        """
+        signature = self.compute_signature(data)
+        self.signatures[session_id] = signature
+        if session_name:
+            self.session_names[session_id] = session_name
+
+    def warmup(
+        self,
+        data: Union[torch.Tensor, np.ndarray],
+        return_similarity: bool = False,
+    ) -> Union[int, Tuple[int, float]]:
+        """Match new session data to known sessions.
+
+        Args:
+            data: Warmup samples from new session [N, C, T] (uses first n_warmup_samples)
+            return_similarity: If True, also return the similarity score
+
+        Returns:
+            Matched session ID (and optionally similarity score)
+        """
+        if len(self.signatures) == 0:
+            raise ValueError("No sessions registered. Call register_session() first.")
+
+        # Compute signature from warmup samples
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+        if data.ndim == 2:
+            data = data[np.newaxis, ...]
+
+        # Use only first n_warmup_samples
+        data = data[:self.n_warmup_samples]
+        query_sig = self.compute_signature(data)
+
+        # Find nearest neighbor using cosine similarity
+        best_session = -1
+        best_similarity = -float('inf')
+
+        for session_id, ref_sig in self.signatures.items():
+            # Cosine similarity
+            similarity = np.dot(query_sig, ref_sig) / (
+                np.linalg.norm(query_sig) * np.linalg.norm(ref_sig) + 1e-8
+            )
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_session = session_id
+
+        if return_similarity:
+            return best_session, float(best_similarity)
+        return best_session
+
+    def save(self, path: Union[str, Path]):
+        """Save session signatures to file."""
+        import pickle
+        state = {
+            'signatures': self.signatures,
+            'session_names': self.session_names,
+            'n_channels': self.n_channels,
+            'n_warmup_samples': self.n_warmup_samples,
+            'use_power_spectrum': self.use_power_spectrum,
+            'sample_rate': self.sample_rate,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "SessionMatcher":
+        """Load session signatures from file."""
+        import pickle
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+
+        matcher = cls(
+            n_channels=state['n_channels'],
+            n_warmup_samples=state['n_warmup_samples'],
+            use_power_spectrum=state.get('use_power_spectrum', False),
+            sample_rate=state.get('sample_rate', 1000.0),
+        )
+        matcher.signatures = state['signatures']
+        matcher.session_names = state.get('session_names', {})
+        return matcher
+
+    def __len__(self) -> int:
+        return len(self.signatures)
+
+    def __repr__(self) -> str:
+        return f"SessionMatcher(n_sessions={len(self)}, n_channels={self.n_channels})"
 
 
 # =============================================================================

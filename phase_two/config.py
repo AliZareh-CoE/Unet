@@ -22,10 +22,7 @@ ARCHITECTURE_LIST: List[str] = [
     "linear",       # Linear baseline
     "simplecnn",    # Simple CNN
     "wavenet",      # WaveNet with dilated convolutions
-    "fnet",         # Fourier-based mixing
     "vit",          # Vision Transformer 1D
-    "performer",    # Linear attention transformer
-    # "mamba",      # Disabled - incompatible with FSDP (sequential scan deadlocks)
     "condunet",     # Conditional U-Net (our method)
 ]
 
@@ -51,30 +48,12 @@ ARCHITECTURE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "n_layers": 8,
         "kernel_size": 3,
     },
-    "fnet": {
-        "hidden_dim": 256,
-        "n_layers": 4,
-        "dropout": 0.1,
-    },
     "vit": {
         "embed_dim": 256,
         "n_heads": 8,
         "n_layers": 4,
         "patch_size": 50,
         "dropout": 0.1,
-    },
-    "performer": {
-        "embed_dim": 256,
-        "n_heads": 8,
-        "n_layers": 4,
-        "n_features": 64,  # Random features for FAVOR+
-    },
-    "mamba": {
-        "d_model": 256,
-        "d_state": 16,
-        "d_conv": 4,
-        "expand": 2,
-        "n_layers": 4,
     },
     "condunet": {
         "base_channels": 64,

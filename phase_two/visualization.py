@@ -90,10 +90,7 @@ ARCH_COLORS = {
     "linear": "#6B7280",
     "simplecnn": "#9CA3AF",
     "wavenet": "#2E86AB",
-    "fnet": "#1B5583",
     "vit": "#A23B72",
-    "performer": "#7D2C5A",
-    "mamba": "#F18F01",
     "condunet": "#2CA58D",
 }
 
@@ -216,7 +213,12 @@ class Phase2Visualizer:
         ax.set_xticklabels([a.replace('_', '\n') for a in archs], rotation=45, ha='right')
         ax.set_ylabel('R²')
         ax.set_title('(A) R² by Architecture')
-        ax.set_ylim(0, max(r2_means) * 1.15)
+        # Filter out NaN values for y-axis limit calculation
+        valid_r2s = [r for r in r2_means if not np.isnan(r)]
+        if valid_r2s:
+            ax.set_ylim(0, max(valid_r2s) * 1.15)
+        else:
+            ax.set_ylim(0, 1.0)
         ax.legend(loc='upper right', frameon=False, fontsize=6)
 
         # Mark best

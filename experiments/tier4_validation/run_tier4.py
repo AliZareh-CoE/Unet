@@ -358,8 +358,6 @@ def create_model_from_config(
         "wavenet": "standard",
         "fnet": "standard",
         "vit": "standard",
-        "performer": "standard",
-        "mamba": "standard",
     }
     variant = VARIANT_MAP.get(arch, "standard")
 
