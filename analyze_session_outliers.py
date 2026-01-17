@@ -28,41 +28,50 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def load_session_data():
     """Load the olfactory dataset and extract per-session statistics."""
-    from data import OlfactoryDataset
+    import pandas as pd
+    from data import load_signals, load_odor_labels, extract_window, DATA_PATH, ODOR_CSV_PATH
 
     print("Loading olfactory dataset...")
-    dataset = OlfactoryDataset()
+
+    # Load raw signals and metadata
+    signals = load_signals(DATA_PATH)  # [N, 2, C, T]
+    num_trials = signals.shape[0]
+
+    # Load odor labels and metadata
+    odors, vocab = load_odor_labels(ODOR_CSV_PATH, num_trials)
+
+    # Load session metadata from CSV
+    df = pd.read_csv(ODOR_CSV_PATH)
+    if len(df) > num_trials:
+        df = df.iloc[:num_trials]
+
+    # Extract window (standard preprocessing)
+    windowed = extract_window(signals)  # [N, 2, C, T_window]
+    ob_all = windowed[:, 0]  # [N, C, T]
+    pcx_all = windowed[:, 1]  # [N, C, T]
 
     # Get unique sessions
-    sessions = dataset.data['recording_id'].unique()
+    sessions = df['recording_id'].unique()
     print(f"Found {len(sessions)} sessions: {list(sessions)}")
 
     session_stats = {}
     session_data = {}
 
     for session in sessions:
-        mask = dataset.data['recording_id'] == session
-        session_df = dataset.data[mask]
+        mask = df['recording_id'] == session
+        indices = np.where(mask)[0]
 
-        # Get raw signals for this session
-        ob_signals = []
-        pcx_signals = []
+        # Get signals for this session
+        ob_stack = ob_all[indices]  # [N_session, C, T]
+        pcx_stack = pcx_all[indices]  # [N_session, C, T]
 
-        for idx in session_df.index:
-            row = dataset.data.loc[idx]
-            ob = row['ob_lfp']  # [C, T]
-            pcx = row['pcx_lfp']  # [C, T]
-            ob_signals.append(ob)
-            pcx_signals.append(pcx)
-
-        ob_stack = np.stack(ob_signals)  # [N, C, T]
-        pcx_stack = np.stack(pcx_signals)  # [N, C, T]
+        session_odors = df.loc[mask, 'odor_name'].unique().tolist() if 'odor_name' in df.columns else []
 
         session_data[session] = {
             'ob': ob_stack,
             'pcx': pcx_stack,
-            'n_trials': len(session_df),
-            'odors': session_df['odor_name'].unique().tolist(),
+            'n_trials': len(indices),
+            'odors': session_odors,
         }
 
         # Compute statistics
