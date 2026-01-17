@@ -886,6 +886,7 @@ def run_phase3(
     enable_logging: bool = True,
     min_improvement: float = 0.01,
     no_skip_conditional: bool = False,
+    start_variant: Optional[str] = None,
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies.
 
@@ -902,6 +903,7 @@ def run_phase3(
         enable_logging: Save full output to log file (default: True)
         min_improvement: Minimum R² improvement required for greedy selection (default: 0.01 = 1%)
         no_skip_conditional: If True, run conditional groups even if condition not met
+        start_variant: Skip variants before this one (by name) in each group
 
     Returns:
         Phase3Result with all ablation results
@@ -936,7 +938,7 @@ def run_phase3(
     # Route to appropriate protocol handler
     try:
         if config.protocol == "greedy_forward":
-            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, no_skip_conditional)
+            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, no_skip_conditional, start_variant)
         elif config.protocol == "additive":
             result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
         else:
@@ -959,6 +961,7 @@ def _run_greedy_forward_protocol(
     fsdp_strategy: str = "grad_op",
     min_improvement: float = 0.01,
     no_skip_conditional: bool = False,
+    start_variant: Optional[str] = None,
 ) -> Phase3Result:
     """Run GREEDY FORWARD SELECTION ablation protocol.
 
@@ -985,6 +988,7 @@ def _run_greedy_forward_protocol(
         use_fsdp: Enable FSDP distributed training
         fsdp_strategy: FSDP sharding strategy
         min_improvement: Minimum R² improvement required to adopt new variant (default: 0.01 = 1%)
+        start_variant: Skip variants before this one (by name) in each group
     """
     # Setup checkpoint for resume capability
     checkpoint_path = get_checkpoint_path(config.output_dir)
@@ -1055,9 +1059,21 @@ def _run_greedy_forward_protocol(
 
         group_results = []
 
+        # Handle --start-variant: skip variants until we reach the specified one
+        skip_until_found = start_variant is not None
         for variant in group["variants"]:
-            run_count += 1
             variant_name = variant["name"]
+
+            # Skip variants until we find the start_variant
+            if skip_until_found:
+                if variant_name == start_variant:
+                    skip_until_found = False  # Found it, stop skipping
+                    print(f"\n  [SKIP] Jumping to variant: {variant_name}")
+                else:
+                    print(f"\n  [SKIP] {variant_name} (--start-variant={start_variant})")
+                    continue
+
+            run_count += 1
 
             # Create config for this variant
             ablation_config = AblationConfig.from_greedy_group(group, variant, current_config)
@@ -2256,6 +2272,14 @@ def main():
              "cycle_lambda even when unidirectional won. This explores more of "
              "the search space at the cost of more compute.",
     )
+    parser.add_argument(
+        "--start-variant",
+        type=str,
+        default=None,
+        help="Skip variants before this one (by name). E.g., '--start-variant session_embedding' "
+             "skips baseline and other variants, jumping straight to session_embedding. "
+             "Useful when you want to test a specific variant without re-running earlier ones.",
+    )
 
     args = parser.parse_args()
 
@@ -2349,6 +2373,7 @@ def main():
         fsdp_strategy=args.fsdp_strategy,
         min_improvement=args.min_improvement,
         no_skip_conditional=args.no_skip_conditional,
+        start_variant=args.start_variant,
     )
 
     # Clean up checkpoint after successful completion
