@@ -38,20 +38,27 @@ def build_condunet(
     try:
         from models import CondUNet1D
 
+        # Determine session embedding parameters
+        n_sessions = config.n_sessions if config.use_session_embedding else 0
+        session_emb_dim = config.session_emb_dim if config.use_session_embedding else 32
+
         model = CondUNet1D(
             in_channels=in_channels,
             out_channels=out_channels,
             base=config.base_channels,
             n_odors=7,  # Default for olfactory
             emb_dim=128,
-            dropout=0.1,
+            dropout=config.dropout,
             use_attention=config.attention_type != "none",
             attention_type=config.attention_type if config.attention_type != "none" else "basic",
-            norm_type="instance",
+            norm_type=config.norm_type,
             cond_mode=config.cond_mode,
             n_downsample=config.n_downsample,
-            conv_type="standard",
+            conv_type=config.conv_type,
             use_output_scaling=True,
+            # Session embedding parameters
+            n_sessions=n_sessions,
+            session_emb_dim=session_emb_dim,
         )
         return model
 

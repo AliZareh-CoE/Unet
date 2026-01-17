@@ -114,18 +114,22 @@ class AblationTrainer:
         n_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            # Handle different batch formats
+            # Handle different batch formats: 2, 3, or 4 elements
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
+                session_ids = batch[3] if len(batch) > 3 else None
             else:
                 x, y = batch, batch
                 odor_ids = None
+                session_ids = None
 
             x = x.to(self.device)
             y = y.to(self.device)
             if odor_ids is not None:
                 odor_ids = odor_ids.to(self.device)
+            if session_ids is not None:
+                session_ids = session_ids.to(self.device)
 
             # Apply augmentation if enabled
             if self.ablation_config.use_augmentation:
@@ -134,11 +138,18 @@ class AblationTrainer:
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
 
+            # Determine what to pass to model
+            use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
+            use_session = session_ids is not None and self.ablation_config.use_session_embedding
+
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
-                    # Pass conditioning if model supports it
-                    if odor_ids is not None and self.ablation_config.use_odor_embedding:
-                        pred = self.model(x, odor_ids)
+                    # Pass conditioning and session_ids if model supports them
+                    if use_odor:
+                        pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
+                    elif use_session:
+                        # Session embedding but no odor embedding
+                        pred = self.model(x, session_ids=session_ids)
                     else:
                         pred = self.model(x)
                     loss, _ = self.criterion(pred, y)
@@ -158,8 +169,10 @@ class AblationTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                if odor_ids is not None and self.ablation_config.use_odor_embedding:
-                    pred = self.model(x, odor_ids)
+                if use_odor:
+                    pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
+                elif use_session:
+                    pred = self.model(x, session_ids=session_ids)
                 else:
                     pred = self.model(x)
                 loss, _ = self.criterion(pred, y)
@@ -190,28 +203,41 @@ class AblationTrainer:
         all_targets = []
 
         for batch in dataloader:
+            # Handle different batch formats: 2, 3, or 4 elements
             if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
                 odor_ids = batch[2] if len(batch) > 2 else None
+                session_ids = batch[3] if len(batch) > 3 else None
             else:
                 x, y = batch, batch
                 odor_ids = None
+                session_ids = None
 
             x = x.to(self.device)
             y = y.to(self.device)
             if odor_ids is not None:
                 odor_ids = odor_ids.to(self.device)
+            if session_ids is not None:
+                session_ids = session_ids.to(self.device)
+
+            # Determine what to pass to model
+            use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding
+            use_session = session_ids is not None and self.ablation_config.use_session_embedding
 
             if self.use_amp:
                 with torch.amp.autocast("cuda"):
-                    if odor_ids is not None and self.ablation_config.use_odor_embedding:
-                        pred = self.model(x, odor_ids)
+                    if use_odor:
+                        pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
+                    elif use_session:
+                        pred = self.model(x, session_ids=session_ids)
                     else:
                         pred = self.model(x)
                     loss, _ = self.criterion(pred, y)
             else:
-                if odor_ids is not None and self.ablation_config.use_odor_embedding:
-                    pred = self.model(x, odor_ids)
+                if use_odor:
+                    pred = self.model(x, odor_ids, session_ids=session_ids if use_session else None)
+                elif use_session:
+                    pred = self.model(x, session_ids=session_ids)
                 else:
                     pred = self.model(x)
                 loss, _ = self.criterion(pred, y)

@@ -230,6 +230,10 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "optimizer": "adamw",           # Optimizer
     "lr_schedule": "cosine",        # Learning rate schedule
     "weight_decay": 1e-4,           # Weight decay
+    # Session embedding (starts disabled, can be enabled via ablation group)
+    "use_session_embedding": False,
+    "n_sessions": 0,                # Will be auto-set from data
+    "session_emb_dim": 32,
 }
 
 # =============================================================================
@@ -496,6 +500,24 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": {"parameter": "bidirectional", "equal": True},
     },
+
+    # =========================================================================
+    # PHASE 5: SESSION ADAPTATION (Group 18)
+    # Tests whether session-specific embeddings improve cross-session generalization
+    # =========================================================================
+
+    # GROUP 18: Session Embedding
+    {
+        "group_id": 18,
+        "name": "session_embedding",
+        "description": "Session-specific embedding for cross-session adaptation",
+        "parameter": "use_session_embedding",
+        "variants": [
+            {"value": False, "name": "no_session_emb", "desc": "No session embedding (baseline)"},
+            {"value": True, "name": "with_session_emb", "desc": "Session embedding enabled"},
+        ],
+        "conditional_on": None,  # Always run - important for cross-session evaluation
+    },
 ]
 
 # Calculate total runs
@@ -665,6 +687,11 @@ class AblationConfig:
     n_test_sessions: int = 4  # Sessions held out for testing
     n_val_sessions: int = 1  # Sessions held out for validation
 
+    # Session embedding (for session-specific model adaptation)
+    use_session_embedding: bool = False  # Enable session embedding
+    n_sessions: int = 0  # Number of sessions (0 = disabled, auto-detected if not set)
+    session_emb_dim: int = 32  # Session embedding dimension
+
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
 
@@ -729,6 +756,10 @@ class AblationConfig:
             "split_by_session": self.split_by_session,
             "n_test_sessions": self.n_test_sessions,
             "n_val_sessions": self.n_val_sessions,
+            # Session embedding
+            "use_session_embedding": self.use_session_embedding,
+            "n_sessions": self.n_sessions,
+            "session_emb_dim": self.session_emb_dim,
         }
 
     @property
@@ -798,6 +829,10 @@ class AblationConfig:
             split_by_session=True,
             n_test_sessions=0,  # No separate test set
             n_val_sessions=4,   # All held-out sessions for validation
+            # Session embedding
+            use_session_embedding=config.get("use_session_embedding", False),
+            n_sessions=config.get("n_sessions", 0),
+            session_emb_dim=config.get("session_emb_dim", 32),
         )
 
     @classmethod
