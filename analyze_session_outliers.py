@@ -766,64 +766,355 @@ def create_snr_analysis(session_data: Dict, performance: Dict, output_path: Path
     print(f"Saved SNR analysis to {output_path}")
 
 
+def create_all_sessions_comparison(session_data: Dict, session_stats: Dict,
+                                    val_sessions: Dict, output_path: Path):
+    """Create comparison plots for ALL sessions (training + validation).
+
+    Args:
+        session_data: Dict of session -> raw signal data
+        session_stats: Dict of session -> statistics
+        val_sessions: Dict of validation session -> R² (used to identify train vs val)
+        output_path: Path to save figure
+    """
+    all_sessions = sorted(session_stats.keys())
+    n_sessions = len(all_sessions)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    # Color by train (blue) vs val (green)
+    colors = ['green' if s in val_sessions else 'steelblue' for s in all_sessions]
+
+    # Plot 1: Number of trials per session
+    ax1 = axes[0, 0]
+    n_trials = [session_stats[s]['n_trials'] for s in all_sessions]
+    bars = ax1.bar(range(n_sessions), n_trials, color=colors, edgecolor='black')
+    ax1.set_xticks(range(n_sessions))
+    ax1.set_xticklabels(all_sessions, rotation=45, ha='right', fontsize=8)
+    ax1.set_ylabel('Number of Trials')
+    ax1.set_title('Trials per Session (green=val, blue=train)')
+    ax1.axhline(np.mean(n_trials), color='red', linestyle='--', label=f'Mean: {np.mean(n_trials):.0f}')
+    ax1.legend()
+
+    # Plot 2: OB signal std
+    ax2 = axes[0, 1]
+    ob_stds = [session_stats[s]['ob_std'] for s in all_sessions]
+    ax2.bar(range(n_sessions), ob_stds, color=colors, edgecolor='black')
+    ax2.set_xticks(range(n_sessions))
+    ax2.set_xticklabels(all_sessions, rotation=45, ha='right', fontsize=8)
+    ax2.set_ylabel('OB Signal Std')
+    ax2.set_title('OB Amplitude Variability')
+    ax2.axhline(np.mean(ob_stds), color='red', linestyle='--')
+
+    # Plot 3: PCx signal std
+    ax3 = axes[0, 2]
+    pcx_stds = [session_stats[s]['pcx_std'] for s in all_sessions]
+    ax3.bar(range(n_sessions), pcx_stds, color=colors, edgecolor='black')
+    ax3.set_xticks(range(n_sessions))
+    ax3.set_xticklabels(all_sessions, rotation=45, ha='right', fontsize=8)
+    ax3.set_ylabel('PCx Signal Std')
+    ax3.set_title('PCx Amplitude Variability')
+    ax3.axhline(np.mean(pcx_stds), color='red', linestyle='--')
+
+    # Plot 4: SNR comparison
+    ax4 = axes[1, 0]
+    ob_snr = [session_stats[s]['ob_snr'] for s in all_sessions]
+    pcx_snr = [session_stats[s]['pcx_snr'] for s in all_sessions]
+    x = np.arange(n_sessions)
+    width = 0.35
+    ax4.bar(x - width/2, ob_snr, width, label='OB', color='steelblue', alpha=0.7)
+    ax4.bar(x + width/2, pcx_snr, width, label='PCx', color='coral', alpha=0.7)
+    # Mark validation sessions
+    for i, s in enumerate(all_sessions):
+        if s in val_sessions:
+            ax4.axvline(i, color='green', alpha=0.3, linewidth=3)
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(all_sessions, rotation=45, ha='right', fontsize=8)
+    ax4.set_ylabel('SNR')
+    ax4.set_title('Signal-to-Noise Ratio (all sessions)')
+    ax4.legend()
+
+    # Plot 5: Gamma power
+    ax5 = axes[1, 1]
+    ob_gamma = [session_stats[s]['ob_gamma_rel'] for s in all_sessions]
+    pcx_gamma = [session_stats[s]['pcx_gamma_rel'] for s in all_sessions]
+    ax5.bar(x - width/2, ob_gamma, width, label='OB', color='purple', alpha=0.7)
+    ax5.bar(x + width/2, pcx_gamma, width, label='PCx', color='gold', alpha=0.7)
+    for i, s in enumerate(all_sessions):
+        if s in val_sessions:
+            ax5.axvline(i, color='green', alpha=0.3, linewidth=3)
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(all_sessions, rotation=45, ha='right', fontsize=8)
+    ax5.set_ylabel('Relative Gamma Power')
+    ax5.set_title('Gamma Band Power (30-100 Hz)')
+    ax5.legend()
+
+    # Plot 6: PCA of ALL sessions
+    ax6 = axes[1, 2]
+    feature_names = [
+        'ob_std', 'pcx_std', 'ob_snr', 'pcx_snr',
+        'ob_delta_rel', 'ob_theta_rel', 'ob_beta_rel', 'ob_gamma_rel',
+        'pcx_delta_rel', 'pcx_theta_rel', 'pcx_beta_rel', 'pcx_gamma_rel',
+        'ob_pcx_max_xcorr',
+    ]
+
+    X = []
+    for session in all_sessions:
+        row = [session_stats[session].get(f, 0) for f in feature_names]
+        X.append(row)
+    X = np.array(X)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X_scaled)
+
+    # Plot with different markers for train vs val
+    for i, session in enumerate(all_sessions):
+        if session in val_sessions:
+            ax6.scatter(X_pca[i, 0], X_pca[i, 1], c='green', s=200, marker='*',
+                       edgecolors='black', linewidths=1.5, zorder=5)
+        else:
+            ax6.scatter(X_pca[i, 0], X_pca[i, 1], c='steelblue', s=120, marker='o',
+                       edgecolors='black', linewidths=1)
+        ax6.annotate(session, (X_pca[i, 0], X_pca[i, 1]), fontsize=7,
+                    ha='center', va='bottom', xytext=(0, 5), textcoords='offset points')
+
+    ax6.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)')
+    ax6.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)')
+    ax6.set_title('PCA: All Sessions (star=val, circle=train)')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved all-sessions comparison to {output_path}")
+
+
+def create_all_sessions_spectra(session_data: Dict, val_sessions: Dict, output_path: Path):
+    """Create power spectra for ALL sessions.
+
+    Args:
+        session_data: Dict of session -> raw signal data
+        val_sessions: Dict of validation session -> R²
+        output_path: Path to save figure
+    """
+    fs = 1000
+    all_sessions = sorted(session_data.keys())
+    n_sessions = len(all_sessions)
+
+    # Create 2 rows: OB and PCx
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+
+    # Different colors for each session
+    cmap = plt.cm.tab20
+
+    # Plot 1: OB spectra for all sessions
+    ax1 = axes[0]
+    for i, session in enumerate(all_sessions):
+        ob = session_data[session]['ob'].mean(axis=(0, 1))
+        n = len(ob)
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        psd = np.abs(np.fft.rfft(ob))**2
+
+        # Smooth
+        window = 5
+        psd_smooth = np.convolve(psd, np.ones(window)/window, mode='same')
+
+        color = cmap(i / n_sessions)
+        linestyle = '-' if session in val_sessions else '--'
+        linewidth = 2 if session in val_sessions else 1
+        label = f"{session} (val)" if session in val_sessions else f"{session}"
+
+        ax1.semilogy(freqs[freqs < 100], psd_smooth[freqs < 100],
+                    label=label, color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=0.8)
+
+    ax1.set_xlabel('Frequency (Hz)')
+    ax1.set_ylabel('Power (log)')
+    ax1.set_title('OB Power Spectra - All Sessions (solid=val, dashed=train)')
+    ax1.legend(fontsize=7, loc='upper right', ncol=2)
+    ax1.set_xlim(0, 100)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot 2: PCx spectra for all sessions
+    ax2 = axes[1]
+    for i, session in enumerate(all_sessions):
+        pcx = session_data[session]['pcx'].mean(axis=(0, 1))
+        n = len(pcx)
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        psd = np.abs(np.fft.rfft(pcx))**2
+
+        window = 5
+        psd_smooth = np.convolve(psd, np.ones(window)/window, mode='same')
+
+        color = cmap(i / n_sessions)
+        linestyle = '-' if session in val_sessions else '--'
+        linewidth = 2 if session in val_sessions else 1
+
+        ax2.semilogy(freqs[freqs < 100], psd_smooth[freqs < 100],
+                    color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=0.8)
+
+    ax2.set_xlabel('Frequency (Hz)')
+    ax2.set_ylabel('Power (log)')
+    ax2.set_title('PCx Power Spectra - All Sessions')
+    ax2.set_xlim(0, 100)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved all-sessions spectra to {output_path}")
+
+
+def print_all_session_stats(session_stats: Dict, val_sessions: Dict):
+    """Print statistics for ALL sessions in a formatted table.
+
+    Args:
+        session_stats: Dict of session -> statistics
+        val_sessions: Dict of validation session -> R²
+    """
+    print("\n" + "="*90)
+    print("ALL SESSION STATISTICS")
+    print("="*90)
+
+    all_sessions = sorted(session_stats.keys())
+
+    # Header
+    print(f"\n{'Session':<12} {'Type':<6} {'Trials':<7} {'OB_std':<8} {'PCx_std':<8} "
+          f"{'OB_SNR':<8} {'PCx_SNR':<8} {'OB_gamma':<9} {'PCx_gamma':<9}")
+    print("-"*90)
+
+    train_stats = []
+    val_stats = []
+
+    for session in all_sessions:
+        s = session_stats[session]
+        session_type = "VAL" if session in val_sessions else "TRAIN"
+        r2 = f" R²={val_sessions[session]:.3f}" if session in val_sessions else ""
+
+        print(f"{session:<12} {session_type:<6} {s['n_trials']:<7} "
+              f"{s['ob_std']:<8.4f} {s['pcx_std']:<8.4f} "
+              f"{s['ob_snr']:<8.2f} {s['pcx_snr']:<8.2f} "
+              f"{s['ob_gamma_rel']:<9.4f} {s['pcx_gamma_rel']:<9.4f}{r2}")
+
+        if session in val_sessions:
+            val_stats.append(s)
+        else:
+            train_stats.append(s)
+
+    # Summary statistics
+    print("\n" + "-"*90)
+    print("SUMMARY:")
+
+    metrics = ['n_trials', 'ob_std', 'pcx_std', 'ob_snr', 'pcx_snr', 'ob_gamma_rel', 'pcx_gamma_rel']
+
+    print(f"\n{'Metric':<15} {'Train Mean':<12} {'Train Std':<12} {'Val Mean':<12} {'Val Std':<12} {'Diff %':<10}")
+    print("-"*75)
+
+    for metric in metrics:
+        train_vals = [s[metric] for s in train_stats]
+        val_vals = [s[metric] for s in val_stats]
+
+        train_mean = np.mean(train_vals)
+        train_std = np.std(train_vals)
+        val_mean = np.mean(val_vals)
+        val_std = np.std(val_vals)
+
+        diff_pct = ((val_mean - train_mean) / (train_mean + 1e-10)) * 100
+
+        print(f"{metric:<15} {train_mean:<12.4f} {train_std:<12.4f} "
+              f"{val_mean:<12.4f} {val_std:<12.4f} {diff_pct:>+8.1f}%")
+
+    print("\n" + "="*90)
+    print("TRAIN vs VAL DISTRIBUTION SHIFT ANALYSIS")
+    print("="*90)
+
+    # Check if validation sessions are systematically different from training
+    key_metrics = ['ob_std', 'pcx_std', 'ob_snr', 'pcx_snr', 'ob_gamma_rel']
+
+    for metric in key_metrics:
+        train_vals = [s[metric] for s in train_stats]
+        val_vals = [s[metric] for s in val_stats]
+
+        # Statistical test
+        if len(train_vals) >= 2 and len(val_vals) >= 2:
+            t_stat, p_val = stats.ttest_ind(train_vals, val_vals)
+            sig = "***" if p_val < 0.01 else "**" if p_val < 0.05 else "*" if p_val < 0.1 else ""
+
+            if sig:
+                direction = "higher" if np.mean(val_vals) > np.mean(train_vals) else "lower"
+                print(f"  {metric}: Val sessions are {direction} (p={p_val:.3f}) {sig}")
+
+
 def main():
     """Main analysis pipeline."""
     output_dir = Path("results/session_analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-session R² from your dry run results
-    # UPDATE THESE with actual values from your experiments
+    # Validation sessions have R² values, training sessions are None
     performance = {
-        '141208-1': 0.144,  # From epoch 5 output
-        '141208-2': None,   # Training session
-        '141209': None,     # Training session
-        '160819': None,     # Training session
-        '160820': None,     # Training session
-        '170608': None,     # Training session
-        '170609': 0.226,    # From epoch 5 output
-        '170614': 0.432,    # From epoch 5 output
-        '170618': None,     # Training session
-        '170619': 0.437,    # From epoch 5 output
-        '170621': None,     # Training session
-        '170622': None,     # Training session
+        '141208-1': 0.144,  # Validation
+        '141208-2': None,   # Training
+        '141209': None,     # Training
+        '160819': None,     # Training
+        '160820': None,     # Training
+        '170608': None,     # Training
+        '170609': 0.226,    # Validation
+        '170614': 0.432,    # Validation
+        '170618': None,     # Training
+        '170619': 0.437,    # Validation
+        '170621': None,     # Training
+        '170622': None,     # Training
     }
-
-    # Filter to only validation sessions
-    performance = {k: v for k, v in performance.items() if v is not None}
 
     print("="*70)
     print("SESSION OUTLIER ANALYSIS FOR PHASE 3")
     print("="*70)
 
-    # Load data and compute statistics
+    # Load data and compute statistics for ALL sessions
     session_data, session_stats = load_session_data()
 
-    # Filter to sessions we have performance for
-    session_stats = {k: v for k, v in session_stats.items() if k in performance}
+    # Separate validation and training sessions
+    val_sessions = {k: v for k, v in performance.items() if v is not None}
+    train_sessions = {k: 0.0 for k, v in performance.items() if v is None}  # Placeholder R²
 
-    # Identify outliers
-    r2_values = list(performance.values())
+    print(f"\nValidation sessions ({len(val_sessions)}): {list(val_sessions.keys())}")
+    print(f"Training sessions ({len(train_sessions)}): {list(train_sessions.keys())}")
+
+    # For visualizations that need R², use only validation sessions
+    val_stats = {k: v for k, v in session_stats.items() if k in val_sessions}
+
+    # Identify outliers among validation sessions
+    r2_values = list(val_sessions.values())
     r2_mean = np.mean(r2_values)
     r2_std = np.std(r2_values)
     outlier_threshold = r2_mean - 1.0 * r2_std
 
-    outlier_sessions = [s for s, r2 in performance.items() if r2 < outlier_threshold]
+    outlier_sessions = [s for s, r2 in val_sessions.items() if r2 < outlier_threshold]
     print(f"\nOutlier threshold: R² < {outlier_threshold:.3f}")
     print(f"Outlier sessions: {outlier_sessions}")
 
     # Create visualizations
     print("\nGenerating visualizations...")
 
-    create_pca_plot(session_stats, performance, output_dir / "session_pca.png")
-    create_performance_breakdown(session_stats, performance, output_dir / "session_performance.png")
+    # Performance-based plots (validation sessions only)
+    create_pca_plot(val_stats, val_sessions, output_dir / "session_pca.png")
+    create_performance_breakdown(val_stats, val_sessions, output_dir / "session_performance.png")
+    create_power_spectrum_comparison(session_data, val_sessions, output_dir / "power_spectra.png")
+    create_amplitude_distributions(session_data, val_sessions, output_dir / "amplitude_distributions.png")
+    create_snr_analysis(session_data, val_sessions, output_dir / "snr_analysis.png")
 
-    # NEW: Additional visualizations
-    create_power_spectrum_comparison(session_data, performance, output_dir / "power_spectra.png")
-    create_amplitude_distributions(session_data, performance, output_dir / "amplitude_distributions.png")
-    create_snr_analysis(session_data, performance, output_dir / "snr_analysis.png")
+    # NEW: All-session analysis (train + val)
+    create_all_sessions_comparison(session_data, session_stats, val_sessions, output_dir / "all_sessions_comparison.png")
+    create_all_sessions_spectra(session_data, val_sessions, output_dir / "all_sessions_spectra.png")
 
     # Detailed analysis
-    analyze_outlier_differences(session_stats, performance, outlier_sessions)
+    analyze_outlier_differences(val_stats, val_sessions, outlier_sessions)
+
+    # Print ALL session statistics
+    print_all_session_stats(session_stats, val_sessions)
 
     # Save statistics to JSON
     stats_output = output_dir / "session_statistics.json"
@@ -836,12 +1127,14 @@ def main():
     print("="*70)
     print(f"Output directory: {output_dir}")
     print("Files generated:")
-    print("  - session_pca.png: PCA clustering of sessions")
-    print("  - session_performance.png: Performance breakdown")
-    print("  - power_spectra.png: Power spectrum comparison")
-    print("  - amplitude_distributions.png: Signal amplitude distributions")
-    print("  - snr_analysis.png: SNR estimates and correlation")
-    print("  - session_statistics.json: Raw statistics")
+    print("  - session_pca.png: PCA clustering (val sessions)")
+    print("  - session_performance.png: Performance breakdown (val sessions)")
+    print("  - power_spectra.png: Power spectrum comparison (val sessions)")
+    print("  - amplitude_distributions.png: Amplitude distributions (val sessions)")
+    print("  - snr_analysis.png: SNR estimates (val sessions)")
+    print("  - all_sessions_comparison.png: ALL sessions signal comparison")
+    print("  - all_sessions_spectra.png: ALL sessions power spectra")
+    print("  - session_statistics.json: Raw statistics (all sessions)")
 
 
 if __name__ == "__main__":
