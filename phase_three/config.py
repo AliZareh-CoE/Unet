@@ -630,6 +630,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             # Unlike statistics-based approaches, this learns a unique embedding per session ID.
             # This is what the user discussed: learnable lookup table → concatenated to FiLM condition.
             # NOTE: Does NOT generalize to unseen sessions! Only works for sessions in training set.
+            # IMPORTANT: Must enable cond_mode for FiLM to actually use the embedding!
             {
                 "value": "learnable_embed",
                 "name": "session_embedding",
@@ -640,6 +641,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_cov_augment": False,
                     "use_session_embedding": True,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled to use embedding!
                 }
             },
             # Method 11: Learnable embedding + statistics (both approaches combined)
@@ -653,6 +655,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_cov_augment": False,
                     "use_session_embedding": True,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled to use embedding!
                 }
             },
         ],
