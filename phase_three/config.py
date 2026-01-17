@@ -239,6 +239,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_revin": False,             # Reversible Instance Normalization
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
+    "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
 }
 
 # =============================================================================
@@ -533,6 +534,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": False,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 1: Statistics-based conditioning only (FiLM-style)
@@ -546,6 +548,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": False,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 2: Statistics with spectral features
@@ -559,6 +562,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": False,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 3: Adaptive output scaling only (AdaIN-style)
@@ -572,6 +576,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_revin": False,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 4: ReVIN - Reversible Instance Normalization
@@ -585,6 +590,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": True,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 5: Stats + Adaptive scaling combined
@@ -598,6 +604,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_revin": False,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 6: Covariance expansion augmentation only
@@ -611,6 +618,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": False,
                     "use_cov_augment": True,
+                    "use_session_embedding": False,
                 }
             },
             # Method 7: Stats + Cov augment combined
@@ -624,6 +632,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": False,
                     "use_cov_augment": True,
+                    "use_session_embedding": False,
                 }
             },
             # Method 8: ReVIN + Stats combined
@@ -637,6 +646,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_revin": True,
                     "use_cov_augment": False,
+                    "use_session_embedding": False,
                 }
             },
             # Method 9: Full session adaptation (all methods except ReVIN - incompatible with adaptive scaling)
@@ -650,6 +660,38 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_revin": False,  # ReVIN incompatible with adaptive scaling
                     "use_cov_augment": True,
+                    "use_session_embedding": False,
+                }
+            },
+            # Method 10: Learnable session embedding (lookup table)
+            # Unlike statistics-based approaches, this learns a unique embedding per session ID.
+            # This is what the user discussed: learnable lookup table → concatenated to FiLM condition.
+            # NOTE: Does NOT generalize to unseen sessions! Only works for sessions in training set.
+            {
+                "value": "learnable_embed",
+                "name": "session_embedding",
+                "desc": "Learnable session embedding (lookup table → FiLM)",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                    "use_session_embedding": True,
+                }
+            },
+            # Method 11: Learnable embedding + statistics (both approaches combined)
+            {
+                "value": "embed_and_stats",
+                "name": "embed_and_stats",
+                "desc": "Learnable embedding + statistics conditioning combined",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_revin": False,
+                    "use_cov_augment": False,
+                    "use_session_embedding": True,
                 }
             },
         ],
@@ -833,6 +875,7 @@ class AblationConfig:
     use_revin: bool = False  # Reversible Instance Normalization
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
+    use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
 
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
@@ -906,6 +949,7 @@ class AblationConfig:
             "use_revin": self.use_revin,
             "use_cov_augment": self.use_cov_augment,
             "cov_augment_prob": self.cov_augment_prob,
+            "use_session_embedding": self.use_session_embedding,
         }
 
     @property
@@ -991,6 +1035,7 @@ class AblationConfig:
             use_revin=config.get("use_revin", False),
             use_cov_augment=config.get("use_cov_augment", False),
             cov_augment_prob=config.get("cov_augment_prob", 0.5),
+            use_session_embedding=config.get("use_session_embedding", False),
         )
 
     @classmethod

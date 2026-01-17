@@ -1202,7 +1202,8 @@ class SpectroTemporalEncoder(nn.Module):
         masks = self._build_freq_masks(T, device)  # [n_bands, n_fft]
 
         # Compute FFT and power spectral density (requires float32)
-        x_fft = torch.fft.rfft(x, dim=-1)  # [B, C, n_fft]
+        # FFT doesn't support BFloat16 (used by FSDP mixed precision)
+        x_fft = torch.fft.rfft(x.float(), dim=-1)  # [B, C, n_fft]
         power = x_fft.abs().square()  # [B, C, n_fft]
 
         # Extract band powers: [B, C, n_bands]
@@ -1551,8 +1552,9 @@ class FreqDisentangledEncoder(nn.Module):
         Uses a smooth Gaussian rolloff instead of hard cutoff to avoid
         ringing artifacts (Gibbs phenomenon) and preserve signal amplitude.
         """
-        # FFT
-        X = torch.fft.rfft(x, dim=-1)
+        # FFT - cast to float32 for BFloat16 compatibility (FSDP mixed precision)
+        orig_dtype = x.dtype
+        X = torch.fft.rfft(x.float(), dim=-1)
         freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
 
         # Compute band center and width for Gaussian rolloff
@@ -1568,8 +1570,8 @@ class FreqDisentangledEncoder(nn.Module):
         # Apply mask
         X_filtered = X * mask
 
-        # Inverse FFT
-        return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1)
+        # Inverse FFT and cast back to original dtype
+        return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1).to(orig_dtype)
 
     def _compute_band_power(self, x: torch.Tensor, low: float, high: float) -> torch.Tensor:
         """Compute log power in frequency band for each channel.
@@ -1582,7 +1584,8 @@ class FreqDisentangledEncoder(nn.Module):
         Returns:
             [B, C] log power per channel in the band
         """
-        X = torch.fft.rfft(x, dim=-1)
+        # FFT doesn't support BFloat16 (used by FSDP mixed precision)
+        X = torch.fft.rfft(x.float(), dim=-1)
         freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
 
         # Band mask
@@ -2207,8 +2210,11 @@ class CondUNet1D(nn.Module):
         use_session_stats: bool = False,  # Enable statistics-based session conditioning
         session_emb_dim: int = 32,  # Session embedding dimension
         session_use_spectral: bool = False,  # Include spectral features in session stats
-        # Legacy parameter for backward compatibility (ignored if use_session_stats=True)
-        n_sessions: int = 0,  # Deprecated: use use_session_stats instead
+        # Learnable session embedding (lookup table approach)
+        # Unlike statistics-based, this learns a unique embedding per session ID.
+        # Requires session IDs at training time. Does NOT generalize to unseen sessions.
+        use_session_embedding: bool = False,  # Enable learnable session embedding lookup
+        n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2217,8 +2223,8 @@ class CondUNet1D(nn.Module):
         self.conv_type = conv_type
         self.n_downsample = n_downsample
         self.use_session_stats = use_session_stats
+        self.use_session_embedding = use_session_embedding
         self.session_emb_dim = session_emb_dim
-        # Legacy compatibility
         self.n_sessions = n_sessions
 
         if cond_mode != "none":
@@ -2246,6 +2252,26 @@ class CondUNet1D(nn.Module):
         else:
             self.session_stats_encoder = None
             self.session_proj = None
+
+        # Learnable session embedding (lookup table approach)
+        # This learns a unique embedding per session ID and combines it with FiLM conditioning.
+        # Unlike statistics-based, does NOT generalize to unseen sessions.
+        if use_session_embedding:
+            if n_sessions <= 0:
+                raise ValueError(
+                    f"use_session_embedding=True requires n_sessions > 0, got {n_sessions}"
+                )
+            self.session_embed = nn.Embedding(n_sessions, session_emb_dim)
+            # Project combined embedding (session embed + condition) to emb_dim
+            # Separate projection from session_proj to allow both to be enabled
+            self.session_embed_proj = nn.Sequential(
+                nn.Linear(session_emb_dim + emb_dim, emb_dim),
+                nn.GELU(),
+                nn.Linear(emb_dim, emb_dim),
+            )
+        else:
+            self.session_embed = None
+            self.session_embed_proj = None
 
         # Channel progression: base -> base*2 -> base*4 -> ... up to base*8 max
         # For n_downsample=2: [base, base*2, base*4]
@@ -2389,7 +2415,7 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-        session_ids: Optional[torch.Tensor] = None,  # Deprecated: kept for API compatibility
+        session_ids: Optional[torch.Tensor] = None,  # Required if use_session_embedding=True
         return_bottleneck: bool = False,
         return_bottleneck_temporal: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -2400,8 +2426,9 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
-            session_ids: DEPRECATED - Session IDs are no longer needed.
-                        Statistics-based conditioning computes session info from input.
+            session_ids: Session indices [B] for learnable session embedding lookup.
+                        Required if use_session_embedding=True.
+                        Not needed for statistics-based conditioning (use_session_stats).
             return_bottleneck: If True, also return pooled bottleneck features [B, bottleneck_ch]
                               for label-based contrastive learning
             return_bottleneck_temporal: If True, return unpooled bottleneck features [B, bottleneck_ch, T']
@@ -2466,6 +2493,24 @@ class CondUNet1D(nn.Module):
                 padding = torch.zeros(session_emb.size(0), self.emb_dim, device=session_emb.device)
                 combined = torch.cat([session_emb, padding], dim=-1)
                 emb = self.session_proj(combined)
+
+        # =================================================================
+        # LEARNABLE SESSION EMBEDDING (lookup table approach)
+        # =================================================================
+        # Unlike statistics-based, this uses session IDs to look up learned embeddings.
+        # Does NOT generalize to unseen sessions but can learn session-specific patterns.
+        # =================================================================
+        if self.session_embed is not None and session_ids is not None:
+            learned_session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+            if emb is not None:
+                # Concatenate learned session embedding with existing conditioning
+                combined = torch.cat([learned_session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]
+                emb = self.session_embed_proj(combined)  # [B, emb_dim]
+            else:
+                # No other conditioning - pad and project
+                padding = torch.zeros(learned_session_emb.size(0), self.emb_dim, device=learned_session_emb.device)
+                combined = torch.cat([learned_session_emb, padding], dim=-1)
+                emb = self.session_embed_proj(combined)
 
         # Encoder path with skip connections
         # Use gradient checkpointing if enabled (saves memory, costs ~30% more compute)

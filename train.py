@@ -1491,8 +1491,8 @@ def evaluate(
             # For CondUNet: use cond_emb if available, otherwise odor_ids
             # For other architectures: just pass input directly
             arch = config.get("arch", "condunet") if config else "condunet"
-            # Use proper session_ids from dataloader (not odor!)
-            session_ids = session_ids_batch if config and config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (only needed for learnable session embedding)
+            session_ids = session_ids_batch if config and config.get("use_session_embedding", False) else None
             if arch == "condunet":
                 if cond_emb is not None:
                     pred = model(ob, cond_emb=cond_emb, session_ids=session_ids)
@@ -1885,8 +1885,8 @@ def train_epoch(
 
         if arch == "condunet":
             # CondUNet with conditioning
-            # Use proper session_ids from dataloader (not odor!)
-            session_ids = session_ids_batch if config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (only needed for learnable session embedding)
+            session_ids = session_ids_batch if config.get("use_session_embedding", False) else None
             if cond_emb is not None:
                 fwd_result = model(
                     ob, cond_emb=cond_emb,
@@ -2397,12 +2397,14 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction (disabled if using adaptive scaling)
             use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
-            # Session embedding for session-specific adjustments
-            n_sessions=config.get("n_sessions", 0),
-            session_emb_dim=config.get("session_emb_dim", 32),
             # Statistics-based session adaptation (Phase 3 Group 18)
             use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
+            # Learnable session embedding (lookup table approach)
+            use_session_embedding=config.get("use_session_embedding", False),
+            n_sessions=config.get("n_sessions", 0),
+            # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
             use_revin=config.get("use_revin", False),
         )
@@ -2452,12 +2454,14 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction (disabled if using adaptive scaling)
             use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
-            # Session embedding (same as forward model)
-            n_sessions=config.get("n_sessions", 0),
-            session_emb_dim=config.get("session_emb_dim", 32),
             # Statistics-based session adaptation (same as forward)
             use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
+            # Learnable session embedding (same as forward model)
+            use_session_embedding=config.get("use_session_embedding", False),
+            n_sessions=config.get("n_sessions", 0),
+            # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
             use_revin=config.get("use_revin", False),
         )
