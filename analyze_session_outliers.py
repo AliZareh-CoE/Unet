@@ -429,6 +429,343 @@ def analyze_outlier_differences(session_stats: Dict, performance: Dict, outlier_
         print(f"  OB-PCx correlation: {s['ob_pcx_max_xcorr']:.4f}")
 
 
+def create_power_spectrum_comparison(session_data: Dict, performance: Dict, output_path: Path):
+    """Create power spectrum comparison across sessions.
+
+    Args:
+        session_data: Dict of session -> raw signal data
+        performance: Dict of session -> R² performance
+        output_path: Path to save figure
+    """
+    fs = 1000  # Sampling rate
+
+    # Sort sessions by performance
+    sessions = sorted(performance.keys(), key=lambda s: performance[s], reverse=True)
+    n_sessions = len(sessions)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Colors based on performance
+    cmap = plt.cm.RdYlGn
+    norm = plt.Normalize(vmin=min(performance.values()), vmax=max(performance.values()))
+
+    # Plot 1: OB Power Spectra
+    ax1 = axes[0, 0]
+    for session in sessions:
+        if session not in session_data:
+            continue
+        ob = session_data[session]['ob']  # [N, C, T]
+        # Average across trials and channels
+        ob_avg = ob.mean(axis=(0, 1))
+        n = len(ob_avg)
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        psd = np.abs(np.fft.rfft(ob_avg))**2
+
+        # Smooth with moving average
+        window = 5
+        psd_smooth = np.convolve(psd, np.ones(window)/window, mode='same')
+
+        color = cmap(norm(performance[session]))
+        ax1.semilogy(freqs[freqs < 100], psd_smooth[freqs < 100],
+                     label=f"{session} (R²={performance[session]:.2f})",
+                     color=color, alpha=0.8)
+
+    ax1.set_xlabel('Frequency (Hz)')
+    ax1.set_ylabel('Power (log)')
+    ax1.set_title('OB Power Spectra by Session')
+    ax1.legend(fontsize=7, loc='upper right')
+    ax1.set_xlim(0, 100)
+
+    # Plot 2: PCx Power Spectra
+    ax2 = axes[0, 1]
+    for session in sessions:
+        if session not in session_data:
+            continue
+        pcx = session_data[session]['pcx']
+        pcx_avg = pcx.mean(axis=(0, 1))
+        n = len(pcx_avg)
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        psd = np.abs(np.fft.rfft(pcx_avg))**2
+        psd_smooth = np.convolve(psd, np.ones(5)/5, mode='same')
+
+        color = cmap(norm(performance[session]))
+        ax2.semilogy(freqs[freqs < 100], psd_smooth[freqs < 100],
+                     label=f"{session}", color=color, alpha=0.8)
+
+    ax2.set_xlabel('Frequency (Hz)')
+    ax2.set_ylabel('Power (log)')
+    ax2.set_title('PCx Power Spectra by Session')
+    ax2.set_xlim(0, 100)
+
+    # Plot 3: Band power comparison (stacked bar)
+    ax3 = axes[1, 0]
+    bands = ['delta', 'theta', 'alpha', 'beta', 'gamma']
+    x = np.arange(len(sessions))
+    width = 0.15
+    colors_bands = ['navy', 'blue', 'green', 'orange', 'red']
+
+    for i, band in enumerate(bands):
+        ob_powers = []
+        for session in sessions:
+            if session in session_data:
+                ob = session_data[session]['ob'].mean(axis=(0, 1))
+                freqs = np.fft.rfftfreq(len(ob), 1/fs)
+                psd = np.abs(np.fft.rfft(ob))**2
+
+                band_ranges = {'delta': (1, 4), 'theta': (4, 8), 'alpha': (8, 12),
+                               'beta': (12, 30), 'gamma': (30, 100)}
+                f_low, f_high = band_ranges[band]
+                mask = (freqs >= f_low) & (freqs < f_high)
+                ob_powers.append(np.mean(psd[mask]))
+            else:
+                ob_powers.append(0)
+
+        ax3.bar(x + i*width, ob_powers, width, label=band, color=colors_bands[i])
+
+    ax3.set_xticks(x + 2*width)
+    ax3.set_xticklabels(sessions, rotation=45, ha='right')
+    ax3.set_ylabel('Power')
+    ax3.set_title('OB Band Power by Session')
+    ax3.legend()
+
+    # Plot 4: Gamma/Theta ratio (important for neural coding)
+    ax4 = axes[1, 1]
+    gamma_theta_ratios = []
+    for session in sessions:
+        if session in session_data:
+            ob = session_data[session]['ob'].mean(axis=(0, 1))
+            freqs = np.fft.rfftfreq(len(ob), 1/fs)
+            psd = np.abs(np.fft.rfft(ob))**2
+
+            gamma_mask = (freqs >= 30) & (freqs < 100)
+            theta_mask = (freqs >= 4) & (freqs < 8)
+            ratio = np.mean(psd[gamma_mask]) / (np.mean(psd[theta_mask]) + 1e-10)
+            gamma_theta_ratios.append(ratio)
+        else:
+            gamma_theta_ratios.append(0)
+
+    colors = [cmap(norm(performance[s])) for s in sessions]
+    ax4.bar(range(len(sessions)), gamma_theta_ratios, color=colors, edgecolor='black')
+    ax4.set_xticks(range(len(sessions)))
+    ax4.set_xticklabels(sessions, rotation=45, ha='right')
+    ax4.set_ylabel('Gamma/Theta Ratio')
+    ax4.set_title('Gamma/Theta Power Ratio (color=R²)')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved power spectrum comparison to {output_path}")
+
+
+def create_amplitude_distributions(session_data: Dict, performance: Dict, output_path: Path):
+    """Create signal amplitude distribution comparison.
+
+    Args:
+        session_data: Dict of session -> raw signal data
+        performance: Dict of session -> R² performance
+        output_path: Path to save figure
+    """
+    sessions = sorted(performance.keys(), key=lambda s: performance[s], reverse=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    cmap = plt.cm.RdYlGn
+    norm = plt.Normalize(vmin=min(performance.values()), vmax=max(performance.values()))
+
+    # Plot 1: OB amplitude histograms
+    ax1 = axes[0, 0]
+    for session in sessions:
+        if session not in session_data:
+            continue
+        ob = session_data[session]['ob'].flatten()
+        color = cmap(norm(performance[session]))
+        ax1.hist(ob, bins=100, alpha=0.5, label=f"{session}", color=color, density=True)
+
+    ax1.set_xlabel('Amplitude')
+    ax1.set_ylabel('Density')
+    ax1.set_title('OB Signal Amplitude Distributions')
+    ax1.legend(fontsize=7)
+    ax1.set_xlim(-5, 5)
+
+    # Plot 2: PCx amplitude histograms
+    ax2 = axes[0, 1]
+    for session in sessions:
+        if session not in session_data:
+            continue
+        pcx = session_data[session]['pcx'].flatten()
+        color = cmap(norm(performance[session]))
+        ax2.hist(pcx, bins=100, alpha=0.5, label=f"{session}", color=color, density=True)
+
+    ax2.set_xlabel('Amplitude')
+    ax2.set_ylabel('Density')
+    ax2.set_title('PCx Signal Amplitude Distributions')
+    ax2.set_xlim(-5, 5)
+
+    # Plot 3: Per-channel variance comparison
+    ax3 = axes[1, 0]
+    x = np.arange(len(sessions))
+    width = 0.35
+
+    ob_vars = []
+    pcx_vars = []
+    for session in sessions:
+        if session in session_data:
+            ob = session_data[session]['ob']  # [N, C, T]
+            pcx = session_data[session]['pcx']
+            # Variance per channel, then mean across channels
+            ob_vars.append(np.mean(np.var(ob, axis=(0, 2))))
+            pcx_vars.append(np.mean(np.var(pcx, axis=(0, 2))))
+        else:
+            ob_vars.append(0)
+            pcx_vars.append(0)
+
+    ax3.bar(x - width/2, ob_vars, width, label='OB', color='steelblue')
+    ax3.bar(x + width/2, pcx_vars, width, label='PCx', color='coral')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(sessions, rotation=45, ha='right')
+    ax3.set_ylabel('Mean Channel Variance')
+    ax3.set_title('Signal Variance by Session')
+    ax3.legend()
+
+    # Plot 4: Dynamic range (max - min)
+    ax4 = axes[1, 1]
+    ob_ranges = []
+    pcx_ranges = []
+    for session in sessions:
+        if session in session_data:
+            ob = session_data[session]['ob']
+            pcx = session_data[session]['pcx']
+            ob_ranges.append(np.max(ob) - np.min(ob))
+            pcx_ranges.append(np.max(pcx) - np.min(pcx))
+        else:
+            ob_ranges.append(0)
+            pcx_ranges.append(0)
+
+    ax4.bar(x - width/2, ob_ranges, width, label='OB', color='steelblue')
+    ax4.bar(x + width/2, pcx_ranges, width, label='PCx', color='coral')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(sessions, rotation=45, ha='right')
+    ax4.set_ylabel('Dynamic Range')
+    ax4.set_title('Signal Dynamic Range by Session')
+    ax4.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved amplitude distributions to {output_path}")
+
+
+def create_snr_analysis(session_data: Dict, performance: Dict, output_path: Path):
+    """Create detailed SNR analysis.
+
+    Args:
+        session_data: Dict of session -> raw signal data
+        performance: Dict of session -> R² performance
+        output_path: Path to save figure
+    """
+    sessions = sorted(performance.keys(), key=lambda s: performance[s], reverse=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Compute multiple SNR estimates
+    snr_diff = {'ob': [], 'pcx': []}  # Based on diff (high-freq noise proxy)
+    snr_var = {'ob': [], 'pcx': []}   # Based on variance ratio
+    snr_freq = {'ob': [], 'pcx': []}  # Based on frequency content
+
+    for session in sessions:
+        if session not in session_data:
+            for key in ['ob', 'pcx']:
+                snr_diff[key].append(0)
+                snr_var[key].append(0)
+                snr_freq[key].append(0)
+            continue
+
+        ob = session_data[session]['ob']
+        pcx = session_data[session]['pcx']
+
+        for key, data in [('ob', ob), ('pcx', pcx)]:
+            flat = data.reshape(-1, data.shape[-1])
+
+            # Method 1: Diff-based (high-freq noise)
+            noise_var = np.var(np.diff(flat, axis=-1))
+            signal_var = np.var(flat)
+            snr_diff[key].append(signal_var / (noise_var + 1e-10))
+
+            # Method 2: Low-freq / high-freq ratio
+            avg = data.mean(axis=(0, 1))
+            freqs = np.fft.rfftfreq(len(avg), 1/1000)
+            psd = np.abs(np.fft.rfft(avg))**2
+            low_power = np.mean(psd[(freqs >= 1) & (freqs < 50)])
+            high_power = np.mean(psd[(freqs >= 50) & (freqs < 200)])
+            snr_freq[key].append(low_power / (high_power + 1e-10))
+
+            # Method 3: Inter-trial consistency (signal should be consistent)
+            trial_means = data.mean(axis=-1)  # [N, C]
+            snr_var[key].append(np.mean(trial_means) / (np.std(trial_means) + 1e-10))
+
+    # Plot 1: Diff-based SNR
+    ax1 = axes[0, 0]
+    x = np.arange(len(sessions))
+    width = 0.35
+    ax1.bar(x - width/2, snr_diff['ob'], width, label='OB', color='steelblue')
+    ax1.bar(x + width/2, snr_diff['pcx'], width, label='PCx', color='coral')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(sessions, rotation=45, ha='right')
+    ax1.set_ylabel('SNR (diff-based)')
+    ax1.set_title('SNR: Signal Var / High-Freq Noise')
+    ax1.legend()
+
+    # Plot 2: Frequency-based SNR
+    ax2 = axes[0, 1]
+    ax2.bar(x - width/2, snr_freq['ob'], width, label='OB', color='steelblue')
+    ax2.bar(x + width/2, snr_freq['pcx'], width, label='PCx', color='coral')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(sessions, rotation=45, ha='right')
+    ax2.set_ylabel('SNR (freq-based)')
+    ax2.set_title('SNR: Low-Freq / High-Freq Power')
+    ax2.legend()
+
+    # Plot 3: SNR vs R² correlation
+    ax3 = axes[1, 0]
+    r2_vals = [performance[s] for s in sessions]
+
+    ax3.scatter(snr_diff['ob'], r2_vals, c='steelblue', s=100, label='OB SNR', alpha=0.7)
+    ax3.scatter(snr_diff['pcx'], r2_vals, c='coral', s=100, label='PCx SNR', alpha=0.7)
+
+    for i, s in enumerate(sessions):
+        ax3.annotate(s, (snr_diff['ob'][i], r2_vals[i]), fontsize=7)
+
+    # Fit line for OB
+    slope, intercept, r, p, se = stats.linregress(snr_diff['ob'], r2_vals)
+    ax3.set_xlabel('SNR (diff-based)')
+    ax3.set_ylabel('R² Score')
+    ax3.set_title(f'SNR vs Performance (OB r={r:.2f}, p={p:.3f})')
+    ax3.legend()
+
+    # Plot 4: Combined SNR score
+    ax4 = axes[1, 1]
+    # Normalize each SNR metric and combine
+    snr_combined = []
+    for i in range(len(sessions)):
+        combined = (snr_diff['ob'][i] / (max(snr_diff['ob']) + 1e-10) +
+                    snr_diff['pcx'][i] / (max(snr_diff['pcx']) + 1e-10) +
+                    snr_freq['ob'][i] / (max(snr_freq['ob']) + 1e-10) +
+                    snr_freq['pcx'][i] / (max(snr_freq['pcx']) + 1e-10)) / 4
+        snr_combined.append(combined)
+
+    colors = plt.cm.RdYlGn([performance[s] / max(performance.values()) for s in sessions])
+    ax4.bar(range(len(sessions)), snr_combined, color=colors, edgecolor='black')
+    ax4.set_xticks(range(len(sessions)))
+    ax4.set_xticklabels(sessions, rotation=45, ha='right')
+    ax4.set_ylabel('Combined SNR Score')
+    ax4.set_title('Combined SNR Score (color=R²)')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved SNR analysis to {output_path}")
+
+
 def main():
     """Main analysis pipeline."""
     output_dir = Path("results/session_analysis")
@@ -480,6 +817,11 @@ def main():
     create_pca_plot(session_stats, performance, output_dir / "session_pca.png")
     create_performance_breakdown(session_stats, performance, output_dir / "session_performance.png")
 
+    # NEW: Additional visualizations
+    create_power_spectrum_comparison(session_data, performance, output_dir / "power_spectra.png")
+    create_amplitude_distributions(session_data, performance, output_dir / "amplitude_distributions.png")
+    create_snr_analysis(session_data, performance, output_dir / "snr_analysis.png")
+
     # Detailed analysis
     analyze_outlier_differences(session_stats, performance, outlier_sessions)
 
@@ -496,6 +838,9 @@ def main():
     print("Files generated:")
     print("  - session_pca.png: PCA clustering of sessions")
     print("  - session_performance.png: Performance breakdown")
+    print("  - power_spectra.png: Power spectrum comparison")
+    print("  - amplitude_distributions.png: Signal amplitude distributions")
+    print("  - snr_analysis.png: SNR estimates and correlation")
     print("  - session_statistics.json: Raw statistics")
 
 
