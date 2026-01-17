@@ -41,12 +41,18 @@ class AblationTrainer:
         training_config: TrainingConfig,
         device: str = "cuda",
         checkpoint_dir: Optional[Path] = None,
+        session_id_mapping: Optional[Dict[int, int]] = None,
     ):
         self.model = model.to(device)
         self.ablation_config = ablation_config
         self.training_config = training_config
         self.device = device
         self.checkpoint_dir = checkpoint_dir
+
+        # Session ID mapping: maps validation session IDs to closest training session IDs
+        # This is CRITICAL for session embedding - validation sessions have untrained embeddings
+        # so we map them to the closest training session's embedding
+        self.session_id_mapping = session_id_mapping or {}
 
         # Build loss function based on ablation config
         self.criterion = build_loss(
@@ -194,9 +200,36 @@ class AblationTrainer:
 
         return total_loss / max(n_batches, 1)
 
+    def _map_session_ids(self, session_ids: torch.Tensor) -> torch.Tensor:
+        """Map validation session IDs to closest training session IDs.
+
+        This is CRITICAL for session embedding during validation:
+        - Validation sessions have UNTRAINED embeddings (random values)
+        - We map them to the closest training session to use trained embeddings
+
+        Args:
+            session_ids: Original session IDs tensor
+
+        Returns:
+            Mapped session IDs (validation sessions mapped to training sessions)
+        """
+        if not self.session_id_mapping:
+            return session_ids
+
+        # Apply mapping efficiently
+        mapped = session_ids.clone()
+        for val_sid, train_sid in self.session_id_mapping.items():
+            mask = session_ids == val_sid
+            mapped[mask] = train_sid
+        return mapped
+
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> Tuple[float, float]:
-        """Validate model and compute R²."""
+        """Validate model and compute R².
+
+        For session embedding: maps validation session IDs to closest training
+        sessions to use trained embeddings instead of random untrained ones.
+        """
         self.model.eval()
         total_loss = 0.0
         all_preds = []
@@ -219,6 +252,10 @@ class AblationTrainer:
                 odor_ids = odor_ids.to(self.device)
             if session_ids is not None:
                 session_ids = session_ids.to(self.device)
+                # CRITICAL: Map validation session IDs to closest training sessions
+                # This ensures we use TRAINED embeddings, not random untrained ones
+                if self.session_id_mapping and self.ablation_config.use_session_embedding:
+                    session_ids = self._map_session_ids(session_ids)
 
             # Determine what to pass to model
             use_odor = odor_ids is not None and self.ablation_config.use_odor_embedding

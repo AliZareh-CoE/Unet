@@ -770,6 +770,85 @@ def create_synthetic_data(
 
 
 # =============================================================================
+# Session Mapping for Validation
+# =============================================================================
+
+def compute_session_mapping(
+    X: torch.Tensor,
+    session_ids: torch.Tensor,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    in_channels: int,
+) -> Dict[int, int]:
+    """Compute mapping from validation session IDs to closest training sessions.
+
+    This is CRITICAL for session embedding:
+    - Training sessions have trained embeddings
+    - Validation sessions have UNTRAINED embeddings (random!)
+    - We map validation sessions to closest training sessions based on statistics
+
+    Args:
+        X: Full data tensor [N, C, T]
+        session_ids: Session IDs for all samples
+        train_idx: Indices of training samples
+        val_idx: Indices of validation samples
+        in_channels: Number of channels
+
+    Returns:
+        Dict mapping validation session ID -> closest training session ID
+    """
+    try:
+        from models import SessionMatcher
+    except ImportError:
+        print("  Warning: SessionMatcher not available, no session mapping applied")
+        return {}
+
+    # Get unique sessions in train and val
+    train_sessions = set(session_ids[train_idx].numpy().tolist())
+    val_sessions = set(session_ids[val_idx].numpy().tolist())
+
+    # Sessions that are ONLY in validation (need mapping)
+    unseen_sessions = val_sessions - train_sessions
+
+    if not unseen_sessions:
+        # All validation sessions are also in training - no mapping needed
+        return {}
+
+    print(f"  Session mapping: {len(unseen_sessions)} validation sessions need mapping to training sessions")
+
+    # Create SessionMatcher and register training sessions
+    matcher = SessionMatcher(n_channels=in_channels)
+
+    for train_sid in train_sessions:
+        # Get all samples from this training session
+        mask = (session_ids == train_sid).numpy()
+        train_mask = np.zeros(len(session_ids), dtype=bool)
+        train_mask[train_idx] = True
+        combined_mask = mask & train_mask
+
+        if combined_mask.sum() > 0:
+            session_data = X[combined_mask].numpy()
+            matcher.register_session(int(train_sid), session_data)
+
+    # Map each validation-only session to closest training session
+    mapping = {}
+    for val_sid in unseen_sessions:
+        # Get samples from this validation session
+        mask = (session_ids == val_sid).numpy()
+        val_mask = np.zeros(len(session_ids), dtype=bool)
+        val_mask[val_idx] = True
+        combined_mask = mask & val_mask
+
+        if combined_mask.sum() > 0:
+            session_data = X[combined_mask].numpy()
+            matched_train_sid = matcher.warmup(session_data)
+            mapping[int(val_sid)] = matched_train_sid
+            print(f"    Session {val_sid} -> {matched_train_sid}")
+
+    return mapping
+
+
+# =============================================================================
 # Main Runner
 # =============================================================================
 
@@ -785,6 +864,7 @@ def run_single_ablation(
     device: str = "cuda",
     checkpoint_dir: Optional[Path] = None,
     verbose: int = 1,
+    session_id_mapping: Optional[Dict[int, int]] = None,
 ) -> AblationResult:
     """Run a single ablation experiment (one fold).
 
@@ -800,6 +880,8 @@ def run_single_ablation(
         device: Device to use
         checkpoint_dir: Directory for checkpoints
         verbose: Verbosity level
+        session_id_mapping: Mapping from validation session IDs to training session IDs
+            (for session embedding - maps unseen sessions to closest trained sessions)
 
     Returns:
         AblationResult with training metrics
@@ -817,13 +899,14 @@ def run_single_ablation(
         print(f"\n  [{ablation_config.study}] {ablation_config.variant} (fold {fold + 1})")
         print(f"    Parameters: {n_params:,}")
 
-    # Create trainer
+    # Create trainer with session mapping for validation
     trainer = AblationTrainer(
         model=model,
         ablation_config=ablation_config,
         training_config=training_config,
         device=device,
         checkpoint_dir=checkpoint_dir,
+        session_id_mapping=session_id_mapping,
     )
 
     # Train
@@ -986,6 +1069,10 @@ def _run_greedy_forward_protocol(
     # This preserves the 8 train / 4 val session split from prepare_data
     print(f"Session-based split: {len(train_idx)} train, {len(val_idx)} val samples")
 
+    # Compute session mapping for validation (CRITICAL for session embedding)
+    # Maps validation-only sessions to closest training sessions
+    session_id_mapping = compute_session_mapping(X, session_ids, train_idx, val_idx, in_channels)
+
     # Get groups to run
     groups = config.get_greedy_groups()
     run_count = 0
@@ -1097,6 +1184,9 @@ def _run_greedy_forward_protocol(
                     n_workers=config.n_workers,
                 )
 
+                # Only pass session mapping if session embedding is enabled for this ablation
+                use_session_emb = ablation_config.use_session_embedding
+
                 result = run_single_ablation(
                     ablation_config=ablation_config,
                     training_config=config.training,
@@ -1109,6 +1199,7 @@ def _run_greedy_forward_protocol(
                     device=config.device,
                     checkpoint_dir=config.checkpoint_dir / f"g{group_id}" / variant_name,
                     verbose=config.verbose,
+                    session_id_mapping=session_id_mapping if use_session_emb else None,
                 )
                 print(f"    R²: {result.best_r2:.4f}")
 
@@ -1464,6 +1555,13 @@ def _run_additive_protocol(
                     n_workers=config.n_workers,
                 )
 
+                # Compute session mapping for this fold if session embedding is enabled
+                fold_session_mapping = None
+                if ablation_config.use_session_embedding:
+                    fold_session_mapping = compute_session_mapping(
+                        X, session_ids, train_idx, val_idx, in_channels
+                    )
+
                 result = run_single_ablation(
                     ablation_config=ablation_config,
                     training_config=config.training,
@@ -1476,6 +1574,7 @@ def _run_additive_protocol(
                     device=config.device,
                     checkpoint_dir=config.checkpoint_dir / stage_name / f"fold{fold_idx}",
                     verbose=config.verbose,
+                    session_id_mapping=fold_session_mapping,
                 )
 
             all_results.append(result)
@@ -1753,6 +1852,13 @@ def _run_subtractive_protocol(
                     n_workers=config.n_workers,
                 )
 
+                # Compute session mapping for this fold if session embedding is enabled
+                fold_session_mapping = None
+                if baseline_config.use_session_embedding:
+                    fold_session_mapping = compute_session_mapping(
+                        X, session_ids, train_idx, val_idx, in_channels
+                    )
+
                 result = run_single_ablation(
                     ablation_config=baseline_config,
                     training_config=config.training,
@@ -1765,6 +1871,7 @@ def _run_subtractive_protocol(
                     device=config.device,
                     checkpoint_dir=config.checkpoint_dir / "baseline" / f"fold{fold_idx}",
                     verbose=config.verbose,
+                    session_id_mapping=fold_session_mapping,
                 )
             baseline_results.append(result)
 
@@ -1873,6 +1980,13 @@ def _run_subtractive_protocol(
                     n_workers=config.n_workers,
                 )
 
+                # Compute session mapping for this fold if session embedding is enabled
+                fold_session_mapping = None
+                if ablation_config.use_session_embedding:
+                    fold_session_mapping = compute_session_mapping(
+                        X, session_ids, train_idx, val_idx, in_channels
+                    )
+
                 result = run_single_ablation(
                     ablation_config=ablation_config,
                     training_config=config.training,
@@ -1885,6 +1999,7 @@ def _run_subtractive_protocol(
                     device=config.device,
                     checkpoint_dir=config.checkpoint_dir / ablation_config.study / f"fold{fold_idx}",
                     verbose=config.verbose,
+                    session_id_mapping=fold_session_mapping,
                 )
             all_results.append(result)
 
