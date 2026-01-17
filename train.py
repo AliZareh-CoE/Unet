@@ -2779,6 +2779,26 @@ def train(
     # =============================================================================
     # Training loop
     # =============================================================================
+    # Session embedding verification - print BEFORE training
+    if config.get("use_session_embedding", False) and is_primary():
+        # Get the actual model (unwrap from FSDP/DDP if needed)
+        unwrapped = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+            with torch.no_grad():
+                init_weight = unwrapped.session_embed.weight.clone()
+                print(f"\n{'='*60}")
+                print(f"[SESSION EMBED] BEFORE TRAINING:")
+                print(f"  Weight shape: {init_weight.shape}")
+                print(f"  Weight norm: {init_weight.norm().item():.6f}")
+                print(f"  Weight mean: {init_weight.mean().item():.6f}")
+                print(f"  Weight std: {init_weight.std().item():.6f}")
+                print(f"  First 3 embeddings (norm): {[init_weight[i].norm().item() for i in range(min(3, init_weight.shape[0]))]}")
+                print(f"{'='*60}\n")
+                # Store for later comparison
+                config['_session_embed_init_weight'] = init_weight.cpu()
+        else:
+            print(f"\n[SESSION EMBED] WARNING: use_session_embedding=True but model has no session_embed!\n")
+
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
@@ -3406,6 +3426,33 @@ def train(
         finally:
             # Always close the recording session
             recording_session.close()
+
+    # Session embedding verification - print AFTER training
+    if config.get("use_session_embedding", False) and is_primary():
+        # Get the actual model (unwrap from FSDP/DDP if needed)
+        unwrapped = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+            with torch.no_grad():
+                final_weight = unwrapped.session_embed.weight.clone()
+                print(f"\n{'='*60}")
+                print(f"[SESSION EMBED] AFTER TRAINING:")
+                print(f"  Weight shape: {final_weight.shape}")
+                print(f"  Weight norm: {final_weight.norm().item():.6f}")
+                print(f"  Weight mean: {final_weight.mean().item():.6f}")
+                print(f"  Weight std: {final_weight.std().item():.6f}")
+                print(f"  First 3 embeddings (norm): {[final_weight[i].norm().item() for i in range(min(3, final_weight.shape[0]))]}")
+                # Compare with initial weights if available
+                if '_session_embed_init_weight' in config:
+                    init_weight = config['_session_embed_init_weight'].to(final_weight.device)
+                    weight_delta = (final_weight - init_weight).norm().item()
+                    print(f"  WEIGHT CHANGE (L2 norm of delta): {weight_delta:.6f}")
+                    if weight_delta > 0.001:
+                        print(f"  ✓ Session embeddings CHANGED during training (delta > 0.001)")
+                    else:
+                        print(f"  ⚠ Session embeddings BARELY changed (delta={weight_delta:.6f})")
+                print(f"{'='*60}\n")
+        else:
+            print(f"\n[SESSION EMBED] WARNING: use_session_embedding=True but model has no session_embed!\n")
 
     return {
         "best_val_loss": best_val_loss,

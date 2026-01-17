@@ -2192,6 +2192,8 @@ class CondUNet1D(nn.Module):
                 nn.GELU(),
                 nn.Linear(emb_dim, emb_dim),
             )
+            # Debug counter for verification
+            self._session_embed_use_count = 0
         else:
             self.session_embed = None
             self.session_embed_proj = None
@@ -2410,6 +2412,14 @@ class CondUNet1D(nn.Module):
         # =================================================================
         if self.session_embed is not None and session_ids is not None:
             learned_session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+            # Debug verification - print on first few uses
+            if hasattr(self, '_session_embed_use_count'):
+                self._session_embed_use_count += 1
+                if self._session_embed_use_count <= 3:
+                    print(f"[SESSION EMBED VERIFY] Use #{self._session_embed_use_count}: "
+                          f"session_ids={session_ids.tolist()[:8]}{'...' if len(session_ids) > 8 else ''}, "
+                          f"embed_norm={learned_session_emb.norm().item():.4f}, "
+                          f"weight_norm={self.session_embed.weight.norm().item():.4f}")
             if emb is not None:
                 # Concatenate learned session embedding with existing conditioning
                 combined = torch.cat([learned_session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]
