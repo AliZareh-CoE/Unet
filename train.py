@@ -1437,11 +1437,13 @@ def evaluate(
             # For CondUNet: use cond_emb if available, otherwise odor_ids
             # For other architectures: just pass input directly
             arch = config.get("arch", "condunet") if config else "condunet"
+            # When using session embedding, 'odor' variable contains session IDs
+            session_ids = odor if config and config.get("n_sessions", 0) > 0 else None
             if arch == "condunet":
                 if cond_emb is not None:
-                    pred = model(ob, cond_emb=cond_emb)
+                    pred = model(ob, cond_emb=cond_emb, session_ids=session_ids)
                 else:
-                    pred = model(ob, odor)
+                    pred = model(ob, odor, session_ids=session_ids)
             else:
                 # Other architectures: just pass input
                 pred = model(ob)
@@ -1517,9 +1519,9 @@ def evaluate(
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
                 if cond_emb is not None:
-                    pred_rev = reverse_model(pcx, cond_emb=cond_emb)
+                    pred_rev = reverse_model(pcx, cond_emb=cond_emb, session_ids=session_ids)
                 else:
-                    pred_rev = reverse_model(pcx, odor)
+                    pred_rev = reverse_model(pcx, odor, session_ids=session_ids)
 
                 # Apply envelope histogram matching (reverse direction)
                 if envelope_matcher_rev is not None:
@@ -1822,15 +1824,19 @@ def train_epoch(
 
         if arch == "condunet":
             # CondUNet with conditioning
+            # When using session embedding, 'odor' variable contains session IDs
+            session_ids = odor if config.get("n_sessions", 0) > 0 else None
             if cond_emb is not None:
                 fwd_result = model(
                     ob, cond_emb=cond_emb,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
             else:
                 fwd_result = model(
                     ob, odor,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
@@ -1881,12 +1887,14 @@ def train_epoch(
             if cond_emb_rev is not None:
                 rev_result = reverse_model(
                     pcx, cond_emb=cond_emb_rev,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
             else:
                 rev_result = reverse_model(
                     pcx, odor,
+                    session_ids=session_ids,
                     return_bottleneck=(use_contrastive and not use_temporal_cebra),
                     return_bottleneck_temporal=use_temporal_cebra
                 )
@@ -1920,9 +1928,9 @@ def train_epoch(
 
             # Cycle consistency: OB → PCx → OB
             if cond_emb_rev is not None:
-                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev)
+                cycle_ob = reverse_model(pred_raw.detach(), cond_emb=cond_emb_rev, session_ids=session_ids)
             else:
-                cycle_ob = reverse_model(pred_raw.detach(), odor)
+                cycle_ob = reverse_model(pred_raw.detach(), odor, session_ids=session_ids)
             cycle_ob_c = crop_to_target_torch(cycle_ob)
             cycle_loss_ob = config.get("cycle_lambda", 1.0) * F.l1_loss(cycle_ob_c, ob_c)
             loss = loss + cycle_loss_ob
@@ -2258,11 +2266,27 @@ def train(
     conv_type = config.get("conv_type", "standard")
     arch = config.get("arch", "condunet")  # Architecture selection
 
+    # Auto-detect number of sessions for session embedding if not specified
+    if config.get("use_session_embedding", False) and config.get("n_sessions") is None:
+        # Try to get number of sessions from data
+        if "train_sessions" in data and "val_sessions" in data:
+            all_sessions = list(set(data["train_sessions"]) | set(data.get("val_sessions", [])))
+            config["n_sessions"] = len(all_sessions)
+        elif "session_to_idx" in data:
+            config["n_sessions"] = len(data["session_to_idx"])
+        else:
+            # Default fallback - can be overridden with --n-sessions
+            config["n_sessions"] = 15  # Reasonable default for olfactory data
+        if is_primary():
+            print(f"Session embedding: auto-detected {config['n_sessions']} sessions")
+
     if is_primary():
         print(f"Architecture: {arch.upper()}")
         print(f"Model: {in_channels} input channels → {out_channels} output channels")
         if arch == "condunet":
             print(f"Conditions: {n_odors} classes")
+            if config.get("n_sessions", 0) > 0:
+                print(f"Session embedding: {config['n_sessions']} sessions, dim={config['session_emb_dim']}")
 
     # Create model based on architecture
     if arch == "condunet":
@@ -2286,6 +2310,9 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction
             use_output_scaling=config.get("use_output_scaling", True),
+            # Session embedding for session-specific adjustments
+            n_sessions=config.get("n_sessions", 0),
+            session_emb_dim=config.get("session_emb_dim", 32),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2333,6 +2360,9 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction
             use_output_scaling=config.get("use_output_scaling", True),
+            # Session embedding (same as forward model)
+            n_sessions=config.get("n_sessions", 0),
+            session_emb_dim=config.get("session_emb_dim", 32),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -3501,6 +3531,14 @@ def parse_args():
     parser.add_argument("--n-downsample", type=int, default=None,
                         help="Number of encoder/decoder downsample levels (depth) for ablation studies")
 
+    # Session embedding for session-specific adjustments
+    parser.add_argument("--use-session-embedding", action="store_true",
+                        help="Enable session embedding for session-specific model adjustments")
+    parser.add_argument("--n-sessions", type=int, default=None,
+                        help="Number of sessions for session embedding (auto-detected if not specified)")
+    parser.add_argument("--session-emb-dim", type=int, default=32,
+                        help="Session embedding dimension (default: 32)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3612,6 +3650,18 @@ def main():
         config["no_test_set"] = args.no_test_set
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
+
+    # Session embedding configuration
+    if args.use_session_embedding:
+        # n_sessions will be auto-detected from data if not specified
+        config["use_session_embedding"] = True
+        if args.n_sessions is not None:
+            config["n_sessions"] = args.n_sessions
+        # session_emb_dim is set via CLI (default 32)
+        config["session_emb_dim"] = args.session_emb_dim
+    else:
+        config["n_sessions"] = 0  # Disabled
+        config["session_emb_dim"] = 32
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
