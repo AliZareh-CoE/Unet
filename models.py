@@ -2178,7 +2178,7 @@ class CondUNet1D(nn.Module):
 
         # Learnable session embedding (lookup table approach)
         # This learns a unique embedding per session ID and combines it with FiLM conditioning.
-        # Unlike statistics-based, does NOT generalize to unseen sessions.
+        # NEW: Uses statistics-based matching for unseen sessions (soft attention over embeddings)
         if use_session_embedding:
             if n_sessions <= 0:
                 raise ValueError(
@@ -2192,6 +2192,20 @@ class CondUNet1D(nn.Module):
                 nn.GELU(),
                 nn.Linear(emb_dim, emb_dim),
             )
+            # NEW: Statistics-based session matcher for generalization to unseen sessions
+            # Computes input statistics and uses soft attention over all session embeddings
+            # This allows the model to find the "nearest" session based on signal characteristics
+            stat_dim = 64  # Dimension of statistics encoding
+            self.session_stat_encoder = nn.Sequential(
+                nn.Linear(in_channels * 4, stat_dim),  # 4 stats: mean, std, min, max per channel
+                nn.GELU(),
+                nn.Linear(stat_dim, stat_dim),
+            )
+            # Attention over session embeddings based on statistics
+            self.session_stat_to_query = nn.Linear(stat_dim, session_emb_dim)
+            self.session_embed_keys = nn.Linear(session_emb_dim, session_emb_dim)
+            # Track which sessions are "known" (seen during training)
+            self.register_buffer('known_sessions', torch.zeros(n_sessions, dtype=torch.bool))
             # Debug counter for verification
             self._session_embed_use_count = 0
         else:
@@ -2405,21 +2419,58 @@ class CondUNet1D(nn.Module):
                 emb = self.session_proj(combined)
 
         # =================================================================
-        # LEARNABLE SESSION EMBEDDING (lookup table approach)
+        # LEARNABLE SESSION EMBEDDING with STATISTICS-BASED MATCHING
         # =================================================================
-        # Unlike statistics-based, this uses session IDs to look up learned embeddings.
-        # Does NOT generalize to unseen sessions but can learn session-specific patterns.
+        # Training: Direct lookup (learns session-specific patterns)
+        # Inference: Statistics-based soft attention (generalizes to unseen sessions)
         # =================================================================
-        if self.session_embed is not None and session_ids is not None:
-            learned_session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+        if self.session_embed is not None:
+            # Compute input statistics for session matching (from raw_input, before normalization)
+            # Stats: [mean, std, min, max] per channel -> [B, C*4]
+            input_mean = raw_input.mean(dim=-1)  # [B, C]
+            input_std = raw_input.std(dim=-1)    # [B, C]
+            input_min = raw_input.min(dim=-1).values  # [B, C]
+            input_max = raw_input.max(dim=-1).values  # [B, C]
+            input_stats = torch.cat([input_mean, input_std, input_min, input_max], dim=-1)  # [B, C*4]
+
+            # Encode statistics
+            stat_encoding = self.session_stat_encoder(input_stats)  # [B, stat_dim]
+            stat_query = self.session_stat_to_query(stat_encoding)  # [B, session_emb_dim]
+
+            # Get all session embeddings and compute keys
+            all_embeds = self.session_embed.weight  # [n_sessions, session_emb_dim]
+            embed_keys = self.session_embed_keys(all_embeds)  # [n_sessions, session_emb_dim]
+
+            # Compute attention: query @ keys^T -> softmax -> weighted sum
+            # [B, session_emb_dim] @ [session_emb_dim, n_sessions] -> [B, n_sessions]
+            attn_logits = torch.matmul(stat_query, embed_keys.T) / (self.session_emb_dim ** 0.5)
+            attn_weights = torch.softmax(attn_logits, dim=-1)  # [B, n_sessions]
+
+            # Statistics-based session embedding (soft attention over all embeddings)
+            stats_session_emb = torch.matmul(attn_weights, all_embeds)  # [B, session_emb_dim]
+
+            if self.training and session_ids is not None:
+                # TRAINING: Use direct lookup for known sessions (supervised learning)
+                # Also mark these sessions as known
+                self.known_sessions[session_ids] = True
+                direct_session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+
+                # Blend: 70% direct (for supervised learning) + 30% stats-based (to train matcher)
+                learned_session_emb = 0.7 * direct_session_emb + 0.3 * stats_session_emb
+            else:
+                # INFERENCE: Use statistics-based matching (generalizes to unseen sessions)
+                learned_session_emb = stats_session_emb
+
             # Debug verification - print on first few uses
             if hasattr(self, '_session_embed_use_count'):
                 self._session_embed_use_count += 1
                 if self._session_embed_use_count <= 3:
-                    print(f"[SESSION EMBED VERIFY] Use #{self._session_embed_use_count}: "
-                          f"session_ids={session_ids.tolist()[:8]}{'...' if len(session_ids) > 8 else ''}, "
-                          f"embed_norm={learned_session_emb.norm().item():.4f}, "
-                          f"weight_norm={self.session_embed.weight.norm().item():.4f}")
+                    mode = "TRAIN(blend)" if self.training else "EVAL(stats)"
+                    top_sessions = attn_weights.argmax(dim=-1).tolist()[:8]
+                    print(f"[SESSION EMBED VERIFY] Use #{self._session_embed_use_count} [{mode}]: "
+                          f"matched_sessions={top_sessions}{'...' if len(attn_weights) > 8 else ''}, "
+                          f"embed_norm={learned_session_emb.norm().item():.4f}")
+
             if emb is not None:
                 # Concatenate learned session embedding with existing conditioning
                 combined = torch.cat([learned_session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]
