@@ -2387,6 +2387,26 @@ class SessionMatcher:
         matcher.session_names = state.get('session_names', {})
         return matcher
 
+    @classmethod
+    def from_checkpoint_state(cls, state: Dict[str, Any]) -> "SessionMatcher":
+        """Load session matcher from checkpoint state dict.
+
+        Args:
+            state: Dictionary from checkpoint["session_matcher_state"]
+
+        Returns:
+            SessionMatcher with loaded signatures
+        """
+        matcher = cls(
+            n_channels=state['n_channels'],
+            n_warmup_samples=state['n_warmup_samples'],
+            use_power_spectrum=state.get('use_power_spectrum', False),
+            sample_rate=state.get('sample_rate', 1000.0),
+        )
+        matcher.signatures = state['signatures']
+        matcher.session_names = state.get('session_names', {})
+        return matcher
+
     def __len__(self) -> int:
         return len(self.signatures)
 

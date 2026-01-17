@@ -285,7 +285,12 @@ def train_epoch_single_gpu(
     loss_components = {"l1_fwd": 0.0, "wavelet_fwd": 0.0, "l1_rev": 0.0, "wavelet_rev": 0.0,
                        "cycle_ob": 0.0, "cycle_pcx": 0.0, "prob": 0.0}
 
-    for ob, pcx, odor in loader:
+    for batch in loader:
+        # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
+        if len(batch) == 4:
+            ob, pcx, odor, _ = batch  # Discard session_ids in HPO
+        else:
+            ob, pcx, odor = batch
         ob = ob.to(device, non_blocking=True)
         pcx = pcx.to(device, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
@@ -392,7 +397,12 @@ def evaluate_single_gpu(
     corr_list_rev, r2_list_rev = [], []
     mae_list, mae_list_rev = [], []
 
-    for ob, pcx, odor in loader:
+    for batch in loader:
+        # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
+        if len(batch) == 4:
+            ob, pcx, odor, _ = batch  # Discard session_ids in HPO
+        else:
+            ob, pcx, odor = batch
         ob = ob.to(device)
         pcx = pcx.to(device)
         odor = odor.to(device)
