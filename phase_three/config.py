@@ -937,9 +937,17 @@ class AblationConfig:
         # Start with current best config
         config = current_config.copy()
 
-        # Apply the variant's parameter value
-        param = group["parameter"]
-        config[param] = variant["value"]
+        # Apply the variant's parameter(s)
+        # Support both single-parameter and multi-parameter variants
+        if "config" in variant:
+            # Multi-parameter variant (like Group 18 session adaptation)
+            # The variant has a "config" dict with multiple param: value pairs
+            for param, value in variant["config"].items():
+                config[param] = value
+        else:
+            # Single-parameter variant (traditional)
+            param = group["parameter"]
+            config[param] = variant["value"]
 
         # Handle special cases for augmentation variants
         if "aug_strength" in variant:
