@@ -239,6 +239,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
+    "use_adabn": False,             # AdaBN: use batch stats at inference (requires norm_type="batch")
 }
 
 # =============================================================================
@@ -546,6 +547,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 2: Statistics with spectral features
@@ -559,6 +561,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 3: Adaptive output scaling only (AdaIN-style)
@@ -572,6 +575,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 4: Stats + Adaptive scaling combined
@@ -585,6 +589,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 5: Covariance expansion augmentation only
@@ -611,6 +616,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": False,
                     "use_cov_augment": True,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 7: Full session adaptation (all methods combined)
@@ -624,6 +630,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_adaptive_scaling": True,
                     "use_cov_augment": True,
                     "use_session_embedding": False,
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
             # Method 10: Learnable session embedding (lookup table)
@@ -656,6 +663,42 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_cov_augment": False,
                     "use_session_embedding": True,
                     "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled to use embedding!
+                }
+            },
+            # Method 12: AdaBN (Adaptive Batch Normalization) - parameter-free domain adaptation
+            # Literature: "Revisiting Batch Normalization for Practical Domain Adaptation" (Li et al., 2016)
+            # At inference, BN layers use batch statistics instead of running statistics.
+            # This is the simplest and most robust session adaptation technique.
+            # REQUIRES: norm_type="batch" for BatchNorm layers to exist
+            {
+                "value": "adabn",
+                "name": "adabn",
+                "desc": "AdaBN: use batch stats at inference (parameter-free)",
+                "config": {
+                    "use_session_stats": False,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_cov_augment": False,
+                    "use_session_embedding": False,
+                    "norm_type": "batch",  # REQUIRED: AdaBN needs BatchNorm layers
+                    "use_adabn": True,     # Flag to enable AdaBN mode at inference
+                }
+            },
+            # Method 13: AdaBN + Statistics conditioning combined
+            # Uses both AdaBN for BN stats adaptation AND statistics-based FiLM conditioning
+            {
+                "value": "adabn_stats",
+                "name": "adabn_and_stats",
+                "desc": "AdaBN + statistics conditioning combined",
+                "config": {
+                    "use_session_stats": True,
+                    "session_use_spectral": False,
+                    "use_adaptive_scaling": False,
+                    "use_cov_augment": False,
+                    "use_session_embedding": False,
+                    "norm_type": "batch",  # REQUIRED: AdaBN needs BatchNorm layers
+                    "use_adabn": True,     # Flag to enable AdaBN mode at inference
+                    "cond_mode": "cross_attn_gated",  # REQUIRED: FiLM must be enabled!
                 }
             },
         ],
@@ -839,6 +882,7 @@ class AblationConfig:
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
     use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
+    use_adabn: bool = False  # AdaBN: use batch stats at inference (requires norm_type="batch")
 
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
@@ -912,6 +956,7 @@ class AblationConfig:
             "use_cov_augment": self.use_cov_augment,
             "cov_augment_prob": self.cov_augment_prob,
             "use_session_embedding": self.use_session_embedding,
+            "use_adabn": self.use_adabn,
         }
 
     @property
@@ -997,6 +1042,7 @@ class AblationConfig:
             use_cov_augment=config.get("use_cov_augment", False),
             cov_augment_prob=config.get("cov_augment_prob", 0.5),
             use_session_embedding=config.get("use_session_embedding", False),
+            use_adabn=config.get("use_adabn", False),
         )
 
     @classmethod

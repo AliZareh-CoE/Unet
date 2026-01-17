@@ -2321,6 +2321,72 @@ class CondUNet1D(nn.Module):
         """
         self.gradient_checkpointing = enable
 
+    def enable_adabn(self):
+        """Enable Adaptive Batch Normalization (AdaBN) for domain adaptation.
+
+        AdaBN is a simple, parameter-free domain adaptation technique from:
+        "Revisiting Batch Normalization for Practical Domain Adaptation" (Li et al., 2016)
+
+        When enabled, all BatchNorm layers compute statistics from the current batch
+        instead of using running statistics. This allows the model to adapt to new
+        sessions/domains without any additional training.
+
+        Call this method before inference on a new session/domain.
+        Call disable_adabn() to restore normal behavior.
+
+        Literature:
+        - AdaBN achieves comparable results to more complex domain adaptation methods
+        - Works because BN statistics capture domain-specific characteristics
+        - Particularly effective for neural signal translation where sessions have
+          different baseline statistics due to electrode placement, impedance, etc.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                # Set to training mode so it computes batch statistics
+                module.training = True
+                # Reset running stats so they don't interfere
+                module.reset_running_stats()
+
+    def disable_adabn(self):
+        """Disable Adaptive Batch Normalization, restore normal inference behavior.
+
+        This restores BatchNorm layers to use their learned running statistics.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                module.training = False
+
+    def calibrate_bn_stats(self, dataloader, device: torch.device, max_batches: int = 50):
+        """Calibrate BatchNorm running statistics on a new session/domain.
+
+        Alternative to AdaBN: instead of using batch statistics at inference,
+        this method runs a forward pass on calibration data to update the
+        running statistics to the new domain.
+
+        Args:
+            dataloader: DataLoader for the new session/domain (no labels needed)
+            device: Device to run on
+            max_batches: Maximum number of batches to use for calibration
+
+        Note: Model should be in eval mode after this, not AdaBN mode.
+        """
+        # Set BN layers to training mode to update running stats
+        self.train()
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if i >= max_batches:
+                    break
+                # Handle different batch formats
+                if isinstance(batch, (list, tuple)):
+                    x = batch[0]
+                else:
+                    x = batch
+                x = x.to(device)
+                # Forward pass to update BN running stats
+                _ = self(x)
+        # Set back to eval mode
+        self.eval()
+
     def _build_attention(self, channels: int, attention_type: str) -> nn.Module:
         """Build attention module based on type.
 
