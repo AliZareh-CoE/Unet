@@ -236,7 +236,6 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
     "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style)
-    "use_revin": False,             # Reversible Instance Normalization
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
@@ -532,7 +531,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": False,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
                 }
@@ -546,7 +544,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
                 }
@@ -560,7 +557,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": True,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
                 }
@@ -574,26 +570,11 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": False,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": True,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
                 }
             },
-            # Method 4: ReVIN - Reversible Instance Normalization
-            {
-                "value": "revin",
-                "name": "revin",
-                "desc": "ReVIN: normalize->process->denormalize (preserves session stats)",
-                "config": {
-                    "use_session_stats": False,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": True,
-                    "use_cov_augment": False,
-                    "use_session_embedding": False,
-                }
-            },
-            # Method 5: Stats + Adaptive scaling combined
+            # Method 4: Stats + Adaptive scaling combined
             {
                 "value": "stats_adaptive",
                 "name": "stats_and_adaptive",
@@ -602,12 +583,11 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": True,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": False,
                 }
             },
-            # Method 6: Covariance expansion augmentation only
+            # Method 5: Covariance expansion augmentation only
             {
                 "value": "cov_augment",
                 "name": "cov_augment",
@@ -616,12 +596,11 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": False,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": True,
                     "use_session_embedding": False,
                 }
             },
-            # Method 7: Stats + Cov augment combined
+            # Method 6: Stats + Cov augment combined
             {
                 "value": "stats_cov",
                 "name": "stats_and_cov",
@@ -630,26 +609,11 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": True,
                     "use_session_embedding": False,
                 }
             },
-            # Method 8: ReVIN + Stats combined
-            {
-                "value": "revin_stats",
-                "name": "revin_and_stats",
-                "desc": "ReVIN + session stats conditioning",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": True,
-                    "use_cov_augment": False,
-                    "use_session_embedding": False,
-                }
-            },
-            # Method 9: Full session adaptation (all methods except ReVIN - incompatible with adaptive scaling)
+            # Method 7: Full session adaptation (all methods combined)
             {
                 "value": "full",
                 "name": "full_session",
@@ -658,7 +622,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": True,
                     "use_adaptive_scaling": True,
-                    "use_revin": False,  # ReVIN incompatible with adaptive scaling
                     "use_cov_augment": True,
                     "use_session_embedding": False,
                 }
@@ -675,7 +638,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": False,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": True,
                 }
@@ -689,7 +651,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
                     "use_session_stats": True,
                     "session_use_spectral": False,
                     "use_adaptive_scaling": False,
-                    "use_revin": False,
                     "use_cov_augment": False,
                     "use_session_embedding": True,
                 }
@@ -872,7 +833,6 @@ class AblationConfig:
     session_emb_dim: int = 32  # Session statistics embedding dimension
     session_use_spectral: bool = False  # Include spectral features in session stats
     use_adaptive_scaling: bool = False  # Session-adaptive output scaling (AdaIN style)
-    use_revin: bool = False  # Reversible Instance Normalization
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
     use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
@@ -946,7 +906,6 @@ class AblationConfig:
             "session_emb_dim": self.session_emb_dim,
             "session_use_spectral": self.session_use_spectral,
             "use_adaptive_scaling": self.use_adaptive_scaling,
-            "use_revin": self.use_revin,
             "use_cov_augment": self.use_cov_augment,
             "cov_augment_prob": self.cov_augment_prob,
             "use_session_embedding": self.use_session_embedding,
@@ -1032,7 +991,6 @@ class AblationConfig:
             session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
             use_cov_augment=config.get("use_cov_augment", False),
             cov_augment_prob=config.get("cov_augment_prob", 0.5),
             use_session_embedding=config.get("use_session_embedding", False),

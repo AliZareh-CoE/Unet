@@ -2406,7 +2406,6 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2463,7 +2462,6 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -3647,8 +3645,6 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (AdaIN style)")
-    parser.add_argument("--use-revin", action="store_true",
-                        help="Use Reversible Instance Normalization (ReVIN)")
     parser.add_argument("--use-cov-augment", action="store_true",
                         help="Use covariance expansion augmentation for synthetic sessions")
     parser.add_argument("--cov-augment-prob", type=float, default=0.5,
@@ -3782,7 +3778,6 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
-    config["use_revin"] = args.use_revin
     config["use_cov_augment"] = args.use_cov_augment
     config["cov_augment_prob"] = args.cov_augment_prob
 

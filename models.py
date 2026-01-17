@@ -1788,10 +1788,9 @@ class SessionStatisticsEncoder(nn.Module):
 
     1. Generalizes automatically to new/unseen sessions
     2. Learns meaningful relationships between statistics and predictions
-    3. Aligns with domain adaptation literature (ReVIN, AdaIN, FiLM)
+    3. Aligns with domain adaptation literature (AdaIN, FiLM)
 
     Based on:
-    - ReVIN (Reversible Instance Normalization) for cross-subject EEG
     - Domain-specific batch normalization for EEG transfer learning
     - FiLM (Feature-wise Linear Modulation) conditioning
 
@@ -2002,81 +2001,6 @@ class SessionAdaptiveScaling(nn.Module):
         return x * gamma + beta
 
 
-class ReversibleInstanceNorm(nn.Module):
-    """Reversible Instance Normalization (ReVIN) for session adaptation.
-
-    From "ReVIN: Reversible Instance Normalization for Accurate Time-Series Forecasting"
-    and adapted for EEG/neural signals.
-
-    Key insight: Session differences are often just scale/shift differences.
-    ReVIN:
-    1. Removes session-specific mean/std at input (normalize)
-    2. Processes in normalized space (session-agnostic)
-    3. Restores original statistics at output (denormalize)
-
-    This is different from AdaIN:
-    - AdaIN: Predict scale/bias from conditioning → apply to features
-    - ReVIN: Remove statistics → process → restore SAME statistics
-
-    ReVIN preserves the session-specific amplitude characteristics while
-    allowing the model to learn session-agnostic transformations.
-    """
-
-    def __init__(self, n_channels: int, affine: bool = True, eps: float = 1e-5):
-        """Initialize ReVIN.
-
-        Args:
-            n_channels: Number of channels
-            affine: If True, learn additional affine parameters
-            eps: Small constant for numerical stability
-        """
-        super().__init__()
-        self.n_channels = n_channels
-        self.eps = eps
-        self.affine = affine
-
-        if affine:
-            # Learnable affine parameters (optional refinement)
-            self.affine_weight = nn.Parameter(torch.ones(1, n_channels, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, n_channels, 1))
-
-    def forward(self, x: torch.Tensor, mode: str = "norm") -> torch.Tensor:
-        """Apply ReVIN normalization or denormalization.
-
-        Args:
-            x: Input tensor [B, C, T]
-            mode: "norm" to normalize, "denorm" to denormalize
-
-        Returns:
-            Normalized or denormalized tensor
-        """
-        if mode == "norm":
-            # Save statistics for later denormalization
-            self._mean = x.mean(dim=-1, keepdim=True)
-            self._std = x.std(dim=-1, keepdim=True) + self.eps
-
-            # Normalize
-            x = (x - self._mean) / self._std
-
-            # Apply learnable affine if enabled
-            if self.affine:
-                x = x * self.affine_weight + self.affine_bias
-
-            return x
-
-        elif mode == "denorm":
-            # Reverse learnable affine if enabled
-            if self.affine:
-                x = (x - self.affine_bias) / (self.affine_weight + self.eps)
-
-            # Restore original statistics
-            x = x * self._std + self._mean
-
-            return x
-
-        else:
-            raise ValueError(f"Unknown mode: {mode}. Use 'norm' or 'denorm'.")
-
 
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
@@ -2203,7 +2127,6 @@ class CondUNet1D(nn.Module):
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
         use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (AdaIN-style)
-        use_revin: bool = False,  # Reversible Instance Normalization (normalize→process→denormalize)
         # Session conditioning - statistics-based (literature-recommended approach)
         # Instead of learned embeddings per session ID, computes statistics from
         # input signal and learns to encode them. Generalizes to unseen sessions.
@@ -2354,7 +2277,6 @@ class CondUNet1D(nn.Module):
         # Helps match target distribution, especially important for probabilistic losses
         self.use_output_scaling = use_output_scaling
         self.use_adaptive_scaling = use_adaptive_scaling
-        self.use_revin = use_revin
 
         if use_adaptive_scaling:
             # Session-adaptive output scaling (AdaIN-style)
@@ -2368,12 +2290,6 @@ class CondUNet1D(nn.Module):
             # Initialize scale to 1.0 and bias to 0.0 (identity at init)
             self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
             self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
-
-        # ReVIN: Reversible Instance Normalization
-        # Normalize at input → process → denormalize at output
-        # Preserves session-specific characteristics while processing in normalized space
-        if use_revin:
-            self.revin = ReversibleInstanceNorm(in_channels, affine=True)
 
         # Store in_channels for adaptive scaling
         self.in_channels = in_channels
@@ -2463,16 +2379,8 @@ class CondUNet1D(nn.Module):
         # =================================================================
         # INPUT NORMALIZATION - The key to session-agnostic generalization
         # =================================================================
-        # Option 1: ReVIN - Reversible Instance Norm (will denorm at output)
-        # Option 2: Standard z-score normalization
-        # =================================================================
-        if self.use_revin:
-            # ReVIN: normalize now, denormalize at output
-            # This preserves session statistics while processing in normalized space
-            ob = self.revin(ob, mode="norm")
-        else:
-            # Standard per-channel, per-sample z-score
-            ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
+        # Standard per-channel, per-sample z-score normalization
+        ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
 
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2568,11 +2476,6 @@ class CondUNet1D(nn.Module):
         elif self.use_output_scaling:
             # Fixed learnable scale/bias
             out = out * self.output_scale + self.output_bias
-
-        # ReVIN denormalization: restore original session statistics
-        # This preserves session-specific amplitude while the model learned in normalized space
-        if self.use_revin:
-            out = self.revin(out, mode="denorm")
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
         if return_bottleneck or return_bottleneck_temporal:
