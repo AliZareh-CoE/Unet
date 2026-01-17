@@ -815,6 +815,7 @@ def run_phase3(
     fsdp_strategy: str = "grad_op",
     enable_logging: bool = True,
     min_improvement: float = 0.01,
+    no_skip_conditional: bool = False,
 ) -> Phase3Result:
     """Run all Phase 3 ablation studies.
 
@@ -830,6 +831,7 @@ def run_phase3(
         fsdp_strategy: FSDP sharding strategy
         enable_logging: Save full output to log file (default: True)
         min_improvement: Minimum R² improvement required for greedy selection (default: 0.01 = 1%)
+        no_skip_conditional: If True, run conditional groups even if condition not met
 
     Returns:
         Phase3Result with all ablation results
@@ -864,7 +866,7 @@ def run_phase3(
     # Route to appropriate protocol handler
     try:
         if config.protocol == "greedy_forward":
-            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement)
+            result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, no_skip_conditional)
         elif config.protocol == "additive":
             result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
         else:
@@ -886,12 +888,13 @@ def _run_greedy_forward_protocol(
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     min_improvement: float = 0.01,
+    no_skip_conditional: bool = False,
 ) -> Phase3Result:
     """Run GREEDY FORWARD SELECTION ablation protocol.
 
     Tests variants in each group sequentially. Winner (best R²) becomes
     default for subsequent groups. Conditional groups are skipped if
-    the condition is not met.
+    the condition is not met (unless no_skip_conditional=True).
 
     IMPORTANT: A variant only becomes the winner if it beats the current
     default by at least `min_improvement` (default: 1% R²). This prevents
@@ -960,11 +963,14 @@ def _run_greedy_forward_protocol(
             print(f"\n[Group {group_id}] {group_name} - SKIPPED (already completed)")
             continue
 
-        # Check conditional
+        # Check conditional (skip if condition not met, unless --no-skip-conditional)
         if not check_conditional(group["conditional_on"], current_config):
-            print(f"\n[Group {group_id}] {group_name} - SKIPPED (condition not met)")
-            completed_groups.add(str(group_id))
-            continue
+            if no_skip_conditional:
+                print(f"\n[Group {group_id}] {group_name} - RUNNING (condition not met but --no-skip-conditional set)")
+            else:
+                print(f"\n[Group {group_id}] {group_name} - SKIPPED (condition not met)")
+                completed_groups.add(str(group_id))
+                continue
 
         print(f"\n{'=' * 60}")
         print(f"GROUP {group_id}: {group['description']}")
@@ -2165,6 +2171,14 @@ def main():
              "If a variant doesn't beat the baseline by this margin, we stick with the simpler option. "
              "Default: 0.01 (1%%). Example: 0.005 = 0.5%%, 0.02 = 2%%",
     )
+    parser.add_argument(
+        "--no-skip-conditional",
+        action="store_true",
+        help="Don't skip conditional groups even if their condition isn't met. "
+             "Use this to test attention_heads even when no_attention won, or "
+             "cycle_lambda even when unidirectional won. This explores more of "
+             "the search space at the cost of more compute.",
+    )
 
     args = parser.parse_args()
 
@@ -2257,6 +2271,7 @@ def main():
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
         min_improvement=args.min_improvement,
+        no_skip_conditional=args.no_skip_conditional,
     )
 
     # Clean up checkpoint after successful completion
