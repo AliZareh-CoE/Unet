@@ -1887,8 +1887,10 @@ class SessionStatisticsEncoder(nn.Module):
         """
         B, C, T = x.shape
 
-        # FFT
-        fft = torch.fft.rfft(x, dim=-1)
+        # FFT doesn't support BFloat16 (used by FSDP mixed precision)
+        # Cast to float32 for FFT computation
+        x_float = x.float()
+        fft = torch.fft.rfft(x_float, dim=-1)
         power = (fft.real ** 2 + fft.imag ** 2)  # [B, C, T//2+1]
 
         # Frequency resolution
@@ -1911,10 +1913,11 @@ class SessionStatisticsEncoder(nn.Module):
             if high_idx > low_idx:
                 band_power = power[:, :, low_idx:high_idx].mean(dim=-1)  # [B, C]
             else:
-                band_power = torch.zeros(B, C, device=x.device)
+                band_power = torch.zeros(B, C, device=x.device, dtype=power.dtype)
             band_powers.append(band_power)
 
-        return torch.cat(band_powers, dim=-1)  # [B, 5*C]
+        # Cast back to original dtype (may be BFloat16 with FSDP)
+        return torch.cat(band_powers, dim=-1).to(x.dtype)  # [B, 5*C]
 
 
 class SessionAdaptiveScaling(nn.Module):
