@@ -594,7 +594,7 @@ def create_cv_splits(
 def load_dataset_raw(
     dataset_name: str,
     split_by_session: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, np.ndarray, np.ndarray]:
     """Load dataset as raw tensors for cross-validation.
 
     Args:
@@ -602,7 +602,8 @@ def load_dataset_raw(
         split_by_session: If True, load with session info for session embedding
 
     Returns:
-        X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions
+        X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions,
+        original_train_idx, original_val_idx (indices into the returned arrays)
     """
     try:
         from data import prepare_data
@@ -613,10 +614,12 @@ def load_dataset_raw(
         ob = data["ob"]    # [N, C, T]
         pcx = data["pcx"]  # [N, C, T]
 
-        # Combine train+val for CV
-        train_idx = data["train_idx"]
-        val_idx = data["val_idx"]
-        all_idx = np.concatenate([train_idx, val_idx])
+        # Get original train/val indices from session-based splits
+        orig_train_idx = data["train_idx"]
+        orig_val_idx = data["val_idx"]
+
+        # Combine train+val for the data arrays
+        all_idx = np.concatenate([orig_train_idx, orig_val_idx])
 
         X = torch.from_numpy(ob[all_idx]).float()
         y = torch.from_numpy(pcx[all_idx]).float()
@@ -641,9 +644,14 @@ def load_dataset_raw(
         in_channels = X.shape[1]
         out_channels = y.shape[1]
 
-        print(f"  Loaded: {X.shape} samples for cross-validation")
+        # Create new indices relative to the combined array
+        # First len(orig_train_idx) samples are training, rest are validation
+        new_train_idx = np.arange(len(orig_train_idx))
+        new_val_idx = np.arange(len(orig_train_idx), len(all_idx))
 
-        return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions
+        print(f"  Loaded: {X.shape} samples ({len(new_train_idx)} train, {len(new_val_idx)} val)")
+
+        return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, new_train_idx, new_val_idx
 
     except (ImportError, FileNotFoundError) as e:
         print(f"Dataset '{dataset_name}' not available ({e}), using synthetic data")
@@ -656,7 +664,7 @@ def create_synthetic_data_raw(
     in_channels: int = 32,
     out_channels: int = 32,
     n_sessions: int = 8,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, np.ndarray, np.ndarray]:
     """Create synthetic data as raw tensors."""
     X = torch.randn(n_samples, in_channels, seq_len)
     y = X + 0.5 * torch.randn_like(X)
@@ -672,7 +680,12 @@ def create_synthetic_data_raw(
     # Create synthetic session IDs (evenly distributed)
     session_ids = torch.arange(n_samples) % n_sessions
 
-    return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions
+    # Create 80/20 train/val split
+    n_train = int(n_samples * 0.8)
+    train_idx = np.arange(n_train)
+    val_idx = np.arange(n_train, n_samples)
+
+    return X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, train_idx, val_idx
 
 
 def create_dataloaders_from_indices(
@@ -963,16 +976,15 @@ def _run_greedy_forward_protocol(
         group_winners = {}  # group_id -> {"variant": name, "r2": value, "config": {...}}
 
     # Load raw data (including session_ids for session embedding)
-    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions = load_dataset_raw(config.dataset)
+    # Also returns session-based train/val split indices
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, train_idx, val_idx = load_dataset_raw(config.dataset)
 
     # Store n_sessions in current_config for use in ablation
     current_config["n_sessions"] = n_sessions
 
-    # Create single split (no CV for ablation per nnU-Net)
-    # Use first "fold" as the single train/test split
-    cv_splits = create_cv_splits(len(X), n_folds=1, seed=config.cv_seed)
-    train_idx, val_idx = cv_splits[0]
-    print(f"Single split: {len(train_idx)} train, {len(val_idx)} test samples")
+    # Use the session-based split directly (no CV for ablation per nnU-Net)
+    # This preserves the 8 train / 4 val session split from prepare_data
+    print(f"Session-based split: {len(train_idx)} train, {len(val_idx)} val samples")
 
     # Get groups to run
     groups = config.get_greedy_groups()
@@ -1358,7 +1370,8 @@ def _run_additive_protocol(
         completed_studies = set()  # stage names like "stage0", "stage1", etc.
 
     # Load raw data for CV
-    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions = load_dataset_raw(config.dataset)
+    # Load raw data (ignore train/val split, we'll use CV splits instead)
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, _, _ = load_dataset_raw(config.dataset)
 
     # Create CV splits
     cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
@@ -1652,7 +1665,8 @@ def _run_subtractive_protocol(
         baseline_completed = False
 
     # Load raw data for CV
-    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions = load_dataset_raw(config.dataset)
+    # Load raw data (ignore train/val split, we'll use CV splits instead)
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, _, _ = load_dataset_raw(config.dataset)
 
     # Create CV splits
     cv_splits = create_cv_splits(len(X), config.n_folds, config.cv_seed)
