@@ -871,6 +871,26 @@ def apply_augmentations(
         ob = aug_dc_offset(ob, offset_range)
         pcx = aug_dc_offset(pcx, offset_range)
 
+    # Covariance expansion augmentation: create synthetic sessions via random per-channel scale/shift
+    # This helps the model learn session-invariant representations by exposing it to
+    # more diverse covariance structures during training (from statistics literature)
+    if config.get("use_cov_augment", False):
+        cov_prob = config.get("cov_augment_prob", 0.5)
+        if torch.rand(1).item() < cov_prob:
+            batch_size, n_channels_ob, _ = ob.shape
+            _, n_channels_pcx, _ = pcx.shape
+            # Random per-channel scale (simulates different electrode impedances across sessions)
+            scale_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(0.8, 1.2)
+            scale_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(0.8, 1.2)
+            # Random per-channel shift relative to std (simulates baseline drift)
+            shift_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(-0.2, 0.2)
+            shift_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(-0.2, 0.2)
+            # Apply: x_aug = x * scale + shift * std(x)
+            ob_std = ob.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            pcx_std = pcx.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            ob = ob * scale_ob + shift_ob * ob_std
+            pcx = pcx * scale_pcx + shift_pcx * pcx_std
+
     return ob, pcx
 
 
@@ -2375,11 +2395,16 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction
-            use_output_scaling=config.get("use_output_scaling", True),
+            # Output scaling correction (disabled if using adaptive scaling)
+            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Session embedding for session-specific adjustments
             n_sessions=config.get("n_sessions", 0),
             session_emb_dim=config.get("session_emb_dim", 32),
+            # Statistics-based session adaptation (Phase 3 Group 18)
+            use_session_stats=config.get("use_session_stats", False),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_revin=config.get("use_revin", False),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2425,11 +2450,16 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction
-            use_output_scaling=config.get("use_output_scaling", True),
+            # Output scaling correction (disabled if using adaptive scaling)
+            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Session embedding (same as forward model)
             n_sessions=config.get("n_sessions", 0),
             session_emb_dim=config.get("session_emb_dim", 32),
+            # Statistics-based session adaptation (same as forward)
+            use_session_stats=config.get("use_session_stats", False),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_revin=config.get("use_revin", False),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -3606,6 +3636,20 @@ def parse_args():
     parser.add_argument("--session-emb-dim", type=int, default=32,
                         help="Session embedding dimension (default: 32)")
 
+    # NEW: Statistics-based session adaptation (Phase 3 Group 18)
+    parser.add_argument("--use-session-stats", action="store_true",
+                        help="Use statistics-based session conditioning (FiLM style) instead of ID embedding")
+    parser.add_argument("--session-use-spectral", action="store_true",
+                        help="Include spectral features in session statistics encoder")
+    parser.add_argument("--use-adaptive-scaling", action="store_true",
+                        help="Use session-adaptive output scaling (AdaIN style)")
+    parser.add_argument("--use-revin", action="store_true",
+                        help="Use Reversible Instance Normalization (ReVIN)")
+    parser.add_argument("--use-cov-augment", action="store_true",
+                        help="Use covariance expansion augmentation for synthetic sessions")
+    parser.add_argument("--cov-augment-prob", type=float, default=0.5,
+                        help="Probability of applying covariance augmentation (default: 0.5)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3729,6 +3773,14 @@ def main():
     else:
         config["n_sessions"] = 0  # Disabled
         config["session_emb_dim"] = 32
+
+    # NEW: Statistics-based session adaptation (Phase 3 Group 18)
+    config["use_session_stats"] = args.use_session_stats
+    config["session_use_spectral"] = args.session_use_spectral
+    config["use_adaptive_scaling"] = args.use_adaptive_scaling
+    config["use_revin"] = args.use_revin
+    config["use_cov_augment"] = args.use_cov_augment
+    config["cov_augment_prob"] = args.cov_augment_prob
 
     # Print session split info
     if is_primary() and config["split_by_session"]:

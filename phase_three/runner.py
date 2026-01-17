@@ -289,6 +289,21 @@ def run_train_subprocess(
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
+    # Session adaptation parameters (Phase 3 Group 18)
+    if config.get("use_session_stats", False):
+        cmd.append("--use-session-stats")
+    if config.get("session_use_spectral", False):
+        cmd.append("--session-use-spectral")
+    if config.get("use_adaptive_scaling", False):
+        cmd.append("--use-adaptive-scaling")
+    if config.get("use_revin", False):
+        cmd.append("--use-revin")
+    if config.get("use_cov_augment", False):
+        cmd.append("--use-cov-augment")
+        # Also pass the probability
+        cov_prob = config.get("cov_augment_prob", 0.5)
+        cmd.extend(["--cov-augment-prob", str(cov_prob)])
+
     # Run subprocess with live output capture (goes through TeeLogger)
     start_time = time.time()
     try:
