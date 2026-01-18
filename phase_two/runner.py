@@ -538,8 +538,13 @@ def load_olfactory_data(verbose: bool = True):
     from data import prepare_data
 
     if verbose:
-        print("Loading olfactory dataset (cross-subject session-based split)...")
-    data = prepare_data(split_by_session=True)
+        print("Loading olfactory dataset (cross-subject: 3 held-out sessions, no test set)...")
+    data = prepare_data(
+        split_by_session=True,
+        n_test_sessions=0,   # No separate test set (matches Phase 3)
+        n_val_sessions=3,    # 3 sessions held out for validation (matches Phase 3)
+        no_test_set=True,    # All held-out sessions for validation
+    )
 
     ob = data["ob"]    # [N, C, T]
     pcx = data["pcx"]  # [N, C, T]
