@@ -2617,12 +2617,24 @@ PCX1_CONTINUOUS_PATH = _DATA_DIR / "PCx1" / "extracted" / "continuous_1khz"
 PCX1_SAMPLING_RATE = 1000  # Hz
 PCX1_N_CHANNELS = 32  # per region (OB and PCx)
 
+# Sessions to exclude from PCx1 dataset
+# 2014 sessions (141208-1, 141208-2, 141209) were recorded under anesthesia
+# which fundamentally alters neural dynamics - exclude from awake behaving analysis
+PCX1_EXCLUDED_SESSIONS = {"141208-1", "141208-2", "141209"}
 
-def list_pcx1_sessions(path: Path = PCX1_CONTINUOUS_PATH) -> List[str]:
+
+def list_pcx1_sessions(
+    path: Path = PCX1_CONTINUOUS_PATH,
+    include_excluded: bool = False,
+) -> List[str]:
     """List available PCx1 continuous sessions.
 
+    Args:
+        path: Base path to continuous_1khz folder
+        include_excluded: If True, include anesthetized 2014 sessions (default: False)
+
     Returns:
-        List of session names (e.g., ['141208-1', '141208-2', ...])
+        List of session names (e.g., ['160819', '160820', ...])
     """
     if not path.exists():
         raise FileNotFoundError(f"PCx1 continuous data path not found: {path}")
@@ -2631,6 +2643,13 @@ def list_pcx1_sessions(path: Path = PCX1_CONTINUOUS_PATH) -> List[str]:
         d.name for d in path.iterdir()
         if d.is_dir() and (d / 'OB.npy').exists()
     ])
+
+    if not include_excluded:
+        excluded_count = len([s for s in sessions if s in PCX1_EXCLUDED_SESSIONS])
+        sessions = [s for s in sessions if s not in PCX1_EXCLUDED_SESSIONS]
+        if excluded_count > 0:
+            print(f"  Excluded {excluded_count} anesthetized sessions (2014)")
+
     return sessions
 
 
