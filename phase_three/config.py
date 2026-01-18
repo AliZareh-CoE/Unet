@@ -593,6 +593,19 @@ STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
+
+    # GROUP 6: LOSS TYPE - L1 vs wavelet-enhanced
+    {
+        "group_id": 6,
+        "name": "loss_type",
+        "description": "Loss function - L1 alone vs L1+wavelet for multi-scale learning",
+        "parameter": "loss_type",
+        "variants": [
+            {"value": "l1", "name": "l1_only", "desc": "Pure L1 loss - simple, robust"},
+            {"value": "l1_wavelet", "name": "l1_wavelet", "desc": "L1 + wavelet loss - multi-scale frequency learning"},
+        ],
+        "conditional_on": None,
+    },
 ]
 
 # Stage 2 defaults - starting point for Stage 2 (should load from Stage 1 results)
