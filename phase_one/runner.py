@@ -342,6 +342,7 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
         n_test_sessions=0,   # No separate test set (matches Phase 3)
         n_val_sessions=3,    # 3 sessions held out for validation (matches Phase 3)
         no_test_set=True,    # All held-out sessions for validation
+        force_recreate_splits=True,  # Override any cached splits to ensure correct config
     )
 
     ob = data["ob"]    # [N, C, T] - Olfactory Bulb

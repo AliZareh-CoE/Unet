@@ -633,8 +633,14 @@ def load_dataset_raw(
     try:
         from data import prepare_data
 
-        print(f"Loading {dataset_name} dataset...")
-        data = prepare_data(split_by_session=split_by_session)
+        print(f"Loading {dataset_name} dataset (cross-subject: 3 held-out val sessions, no test set)...")
+        data = prepare_data(
+            split_by_session=split_by_session,
+            n_test_sessions=0,   # No separate test set
+            n_val_sessions=3,    # 3 sessions held out for validation
+            no_test_set=True,    # All held-out sessions for validation
+            force_recreate_splits=True,  # Override any cached splits
+        )
 
         ob = data["ob"]    # [N, C, T]
         pcx = data["pcx"]  # [N, C, T]
