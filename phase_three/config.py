@@ -519,7 +519,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
 # - Bidirectional (confirm always on)
 # - Batch size (training dynamics)
 #
-# Total: 5 + 3 + 4 + 1 + 4 = 17 runs
+# Total: 4 + 3 + 4 + 1 + 4 + 2 = 18 runs
 
 STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
     # GROUP 1: WIDTH - model capacity scaling
@@ -533,7 +533,6 @@ STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
             {"value": 192, "name": "width_192", "desc": "192 base channels - medium-small"},
             {"value": 256, "name": "width_256", "desc": "256 base channels - medium"},
             {"value": 384, "name": "width_384", "desc": "384 base channels - medium-large"},
-            {"value": 512, "name": "width_512", "desc": "512 base channels - large model"},
         ],
         "conditional_on": None,
     },
