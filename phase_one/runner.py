@@ -617,32 +617,186 @@ def evaluate_baseline(
     return result, last_predictions, final_model
 
 
+def evaluate_baseline_cross_subject(
+    baseline_name: str,
+    X_train: NDArray,
+    y_train: NDArray,
+    X_val: NDArray,
+    y_val: NDArray,
+    config: Phase1Config,
+    return_model: bool = True,
+) -> Tuple[Phase1Metrics, Optional[NDArray], Optional[Any]]:
+    """Evaluate a single baseline with cross-subject split (no CV mixing).
+
+    This is the proper cross-subject evaluation:
+    - Train ONLY on X_train/y_train (train sessions)
+    - Evaluate ONLY on X_val/y_val (held-out sessions)
+    - No K-fold CV that would mix sessions
+
+    Args:
+        baseline_name: Name of baseline method
+        X_train: Training input signals [N_train, C, T]
+        y_train: Training target signals [N_train, C, T]
+        X_val: Validation input signals [N_val, C, T] (held-out sessions)
+        y_val: Validation target signals [N_val, C, T] (held-out sessions)
+        config: Configuration object
+        return_model: Whether to return the trained model
+
+    Returns:
+        Phase1Metrics object, predictions on val set, and trained model
+    """
+    metrics_calc = MetricsCalculator(
+        sample_rate=config.sample_rate,
+        n_bootstrap=config.n_bootstrap,
+        ci_level=config.ci_level,
+    )
+
+    try:
+        # Create and fit model on training data ONLY
+        model = create_baseline(baseline_name)
+        model.fit(X_train, y_train)
+
+        # Evaluate on held-out validation sessions
+        y_pred = model.predict(X_val)
+
+        # Compute metrics on held-out data
+        metrics = metrics_calc.compute(y_pred, y_val)
+
+    except Exception as e:
+        print(f"    Warning: Evaluation failed for {baseline_name}: {e}")
+        metrics = {"r2": np.nan, "mae": np.nan, "pearson": np.nan}
+        y_pred = None
+        model = None
+
+    # Extract metrics (single evaluation, no folds)
+    r2 = metrics.get("r2", np.nan)
+    mae = metrics.get("mae", np.nan)
+    pearson = metrics.get("pearson", np.nan)
+    spearman = metrics.get("spearman", np.nan)
+
+    # Band R²
+    band_r2 = {}
+    for band in NEURAL_BANDS.keys():
+        band_r2[band] = metrics.get(f"r2_{band}", np.nan)
+
+    # PSD error
+    psd_error_db = metrics.get("psd_error_db", np.nan)
+
+    # DSP metrics
+    plv = metrics.get("plv", 0.0)
+    pli = metrics.get("pli", 0.0)
+    wpli = metrics.get("wpli", 0.0)
+    coherence = metrics.get("coherence", 0.0)
+    recon_snr = metrics.get("reconstruction_snr_db", 0.0)
+    env_corr = metrics.get("envelope_corr", 0.0)
+    mi = metrics.get("mutual_info", 0.0)
+    nmi = metrics.get("normalized_mi", 0.0)
+    psd_corr = metrics.get("psd_correlation", 0.0)
+
+    # Coherence bands
+    coherence_bands = {}
+    for band in NEURAL_BANDS.keys():
+        coh_bands = metrics.get("coherence_bands", {})
+        coherence_bands[band] = coh_bands.get(band, 0.0) if isinstance(coh_bands, dict) else 0.0
+
+    # Band power errors
+    band_power_errors = {}
+    for band in NEURAL_BANDS.keys():
+        bp_errors = metrics.get("band_power_errors", {})
+        band_power_errors[band] = bp_errors.get(band, 0.0) if isinstance(bp_errors, dict) else 0.0
+
+    # For cross-subject, we have a single evaluation (no folds)
+    # Store as single-element list for compatibility
+    result = Phase1Metrics(
+        method=baseline_name,
+        r2_mean=float(r2) if not np.isnan(r2) else np.nan,
+        r2_std=0.0,  # Single evaluation, no std
+        r2_ci=(float(r2), float(r2)),  # Point estimate
+        mae_mean=float(mae) if not np.isnan(mae) else np.nan,
+        mae_std=0.0,
+        pearson_mean=float(pearson) if not np.isnan(pearson) else np.nan,
+        pearson_std=0.0,
+        spearman_mean=float(spearman) if not np.isnan(spearman) else np.nan,
+        spearman_std=0.0,
+        psd_error_db=float(psd_error_db) if not np.isnan(psd_error_db) else np.nan,
+        band_r2=band_r2,
+        fold_r2s=[r2],  # Single value for compatibility
+        fold_maes=[mae],
+        fold_pearsons=[pearson],
+        n_folds=1,  # Cross-subject = single split
+        n_samples=X_val.shape[0],
+        # DSP metrics
+        plv_mean=plv,
+        plv_std=0.0,
+        pli_mean=pli,
+        pli_std=0.0,
+        wpli_mean=wpli,
+        wpli_std=0.0,
+        coherence_mean=coherence,
+        coherence_std=0.0,
+        coherence_bands=coherence_bands,
+        reconstruction_snr_db=recon_snr,
+        envelope_corr_mean=env_corr,
+        envelope_corr_std=0.0,
+        mutual_info_mean=mi,
+        normalized_mi_mean=nmi,
+        psd_correlation=psd_corr,
+        band_power_errors=band_power_errors,
+        # Single fold data
+        fold_plvs=[plv],
+        fold_plis=[pli],
+        fold_coherences=[coherence],
+        fold_envelope_corrs=[env_corr],
+        fold_reconstruction_snrs=[recon_snr],
+    )
+
+    predictions = (y_pred, y_val) if y_pred is not None else None
+
+    return result, predictions, model
+
+
 # =============================================================================
 # Main Runner
 # =============================================================================
 
 def run_phase1(
     config: Phase1Config,
-    X: NDArray,
-    y: NDArray,
+    X_train: NDArray,
+    y_train: NDArray,
+    X_val: Optional[NDArray] = None,
+    y_val: Optional[NDArray] = None,
 ) -> Phase1Result:
     """Run complete Phase 1 evaluation.
 
     Args:
         config: Configuration object
-        X: Input signals [N, C, T]
-        y: Target signals [N, C, T]
+        X_train: Training input signals [N_train, C, T]
+        y_train: Training target signals [N_train, C, T]
+        X_val: Validation input signals [N_val, C, T] (held-out sessions)
+        y_val: Validation target signals [N_val, C, T] (held-out sessions)
 
     Returns:
         Phase1Result with all metrics and analysis
+
+    Cross-subject evaluation mode (when X_val/y_val provided):
+        - Train on X_train/y_train (train sessions only)
+        - Evaluate on X_val/y_val (held-out sessions)
+        - No K-fold CV - true cross-subject generalization
+
+    Legacy mode (when X_val/y_val are None):
+        - Use K-fold CV on X_train/y_train
     """
+    cross_subject_mode = X_val is not None and y_val is not None
+
     print("\n" + "=" * 70)
     print("PHASE 1: Classical Baselines Evaluation")
     print("=" * 70)
     print(f"Dataset: {config.dataset}")
-    print(f"Data shape: X={X.shape}, y={y.shape}")
+    if cross_subject_mode:
+        print(f"Mode: CROSS-SUBJECT (train on {X_train.shape[0]} samples, eval on {X_val.shape[0]} held-out samples)")
+    else:
+        print(f"Mode: K-fold CV on {X_train.shape[0]} samples ({config.n_folds} folds)")
     print(f"Methods: {', '.join(config.baselines)}")
-    print(f"CV folds: {config.n_folds}")
     print()
 
     # Setup checkpoint for resume capability
@@ -673,7 +827,14 @@ def run_phase1(
         print(f"[{i+1}/{len(config.baselines)}] Evaluating {baseline_name}...")
         start_time = time.time()
 
-        result, predictions, model = evaluate_baseline(baseline_name, X, y, config, return_model=True)
+        if cross_subject_mode:
+            # Cross-subject: train on train sessions, eval on held-out val sessions
+            result, predictions, model = evaluate_baseline_cross_subject(
+                baseline_name, X_train, y_train, X_val, y_val, config, return_model=True
+            )
+        else:
+            # Legacy K-fold CV mode
+            result, predictions, model = evaluate_baseline(baseline_name, X_train, y_train, config, return_model=True)
         all_metrics.append(result)
 
         if predictions is not None:
@@ -982,17 +1143,25 @@ Examples:
         print("[DRY-RUN] Using synthetic data")
         X, y = create_synthetic_data(n_samples=100, time_points=500)
         ground_truth = y
+        # For dry-run, just use all data with internal CV
+        X_train, y_train = X, y
+        X_val, y_val = None, None
     else:
         try:
             X, y, train_idx, val_idx, test_idx = load_olfactory_data()
-            # Use train + val for CV (test is held out for Phase 4)
-            cv_idx = np.concatenate([train_idx, val_idx])
-            X = X[cv_idx]
-            y = y[cv_idx]
-            ground_truth = y
+            # Cross-subject evaluation: train on train sessions, eval on held-out val sessions
+            # NO mixing of sessions - this ensures true cross-subject generalization
+            X_train = X[train_idx]
+            y_train = y[train_idx]
+            X_val = X[val_idx]
+            y_val = y[val_idx]
+            ground_truth = y_val
+            print(f"  Cross-subject split: Train {X_train.shape[0]} samples, Val {X_val.shape[0]} samples (held-out sessions)")
         except Exception as e:
             print(f"Warning: Could not load data ({e}). Using synthetic data.")
             X, y = create_synthetic_data()
+            X_train, y_train = X, y
+            X_val, y_val = None, None
             ground_truth = y
 
     # Handle --fresh flag: delete existing checkpoint
@@ -1003,7 +1172,8 @@ Examples:
             print("Deleted existing checkpoint (--fresh mode)")
 
     # Run evaluation
-    result = run_phase1(config, X, y)
+    # For cross-subject: train on train sessions, eval on held-out val sessions
+    result = run_phase1(config, X_train, y_train, X_val, y_val)
 
     # Clean up checkpoint after successful completion
     checkpoint_path = get_checkpoint_path(config.output_dir)

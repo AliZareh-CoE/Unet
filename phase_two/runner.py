@@ -526,14 +526,16 @@ def load_olfactory_data(verbose: bool = True):
     """Load olfactory dataset (cross-subject session-based split).
 
     Uses session-based split where entire sessions are held out for
-    validation and test, ensuring true cross-subject generalization.
+    validation, ensuring true cross-subject generalization.
 
     Args:
         verbose: Whether to print loading messages (set False for non-main ranks)
 
     Returns:
-        X: Input signals [N, C, T]
-        y: Target signals [N, C, T]
+        X_train: Training input signals [N_train, C, T]
+        y_train: Training target signals [N_train, C, T]
+        X_val: Validation input signals [N_val, C, T] (held-out sessions)
+        y_val: Validation target signals [N_val, C, T] (held-out sessions)
     """
     from data import prepare_data
 
@@ -549,26 +551,25 @@ def load_olfactory_data(verbose: bool = True):
     ob = data["ob"]    # [N, C, T]
     pcx = data["pcx"]  # [N, C, T]
 
-    # Combine train+val for CV (exclude test set for final evaluation)
-    # Note: With session-based split, train/val sessions are already separate
+    # Cross-subject: keep train and val SEPARATE (no mixing!)
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
+
+    X_train = ob[train_idx]
+    y_train = pcx[train_idx]
+    X_val = ob[val_idx]
+    y_val = pcx[val_idx]
 
     # Log session split info if available
     if verbose and "split_info" in data:
         split_info = data["split_info"]
         print(f"  Train sessions: {split_info.get('train_sessions', 'N/A')}")
         print(f"  Val sessions: {split_info.get('val_sessions', 'N/A')}")
-        print(f"  Test sessions: {split_info.get('test_sessions', 'N/A')}")
-
-    all_idx = np.concatenate([train_idx, val_idx])
-    X = ob[all_idx]
-    y = pcx[all_idx]
 
     if verbose:
-        print(f"  Loaded: {X.shape} samples for cross-validation")
+        print(f"  Cross-subject split: Train {X_train.shape[0]} samples, Val {X_val.shape[0]} samples (held-out sessions)")
 
-    return X, y
+    return X_train, y_train, X_val, y_val
 
 
 def create_synthetic_data(
@@ -635,20 +636,24 @@ def create_cv_splits(
 
 def run_phase2(
     config: Phase2Config,
-    X: np.ndarray,
-    y: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: Optional[np.ndarray] = None,
+    y_val: Optional[np.ndarray] = None,
     classical_r2: float = 0.35,  # From Phase 1
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     fsdp_cpu_offload: bool = False,
     use_train_py: bool = False,
 ) -> Phase2Result:
-    """Run Phase 2 architecture screening with 5-fold cross-validation.
+    """Run Phase 2 architecture screening.
 
     Args:
         config: Phase 2 configuration
-        X: Input signals [N, C, T]
-        y: Target signals [N, C, T]
+        X_train: Training input signals [N_train, C, T]
+        y_train: Training target signals [N_train, C, T]
+        X_val: Validation input signals [N_val, C, T] (held-out sessions, optional)
+        y_val: Validation target signals [N_val, C, T] (held-out sessions, optional)
         classical_r2: Best R² from Phase 1 (for gate check)
         use_fsdp: Enable FSDP for distributed training
         fsdp_strategy: FSDP sharding strategy ('full', 'grad_op', 'no_shard', 'hybrid')
@@ -658,23 +663,30 @@ def run_phase2(
     Returns:
         Phase2Result with all metrics
 
-    FSDP Usage:
-        torchrun --nproc_per_node=8 -m phase_two.runner --fsdp --epochs 80 --batch-size 64
+    Cross-subject mode (when X_val/y_val provided):
+        - Train on X_train/y_train (train sessions only)
+        - Evaluate on X_val/y_val (held-out sessions)
+        - No K-fold CV - true cross-subject generalization
 
-    train.py Integration:
-        python -m phase_two.runner --use-train-py --fsdp --epochs 80
+    Legacy mode (when X_val/y_val are None):
+        - Use K-fold CV on X_train/y_train
     """
     # Only print on main process
     _is_main = is_main_process()
 
+    # Determine evaluation mode
+    cross_subject_mode = X_val is not None and y_val is not None
+
     if _is_main:
         print("\n" + "=" * 70)
-        print("PHASE 2: Architecture Screening (5-Fold Cross-Validation)")
+        print("PHASE 2: Architecture Screening")
         print("=" * 70)
         print(f"Dataset: {config.dataset}")
         print(f"Architectures: {', '.join(config.architectures)}")
-        print(f"Cross-validation: {config.n_folds} folds")
-        print(f"Total runs: {config.total_runs}")
+        if cross_subject_mode:
+            print(f"Mode: CROSS-SUBJECT (train on {X_train.shape[0]} samples, eval on {X_val.shape[0]} held-out samples)")
+        else:
+            print(f"Mode: K-fold CV on {X_train.shape[0]} samples ({config.n_folds} folds)")
         print(f"Device: {config.device}")
         if use_train_py:
             print(f"Training mode: train.py subprocess (exact consistency)")
@@ -684,15 +696,23 @@ def run_phase2(
             print(f"FSDP: Enabled (strategy={fsdp_strategy}, cpu_offload={fsdp_cpu_offload})")
         print()
 
-    n_samples = X.shape[0]
-    in_channels = X.shape[1]
-    out_channels = y.shape[1]
-    time_steps = X.shape[2]
+    in_channels = X_train.shape[1]
+    out_channels = y_train.shape[1]
+    time_steps = X_train.shape[2]
 
-    # Create CV splits
-    cv_splits = create_cv_splits(n_samples, config.n_folds, config.cv_seed)
-    if _is_main:
-        print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
+    # Create splits based on mode
+    if cross_subject_mode:
+        # Cross-subject: single train/val split (held-out sessions)
+        # Create a single "fold" with the provided train/val split
+        cv_splits = [(np.arange(len(X_train)), np.arange(len(X_val)))]
+        if _is_main:
+            print(f"Cross-subject split: {len(X_train)} train, {len(X_val)} val samples")
+    else:
+        # Legacy: K-fold CV
+        n_samples = X_train.shape[0]
+        cv_splits = create_cv_splits(n_samples, config.n_folds, config.cv_seed)
+        if _is_main:
+            print(f"CV splits created: {[len(s[1]) for s in cv_splits]} validation samples per fold")
 
     # Setup checkpoint for resume capability (only main process)
     checkpoint_path = get_checkpoint_path(config.output_dir)
@@ -841,9 +861,15 @@ def run_phase2(
             else:
                 # Use internal trainer (original code path)
 
-                # Get fold data
-                X_train, X_val = X[train_idx], X[val_idx]
-                y_train, y_val = y[train_idx], y[val_idx]
+                # Get fold data based on mode
+                if cross_subject_mode:
+                    # Cross-subject: use train/val data directly (already separate)
+                    X_fold_train, X_fold_val = X_train, X_val
+                    y_fold_train, y_fold_val = y_train, y_val
+                else:
+                    # Legacy: index into X_train for this fold
+                    X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+                    y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
 
                 # Set seed for reproducibility (use fold index as seed offset)
                 seed = config.cv_seed + fold_idx
@@ -863,13 +889,13 @@ def run_phase2(
                 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 if _is_main:
                     print(f"  Parameters: {n_params:,}")
-                    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+                    print(f"  Train: {len(X_fold_train)}, Val: {len(X_fold_val)}")
                     if use_fsdp:
                         print(f"  FSDP: Enabled with strategy={fsdp_strategy}")
 
                 # Create data loaders (with distributed sampler if using FSDP)
                 train_loader, val_loader = create_dataloaders(
-                    X_train, y_train, X_val, y_val,
+                    X_fold_train, y_fold_train, X_fold_val, y_fold_val,
                     batch_size=config.training.batch_size,
                     n_workers=config.n_workers,
                     use_distributed=use_fsdp,
@@ -1258,20 +1284,24 @@ Examples:
         if _is_main:
             print(f"Using specified classical R²: {classical_r2:.4f}")
 
-    # Load data (full dataset for cross-validation)
+    # Load data (cross-subject split: train sessions and held-out val sessions)
     if args.dry_run:
         if _is_main:
             print("[DRY-RUN] Using synthetic data")
         X, y = create_synthetic_data(
             n_samples=100, time_steps=500
         )
+        X_train, y_train = X, y
+        X_val, y_val = None, None  # Dry-run uses CV on all data
     else:
         try:
-            X, y = load_olfactory_data(verbose=_is_main)
+            X_train, y_train, X_val, y_val = load_olfactory_data(verbose=_is_main)
         except Exception as e:
             if _is_main:
                 print(f"Warning: Could not load data ({e}). Using synthetic.")
             X, y = create_synthetic_data()
+            X_train, y_train = X, y
+            X_val, y_val = None, None
 
     # Handle --fresh flag: delete existing checkpoint (only main process)
     if args.fresh and _is_main:
@@ -1289,11 +1319,13 @@ Examples:
             print("Resume mode: No checkpoint found, starting fresh")
 
     try:
-        # Run with 5-fold cross-validation
+        # Run cross-subject evaluation: train on train sessions, eval on held-out sessions
         result = run_phase2(
             config=config,
-            X=X,
-            y=y,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
             classical_r2=classical_r2,
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
