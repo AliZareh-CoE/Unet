@@ -336,8 +336,8 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
     """
     from data import prepare_data
 
-    print("Loading olfactory dataset...")
-    data = prepare_data()
+    print("Loading olfactory dataset (cross-subject session-based split)...")
+    data = prepare_data(split_by_session=True)
 
     ob = data["ob"]    # [N, C, T] - Olfactory Bulb
     pcx = data["pcx"]  # [N, C, T] - Piriform Cortex
@@ -345,6 +345,13 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
     test_idx = data["test_idx"]
+
+    # Log session split info if available
+    if "split_info" in data:
+        split_info = data["split_info"]
+        print(f"  Train sessions: {split_info.get('train_sessions', 'N/A')}")
+        print(f"  Val sessions: {split_info.get('val_sessions', 'N/A')}")
+        print(f"  Test sessions: {split_info.get('test_sessions', 'N/A')}")
 
     print(f"  Loaded: OB {ob.shape} -> PCx {pcx.shape}")
     print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")

@@ -523,7 +523,10 @@ class Phase2Result:
 # =============================================================================
 
 def load_olfactory_data(verbose: bool = True):
-    """Load olfactory dataset (full data for cross-validation).
+    """Load olfactory dataset (cross-subject session-based split).
+
+    Uses session-based split where entire sessions are held out for
+    validation and test, ensuring true cross-subject generalization.
 
     Args:
         verbose: Whether to print loading messages (set False for non-main ranks)
@@ -535,15 +538,23 @@ def load_olfactory_data(verbose: bool = True):
     from data import prepare_data
 
     if verbose:
-        print("Loading olfactory dataset...")
-    data = prepare_data()
+        print("Loading olfactory dataset (cross-subject session-based split)...")
+    data = prepare_data(split_by_session=True)
 
     ob = data["ob"]    # [N, C, T]
     pcx = data["pcx"]  # [N, C, T]
 
     # Combine train+val for CV (exclude test set for final evaluation)
+    # Note: With session-based split, train/val sessions are already separate
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
+
+    # Log session split info if available
+    if verbose and "split_info" in data:
+        split_info = data["split_info"]
+        print(f"  Train sessions: {split_info.get('train_sessions', 'N/A')}")
+        print(f"  Val sessions: {split_info.get('val_sessions', 'N/A')}")
+        print(f"  Test sessions: {split_info.get('test_sessions', 'N/A')}")
 
     all_idx = np.concatenate([train_idx, val_idx])
     X = ob[all_idx]
