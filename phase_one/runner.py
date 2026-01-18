@@ -1075,6 +1075,11 @@ Examples:
         action="store_true",
         help="Start fresh, ignoring any existing checkpoint",
     )
+    parser.add_argument(
+        "--within-subject",
+        action="store_true",
+        help="Use within-subject K-fold CV (old mode) instead of cross-subject session-based split",
+    )
 
     args = parser.parse_args()
 
@@ -1147,6 +1152,24 @@ Examples:
         # For dry-run, just use all data with internal CV
         X_train, y_train = X, y
         X_val, y_val = None, None
+    elif args.within_subject:
+        # Within-subject mode: random stratified splits (old evaluation mode)
+        from data import prepare_data
+        print("Loading olfactory dataset (WITHIN-SUBJECT: random stratified splits)...")
+        data = prepare_data(split_by_session=False)  # Random splits, NOT session-based
+
+        X = data["ob"]
+        y = data["pcx"]
+        train_idx = data["train_idx"]
+        val_idx = data["val_idx"]
+
+        # Combine train+val for K-fold CV (like the old code)
+        cv_idx = np.concatenate([train_idx, val_idx])
+        X_train = X[cv_idx]
+        y_train = y[cv_idx]
+        X_val, y_val = None, None  # Will use K-fold CV
+        ground_truth = y_train
+        print(f"  Within-subject split: {len(cv_idx)} samples for K-fold CV")
     else:
         try:
             X, y, train_idx, val_idx, test_idx = load_olfactory_data()
