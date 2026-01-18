@@ -324,7 +324,7 @@ class Phase1Result:
 # Data Loading
 # =============================================================================
 
-def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
+def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
     """Load olfactory dataset (OB -> PCx translation).
 
     Returns:
@@ -333,6 +333,7 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
         train_idx: Training indices
         val_idx: Validation indices
         test_idx: Test indices (held out)
+        val_idx_per_session: Dict mapping session name -> validation indices for that session
     """
     from data import prepare_data
 
@@ -343,6 +344,7 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
         n_val_sessions=3,    # 3 sessions held out for validation (matches Phase 3)
         no_test_set=True,    # All held-out sessions for validation
         force_recreate_splits=True,  # Override any cached splits to ensure correct config
+        separate_val_sessions=True,  # Get per-session val indices
     )
 
     ob = data["ob"]    # [N, C, T] - Olfactory Bulb
@@ -351,6 +353,7 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
     test_idx = data["test_idx"]
+    val_idx_per_session = data.get("val_idx_per_session", None)
 
     # Log session split info if available
     if "split_info" in data:
@@ -361,8 +364,11 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
 
     print(f"  Loaded: OB {ob.shape} -> PCx {pcx.shape}")
     print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    if val_idx_per_session:
+        for sess_name, sess_idx in val_idx_per_session.items():
+            print(f"    Val session {sess_name}: {len(sess_idx)} samples")
 
-    return ob, pcx, train_idx, val_idx, test_idx
+    return ob, pcx, train_idx, val_idx, test_idx, val_idx_per_session
 
 
 def create_synthetic_data(
@@ -626,7 +632,10 @@ def evaluate_baseline_cross_subject(
     y_val: NDArray,
     config: Phase1Config,
     return_model: bool = True,
-) -> Tuple[Phase1Metrics, Optional[NDArray], Optional[Any]]:
+    val_idx_per_session: Optional[Dict[str, NDArray]] = None,
+    X_full: Optional[NDArray] = None,
+    y_full: Optional[NDArray] = None,
+) -> Tuple[Phase1Metrics, Optional[NDArray], Optional[Any], Optional[Dict[str, float]]]:
     """Evaluate a single baseline with cross-subject split (no CV mixing).
 
     This is the proper cross-subject evaluation:
@@ -642,9 +651,12 @@ def evaluate_baseline_cross_subject(
         y_val: Validation target signals [N_val, C, T] (held-out sessions)
         config: Configuration object
         return_model: Whether to return the trained model
+        val_idx_per_session: Dict mapping session name -> indices (into full array)
+        X_full: Full input array (needed for per-session metrics)
+        y_full: Full target array (needed for per-session metrics)
 
     Returns:
-        Phase1Metrics object, predictions on val set, and trained model
+        Phase1Metrics object, predictions on val set, trained model, and per-session R² dict
     """
     metrics_calc = MetricsCalculator(
         sample_rate=config.sample_rate,
@@ -668,6 +680,22 @@ def evaluate_baseline_cross_subject(
         metrics = {"r2": np.nan, "mae": np.nan, "pearson": np.nan}
         y_pred = None
         model = None
+
+    # Compute per-session R² if session info is available
+    per_session_r2 = {}
+    if val_idx_per_session is not None and X_full is not None and y_full is not None and model is not None:
+        from sklearn.metrics import r2_score
+        for sess_name, sess_idx in val_idx_per_session.items():
+            X_sess = X_full[sess_idx]
+            y_sess = y_full[sess_idx]
+            try:
+                y_pred_sess = model.predict(X_sess)
+                # Flatten for r2_score
+                r2_sess = r2_score(y_sess.flatten(), y_pred_sess.flatten())
+                per_session_r2[sess_name] = float(r2_sess)
+            except Exception as e:
+                print(f"    Warning: Per-session R² failed for {sess_name}: {e}")
+                per_session_r2[sess_name] = np.nan
 
     # Extract metrics (single evaluation, no folds)
     r2 = metrics.get("r2", np.nan)
@@ -753,7 +781,7 @@ def evaluate_baseline_cross_subject(
 
     predictions = (y_pred, y_val) if y_pred is not None else None
 
-    return result, predictions, model
+    return result, predictions, model, per_session_r2
 
 
 # =============================================================================
@@ -766,6 +794,9 @@ def run_phase1(
     y_train: NDArray,
     X_val: Optional[NDArray] = None,
     y_val: Optional[NDArray] = None,
+    val_idx_per_session: Optional[Dict[str, NDArray]] = None,
+    X_full: Optional[NDArray] = None,
+    y_full: Optional[NDArray] = None,
 ) -> Phase1Result:
     """Run complete Phase 1 evaluation.
 
@@ -775,6 +806,9 @@ def run_phase1(
         y_train: Training target signals [N_train, C, T]
         X_val: Validation input signals [N_val, C, T] (held-out sessions)
         y_val: Validation target signals [N_val, C, T] (held-out sessions)
+        val_idx_per_session: Dict mapping session name -> indices (for per-session metrics)
+        X_full: Full input array (needed for per-session metrics)
+        y_full: Full target array (needed for per-session metrics)
 
     Returns:
         Phase1Result with all metrics and analysis
@@ -795,6 +829,8 @@ def run_phase1(
     print(f"Dataset: {config.dataset}")
     if cross_subject_mode:
         print(f"Mode: CROSS-SUBJECT (train on {X_train.shape[0]} samples, eval on {X_val.shape[0]} held-out samples)")
+        if val_idx_per_session:
+            print(f"Per-session evaluation: {list(val_idx_per_session.keys())}")
     else:
         print(f"Mode: K-fold CV on {X_train.shape[0]} samples ({config.n_folds} folds)")
     print(f"Methods: {', '.join(config.baselines)}")
@@ -816,6 +852,7 @@ def run_phase1(
         completed_methods = set()
 
     skipped_methods = 0
+    all_per_session_r2 = {}  # Store per-session R² for each method
 
     # Evaluate each baseline
     for i, baseline_name in enumerate(config.baselines):
@@ -830,9 +867,12 @@ def run_phase1(
 
         if cross_subject_mode:
             # Cross-subject: train on train sessions, eval on held-out val sessions
-            result, predictions, model = evaluate_baseline_cross_subject(
-                baseline_name, X_train, y_train, X_val, y_val, config, return_model=True
+            result, predictions, model, per_session_r2 = evaluate_baseline_cross_subject(
+                baseline_name, X_train, y_train, X_val, y_val, config, return_model=True,
+                val_idx_per_session=val_idx_per_session, X_full=X_full, y_full=y_full
             )
+            if per_session_r2:
+                all_per_session_r2[baseline_name] = per_session_r2
         else:
             # Legacy K-fold CV mode
             result, predictions, model = evaluate_baseline(baseline_name, X_train, y_train, config, return_model=True)
@@ -849,6 +889,13 @@ def run_phase1(
         elapsed = time.time() - start_time
         ci_str = f"[{result.r2_ci[0]:.4f}, {result.r2_ci[1]:.4f}]"
         print(f"    R² = {result.r2_mean:.4f} ± {result.r2_std:.4f} {ci_str} ({elapsed:.1f}s)")
+
+        # Print per-session R² if available
+        if cross_subject_mode and baseline_name in all_per_session_r2:
+            per_sess = all_per_session_r2[baseline_name]
+            sess_str = ", ".join([f"{s}: {r2:.4f}" for s, r2 in sorted(per_sess.items())])
+            print(f"    Per-session R²: {sess_str}")
+
         # Print key DSP metrics
         print(f"    PLV = {result.plv_mean:.4f}, Coherence = {result.coherence_mean:.4f}, SNR = {result.reconstruction_snr_db:.1f} dB")
 
@@ -956,6 +1003,25 @@ def run_phase1(
     for _, m in ranked:
         bands = "".join(f"{m.band_r2.get(b, np.nan):>10.4f}" for b in NEURAL_BANDS.keys())
         print(f"{m.method:<18}{bands}")
+
+    # Per-Session R² Summary (cross-subject mode only)
+    if all_per_session_r2:
+        session_names = sorted(list(next(iter(all_per_session_r2.values())).keys()))
+        print("\n" + "=" * 70)
+        print("PER-SESSION R² VALUES (Cross-Subject Evaluation)")
+        print("=" * 70)
+        # Header
+        header = f"{'Method':<18}" + "".join(f"{s:>12}" for s in session_names) + f"{'Mean':>12}"
+        print(header)
+        print("-" * len(header))
+        # Rows (sorted by overall R²)
+        for m in sorted(all_metrics, key=lambda x: -x.r2_mean):
+            if m.method in all_per_session_r2:
+                per_sess = all_per_session_r2[m.method]
+                sess_vals = [per_sess.get(s, np.nan) for s in session_names]
+                sess_str = "".join(f"{v:>12.4f}" for v in sess_vals)
+                mean_val = np.nanmean(sess_vals)
+                print(f"{m.method:<18}{sess_str}{mean_val:>12.4f}")
 
     # Statistical summary
     sig_comparisons = [c for c in comparisons if c.significant]
@@ -1145,6 +1211,9 @@ Examples:
     )
 
     # Load data
+    val_idx_per_session = None  # For per-session R² reporting
+    X_full, y_full = None, None
+
     if args.dry_run:
         print("[DRY-RUN] Using synthetic data")
         X, y = create_synthetic_data(n_samples=100, time_points=500)
@@ -1156,7 +1225,10 @@ Examples:
         # Within-subject mode: random stratified splits (old evaluation mode)
         from data import prepare_data
         print("Loading olfactory dataset (WITHIN-SUBJECT: random stratified splits)...")
-        data = prepare_data(split_by_session=False)  # Random splits, NOT session-based
+        data = prepare_data(
+            split_by_session=False,  # Random splits, NOT session-based
+            force_recreate_splits=True,  # Force recreate to match current data
+        )
 
         X = data["ob"]
         y = data["pcx"]
@@ -1172,13 +1244,14 @@ Examples:
         print(f"  Within-subject split: {len(cv_idx)} samples for K-fold CV")
     else:
         try:
-            X, y, train_idx, val_idx, test_idx = load_olfactory_data()
+            X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
             # Cross-subject evaluation: train on train sessions, eval on held-out val sessions
             # NO mixing of sessions - this ensures true cross-subject generalization
             X_train = X[train_idx]
             y_train = y[train_idx]
             X_val = X[val_idx]
             y_val = y[val_idx]
+            X_full, y_full = X, y  # Keep full arrays for per-session metrics
             ground_truth = y_val
             print(f"  Cross-subject split: Train {X_train.shape[0]} samples, Val {X_val.shape[0]} samples (held-out sessions)")
         except Exception as e:
@@ -1197,7 +1270,11 @@ Examples:
 
     # Run evaluation
     # For cross-subject: train on train sessions, eval on held-out val sessions
-    result = run_phase1(config, X_train, y_train, X_val, y_val)
+    result = run_phase1(
+        config, X_train, y_train, X_val, y_val,
+        val_idx_per_session=val_idx_per_session,
+        X_full=X_full, y_full=y_full
+    )
 
     # Clean up checkpoint after successful completion
     checkpoint_path = get_checkpoint_path(config.output_dir)
