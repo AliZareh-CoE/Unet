@@ -1202,7 +1202,8 @@ class SpectroTemporalEncoder(nn.Module):
         masks = self._build_freq_masks(T, device)  # [n_bands, n_fft]
 
         # Compute FFT and power spectral density (requires float32)
-        x_fft = torch.fft.rfft(x, dim=-1)  # [B, C, n_fft]
+        # FFT doesn't support BFloat16 (used by FSDP mixed precision)
+        x_fft = torch.fft.rfft(x.float(), dim=-1)  # [B, C, n_fft]
         power = x_fft.abs().square()  # [B, C, n_fft]
 
         # Extract band powers: [B, C, n_bands]
@@ -1551,8 +1552,9 @@ class FreqDisentangledEncoder(nn.Module):
         Uses a smooth Gaussian rolloff instead of hard cutoff to avoid
         ringing artifacts (Gibbs phenomenon) and preserve signal amplitude.
         """
-        # FFT
-        X = torch.fft.rfft(x, dim=-1)
+        # FFT - cast to float32 for BFloat16 compatibility (FSDP mixed precision)
+        orig_dtype = x.dtype
+        X = torch.fft.rfft(x.float(), dim=-1)
         freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
 
         # Compute band center and width for Gaussian rolloff
@@ -1568,8 +1570,8 @@ class FreqDisentangledEncoder(nn.Module):
         # Apply mask
         X_filtered = X * mask
 
-        # Inverse FFT
-        return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1)
+        # Inverse FFT and cast back to original dtype
+        return torch.fft.irfft(X_filtered, n=x.shape[-1], dim=-1).to(orig_dtype)
 
     def _compute_band_power(self, x: torch.Tensor, low: float, high: float) -> torch.Tensor:
         """Compute log power in frequency band for each channel.
@@ -1582,7 +1584,8 @@ class FreqDisentangledEncoder(nn.Module):
         Returns:
             [B, C] log power per channel in the band
         """
-        X = torch.fft.rfft(x, dim=-1)
+        # FFT doesn't support BFloat16 (used by FSDP mixed precision)
+        X = torch.fft.rfft(x.float(), dim=-1)
         freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / self.fs).to(x.device)
 
         # Band mask
@@ -1785,10 +1788,9 @@ class SessionStatisticsEncoder(nn.Module):
 
     1. Generalizes automatically to new/unseen sessions
     2. Learns meaningful relationships between statistics and predictions
-    3. Aligns with domain adaptation literature (ReVIN, AdaIN, FiLM)
+    3. Aligns with domain adaptation literature (AdaIN, FiLM)
 
     Based on:
-    - ReVIN (Reversible Instance Normalization) for cross-subject EEG
     - Domain-specific batch normalization for EEG transfer learning
     - FiLM (Feature-wise Linear Modulation) conditioning
 
@@ -1999,81 +2001,6 @@ class SessionAdaptiveScaling(nn.Module):
         return x * gamma + beta
 
 
-class ReversibleInstanceNorm(nn.Module):
-    """Reversible Instance Normalization (ReVIN) for session adaptation.
-
-    From "ReVIN: Reversible Instance Normalization for Accurate Time-Series Forecasting"
-    and adapted for EEG/neural signals.
-
-    Key insight: Session differences are often just scale/shift differences.
-    ReVIN:
-    1. Removes session-specific mean/std at input (normalize)
-    2. Processes in normalized space (session-agnostic)
-    3. Restores original statistics at output (denormalize)
-
-    This is different from AdaIN:
-    - AdaIN: Predict scale/bias from conditioning → apply to features
-    - ReVIN: Remove statistics → process → restore SAME statistics
-
-    ReVIN preserves the session-specific amplitude characteristics while
-    allowing the model to learn session-agnostic transformations.
-    """
-
-    def __init__(self, n_channels: int, affine: bool = True, eps: float = 1e-5):
-        """Initialize ReVIN.
-
-        Args:
-            n_channels: Number of channels
-            affine: If True, learn additional affine parameters
-            eps: Small constant for numerical stability
-        """
-        super().__init__()
-        self.n_channels = n_channels
-        self.eps = eps
-        self.affine = affine
-
-        if affine:
-            # Learnable affine parameters (optional refinement)
-            self.affine_weight = nn.Parameter(torch.ones(1, n_channels, 1))
-            self.affine_bias = nn.Parameter(torch.zeros(1, n_channels, 1))
-
-    def forward(self, x: torch.Tensor, mode: str = "norm") -> torch.Tensor:
-        """Apply ReVIN normalization or denormalization.
-
-        Args:
-            x: Input tensor [B, C, T]
-            mode: "norm" to normalize, "denorm" to denormalize
-
-        Returns:
-            Normalized or denormalized tensor
-        """
-        if mode == "norm":
-            # Save statistics for later denormalization
-            self._mean = x.mean(dim=-1, keepdim=True)
-            self._std = x.std(dim=-1, keepdim=True) + self.eps
-
-            # Normalize
-            x = (x - self._mean) / self._std
-
-            # Apply learnable affine if enabled
-            if self.affine:
-                x = x * self.affine_weight + self.affine_bias
-
-            return x
-
-        elif mode == "denorm":
-            # Reverse learnable affine if enabled
-            if self.affine:
-                x = (x - self.affine_bias) / (self.affine_weight + self.eps)
-
-            # Restore original statistics
-            x = x * self._std + self._mean
-
-            return x
-
-        else:
-            raise ValueError(f"Unknown mode: {mode}. Use 'norm' or 'denorm'.")
-
 
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
@@ -2200,15 +2127,17 @@ class CondUNet1D(nn.Module):
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
         use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (AdaIN-style)
-        use_revin: bool = False,  # Reversible Instance Normalization (normalize→process→denormalize)
         # Session conditioning - statistics-based (literature-recommended approach)
         # Instead of learned embeddings per session ID, computes statistics from
         # input signal and learns to encode them. Generalizes to unseen sessions.
         use_session_stats: bool = False,  # Enable statistics-based session conditioning
         session_emb_dim: int = 32,  # Session embedding dimension
         session_use_spectral: bool = False,  # Include spectral features in session stats
-        # Legacy parameter for backward compatibility (ignored if use_session_stats=True)
-        n_sessions: int = 0,  # Deprecated: use use_session_stats instead
+        # Learnable session embedding (lookup table approach)
+        # Unlike statistics-based, this learns a unique embedding per session ID.
+        # Requires session IDs at training time. Does NOT generalize to unseen sessions.
+        use_session_embedding: bool = False,  # Enable learnable session embedding lookup
+        n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2217,8 +2146,8 @@ class CondUNet1D(nn.Module):
         self.conv_type = conv_type
         self.n_downsample = n_downsample
         self.use_session_stats = use_session_stats
+        self.use_session_embedding = use_session_embedding
         self.session_emb_dim = session_emb_dim
-        # Legacy compatibility
         self.n_sessions = n_sessions
 
         if cond_mode != "none":
@@ -2246,6 +2175,42 @@ class CondUNet1D(nn.Module):
         else:
             self.session_stats_encoder = None
             self.session_proj = None
+
+        # Learnable session embedding (lookup table approach)
+        # This learns a unique embedding per session ID and combines it with FiLM conditioning.
+        # NEW: Uses statistics-based matching for unseen sessions (soft attention over embeddings)
+        if use_session_embedding:
+            if n_sessions <= 0:
+                raise ValueError(
+                    f"use_session_embedding=True requires n_sessions > 0, got {n_sessions}"
+                )
+            self.session_embed = nn.Embedding(n_sessions, session_emb_dim)
+            # Project combined embedding (session embed + condition) to emb_dim
+            # Separate projection from session_proj to allow both to be enabled
+            self.session_embed_proj = nn.Sequential(
+                nn.Linear(session_emb_dim + emb_dim, emb_dim),
+                nn.GELU(),
+                nn.Linear(emb_dim, emb_dim),
+            )
+            # NEW: Statistics-based session matcher for generalization to unseen sessions
+            # Computes input statistics and uses soft attention over all session embeddings
+            # This allows the model to find the "nearest" session based on signal characteristics
+            stat_dim = 64  # Dimension of statistics encoding
+            self.session_stat_encoder = nn.Sequential(
+                nn.Linear(in_channels * 4, stat_dim),  # 4 stats: mean, std, min, max per channel
+                nn.GELU(),
+                nn.Linear(stat_dim, stat_dim),
+            )
+            # Attention over session embeddings based on statistics
+            self.session_stat_to_query = nn.Linear(stat_dim, session_emb_dim)
+            self.session_embed_keys = nn.Linear(session_emb_dim, session_emb_dim)
+            # Track which sessions are "known" (seen during training)
+            self.register_buffer('known_sessions', torch.zeros(n_sessions, dtype=torch.bool))
+            # Debug counter for verification
+            self._session_embed_use_count = 0
+        else:
+            self.session_embed = None
+            self.session_embed_proj = None
 
         # Channel progression: base -> base*2 -> base*4 -> ... up to base*8 max
         # For n_downsample=2: [base, base*2, base*4]
@@ -2328,7 +2293,6 @@ class CondUNet1D(nn.Module):
         # Helps match target distribution, especially important for probabilistic losses
         self.use_output_scaling = use_output_scaling
         self.use_adaptive_scaling = use_adaptive_scaling
-        self.use_revin = use_revin
 
         if use_adaptive_scaling:
             # Session-adaptive output scaling (AdaIN-style)
@@ -2343,12 +2307,6 @@ class CondUNet1D(nn.Module):
             self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
             self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
 
-        # ReVIN: Reversible Instance Normalization
-        # Normalize at input → process → denormalize at output
-        # Preserves session-specific characteristics while processing in normalized space
-        if use_revin:
-            self.revin = ReversibleInstanceNorm(in_channels, affine=True)
-
         # Store in_channels for adaptive scaling
         self.in_channels = in_channels
 
@@ -2362,6 +2320,72 @@ class CondUNet1D(nn.Module):
         at the cost of ~30% more compute (recomputes activations during backward).
         """
         self.gradient_checkpointing = enable
+
+    def enable_adabn(self):
+        """Enable Adaptive Batch Normalization (AdaBN) for domain adaptation.
+
+        AdaBN is a simple, parameter-free domain adaptation technique from:
+        "Revisiting Batch Normalization for Practical Domain Adaptation" (Li et al., 2016)
+
+        When enabled, all BatchNorm layers compute statistics from the current batch
+        instead of using running statistics. This allows the model to adapt to new
+        sessions/domains without any additional training.
+
+        Call this method before inference on a new session/domain.
+        Call disable_adabn() to restore normal behavior.
+
+        Literature:
+        - AdaBN achieves comparable results to more complex domain adaptation methods
+        - Works because BN statistics capture domain-specific characteristics
+        - Particularly effective for neural signal translation where sessions have
+          different baseline statistics due to electrode placement, impedance, etc.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                # Set to training mode so it computes batch statistics
+                module.training = True
+                # Reset running stats so they don't interfere
+                module.reset_running_stats()
+
+    def disable_adabn(self):
+        """Disable Adaptive Batch Normalization, restore normal inference behavior.
+
+        This restores BatchNorm layers to use their learned running statistics.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                module.training = False
+
+    def calibrate_bn_stats(self, dataloader, device: torch.device, max_batches: int = 50):
+        """Calibrate BatchNorm running statistics on a new session/domain.
+
+        Alternative to AdaBN: instead of using batch statistics at inference,
+        this method runs a forward pass on calibration data to update the
+        running statistics to the new domain.
+
+        Args:
+            dataloader: DataLoader for the new session/domain (no labels needed)
+            device: Device to run on
+            max_batches: Maximum number of batches to use for calibration
+
+        Note: Model should be in eval mode after this, not AdaBN mode.
+        """
+        # Set BN layers to training mode to update running stats
+        self.train()
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if i >= max_batches:
+                    break
+                # Handle different batch formats
+                if isinstance(batch, (list, tuple)):
+                    x = batch[0]
+                else:
+                    x = batch
+                x = x.to(device)
+                # Forward pass to update BN running stats
+                _ = self(x)
+        # Set back to eval mode
+        self.eval()
 
     def _build_attention(self, channels: int, attention_type: str) -> nn.Module:
         """Build attention module based on type.
@@ -2389,7 +2413,7 @@ class CondUNet1D(nn.Module):
         ob: torch.Tensor,
         odor_ids: Optional[torch.Tensor] = None,
         cond_emb: Optional[torch.Tensor] = None,
-        session_ids: Optional[torch.Tensor] = None,  # Deprecated: kept for API compatibility
+        session_ids: Optional[torch.Tensor] = None,  # Required if use_session_embedding=True
         return_bottleneck: bool = False,
         return_bottleneck_temporal: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -2400,8 +2424,9 @@ class CondUNet1D(nn.Module):
             odor_ids: Odor class indices [B] for conditioning (uses internal embedding)
             cond_emb: External conditioning embedding [B, emb_dim] (bypasses internal embedding)
                       If provided, odor_ids is ignored.
-            session_ids: DEPRECATED - Session IDs are no longer needed.
-                        Statistics-based conditioning computes session info from input.
+            session_ids: Session indices [B] for learnable session embedding lookup.
+                        Required if use_session_embedding=True.
+                        Not needed for statistics-based conditioning (use_session_stats).
             return_bottleneck: If True, also return pooled bottleneck features [B, bottleneck_ch]
                               for label-based contrastive learning
             return_bottleneck_temporal: If True, return unpooled bottleneck features [B, bottleneck_ch, T']
@@ -2436,16 +2461,8 @@ class CondUNet1D(nn.Module):
         # =================================================================
         # INPUT NORMALIZATION - The key to session-agnostic generalization
         # =================================================================
-        # Option 1: ReVIN - Reversible Instance Norm (will denorm at output)
-        # Option 2: Standard z-score normalization
-        # =================================================================
-        if self.use_revin:
-            # ReVIN: normalize now, denormalize at output
-            # This preserves session statistics while processing in normalized space
-            ob = self.revin(ob, mode="norm")
-        else:
-            # Standard per-channel, per-sample z-score
-            ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
+        # Standard per-channel, per-sample z-score normalization
+        ob = (ob - ob.mean(dim=-1, keepdim=True)) / (ob.std(dim=-1, keepdim=True) + 1e-8)
 
         # Use external embeddings if provided, otherwise use internal odor embedding
         if cond_emb is not None:
@@ -2466,6 +2483,69 @@ class CondUNet1D(nn.Module):
                 padding = torch.zeros(session_emb.size(0), self.emb_dim, device=session_emb.device)
                 combined = torch.cat([session_emb, padding], dim=-1)
                 emb = self.session_proj(combined)
+
+        # =================================================================
+        # LEARNABLE SESSION EMBEDDING with STATISTICS-BASED MATCHING
+        # =================================================================
+        # Training: Direct lookup (learns session-specific patterns)
+        # Inference: Statistics-based soft attention (generalizes to unseen sessions)
+        # =================================================================
+        if self.session_embed is not None:
+            # Compute input statistics for session matching (from raw_input, before normalization)
+            # Stats: [mean, std, min, max] per channel -> [B, C*4]
+            input_mean = raw_input.mean(dim=-1)  # [B, C]
+            input_std = raw_input.std(dim=-1)    # [B, C]
+            input_min = raw_input.min(dim=-1).values  # [B, C]
+            input_max = raw_input.max(dim=-1).values  # [B, C]
+            input_stats = torch.cat([input_mean, input_std, input_min, input_max], dim=-1)  # [B, C*4]
+
+            # Encode statistics
+            stat_encoding = self.session_stat_encoder(input_stats)  # [B, stat_dim]
+            stat_query = self.session_stat_to_query(stat_encoding)  # [B, session_emb_dim]
+
+            # Get all session embeddings and compute keys
+            all_embeds = self.session_embed.weight  # [n_sessions, session_emb_dim]
+            embed_keys = self.session_embed_keys(all_embeds)  # [n_sessions, session_emb_dim]
+
+            # Compute attention: query @ keys^T -> softmax -> weighted sum
+            # [B, session_emb_dim] @ [session_emb_dim, n_sessions] -> [B, n_sessions]
+            attn_logits = torch.matmul(stat_query, embed_keys.T) / (self.session_emb_dim ** 0.5)
+            attn_weights = torch.softmax(attn_logits, dim=-1)  # [B, n_sessions]
+
+            # Statistics-based session embedding (soft attention over all embeddings)
+            stats_session_emb = torch.matmul(attn_weights, all_embeds)  # [B, session_emb_dim]
+
+            if self.training and session_ids is not None:
+                # TRAINING: Use direct lookup for known sessions (supervised learning)
+                # Also mark these sessions as known
+                self.known_sessions[session_ids] = True
+                direct_session_emb = self.session_embed(session_ids)  # [B, session_emb_dim]
+
+                # Blend: 70% direct (for supervised learning) + 30% stats-based (to train matcher)
+                learned_session_emb = 0.7 * direct_session_emb + 0.3 * stats_session_emb
+            else:
+                # INFERENCE: Use statistics-based matching (generalizes to unseen sessions)
+                learned_session_emb = stats_session_emb
+
+            # Debug verification - print on first few uses
+            if hasattr(self, '_session_embed_use_count'):
+                self._session_embed_use_count += 1
+                if self._session_embed_use_count <= 3:
+                    mode = "TRAIN(blend)" if self.training else "EVAL(stats)"
+                    top_sessions = attn_weights.argmax(dim=-1).tolist()[:8]
+                    print(f"[SESSION EMBED VERIFY] Use #{self._session_embed_use_count} [{mode}]: "
+                          f"matched_sessions={top_sessions}{'...' if len(attn_weights) > 8 else ''}, "
+                          f"embed_norm={learned_session_emb.norm().item():.4f}")
+
+            if emb is not None:
+                # Concatenate learned session embedding with existing conditioning
+                combined = torch.cat([learned_session_emb, emb], dim=-1)  # [B, session_emb_dim + emb_dim]
+                emb = self.session_embed_proj(combined)  # [B, emb_dim]
+            else:
+                # No other conditioning - pad and project
+                padding = torch.zeros(learned_session_emb.size(0), self.emb_dim, device=learned_session_emb.device)
+                combined = torch.cat([learned_session_emb, padding], dim=-1)
+                emb = self.session_embed_proj(combined)
 
         # Encoder path with skip connections
         # Use gradient checkpointing if enabled (saves memory, costs ~30% more compute)
@@ -2523,11 +2603,6 @@ class CondUNet1D(nn.Module):
         elif self.use_output_scaling:
             # Fixed learnable scale/bias
             out = out * self.output_scale + self.output_bias
-
-        # ReVIN denormalization: restore original session statistics
-        # This preserves session-specific amplitude while the model learned in normalized space
-        if self.use_revin:
-            out = self.revin(out, mode="denorm")
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
         if return_bottleneck or return_bottleneck_temporal:

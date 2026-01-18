@@ -272,7 +272,7 @@ DEFAULT_CONFIG = {
     # This tests true cross-session generalization (harder but more realistic)
     "split_by_session": False,  # Use session-based holdout instead of random splits
     "n_test_sessions": 1,       # Number of sessions to hold out for testing
-    "n_val_sessions": 4,        # Number of sessions to hold out for validation
+    "n_val_sessions": 3,        # Number of sessions to hold out for validation
     "session_column": "recording_id",  # CSV column containing session/recording IDs
     "no_test_set": True,        # If True, no test set - all held-out sessions for validation
     "separate_val_sessions": True,  # If True, evaluate each val session separately
@@ -1491,8 +1491,8 @@ def evaluate(
             # For CondUNet: use cond_emb if available, otherwise odor_ids
             # For other architectures: just pass input directly
             arch = config.get("arch", "condunet") if config else "condunet"
-            # Use proper session_ids from dataloader (not odor!)
-            session_ids = session_ids_batch if config and config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (only needed for learnable session embedding)
+            session_ids = session_ids_batch if config and config.get("use_session_embedding", False) else None
             if arch == "condunet":
                 if cond_emb is not None:
                     pred = model(ob, cond_emb=cond_emb, session_ids=session_ids)
@@ -1885,8 +1885,8 @@ def train_epoch(
 
         if arch == "condunet":
             # CondUNet with conditioning
-            # Use proper session_ids from dataloader (not odor!)
-            session_ids = session_ids_batch if config.get("n_sessions", 0) > 0 else None
+            # Use proper session_ids from dataloader (only needed for learnable session embedding)
+            session_ids = session_ids_batch if config.get("use_session_embedding", False) else None
             if cond_emb is not None:
                 fwd_result = model(
                     ob, cond_emb=cond_emb,
@@ -2397,14 +2397,15 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction (disabled if using adaptive scaling)
             use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
-            # Session embedding for session-specific adjustments
-            n_sessions=config.get("n_sessions", 0),
-            session_emb_dim=config.get("session_emb_dim", 32),
             # Statistics-based session adaptation (Phase 3 Group 18)
             use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
+            # Learnable session embedding (lookup table approach)
+            use_session_embedding=config.get("use_session_embedding", False),
+            n_sessions=config.get("n_sessions", 0),
+            # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2452,14 +2453,15 @@ def train(
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
             # Output scaling correction (disabled if using adaptive scaling)
             use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
-            # Session embedding (same as forward model)
-            n_sessions=config.get("n_sessions", 0),
-            session_emb_dim=config.get("session_emb_dim", 32),
             # Statistics-based session adaptation (same as forward)
             use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
+            # Learnable session embedding (same as forward model)
+            use_session_embedding=config.get("use_session_embedding", False),
+            n_sessions=config.get("n_sessions", 0),
+            # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2777,6 +2779,26 @@ def train(
     # =============================================================================
     # Training loop
     # =============================================================================
+    # Session embedding verification - print BEFORE training
+    if config.get("use_session_embedding", False) and is_primary():
+        # Get the actual model (unwrap from FSDP/DDP if needed)
+        unwrapped = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+            with torch.no_grad():
+                init_weight = unwrapped.session_embed.weight.clone()
+                print(f"\n{'='*60}")
+                print(f"[SESSION EMBED] BEFORE TRAINING:")
+                print(f"  Weight shape: {init_weight.shape}")
+                print(f"  Weight norm: {init_weight.norm().item():.6f}")
+                print(f"  Weight mean: {init_weight.mean().item():.6f}")
+                print(f"  Weight std: {init_weight.std().item():.6f}")
+                print(f"  First 3 embeddings (norm): {[init_weight[i].norm().item() for i in range(min(3, init_weight.shape[0]))]}")
+                print(f"{'='*60}\n")
+                # Store for later comparison
+                config['_session_embed_init_weight'] = init_weight.cpu()
+        else:
+            print(f"\n[SESSION EMBED] WARNING: use_session_embedding=True but model has no session_embed!\n")
+
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
@@ -2879,6 +2901,14 @@ def train(
                 for sess_name, sess_m in per_session_metrics.items():
                     sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
                 print("  Per-session: " + " | ".join(sess_strs))
+
+            # Print session embedding weight stats every 10 epochs
+            if config.get("use_session_embedding", False) and epoch % 10 == 0:
+                unwrapped = model.module if hasattr(model, 'module') else model
+                if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+                    with torch.no_grad():
+                        w = unwrapped.session_embed.weight
+                        print(f"  [Session Embed] norm={w.norm().item():.4f}, mean={w.mean().item():.4f}, std={w.std().item():.4f}")
 
             sys.stdout.flush()
 
@@ -3405,6 +3435,33 @@ def train(
             # Always close the recording session
             recording_session.close()
 
+    # Session embedding verification - print AFTER training
+    if config.get("use_session_embedding", False) and is_primary():
+        # Get the actual model (unwrap from FSDP/DDP if needed)
+        unwrapped = model.module if hasattr(model, 'module') else model
+        if hasattr(unwrapped, 'session_embed') and unwrapped.session_embed is not None:
+            with torch.no_grad():
+                final_weight = unwrapped.session_embed.weight.clone()
+                print(f"\n{'='*60}")
+                print(f"[SESSION EMBED] AFTER TRAINING:")
+                print(f"  Weight shape: {final_weight.shape}")
+                print(f"  Weight norm: {final_weight.norm().item():.6f}")
+                print(f"  Weight mean: {final_weight.mean().item():.6f}")
+                print(f"  Weight std: {final_weight.std().item():.6f}")
+                print(f"  First 3 embeddings (norm): {[final_weight[i].norm().item() for i in range(min(3, final_weight.shape[0]))]}")
+                # Compare with initial weights if available
+                if '_session_embed_init_weight' in config:
+                    init_weight = config['_session_embed_init_weight'].to(final_weight.device)
+                    weight_delta = (final_weight - init_weight).norm().item()
+                    print(f"  WEIGHT CHANGE (L2 norm of delta): {weight_delta:.6f}")
+                    if weight_delta > 0.001:
+                        print(f"  ✓ Session embeddings CHANGED during training (delta > 0.001)")
+                    else:
+                        print(f"  ⚠ Session embeddings BARELY changed (delta={weight_delta:.6f})")
+                print(f"{'='*60}\n")
+        else:
+            print(f"\n[SESSION EMBED] WARNING: use_session_embedding=True but model has no session_embed!\n")
+
     return {
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
@@ -3643,8 +3700,6 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (AdaIN style)")
-    parser.add_argument("--use-revin", action="store_true",
-                        help="Use Reversible Instance Normalization (ReVIN)")
     parser.add_argument("--use-cov-augment", action="store_true",
                         help="Use covariance expansion augmentation for synthetic sessions")
     parser.add_argument("--cov-augment-prob", type=float, default=0.5,
@@ -3778,7 +3833,6 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
-    config["use_revin"] = args.use_revin
     config["use_cov_augment"] = args.use_cov_augment
     config["cov_augment_prob"] = args.cov_augment_prob
 

@@ -31,7 +31,7 @@ import torch
 # Ablation Protocol Selection
 # =============================================================================
 
-ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward"]
+ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward", "stage2_greedy"]
 
 # =============================================================================
 # ADDITIVE PROTOCOL: Incremental Component Analysis
@@ -236,9 +236,10 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
     "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style)
-    "use_revin": False,             # Reversible Instance Normalization
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
+    "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
+    "use_adabn": False,             # AdaBN: use batch stats at inference (requires norm_type="batch")
 }
 
 # =============================================================================
@@ -270,7 +271,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 2: Activation Function
     # Literature: ReLU (2010), GELU (2016), SiLU/Swish (2017), Mish (2019)
     {
-        "group_id": 2,
+        "group_id": 7,
         "name": "activation",
         "description": "Activation function - affects gradient flow and expressivity",
         "parameter": "activation",
@@ -298,7 +299,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 4: Skip Connection Type (core U-Net design)
     # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
     {
-        "group_id": 4,
+        "group_id": 6,
         "name": "skip_connection",
         "description": "Skip connection type in U-Net architecture",
         "parameter": "skip_type",
@@ -312,7 +313,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 5: Network Depth
     {
-        "group_id": 5,
+        "group_id": 4,
         "name": "depth",
         "description": "Encoder/decoder depth",
         "parameter": "n_downsample",
@@ -325,7 +326,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 6: Network Width
     {
-        "group_id": 6,
+        "group_id": 5,
         "name": "width",
         "description": "Base channel count",
         "parameter": "base_channels",
@@ -342,7 +343,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # =========================================================================
     # GROUP 7: Attention Type
     {
-        "group_id": 7,
+        "group_id": 8,
         "name": "attention",
         "description": "Attention mechanism",
         "parameter": "attention_type",
@@ -355,7 +356,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 8: Attention Heads (conditional on attention != none)
     {
-        "group_id": 8,
+        "group_id": 9,
         "name": "attention_heads",
         "description": "Number of attention heads",
         "parameter": "n_heads",
@@ -364,12 +365,12 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 4, "name": "4_heads", "desc": "4 attention heads"},
             {"value": 8, "name": "8_heads", "desc": "8 attention heads"},
         ],
-        "conditional_on": {"parameter": "attention_type", "not_equal": "none"},
+        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
     },
     # GROUP 9: Conditioning Mode
     # NOTE: train.py only supports 'none' and 'cross_attn_gated' currently
     {
-        "group_id": 9,
+        "group_id": 10,
         "name": "conditioning",
         "description": "Conditioning mechanism",
         "parameter": "cond_mode",
@@ -385,7 +386,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # =========================================================================
     # GROUP 10: Loss Function
     {
-        "group_id": 10,
+        "group_id": 12,
         "name": "loss",
         "description": "Training loss function",
         "parameter": "loss_type",
@@ -399,7 +400,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 11: Data Augmentation
     {
-        "group_id": 11,
+        "group_id": 2,
         "name": "augmentation",
         "description": "Data augmentation strategy",
         "parameter": "use_augmentation",
@@ -414,7 +415,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 12: Dropout Strategy
     # Literature: Dropout (2014), Spatial Dropout (2015), DropBlock (2018)
     {
-        "group_id": 12,
+        "group_id": 15,
         "name": "dropout",
         "description": "Dropout regularization strategy",
         "parameter": "dropout",
@@ -430,7 +431,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 13: Weight Decay
     # Literature: L2 regularization, decoupled weight decay (AdamW paper)
     {
-        "group_id": 13,
+        "group_id": 16,
         "name": "weight_decay",
         "description": "Weight decay (L2 regularization) strength",
         "parameter": "weight_decay",
@@ -450,7 +451,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 14: Optimizer
     # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
     {
-        "group_id": 14,
+        "group_id": 13,
         "name": "optimizer",
         "description": "Optimization algorithm",
         "parameter": "optimizer",
@@ -466,7 +467,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # GROUP 15: Learning Rate Schedule
     # Literature: Step decay, Cosine annealing (2016), Warmup (2017), OneCycle (2018)
     {
-        "group_id": 15,
+        "group_id": 14,
         "name": "lr_schedule",
         "description": "Learning rate scheduling strategy",
         "parameter": "lr_schedule",
@@ -482,7 +483,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 16: Bidirectional Training
     {
-        "group_id": 16,
+        "group_id": 17,
         "name": "bidirectional",
         "description": "Bidirectional training with cycle consistency",
         "parameter": "bidirectional",
@@ -494,7 +495,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # GROUP 17: Cycle Lambda (conditional on bidirectional=True)
     {
-        "group_id": 17,
+        "group_id": 18,
         "name": "cycle_lambda",
         "description": "Cycle consistency loss weight",
         "parameter": "cycle_lambda",
@@ -503,159 +504,153 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
             {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
         ],
-        "conditional_on": {"parameter": "bidirectional", "equal": True},
-    },
-
-    # =========================================================================
-    # PHASE 5: SESSION ADAPTATION (Group 18)
-    # Tests multiple approaches for cross-session generalization based on literature:
-    # - Statistics-based conditioning (ReVIN, FiLM)
-    # - Adaptive output scaling (AdaIN)
-    # - Covariance expansion augmentation (domain randomization)
-    # =========================================================================
-
-    # GROUP 18: Session Adaptation Methods
-    # This is a MULTI-PARAMETER group - each variant sets multiple params
-    {
-        "group_id": 18,
-        "name": "session_adaptation",
-        "description": "Session adaptation methods for cross-session generalization",
-        "parameter": "_session_method",  # Virtual param - variants set multiple real params
-        "variants": [
-            # Baseline: no session adaptation
-            {
-                "value": "none",
-                "name": "no_session",
-                "desc": "No session adaptation (baseline)",
-                "config": {
-                    "use_session_stats": False,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": False,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 1: Statistics-based conditioning only (FiLM-style)
-            {
-                "value": "stats",
-                "name": "session_stats",
-                "desc": "Session statistics conditioning (mean/std)",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": False,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 2: Statistics with spectral features
-            {
-                "value": "stats_spectral",
-                "name": "session_stats_spectral",
-                "desc": "Session stats + spectral features (power bands)",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": True,
-                    "use_adaptive_scaling": False,
-                    "use_revin": False,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 3: Adaptive output scaling only (AdaIN-style)
-            {
-                "value": "adaptive",
-                "name": "adaptive_scaling",
-                "desc": "Session-adaptive output scaling (AdaIN style)",
-                "config": {
-                    "use_session_stats": False,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": True,
-                    "use_revin": False,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 4: ReVIN - Reversible Instance Normalization
-            {
-                "value": "revin",
-                "name": "revin",
-                "desc": "ReVIN: normalize->process->denormalize (preserves session stats)",
-                "config": {
-                    "use_session_stats": False,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": True,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 5: Stats + Adaptive scaling combined
-            {
-                "value": "stats_adaptive",
-                "name": "stats_and_adaptive",
-                "desc": "Session stats + adaptive scaling combined",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": True,
-                    "use_revin": False,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 6: Covariance expansion augmentation only
-            {
-                "value": "cov_augment",
-                "name": "cov_augment",
-                "desc": "Covariance expansion augmentation",
-                "config": {
-                    "use_session_stats": False,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": False,
-                    "use_cov_augment": True,
-                }
-            },
-            # Method 7: Stats + Cov augment combined
-            {
-                "value": "stats_cov",
-                "name": "stats_and_cov",
-                "desc": "Session stats + covariance augmentation",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": False,
-                    "use_cov_augment": True,
-                }
-            },
-            # Method 8: ReVIN + Stats combined
-            {
-                "value": "revin_stats",
-                "name": "revin_and_stats",
-                "desc": "ReVIN + session stats conditioning",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": False,
-                    "use_adaptive_scaling": False,
-                    "use_revin": True,
-                    "use_cov_augment": False,
-                }
-            },
-            # Method 9: Full session adaptation (all methods except ReVIN - incompatible with adaptive scaling)
-            {
-                "value": "full",
-                "name": "full_session",
-                "desc": "Full: stats + spectral + adaptive + cov augment",
-                "config": {
-                    "use_session_stats": True,
-                    "session_use_spectral": True,
-                    "use_adaptive_scaling": True,
-                    "use_revin": False,  # ReVIN incompatible with adaptive scaling
-                    "use_cov_augment": True,
-                }
-            },
-        ],
-        "conditional_on": None,  # Always run - critical for cross-session evaluation
+        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
     },
 ]
+
+# =============================================================================
+# STAGE 2 GREEDY: Fine-tuning after Stage 1
+# =============================================================================
+# After Stage 1 greedy forward selection identifies optimal architecture/training choices,
+# Stage 2 explores scaling and fine-tuning parameters that interact with each other:
+# - Width (model capacity)
+# - Augmentation strength (regularization)
+# - Depth (model complexity)
+# - Bidirectional (confirm always on)
+# - Batch size (training dynamics)
+#
+# Total: 5 + 3 + 4 + 1 + 4 = 17 runs
+
+STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
+    # GROUP 1: WIDTH - model capacity scaling
+    {
+        "group_id": 1,
+        "name": "width",
+        "description": "Model width (base_channels) - primary capacity control",
+        "parameter": "base_channels",
+        "variants": [
+            {"value": 128, "name": "width_128", "desc": "128 base channels - smaller model"},
+            {"value": 192, "name": "width_192", "desc": "192 base channels - medium-small"},
+            {"value": 256, "name": "width_256", "desc": "256 base channels - medium"},
+            {"value": 384, "name": "width_384", "desc": "384 base channels - medium-large"},
+            {"value": 512, "name": "width_512", "desc": "512 base channels - large model"},
+        ],
+        "conditional_on": None,
+    },
+
+    # GROUP 2: AUGMENTATION STRENGTH - regularization
+    {
+        "group_id": 2,
+        "name": "augmentation",
+        "description": "Data augmentation strength - regularization and generalization",
+        "parameter": "aug_strength",
+        "variants": [
+            {"value": "medium", "name": "medium_aug", "desc": "Medium augmentation (noise=0.05, shift=25)"},
+            {"value": "strong", "name": "strong_aug", "desc": "Strong augmentation (noise=0.1, shift=50)"},
+            {"value": "very_strong", "name": "very_strong_aug", "desc": "Very strong augmentation (noise=0.15, shift=75)"},
+        ],
+        "conditional_on": None,
+    },
+
+    # GROUP 3: DEPTH - model complexity
+    {
+        "group_id": 3,
+        "name": "depth",
+        "description": "Model depth (n_downsample) - complexity vs efficiency trade-off",
+        "parameter": "n_downsample",
+        "variants": [
+            {"value": 2, "name": "depth_2", "desc": "2 downsample blocks - shallow"},
+            {"value": 3, "name": "depth_3", "desc": "3 downsample blocks - medium"},
+            {"value": 4, "name": "depth_4", "desc": "4 downsample blocks - deep"},
+            {"value": 5, "name": "depth_5", "desc": "5 downsample blocks - very deep"},
+        ],
+        "conditional_on": None,
+    },
+
+    # GROUP 4: BIDIRECTIONAL - confirm winner
+    {
+        "group_id": 4,
+        "name": "bidirectional",
+        "description": "Bidirectional processing - confirm always on is optimal",
+        "parameter": "bidirectional",
+        "variants": [
+            {"value": True, "name": "bidirectional_on", "desc": "Bidirectional processing enabled"},
+        ],
+        "conditional_on": None,
+    },
+
+    # GROUP 5: BATCH SIZE - training dynamics
+    {
+        "group_id": 5,
+        "name": "batch_size",
+        "description": "Batch size - affects gradient noise and memory usage",
+        "parameter": "batch_size",
+        "variants": [
+            {"value": 8, "name": "batch_8", "desc": "Batch size 8 - more gradient noise"},
+            {"value": 16, "name": "batch_16", "desc": "Batch size 16 - balanced"},
+            {"value": 32, "name": "batch_32", "desc": "Batch size 32 - less noise"},
+            {"value": 64, "name": "batch_64", "desc": "Batch size 64 - smooth gradients"},
+        ],
+        "conditional_on": None,
+    },
+
+    # GROUP 6: LOSS TYPE - L1 vs wavelet-enhanced
+    {
+        "group_id": 6,
+        "name": "loss_type",
+        "description": "Loss function - L1 alone vs L1+wavelet for multi-scale learning",
+        "parameter": "loss_type",
+        "variants": [
+            {"value": "l1", "name": "l1_only", "desc": "Pure L1 loss - simple, robust"},
+            {"value": "l1_wavelet", "name": "l1_wavelet", "desc": "L1 + wavelet loss - multi-scale frequency learning"},
+        ],
+        "conditional_on": None,
+    },
+]
+
+# Stage 2 defaults - starting point for Stage 2 (should load from Stage 1 results)
+# These are placeholder defaults; actual values come from Stage 1 optimal config
+STAGE2_GREEDY_DEFAULTS: Dict[str, Any] = {
+    # These will be overridden by Stage 1 winners when running Stage 2
+    "conv_type": "standard",
+    "n_downsample": 2,
+    "base_channels": 64,
+    "attention_type": "basic",
+    "n_heads": 4,
+    "cond_mode": "film",
+    "use_odor_embedding": True,
+    "loss_type": "l1",
+    "use_augmentation": True,
+    "aug_strength": "medium",
+    "bidirectional": True,
+    "cycle_lambda": 0.5,
+    "norm_type": "batch",
+    "skip_type": "add",
+    "activation": "relu",
+    "dropout": 0.0,
+    "optimizer": "adamw",
+    "lr_schedule": "cosine",
+    "weight_decay": 1e-4,
+    "use_session_stats": False,
+    "session_emb_dim": 32,
+    "session_use_spectral": False,
+    "use_adaptive_scaling": False,
+    "use_cov_augment": False,
+    "cov_augment_prob": 0.5,
+    "use_session_embedding": False,
+    "use_adabn": False,
+    # Stage 2 specific - batch_size is special (handled by TrainingConfig)
+    "batch_size": 16,
+}
+
+def _count_stage2_runs() -> int:
+    """Count total runs for Stage 2 greedy selection."""
+    total = 0
+    for group in STAGE2_GREEDY_GROUPS:
+        total += len(group["variants"])
+    return total
+
+STAGE2_TOTAL_RUNS = _count_stage2_runs()  # 17 runs
 
 # Calculate total runs
 def _count_greedy_runs() -> int:
@@ -830,9 +825,10 @@ class AblationConfig:
     session_emb_dim: int = 32  # Session statistics embedding dimension
     session_use_spectral: bool = False  # Include spectral features in session stats
     use_adaptive_scaling: bool = False  # Session-adaptive output scaling (AdaIN style)
-    use_revin: bool = False  # Reversible Instance Normalization
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
+    use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
+    use_adabn: bool = False  # AdaBN: use batch stats at inference (requires norm_type="batch")
 
     # Stage info for additive protocol
     stage: int = -1  # -1 = subtractive protocol
@@ -903,9 +899,10 @@ class AblationConfig:
             "session_emb_dim": self.session_emb_dim,
             "session_use_spectral": self.session_use_spectral,
             "use_adaptive_scaling": self.use_adaptive_scaling,
-            "use_revin": self.use_revin,
             "use_cov_augment": self.use_cov_augment,
             "cov_augment_prob": self.cov_augment_prob,
+            "use_session_embedding": self.use_session_embedding,
+            "use_adabn": self.use_adabn,
         }
 
     @property
@@ -978,19 +975,20 @@ class AblationConfig:
             optimizer=config.get("optimizer", "adamw"),
             lr_schedule=config.get("lr_schedule", "cosine"),
             weight_decay=config.get("weight_decay", 1e-4),
-            # Multi-session validation: 8 train, 4 val, NO test
-            # Winner = best mean R² across all 4 validation sessions
+            # Multi-session validation: 6 train, 3 val, NO test
+            # Winner = best mean R² across all 3 validation sessions
             split_by_session=True,
             n_test_sessions=0,  # No separate test set
-            n_val_sessions=4,   # All held-out sessions for validation
+            n_val_sessions=3,   # All held-out sessions for validation
             # Session adaptation methods
             use_session_stats=config.get("use_session_stats", False),
             session_emb_dim=config.get("session_emb_dim", 32),
             session_use_spectral=config.get("session_use_spectral", False),
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            use_revin=config.get("use_revin", False),
             use_cov_augment=config.get("use_cov_augment", False),
             cov_augment_prob=config.get("cov_augment_prob", 0.5),
+            use_session_embedding=config.get("use_session_embedding", False),
+            use_adabn=config.get("use_adabn", False),
         )
 
     @classmethod
@@ -1071,17 +1069,18 @@ class TrainingConfig:
 class Phase3Config:
     """Configuration for Phase 3 ablation studies.
 
-    Supports three protocols:
+    Supports four protocols:
     - ADDITIVE (build-up): Start simple, add components incrementally
     - SUBTRACTIVE (traditional): Start full, remove components
     - GREEDY_FORWARD (recommended): Test groups sequentially, winner propagates
+    - STAGE2_GREEDY: Fine-tuning after Stage 1 (width, aug, depth, batch_size)
     """
 
     # Dataset (Phase 3 uses olfactory only)
     dataset: str = "olfactory"
     sample_rate: float = 1000.0
 
-    # Ablation protocol: "additive", "subtractive", or "greedy_forward" (recommended)
+    # Ablation protocol: "additive", "subtractive", "greedy_forward", or "stage2_greedy"
     protocol: str = "greedy_forward"
 
     # For subtractive protocol: which studies to run
@@ -1092,6 +1091,15 @@ class Phase3Config:
 
     # For greedy_forward protocol: which groups to run (default: all)
     groups: List[int] = field(default_factory=lambda: list(range(1, len(ABLATION_GROUPS) + 1)))
+
+    # For stage2_greedy protocol: which Stage 2 groups to run (default: all)
+    stage2_groups: List[int] = field(default_factory=lambda: list(range(1, len(STAGE2_GREEDY_GROUPS) + 1)))
+
+    # For stage2_greedy: path to Stage 1 results (to load optimal config as baseline)
+    stage1_results_path: Optional[Path] = None
+
+    # For stage2_greedy: manually specified Stage 1 optimal config (overrides stage1_results_path)
+    stage1_optimal_config: Optional[Dict[str, Any]] = None
 
     # Cross-validation settings
     # For greedy_forward: use single split (no CV) following nnU-Net methodology
@@ -1135,7 +1143,7 @@ class Phase3Config:
         if self.protocol not in ABLATION_PROTOCOLS:
             raise ValueError(
                 f"Unknown protocol: {self.protocol}. "
-                f"Use 'additive', 'subtractive', or 'greedy_forward'"
+                f"Use 'additive', 'subtractive', 'greedy_forward', or 'stage2_greedy'"
             )
 
         # Validate studies (for subtractive protocol)
@@ -1153,16 +1161,23 @@ class Phase3Config:
             if group_id < 1 or group_id > len(ABLATION_GROUPS):
                 raise ValueError(f"Invalid group: {group_id}. Valid: 1-{len(ABLATION_GROUPS)}")
 
+        # Validate stage2_groups (for stage2_greedy protocol)
+        for group_id in self.stage2_groups:
+            if group_id < 1 or group_id > len(STAGE2_GREEDY_GROUPS):
+                raise ValueError(f"Invalid stage2 group: {group_id}. Valid: 1-{len(STAGE2_GREEDY_GROUPS)}")
+
     def get_ablation_configs(self) -> List[AblationConfig]:
         """Generate ablation configurations based on selected protocol.
 
-        Note: For greedy_forward, this returns ALL possible configs for planning.
-        The actual execution should use get_greedy_groups() and run sequentially.
+        Note: For greedy_forward/stage2_greedy, this returns ALL possible configs for planning.
+        The actual execution should use get_greedy_groups()/get_stage2_groups() and run sequentially.
         """
         if self.protocol == "additive":
             return self._get_additive_configs()
         elif self.protocol == "greedy_forward":
             return self._get_greedy_configs()
+        elif self.protocol == "stage2_greedy":
+            return self._get_stage2_greedy_configs()
         else:
             return self._get_subtractive_configs()
 
@@ -1202,8 +1217,58 @@ class Phase3Config:
         return configs
 
     def get_greedy_groups(self) -> List[Dict[str, Any]]:
-        """Get ablation groups for greedy_forward protocol."""
-        return [g for g in ABLATION_GROUPS if g["group_id"] in self.groups]
+        """Get ablation groups for greedy_forward protocol, sorted by group_id."""
+        groups = [g for g in ABLATION_GROUPS if g["group_id"] in self.groups]
+        return sorted(groups, key=lambda g: g["group_id"])
+
+    def _get_stage2_greedy_configs(self) -> List[AblationConfig]:
+        """Generate configs for Stage 2 greedy selection protocol."""
+        configs = []
+
+        # Start with Stage 1 optimal config or defaults
+        current_config = self.get_stage2_baseline()
+
+        for group in STAGE2_GREEDY_GROUPS:
+            if group["group_id"] not in self.stage2_groups:
+                continue
+
+            for variant in group["variants"]:
+                config = AblationConfig.from_greedy_group(group, variant, current_config)
+                configs.append(config)
+
+        return configs
+
+    def get_stage2_groups(self) -> List[Dict[str, Any]]:
+        """Get ablation groups for stage2_greedy protocol, sorted by group_id."""
+        groups = [g for g in STAGE2_GREEDY_GROUPS if g["group_id"] in self.stage2_groups]
+        return sorted(groups, key=lambda g: g["group_id"])
+
+    def get_stage2_baseline(self) -> Dict[str, Any]:
+        """Get the baseline config for Stage 2 (from Stage 1 results or defaults).
+
+        Priority:
+        1. stage1_optimal_config (if provided)
+        2. Load from stage1_results_path (if provided)
+        3. STAGE2_GREEDY_DEFAULTS (fallback)
+        """
+        if self.stage1_optimal_config is not None:
+            # Merge with defaults to ensure all keys present
+            baseline = STAGE2_GREEDY_DEFAULTS.copy()
+            baseline.update(self.stage1_optimal_config)
+            return baseline
+
+        if self.stage1_results_path is not None:
+            import json
+            results_path = Path(self.stage1_results_path)
+            if results_path.exists():
+                with open(results_path) as f:
+                    data = json.load(f)
+                if "optimal_config" in data:
+                    baseline = STAGE2_GREEDY_DEFAULTS.copy()
+                    baseline.update(data["optimal_config"])
+                    return baseline
+
+        return STAGE2_GREEDY_DEFAULTS.copy()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1213,6 +1278,8 @@ class Phase3Config:
             "studies": self.studies,
             "stages": self.stages,
             "groups": self.groups,
+            "stage2_groups": self.stage2_groups,
+            "stage1_results_path": str(self.stage1_results_path) if self.stage1_results_path else None,
             "n_folds": self.n_folds,
             "cv_seed": self.cv_seed,
             "training": self.training.to_dict(),
@@ -1232,6 +1299,13 @@ class Phase3Config:
             total = 0
             for group in ABLATION_GROUPS:
                 if group["group_id"] in self.groups:
+                    total += len(group["variants"])
+            return total
+        elif self.protocol == "stage2_greedy":
+            # Sum of variants in selected Stage 2 groups (single split, no CV)
+            total = 0
+            for group in STAGE2_GREEDY_GROUPS:
+                if group["group_id"] in self.stage2_groups:
                     total += len(group["variants"])
             return total
         else:
@@ -1307,6 +1381,22 @@ def print_protocol_summary(protocol: str = "greedy_forward"):
             print(f"{group['group_id']:<6}{group['name']:<18}{len(group['variants']):<8}{cond_str:<20}")
         print("-" * 70)
         print(f"Total runs (worst case): {GREEDY_TOTAL_RUNS}")
+        print("Single split: No cross-validation during ablation (per nnU-Net)")
+    elif protocol == "stage2_greedy":
+        print("\nSTAGE 2 GREEDY SELECTION (Fine-tuning after Stage 1)")
+        print("Explores scaling/regularization after architecture is fixed")
+        print("-" * 70)
+        print("Methodology:")
+        print("  1. Load optimal config from Stage 1 results")
+        print("  2. Test width, augmentation, depth, batch_size variants")
+        print("  3. Winner propagates to next group")
+        print("-" * 70)
+        print(f"{'Group':<6}{'Name':<18}{'Variants':<8}{'Parameter':<20}")
+        print("-" * 70)
+        for group in STAGE2_GREEDY_GROUPS:
+            print(f"{group['group_id']:<6}{group['name']:<18}{len(group['variants']):<8}{group['parameter']:<20}")
+        print("-" * 70)
+        print(f"Total runs: {STAGE2_TOTAL_RUNS}")
         print("Single split: No cross-validation during ablation (per nnU-Net)")
     elif protocol == "additive":
         print("\nINCREMENTAL COMPONENT ANALYSIS (Build-Up Approach)")
