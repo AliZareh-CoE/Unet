@@ -13,21 +13,21 @@ from datetime import datetime
 def combine_results(results_dir: Path = Path("results/phase3")):
     """Combine all Phase 3 JSON results into a single summary."""
 
-    # Find all JSON files
-    json_files = sorted(results_dir.glob("*.json"))
+    # Find all JSON files (including in subdirectories like train_results/)
+    json_files = sorted(results_dir.glob("**/*.json"))
 
     if not json_files:
-        print(f"No JSON files found in {results_dir}")
+        print(f"No JSON files found in {results_dir} or subdirectories")
         return None
 
     print(f"Found {len(json_files)} JSON files:")
     for f in json_files:
-        print(f"  - {f.name}")
+        print(f"  - {f.relative_to(results_dir)}")
 
     # Combined result structure
     combined = {
         "generated_at": datetime.now().isoformat(),
-        "source_files": [f.name for f in json_files],
+        "source_files": [str(f.relative_to(results_dir)) for f in json_files],
         "group_results": {},
         "optimal_config": {},
         "winner_summary": [],
