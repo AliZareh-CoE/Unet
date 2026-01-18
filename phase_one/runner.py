@@ -784,6 +784,158 @@ def evaluate_baseline_cross_subject(
     return result, predictions, model, per_session_r2
 
 
+def run_session_cv(
+    config: Phase1Config,
+    n_folds: int = 3,
+) -> None:
+    """Run K-fold session-based cross-validation to investigate variance.
+
+    With 9 sessions, splits into 3 folds of 3 sessions each.
+    Each fold: train on 6 sessions, evaluate on 3 held-out sessions.
+
+    Args:
+        config: Configuration object
+        n_folds: Number of folds (default 3 for 9 sessions)
+    """
+    from data import prepare_data, load_session_ids, ODOR_CSV_PATH
+    from sklearn.metrics import r2_score
+
+    print("\n" + "=" * 70)
+    print("SESSION-BASED CROSS-VALIDATION INVESTIGATION")
+    print("=" * 70)
+
+    # Load data without splitting - we'll do our own splits
+    print("Loading full dataset...")
+    data = prepare_data(
+        split_by_session=False,
+        force_recreate_splits=True,
+    )
+
+    X = data["ob"]
+    y = data["pcx"]
+    odors = data["odors"]
+
+    # Get session IDs
+    session_ids, session_to_idx, idx_to_session = load_session_ids(
+        ODOR_CSV_PATH, num_trials=len(odors)
+    )
+
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+    print(f"Total sessions: {n_sessions}")
+    print(f"Sessions: {[idx_to_session[s] for s in unique_sessions]}")
+
+    # Shuffle sessions
+    rng = np.random.default_rng(config.seed)
+    shuffled_sessions = unique_sessions.copy()
+    rng.shuffle(shuffled_sessions)
+
+    # Split into folds
+    sessions_per_fold = n_sessions // n_folds
+    print(f"\nSplitting {n_sessions} sessions into {n_folds} folds ({sessions_per_fold} sessions each)")
+
+    fold_sessions = []
+    for i in range(n_folds):
+        start = i * sessions_per_fold
+        end = start + sessions_per_fold if i < n_folds - 1 else n_sessions
+        fold_sessions.append(shuffled_sessions[start:end])
+        sess_names = [idx_to_session[s] for s in fold_sessions[i]]
+        print(f"  Fold {i+1}: {sess_names}")
+
+    # Results storage
+    all_fold_results = {method: [] for method in config.baselines}
+    all_session_results = {method: {} for method in config.baselines}
+
+    print("\n" + "-" * 70)
+
+    # Run each fold
+    for fold_idx in range(n_folds):
+        val_session_set = set(fold_sessions[fold_idx].tolist())
+        train_session_set = set(shuffled_sessions.tolist()) - val_session_set
+
+        # Create indices
+        all_indices = np.arange(len(session_ids))
+        train_idx = all_indices[np.isin(session_ids, list(train_session_set))]
+        val_idx = all_indices[np.isin(session_ids, list(val_session_set))]
+
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+
+        val_sess_names = [idx_to_session[s] for s in fold_sessions[fold_idx]]
+        print(f"\nFOLD {fold_idx + 1}: Val sessions = {val_sess_names}")
+        print(f"  Train: {len(train_idx)} samples, Val: {len(val_idx)} samples")
+
+        # Evaluate each baseline
+        for baseline_name in config.baselines:
+            try:
+                model = create_baseline(baseline_name)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
+
+                # Overall R²
+                r2 = r2_score(y_val.flatten(), y_pred.flatten())
+                all_fold_results[baseline_name].append(r2)
+
+                # Per-session R² within this fold
+                for sess_id in fold_sessions[fold_idx]:
+                    sess_name = idx_to_session[sess_id]
+                    sess_mask = session_ids[val_idx] == sess_id
+                    y_sess = y_val[sess_mask]
+                    y_pred_sess = y_pred[sess_mask]
+                    r2_sess = r2_score(y_sess.flatten(), y_pred_sess.flatten())
+
+                    if sess_name not in all_session_results[baseline_name]:
+                        all_session_results[baseline_name][sess_name] = r2_sess
+
+                print(f"  {baseline_name}: R² = {r2:.4f}")
+
+            except Exception as e:
+                print(f"  {baseline_name}: FAILED - {e}")
+                all_fold_results[baseline_name].append(np.nan)
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("SESSION-CV RESULTS SUMMARY")
+    print("=" * 70)
+
+    print("\nPer-Fold R² Values:")
+    print("-" * 70)
+    header = f"{'Method':<18}" + "".join(f"{'Fold '+str(i+1):>12}" for i in range(n_folds)) + f"{'Mean':>12}{'Std':>12}"
+    print(header)
+    print("-" * len(header))
+
+    for method in config.baselines:
+        fold_vals = all_fold_results[method]
+        vals_str = "".join(f"{v:>12.4f}" for v in fold_vals)
+        mean_val = np.nanmean(fold_vals)
+        std_val = np.nanstd(fold_vals)
+        print(f"{method:<18}{vals_str}{mean_val:>12.4f}{std_val:>12.4f}")
+
+    print("\nPer-Session R² Values:")
+    print("-" * 70)
+    all_sessions_sorted = sorted(all_session_results[config.baselines[0]].keys())
+    header = f"{'Method':<18}" + "".join(f"{s:>12}" for s in all_sessions_sorted) + f"{'Mean':>12}"
+    print(header)
+    print("-" * len(header))
+
+    for method in config.baselines:
+        sess_vals = [all_session_results[method].get(s, np.nan) for s in all_sessions_sorted]
+        vals_str = "".join(f"{v:>12.4f}" for v in sess_vals)
+        mean_val = np.nanmean(sess_vals)
+        print(f"{method:<18}{vals_str}{mean_val:>12.4f}")
+
+    # Show which sessions have highest/lowest R²
+    print("\nSession Difficulty Analysis (using first method):")
+    method = config.baselines[0]
+    sess_r2 = all_session_results[method]
+    sorted_sessions = sorted(sess_r2.items(), key=lambda x: x[1], reverse=True)
+    print(f"  Easiest session: {sorted_sessions[0][0]} (R² = {sorted_sessions[0][1]:.4f})")
+    print(f"  Hardest session: {sorted_sessions[-1][0]} (R² = {sorted_sessions[-1][1]:.4f})")
+    print(f"  Range: {sorted_sessions[0][1] - sorted_sessions[-1][1]:.4f}")
+
+    print("\n" + "=" * 70)
+
+
 # =============================================================================
 # Main Runner
 # =============================================================================
@@ -1146,6 +1298,11 @@ Examples:
         action="store_true",
         help="Use within-subject K-fold CV (old mode) instead of cross-subject session-based split",
     )
+    parser.add_argument(
+        "--session-cv",
+        action="store_true",
+        help="Run 3-fold session-based CV (9 sessions split into 3 groups of 3)",
+    )
 
     args = parser.parse_args()
 
@@ -1209,6 +1366,12 @@ Examples:
         output_dir=Path(args.output),
         baselines=baselines,
     )
+
+    # Handle session-CV mode (investigation mode)
+    if args.session_cv:
+        run_session_cv(config, n_folds=3)
+        print("\nSession-CV investigation complete!")
+        return None
 
     # Load data
     val_idx_per_session = None  # For per-session R² reporting
