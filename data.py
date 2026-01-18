@@ -735,6 +735,7 @@ def load_or_create_stratified_splits(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     force_balanced: bool = True,
+    force_recreate: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Create or load stratified train/val/test splits.
 
@@ -747,13 +748,19 @@ def load_or_create_stratified_splits(
         val_ratio: Fraction of data for validation (default: 0.15)
         force_balanced: If True, ensures EQUAL samples per odor in each split.
                        If False, uses proportional stratification.
+        force_recreate: If True, recreate splits even if they exist on disk.
     """
-    # Check if splits already exist
-    if TRAIN_SPLIT_PATH.exists() and VAL_SPLIT_PATH.exists() and TEST_SPLIT_PATH.exists():
+    # Check if splits already exist (skip if force_recreate)
+    if not force_recreate and TRAIN_SPLIT_PATH.exists() and VAL_SPLIT_PATH.exists() and TEST_SPLIT_PATH.exists():
         train_idx = np.load(TRAIN_SPLIT_PATH)
         val_idx = np.load(VAL_SPLIT_PATH)
         test_idx = np.load(TEST_SPLIT_PATH)
-        return train_idx, val_idx, test_idx
+        # Validate indices don't exceed data size
+        max_idx = len(odors) - 1
+        if train_idx.max() > max_idx or val_idx.max() > max_idx or test_idx.max() > max_idx:
+            print(f"WARNING: Cached stratified splits have indices exceeding data size. Recreating...")
+        else:
+            return train_idx, val_idx, test_idx
 
     rng = np.random.default_rng(seed)
     total_trials = odors.shape[0]
@@ -1545,7 +1552,9 @@ def prepare_data(
         )
     else:
         # Random stratified splits (original behavior)
-        train_idx, val_idx, test_idx = load_or_create_stratified_splits(odors, seed)
+        train_idx, val_idx, test_idx = load_or_create_stratified_splits(
+            odors, seed, force_recreate=force_recreate_splits
+        )
 
     # Compute normalization from training set ONLY
     norm_stats = compute_normalization(windowed, train_idx)
