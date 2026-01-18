@@ -1050,8 +1050,14 @@ def _run_greedy_forward_protocol(
             # Restore winner to current config
             if str(group_id) in group_winners:
                 winner = group_winners[str(group_id)]
-                current_config[group["parameter"]] = winner["config"][group["parameter"]]
-                if "aug_strength" in winner["config"]:
+                param = group["parameter"]
+                # Handle both single-param and multi-param groups
+                if param in winner.get("config", {}):
+                    current_config[param] = winner["config"][param]
+                elif "value" in winner:
+                    # Fallback: use the stored winner value directly
+                    current_config[param] = winner["value"]
+                if "aug_strength" in winner.get("config", {}):
                     current_config["aug_strength"] = winner["config"]["aug_strength"]
             print(f"\n[Group {group_id}] {group_name} - SKIPPED (already completed)")
             continue
