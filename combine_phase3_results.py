@@ -25,7 +25,7 @@ def get_group_name(group_id: int) -> str:
     """Get group name from ABLATION_GROUPS config."""
     for group in ABLATION_GROUPS:
         if group["group_id"] == group_id:
-            return group["study"]
+            return group["name"]
     return f"group_{group_id}"
 
 
@@ -34,16 +34,18 @@ def parse_result_filename(filename: str) -> Optional[Dict[str, Any]]:
 
     Expected formats:
     - g{group_id}_{variant}_results.json (e.g., g1_batch_norm_results.json)
+    - g{group_id}_{variant}_results-checkpoint.json (checkpoint files)
     - {study}_{variant}_fold{fold}_results.json (e.g., normalization_batch_norm_fold0_results.json)
     - baseline_full_fold{fold}_results.json (e.g., baseline_full_fold0_results.json)
     """
-    # Format: g{group_id}_{variant}_results.json
-    match = re.match(r'g(\d+)_(.+)_results\.json', filename)
+    # Format: g{group_id}_{variant}_results.json or g{group_id}_{variant}_results-checkpoint.json
+    match = re.match(r'g(\d+)_(.+)_results(?:-checkpoint)?\.json', filename)
     if match:
         return {
             "group_id": int(match.group(1)),
             "variant": match.group(2),
-            "fold": None
+            "fold": None,
+            "is_checkpoint": "-checkpoint" in filename
         }
 
     # Format: {study}_{variant}_fold{fold}_results.json
@@ -56,7 +58,7 @@ def parse_result_filename(filename: str) -> Optional[Dict[str, Any]]:
         # Look up group_id from study name
         group_id = None
         for group in ABLATION_GROUPS:
-            if group["study"] == study:
+            if group["name"] == study:
                 group_id = group["group_id"]
                 break
 
@@ -140,6 +142,7 @@ def combine_results(results_dir: Path = Path("results/phase3")):
             group_id = parsed.get("group_id")
             variant = parsed.get("variant")
             fold = parsed.get("fold")
+            is_checkpoint = parsed.get("is_checkpoint", False)
 
             if group_id is None:
                 print(f"  Warning: Unknown group for {json_file.name}")
@@ -151,6 +154,7 @@ def combine_results(results_dir: Path = Path("results/phase3")):
                 "group_id": group_id,
                 "variant": variant,
                 "fold": fold,
+                "is_checkpoint": is_checkpoint,
                 "best_val_r2": data.get("best_val_r2", 0),
                 "best_val_mae": data.get("best_val_mae", 0),
                 "best_val_corr": data.get("best_val_corr", 0),
@@ -164,11 +168,26 @@ def combine_results(results_dir: Path = Path("results/phase3")):
             combined["raw_results"].append(result_entry)
 
             # Aggregate by group and variant
+            # Use (group_id, variant) as key, prefer final results over checkpoints
             if group_id not in group_variants:
                 group_variants[group_id] = {}
             if variant not in group_variants[group_id]:
                 group_variants[group_id][variant] = []
-            group_variants[group_id][variant].append(result_entry)
+
+            # Check if we already have a result for this variant
+            existing = group_variants[group_id][variant]
+            if existing:
+                # If existing is checkpoint and new is final, replace
+                if existing[0].get("is_checkpoint", False) and not is_checkpoint:
+                    group_variants[group_id][variant] = [result_entry]
+                # If existing is final and new is checkpoint, skip
+                elif not existing[0].get("is_checkpoint", False) and is_checkpoint:
+                    continue
+                else:
+                    # Both same type (both final or both checkpoint), append for fold averaging
+                    group_variants[group_id][variant].append(result_entry)
+            else:
+                group_variants[group_id][variant].append(result_entry)
 
         except Exception as e:
             print(f"  Warning: Could not load {json_file.name}: {e}")
