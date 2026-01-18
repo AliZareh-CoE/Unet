@@ -928,6 +928,12 @@ def run_phase3(
         print(f"Groups: {config.groups} ({len(config.groups)} groups)")
         print(f"Evaluation: Single split (no CV) - per nnU-Net methodology")
         print(f"Min improvement threshold: {min_improvement:.2%} R² (prevents trivial gains)")
+    elif config.protocol == "stage2_greedy":
+        print(f"Stage 2 Groups: {config.stage2_groups} ({len(config.stage2_groups)} groups)")
+        print(f"Baseline: Stage 1 optimal config")
+        print(f"Focus: width, augmentation, depth, batch_size fine-tuning")
+        print(f"Evaluation: Single split (no CV) - per nnU-Net methodology")
+        print(f"Min improvement threshold: {min_improvement:.2%} R² (prevents trivial gains)")
     elif config.protocol == "additive":
         print(f"Stages: {config.stages} ({len(config.stages)} stages)")
         print(f"Cross-validation: {config.n_folds} folds")
@@ -945,6 +951,8 @@ def run_phase3(
     try:
         if config.protocol == "greedy_forward":
             result = _run_greedy_forward_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, no_skip_conditional, start_variant)
+        elif config.protocol == "stage2_greedy":
+            result = _run_stage2_greedy_protocol(config, use_train_py, use_fsdp, fsdp_strategy, min_improvement, start_variant)
         elif config.protocol == "additive":
             result = _run_additive_protocol(config, use_train_py, use_fsdp, fsdp_strategy)
         else:
@@ -1270,6 +1278,310 @@ def _run_greedy_forward_protocol(
 
     # Save results
     output_path = config.output_dir / "phase3_results.json"
+    phase3_result.save(output_path)
+
+    return phase3_result
+
+
+def _run_stage2_greedy_protocol(
+    config: Phase3Config,
+    use_train_py: bool = False,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    min_improvement: float = 0.01,
+    start_variant: Optional[str] = None,
+) -> Phase3Result:
+    """Run STAGE 2 GREEDY SELECTION protocol.
+
+    Fine-tunes scaling and regularization parameters after Stage 1 greedy forward
+    selection has identified the optimal architecture/training choices.
+
+    Groups:
+    - Width (base_channels): 128, 192, 256, 384, 512
+    - Augmentation strength: medium, strong, very_strong
+    - Depth (n_downsample): 2, 3, 4, 5
+    - Bidirectional: True (confirm)
+    - Batch size: 8, 16, 32, 64
+
+    Args:
+        config: Phase3Config with stage2_groups and stage1_results_path/stage1_optimal_config
+        use_train_py: Use train.py subprocess for FSDP support
+        use_fsdp: Enable FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+        min_improvement: Minimum R² improvement required to adopt new variant
+        start_variant: Skip variants before this one (by name) in each group
+    """
+    from phase_three.config import STAGE2_GREEDY_GROUPS, STAGE2_GREEDY_DEFAULTS
+
+    # Setup checkpoint for resume capability
+    checkpoint_path = config.output_dir / "stage2_checkpoint.pkl"
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Try to load checkpoint for resume
+    checkpoint = load_checkpoint(checkpoint_path)
+    if checkpoint is not None:
+        all_results, _, completed_groups, _ = reconstruct_from_checkpoint(checkpoint)
+        current_config = checkpoint.get("current_config", config.get_stage2_baseline())
+        group_winners = checkpoint.get("group_winners", {})
+        print(f"Resuming Stage 2 from checkpoint: {len(completed_groups)} groups completed")
+    else:
+        all_results = []
+        completed_groups = set()
+        # Use Stage 1 optimal config as baseline
+        current_config = config.get_stage2_baseline()
+        group_winners = {}
+
+    print("\n" + "=" * 60)
+    print("STAGE 2 GREEDY SELECTION - BASELINE CONFIG")
+    print("(from Stage 1 results or defaults)")
+    print("=" * 60)
+    for key, value in sorted(current_config.items()):
+        print(f"  {key}: {value}")
+    print("=" * 60)
+
+    # Load raw data
+    X, y, odor_ids, session_ids, in_channels, out_channels, n_sessions, train_idx, val_idx = load_dataset_raw(config.dataset)
+    current_config["n_sessions"] = n_sessions
+    print(f"Session-based split: {len(train_idx)} train, {len(val_idx)} val samples")
+
+    # Get Stage 2 groups to run
+    groups = config.get_stage2_groups()
+    run_count = 0
+    skipped_groups = 0
+
+    for group in groups:
+        group_id = group["group_id"]
+        group_name = group["name"]
+        param = group["parameter"]
+
+        # Check if already completed
+        if str(group_id) in completed_groups or group_id in completed_groups:
+            skipped_groups += 1
+            # Restore winner to current config
+            if str(group_id) in group_winners:
+                winner = group_winners[str(group_id)]
+                if param == "batch_size":
+                    # batch_size is in training config, not model config
+                    config.training.batch_size = winner["value"]
+                else:
+                    current_config[param] = winner["value"]
+            print(f"\n[Stage2 Group {group_id}] {group_name} - SKIPPED (already completed)")
+            continue
+
+        print(f"\n{'=' * 60}")
+        print(f"STAGE 2 GROUP {group_id}: {group['description']}")
+        print(f"Parameter: {param}")
+        print(f"Variants: {len(group['variants'])}")
+        print(f"{'=' * 60}")
+
+        group_results = []
+
+        # Handle --start-variant
+        skip_until_found = start_variant is not None
+        for variant in group["variants"]:
+            variant_name = variant["name"]
+
+            if skip_until_found:
+                if variant_name == start_variant:
+                    skip_until_found = False
+                    print(f"\n  [SKIP] Jumping to variant: {variant_name}")
+                else:
+                    print(f"\n  [SKIP] {variant_name} (--start-variant={start_variant})")
+                    continue
+
+            run_count += 1
+
+            # Create config for this variant
+            # For batch_size, we need to handle it specially
+            if param == "batch_size":
+                # Apply batch_size to training config
+                effective_batch_size = variant["value"]
+                ablation_config = AblationConfig.from_greedy_group(group, variant, current_config)
+            else:
+                ablation_config = AblationConfig.from_greedy_group(group, variant, current_config)
+                effective_batch_size = config.training.batch_size
+
+            if use_train_py:
+                fold_indices_file = save_fold_indices(
+                    config.output_dir, f"s2g{group_id}", variant_name, 0, train_idx, val_idx
+                )
+                output_results_file = config.output_dir / "train_results" / f"s2g{group_id}_{variant_name}_results.json"
+                output_results_file.parent.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n  [{group_name}] {variant_name}: {variant['desc']}")
+                print(f"    Running train.py subprocess...")
+
+                train_results = run_train_subprocess(
+                    study=f"s2g{group_id}",
+                    variant=variant_name,
+                    fold_idx=0,
+                    fold_indices_file=fold_indices_file,
+                    output_results_file=output_results_file,
+                    ablation_config=ablation_config,
+                    epochs=config.training.epochs,
+                    batch_size=effective_batch_size,
+                    use_fsdp=use_fsdp,
+                    fsdp_strategy=fsdp_strategy,
+                    seed=config.cv_seed,
+                    verbose=True,
+                    n_sessions=current_config.get("n_sessions", 0),
+                )
+
+                if train_results is not None:
+                    result = AblationResult(
+                        study=f"stage2_group{group_id}_{group_name}",
+                        variant=variant_name,
+                        fold=0,
+                        best_r2=train_results.get("best_val_r2", 0.0),
+                        best_loss=train_results.get("best_val_loss", 0.0),
+                        train_losses=train_results.get("train_losses", []),
+                        val_losses=train_results.get("val_losses", []),
+                        val_r2s=train_results.get("val_r2s", []),
+                        n_parameters=train_results.get("n_parameters", 0),
+                        epochs_trained=train_results.get("epochs_trained", 0),
+                        total_time=train_results.get("total_time", 0.0),
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    R²: {result.best_r2:.4f}")
+                else:
+                    result = AblationResult(
+                        study=f"stage2_group{group_id}_{group_name}",
+                        variant=variant_name,
+                        fold=0,
+                        best_r2=0.0,
+                        best_loss=float('inf'),
+                        train_losses=[],
+                        val_losses=[],
+                        val_r2s=[],
+                        n_parameters=0,
+                        epochs_trained=0,
+                        total_time=0.0,
+                        config=ablation_config.to_dict(),
+                    )
+                    print(f"    FAILED")
+            else:
+                # Use internal trainer
+                train_loader, val_loader = create_dataloaders_from_indices(
+                    X, y, odor_ids, session_ids, train_idx, val_idx,
+                    batch_size=effective_batch_size,
+                    n_workers=config.n_workers,
+                )
+
+                result = run_single_ablation(
+                    ablation_config=ablation_config,
+                    training_config=config.training,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    fold=0,
+                    cv_seed=config.cv_seed,
+                    device=config.device,
+                    checkpoint_dir=config.checkpoint_dir / f"s2g{group_id}" / variant_name,
+                    verbose=config.verbose,
+                )
+                print(f"    R²: {result.best_r2:.4f}")
+
+            all_results.append(result)
+            group_results.append((variant, result))
+
+        # Determine winner with minimum improvement threshold
+        baseline_value = current_config.get(param) if param != "batch_size" else config.training.batch_size
+
+        # Find baseline variant result
+        baseline_variant = None
+        baseline_result = None
+        for v, r in group_results:
+            if v["value"] == baseline_value:
+                baseline_variant = v
+                baseline_result = r
+                break
+
+        if baseline_result is None:
+            baseline_variant, baseline_result = group_results[0]
+
+        # Find best performing variant
+        best_variant, best_result = max(group_results, key=lambda x: x[1].best_r2)
+
+        improvement = best_result.best_r2 - baseline_result.best_r2
+
+        if best_variant["value"] == baseline_value:
+            winner_variant, winner_result = baseline_variant, baseline_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) - baseline remains best ***")
+        elif improvement >= min_improvement:
+            winner_variant, winner_result = best_variant, best_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) ***")
+            print(f"      Improvement over baseline: +{improvement:.4f} (threshold: {min_improvement:.4f}) ✓")
+        else:
+            winner_variant, winner_result = baseline_variant, baseline_result
+            print(f"\n  *** WINNER: {winner_variant['name']} (R² = {winner_result.best_r2:.4f}) - keeping baseline ***")
+            print(f"      Best candidate: {best_variant['name']} (R² = {best_result.best_r2:.4f})")
+            print(f"      Improvement: +{improvement:.4f} < threshold {min_improvement:.4f} - NOT significant")
+
+        winner_value = winner_variant["value"]
+
+        # Update current config with winner
+        if param == "batch_size":
+            config.training.batch_size = winner_value
+        else:
+            current_config[param] = winner_value
+
+        # Store winner info
+        group_winners[str(group_id)] = {
+            "variant": winner_variant["name"],
+            "value": winner_value,
+            "r2": winner_result.best_r2,
+            "config": winner_result.config,
+        }
+
+        # Mark group as completed and save checkpoint
+        completed_groups.add(str(group_id))
+        _save_greedy_checkpoint(
+            checkpoint_path, all_results, completed_groups,
+            current_config, group_winners
+        )
+        print(f"Checkpoint saved ({len(completed_groups)}/{len(groups)} groups completed)")
+
+    if skipped_groups > 0:
+        print(f"\n*** Resumed run: skipped {skipped_groups} already-completed groups ***")
+
+    # Print final configuration
+    print("\n" + "=" * 60)
+    print("STAGE 2 FINAL OPTIMAL CONFIGURATION")
+    print("=" * 60)
+    for group in groups:
+        param = group["parameter"]
+        if param == "batch_size":
+            value = config.training.batch_size
+        else:
+            value = current_config.get(param)
+        winner_info = group_winners.get(str(group["group_id"]), {})
+        r2 = winner_info.get("r2", "N/A")
+        r2_str = f"{r2:.4f}" if isinstance(r2, float) else r2
+        print(f"  {param:<20}: {value} (R² = {r2_str})")
+    print("=" * 60)
+
+    # Aggregate results
+    aggregated = aggregate_results(all_results)
+
+    # Compute statistics
+    comprehensive_stats = _compute_greedy_stats(all_results, groups, group_winners)
+
+    # Create final result
+    phase3_result = Phase3Result(
+        results=all_results,
+        aggregated=aggregated,
+        baseline_r2=0.0,
+        optimal_config=current_config,
+        config=config.to_dict(),
+        comprehensive_stats=comprehensive_stats,
+    )
+
+    # Print summary
+    _print_greedy_summary(phase3_result, groups, group_winners)
+
+    # Save results
+    output_path = config.output_dir / "stage2_results.json"
     phase3_result.save(output_path)
 
     return phase3_result
@@ -2142,8 +2454,8 @@ def main():
         "--protocol",
         type=str,
         default="greedy_forward",
-        choices=["additive", "subtractive", "greedy_forward"],
-        help="Ablation protocol: 'greedy_forward' (recommended), 'additive', or 'subtractive'",
+        choices=["additive", "subtractive", "greedy_forward", "stage2_greedy"],
+        help="Ablation protocol: 'greedy_forward' (recommended), 'stage2_greedy' (after stage1), 'additive', or 'subtractive'",
     )
 
     # Studies to run (for subtractive protocol)
@@ -2170,7 +2482,24 @@ def main():
         type=int,
         nargs="+",
         default=None,
-        help="Groups to run for greedy_forward protocol (1-17, default: all)",
+        help="Groups to run for greedy_forward protocol (1-18, default: all)",
+    )
+
+    # Stage 2 groups to run (for stage2_greedy protocol)
+    parser.add_argument(
+        "--stage2-groups",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Groups to run for stage2_greedy protocol (1-5, default: all)",
+    )
+
+    # Stage 1 results path (for stage2_greedy protocol)
+    parser.add_argument(
+        "--stage1-results",
+        type=str,
+        default=None,
+        help="Path to Stage 1 results JSON (for stage2_greedy baseline config)",
     )
 
     # Training
@@ -2335,21 +2664,36 @@ def main():
 
     # Handle protocol-specific options
     # --fast runs ALL groups/stages but with 1 epoch (quick full validation)
+    from phase_three.config import STAGE2_GREEDY_GROUPS
+
     if args.protocol == "greedy_forward":
         groups = args.groups if args.groups else list(range(1, len(ABLATION_GROUPS) + 1))
+        stage2_groups = list(range(1, len(STAGE2_GREEDY_GROUPS) + 1))  # Not used
         stages = list(range(len(INCREMENTAL_STAGES)))  # Not used
         studies = list(ABLATION_STUDIES.keys())  # Not used
         n_folds = 1  # Single split for greedy_forward (per nnU-Net)
+        stage1_results_path = None
+    elif args.protocol == "stage2_greedy":
+        stage2_groups = args.stage2_groups if args.stage2_groups else list(range(1, len(STAGE2_GREEDY_GROUPS) + 1))
+        groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
+        stages = list(range(len(INCREMENTAL_STAGES)))  # Not used
+        studies = list(ABLATION_STUDIES.keys())  # Not used
+        n_folds = 1  # Single split for stage2_greedy (per nnU-Net)
+        stage1_results_path = Path(args.stage1_results) if args.stage1_results else None
     elif args.protocol == "additive":
         stages = args.stages if args.stages else list(range(len(INCREMENTAL_STAGES)))
         studies = list(ABLATION_STUDIES.keys())  # Not used in additive, but required
         groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
+        stage2_groups = list(range(1, len(STAGE2_GREEDY_GROUPS) + 1))  # Not used
         n_folds = 2 if args.dry_run else args.n_folds
+        stage1_results_path = None
     else:
         stages = list(range(len(INCREMENTAL_STAGES)))  # Not used in subtractive
         studies = args.studies or list(ABLATION_STUDIES.keys())
         groups = list(range(1, len(ABLATION_GROUPS) + 1))  # Not used
+        stage2_groups = list(range(1, len(STAGE2_GREEDY_GROUPS) + 1))  # Not used
         n_folds = 2 if args.dry_run else args.n_folds
+        stage1_results_path = None
 
     config = Phase3Config(
         dataset=args.dataset,
@@ -2357,6 +2701,8 @@ def main():
         studies=studies,
         stages=stages,
         groups=groups,
+        stage2_groups=stage2_groups,
+        stage1_results_path=stage1_results_path,
         n_folds=n_folds,
         cv_seed=args.cv_seed,
         training=training_config,

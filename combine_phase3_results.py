@@ -45,7 +45,19 @@ def parse_result_filename(filename: str) -> Optional[Dict[str, Any]]:
             "group_id": int(match.group(1)),
             "variant": match.group(2),
             "fold": None,
-            "is_checkpoint": "-checkpoint" in filename
+            "is_checkpoint": "-checkpoint" in filename,
+            "stage": 1,
+        }
+
+    # Format: s2g{group_id}_{variant}_results.json (Stage 2 greedy)
+    match = re.match(r's2g(\d+)_(.+)_results(?:-checkpoint)?\.json', filename)
+    if match:
+        return {
+            "group_id": int(match.group(1)),
+            "variant": match.group(2),
+            "fold": None,
+            "is_checkpoint": "-checkpoint" in filename,
+            "stage": 2,
         }
 
     # Format: {study}_{variant}_fold{fold}_results.json
