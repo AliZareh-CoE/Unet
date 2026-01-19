@@ -44,6 +44,31 @@ NEURAL_FREQ_BANDS = [
 
 
 # =============================================================================
+# Activation Function Helper
+# =============================================================================
+
+def get_activation(name: str) -> nn.Module:
+    """Get activation function by name.
+
+    Args:
+        name: Activation name - one of: relu, leaky_relu, gelu, silu, mish
+
+    Returns:
+        PyTorch activation module
+    """
+    activations = {
+        "relu": nn.ReLU(inplace=True),
+        "leaky_relu": nn.LeakyReLU(0.2, inplace=True),
+        "gelu": nn.GELU(),
+        "silu": nn.SiLU(inplace=True),
+        "mish": nn.Mish(inplace=True),
+    }
+    if name not in activations:
+        raise ValueError(f"Unknown activation: {name}. Available: {list(activations.keys())}")
+    return activations[name]
+
+
+# =============================================================================
 # Core Building Blocks
 # =============================================================================
 
@@ -2138,6 +2163,10 @@ class CondUNet1D(nn.Module):
         # Requires session IDs at training time. Does NOT generalize to unseen sessions.
         use_session_embedding: bool = False,  # Enable learnable session embedding lookup
         n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
+        # NEW: Ablation-configurable parameters
+        activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
+        n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
+        skip_type: str = "add",  # Skip connection type: add, concat (future: attention, dense)
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2149,6 +2178,10 @@ class CondUNet1D(nn.Module):
         self.use_session_embedding = use_session_embedding
         self.session_emb_dim = session_emb_dim
         self.n_sessions = n_sessions
+        # NEW: Store ablation parameters
+        self.activation_name = activation
+        self.n_heads = n_heads
+        self.skip_type = skip_type
 
         if cond_mode != "none":
             self.embed = nn.Embedding(n_odors, emb_dim)
@@ -2169,7 +2202,7 @@ class CondUNet1D(nn.Module):
             # Project combined embedding (session stats + condition) to emb_dim
             self.session_proj = nn.Sequential(
                 nn.Linear(session_emb_dim + emb_dim, emb_dim),
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(emb_dim, emb_dim),
             )
         else:
@@ -2189,7 +2222,7 @@ class CondUNet1D(nn.Module):
             # Separate projection from session_proj to allow both to be enabled
             self.session_embed_proj = nn.Sequential(
                 nn.Linear(session_emb_dim + emb_dim, emb_dim),
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(emb_dim, emb_dim),
             )
             # NEW: Statistics-based session matcher for generalization to unseen sessions
@@ -2198,7 +2231,7 @@ class CondUNet1D(nn.Module):
             stat_dim = 64  # Dimension of statistics encoding
             self.session_stat_encoder = nn.Sequential(
                 nn.Linear(in_channels * 4, stat_dim),  # 4 stats: mean, std, min, max per channel
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(stat_dim, stat_dim),
             )
             # Attention over session embeddings based on statistics
@@ -2266,13 +2299,13 @@ class CondUNet1D(nn.Module):
         bottleneck_ch = channels[n_downsample]
         mid_layers = [
             nn.Conv1d(bottleneck_ch, bottleneck_ch, kernel_size=3, padding=1),
-            nn.GELU(),
+            get_activation(activation),
         ]
         if use_attention and attention_type != "none":
             mid_layers.append(self._build_attention(bottleneck_ch, attention_type))
         mid_layers.extend([
             nn.Conv1d(bottleneck_ch, bottleneck_ch, kernel_size=3, padding=1),
-            nn.GELU(),
+            get_activation(activation),
         ])
         self.mid = nn.Sequential(*mid_layers)
 
@@ -2401,10 +2434,10 @@ class CondUNet1D(nn.Module):
             return SelfAttention1D(channels)
 
         if attention_type == "cross_freq":
-            return CrossFrequencyCouplingAttention(channels)
+            return CrossFrequencyCouplingAttention(channels, n_heads=self.n_heads)
 
         if attention_type == "cross_freq_v2":
-            return CrossFrequencyCouplingAttentionV2(channels)
+            return CrossFrequencyCouplingAttentionV2(channels, n_heads=self.n_heads)
 
         raise ValueError(f"Unknown attention_type: {attention_type}. Available: none, basic, cross_freq, cross_freq_v2")
 

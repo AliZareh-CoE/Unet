@@ -2406,6 +2406,10 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            # NEW: Ablation-configurable parameters
+            activation=config.get("activation", "relu"),
+            n_heads=config.get("n_heads", 4),
+            skip_type=config.get("skip_type", "add"),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2462,6 +2466,10 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            # NEW: Ablation-configurable parameters (same as forward)
+            activation=config.get("activation", "relu"),
+            n_heads=config.get("n_heads", 4),
+            skip_type=config.get("skip_type", "add"),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -4283,6 +4291,75 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
+
+    # =========================================================================
+    # SAFEGUARD: Validate CLI args were properly applied to config
+    # This catches bugs where CLI args are defined but never used
+    # =========================================================================
+    def validate_cli_args_applied(args, config):
+        """Validate that CLI args were properly applied to config.
+
+        Raises RuntimeError if any critical arg was passed but not applied.
+        This catches bugs like defining --activation but never using it.
+        """
+        errors = []
+        warnings = []
+
+        # Critical training hyperparameters
+        if args.lr is not None and config.get("learning_rate") != args.lr:
+            errors.append(f"--lr={args.lr} but config['learning_rate']={config.get('learning_rate')}")
+        if args.batch_size is not None and config.get("batch_size") != args.batch_size:
+            errors.append(f"--batch-size={args.batch_size} but config['batch_size']={config.get('batch_size')}")
+        if args.epochs is not None and config.get("num_epochs") != args.epochs:
+            errors.append(f"--epochs={args.epochs} but config['num_epochs']={config.get('num_epochs')}")
+
+        # Architecture parameters
+        if args.activation is not None and config.get("activation") != args.activation:
+            errors.append(f"--activation={args.activation} but config['activation']={config.get('activation')}")
+        if args.norm_type is not None and config.get("norm_type") != args.norm_type:
+            errors.append(f"--norm-type={args.norm_type} but config['norm_type']={config.get('norm_type')}")
+        if args.skip_type is not None and config.get("skip_type") != args.skip_type:
+            errors.append(f"--skip-type={args.skip_type} but config['skip_type']={config.get('skip_type')}")
+        if args.n_heads is not None and config.get("n_heads") != args.n_heads:
+            errors.append(f"--n-heads={args.n_heads} but config['n_heads']={config.get('n_heads')}")
+        if args.n_downsample is not None and config.get("n_downsample") != args.n_downsample:
+            errors.append(f"--n-downsample={args.n_downsample} but config['n_downsample']={config.get('n_downsample')}")
+        if args.dropout is not None and config.get("dropout") != args.dropout:
+            errors.append(f"--dropout={args.dropout} but config['dropout']={config.get('dropout')}")
+        if args.conv_type is not None and config.get("conv_type") != args.conv_type:
+            errors.append(f"--conv-type={args.conv_type} but config['conv_type']={config.get('conv_type')}")
+        if args.attention_type is not None and config.get("attention_type") != args.attention_type:
+            errors.append(f"--attention-type={args.attention_type} but config['attention_type']={config.get('attention_type')}")
+
+        # Training options
+        if args.optimizer is not None and config.get("optimizer") != args.optimizer:
+            errors.append(f"--optimizer={args.optimizer} but config['optimizer']={config.get('optimizer')}")
+        if args.lr_schedule is not None and config.get("lr_scheduler") != args.lr_schedule:
+            errors.append(f"--lr-schedule={args.lr_schedule} but config['lr_scheduler']={config.get('lr_scheduler')}")
+        if args.weight_decay is not None and config.get("weight_decay") != args.weight_decay:
+            errors.append(f"--weight-decay={args.weight_decay} but config['weight_decay']={config.get('weight_decay')}")
+        if args.base_channels is not None and config.get("base_channels") != args.base_channels:
+            errors.append(f"--base-channels={args.base_channels} but config['base_channels']={config.get('base_channels')}")
+
+        if errors:
+            error_msg = "\n".join([f"  - {e}" for e in errors])
+            raise RuntimeError(
+                f"\n{'='*70}\n"
+                f"CRITICAL: CLI arguments were NOT properly applied to config!\n"
+                f"{'='*70}\n"
+                f"The following CLI args were passed but did NOT update the config:\n"
+                f"{error_msg}\n"
+                f"{'='*70}\n"
+                f"This is a BUG in train.py - CLI arg handling is broken!\n"
+                f"{'='*70}"
+            )
+
+        return True
+
+    # Run validation on primary rank only (to avoid duplicate error messages)
+    if is_primary():
+        validate_cli_args_applied(args, config)
+        print("[SAFEGUARD] CLI args validated - all arguments properly applied to config")
 
     if is_primary():
         arch_name = config.get('arch', 'condunet').upper()

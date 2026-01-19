@@ -37,9 +37,34 @@ warnings.filterwarnings("ignore", module="hdmf.spec.namespace")
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from sklearn.model_selection import StratifiedShuffleSplit
+
+
+# =============================================================================
+# Distributed Training Helpers (to avoid 8x printing on multi-GPU)
+# =============================================================================
+
+def _is_primary_rank() -> bool:
+    """Check if this is the primary rank (rank 0) or not in distributed mode.
+
+    Returns True if:
+    - Not in distributed training mode
+    - In distributed mode and rank == 0
+
+    Use this to gate print statements so they only execute once.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def _print_primary(*args, **kwargs):
+    """Print only on primary rank to avoid duplicate output in distributed training."""
+    if _is_primary_rank():
+        _print_primary(*args, **kwargs)
 
 
 # =============================================================================
@@ -215,7 +240,7 @@ def load_pfc_signals(path: Path = PFC_DATA_PATH) -> Tuple[np.ndarray, np.ndarray
         raise ValueError(f"Expected shape (trials, time, channels), got {arr.shape}")
 
     n_trials, n_time, n_channels = arr.shape
-    print(f"Loaded PFC data: {n_trials} trials, {n_time} time points, {n_channels} channels")
+    _print_primary(f"Loaded PFC data: {n_trials} trials, {n_time} time points, {n_channels} channels")
 
     if n_channels != PFC_TOTAL_CHANNELS:
         raise ValueError(f"Expected {PFC_TOTAL_CHANNELS} channels, got {n_channels}")
@@ -227,7 +252,7 @@ def load_pfc_signals(path: Path = PFC_DATA_PATH) -> Tuple[np.ndarray, np.ndarray
     pfc = arr[:, PFC_CHANNEL_START:PFC_CHANNEL_END, :]  # (494, 64, 6250)
     ca1 = arr[:, CA1_CHANNEL_START:CA1_CHANNEL_END, :]  # (494, 32, 6250)
 
-    print(f"Split into PFC: {pfc.shape}, CA1: {ca1.shape}")
+    _print_primary(f"Split into PFC: {pfc.shape}, CA1: {ca1.shape}")
 
     return pfc, ca1
 
@@ -272,8 +297,8 @@ def load_pfc_metadata(
             vocab[name] = len(vocab)
         ids[idx] = vocab[name]
 
-    print(f"PFC trial types: {vocab}")
-    print(f"Trial type distribution: {np.bincount(ids)}")
+    _print_primary(f"PFC trial types: {vocab}")
+    _print_primary(f"Trial type distribution: {np.bincount(ids)}")
 
     return ids, vocab, df
 
@@ -313,7 +338,7 @@ def load_pfc_session_ids(
 
     session_ids = np.array([session_to_idx[s] for s in raw_sessions], dtype=np.int64)
 
-    print(f"Found {len(unique_sessions)} unique PFC sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
+    _print_primary(f"Found {len(unique_sessions)} unique PFC sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
 
     return session_ids, session_to_idx, idx_to_session
 
@@ -351,7 +376,7 @@ def load_pfc_rat_ids(
 
     rat_ids = np.array([rat_to_idx[r] for r in raw_rats], dtype=np.int64)
 
-    print(f"Found {len(unique_rats)} unique rats: {unique_rats}")
+    _print_primary(f"Found {len(unique_rats)} unique rats: {unique_rats}")
 
     return rat_ids, rat_to_idx, idx_to_rat
 
@@ -432,7 +457,7 @@ def load_session_ids(
     # Convert to integer indices
     session_ids = np.array([session_to_idx[s] for s in raw_sessions], dtype=np.int64)
 
-    print(f"Found {len(unique_sessions)} unique sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
+    _print_primary(f"Found {len(unique_sessions)} unique sessions: {unique_sessions[:5]}{'...' if len(unique_sessions) > 5 else ''}")
 
     return session_ids, session_to_idx, idx_to_session
 
@@ -496,7 +521,7 @@ def load_or_create_session_splits(
         val_max = val_idx.max() if len(val_idx) > 0 else -1
         test_max = test_idx.max() if len(test_idx) > 0 else -1
         if train_max > max_idx or val_max > max_idx or test_max > max_idx:
-            print(f"WARNING: Cached split indices exceed data size! Recreating splits...")
+            _print_primary(f"WARNING: Cached split indices exceed data size! Recreating splits...")
             # Don't return - fall through to recreate splits
         else:
             # Validate no overlap
@@ -505,7 +530,7 @@ def load_or_create_session_splits(
             test_set = set(test_idx.tolist())
             has_overlap = bool(train_set & val_set) or bool(train_set & test_set) or bool(val_set & test_set)
             if has_overlap:
-                print(f"WARNING: Loaded splits have overlapping indices! Recreating splits...")
+                _print_primary(f"WARNING: Loaded splits have overlapping indices! Recreating splits...")
             else:
                 # Verify sessions are separate
                 train_sessions_check = set(session_ids[train_idx])
@@ -518,12 +543,12 @@ def load_or_create_session_splits(
                     bool(val_sessions_check & test_sessions_check)
                 )
                 if session_overlap:
-                    print(f"WARNING: Loaded splits have overlapping sessions! This shouldn't happen!")
-                    print(f"  Train sessions: {train_sessions_check}")
-                    print(f"  Val sessions: {val_sessions_check}")
-                    print(f"  Test sessions: {test_sessions_check}")
+                    _print_primary(f"WARNING: Loaded splits have overlapping sessions! This shouldn't happen!")
+                    _print_primary(f"  Train sessions: {train_sessions_check}")
+                    _print_primary(f"  Val sessions: {val_sessions_check}")
+                    _print_primary(f"  Test sessions: {test_sessions_check}")
 
-                print(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
+                _print_primary(f"Loaded existing session splits: {split_info['n_train_sessions']} train, "
                       f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
                 return train_idx, val_idx, test_idx, split_info
 
@@ -568,9 +593,9 @@ def load_or_create_session_splits(
         if len(train_session_ids) == 0:
             raise ValueError("No sessions left for training after specifying test/val sessions!")
 
-        print(f"\n[Explicit Session Split]")
-        print(f"  Test sessions: {test_sessions}")
-        print(f"  Val sessions: {val_sessions}")
+        _print_primary(f"\n[Explicit Session Split]")
+        _print_primary(f"  Test sessions: {test_sessions}")
+        _print_primary(f"  Val sessions: {val_sessions}")
     else:
         # Random session selection (original behavior)
         # If no_test_set, all held-out sessions go to validation
@@ -633,11 +658,11 @@ def load_or_create_session_splits(
     test_sessions_check = set(session_ids[test_idx])
 
     if train_sessions_check & val_sessions_check:
-        print(f"WARNING: Train and Val have overlapping sessions: {train_sessions_check & val_sessions_check}")
+        _print_primary(f"WARNING: Train and Val have overlapping sessions: {train_sessions_check & val_sessions_check}")
     if train_sessions_check & test_sessions_check:
-        print(f"WARNING: Train and Test have overlapping sessions: {train_sessions_check & test_sessions_check}")
+        _print_primary(f"WARNING: Train and Test have overlapping sessions: {train_sessions_check & test_sessions_check}")
     if val_sessions_check & test_sessions_check:
-        print(f"WARNING: Val and Test have overlapping sessions: {val_sessions_check & test_sessions_check}")
+        _print_primary(f"WARNING: Val and Test have overlapping sessions: {val_sessions_check & test_sessions_check}")
 
     # Shuffle within splits
     rng.shuffle(train_idx)
@@ -691,23 +716,23 @@ def load_or_create_session_splits(
         }
 
     # Print summary
-    print(f"\n{'='*60}")
+    _print_primary(f"\n{'='*60}")
     if no_test_set:
-        print("SESSION-BASED SPLIT (No Test Set - All Held-Out Sessions for Validation)")
+        _print_primary("SESSION-BASED SPLIT (No Test Set - All Held-Out Sessions for Validation)")
     else:
-        print("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
-    print(f"{'='*60}")
-    print(f"Total sessions: {n_sessions}")
-    print(f"Train sessions: {train_session_names} ({len(train_idx)} trials)")
+        _print_primary("SESSION-BASED SPLIT (Held-Out Session Evaluation)")
+    _print_primary(f"{'='*60}")
+    _print_primary(f"Total sessions: {n_sessions}")
+    _print_primary(f"Train sessions: {train_session_names} ({len(train_idx)} trials)")
     if separate_val_sessions and val_idx_per_session is not None:
-        print(f"Val sessions (SEPARATE):")
+        _print_primary(f"Val sessions (SEPARATE):")
         for sess_name, indices in val_idx_per_session.items():
-            print(f"  - {sess_name}: {len(indices)} trials")
+            _print_primary(f"  - {sess_name}: {len(indices)} trials")
     else:
-        print(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
+        _print_primary(f"Val sessions:   {val_session_names} ({len(val_idx)} trials)")
     if not no_test_set:
-        print(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
-    print(f"{'='*60}\n")
+        _print_primary(f"Test sessions:  {test_session_names} ({len(test_idx)} trials)")
+    _print_primary(f"{'='*60}\n")
 
     # Save splits (skip saving if using separate_val_sessions - it's not serializable)
     if not separate_val_sessions:
@@ -758,7 +783,7 @@ def load_or_create_stratified_splits(
         # Validate indices don't exceed data size
         max_idx = len(odors) - 1
         if train_idx.max() > max_idx or val_idx.max() > max_idx or test_idx.max() > max_idx:
-            print(f"WARNING: Cached stratified splits have indices exceeding data size. Recreating...")
+            _print_primary(f"WARNING: Cached stratified splits have indices exceeding data size. Recreating...")
         else:
             return train_idx, val_idx, test_idx
 
@@ -811,9 +836,9 @@ def load_or_create_stratified_splits(
         rng.shuffle(test_idx)
 
         # Log the balanced split info
-        print(f"Balanced split: {n_per_odor_train} train, {n_per_odor_val} val, "
+        _print_primary(f"Balanced split: {n_per_odor_train} train, {n_per_odor_val} val, "
               f"{n_per_odor_test} test per odor (x{n_odors} odors)")
-        print(f"Total: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+        _print_primary(f"Total: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
     else:
         # PROPORTIONAL SPLIT: Maintains original class proportions
@@ -867,7 +892,7 @@ def load_or_create_pfc_stratified_splits(
         train_idx = np.load(PFC_TRAIN_SPLIT_PATH)
         val_idx = np.load(PFC_VAL_SPLIT_PATH)
         test_idx = np.load(PFC_TEST_SPLIT_PATH)
-        print(f"Loaded existing PFC splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+        _print_primary(f"Loaded existing PFC splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
         return train_idx, val_idx, test_idx
 
     rng = np.random.default_rng(seed)
@@ -891,13 +916,13 @@ def load_or_create_pfc_stratified_splits(
     test_idx = temp_idx[test_mask]
 
     # Print split statistics
-    print(f"\nPFC Dataset Splits:")
-    print(f"  Train: {len(train_idx)} samples")
+    _print_primary(f"\nPFC Dataset Splits:")
+    _print_primary(f"  Train: {len(train_idx)} samples")
     for tt in np.unique(trial_types):
         count = np.sum(trial_types[train_idx] == tt)
-        print(f"    - Type {tt}: {count}")
-    print(f"  Val: {len(val_idx)} samples")
-    print(f"  Test: {len(test_idx)} samples")
+        _print_primary(f"    - Type {tt}: {count}")
+    _print_primary(f"  Val: {len(val_idx)} samples")
+    _print_primary(f"  Test: {len(test_idx)} samples")
 
     # Save splits
     PFC_TRAIN_SPLIT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -948,7 +973,7 @@ def load_or_create_pfc_session_splits(
         val_idx = np.load(pfc_session_val)
         test_idx = np.load(pfc_session_test)
         split_info = json.loads(pfc_session_info.read_text())
-        print(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
+        _print_primary(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
               f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
         return train_idx, val_idx, test_idx, split_info
 
@@ -1003,10 +1028,10 @@ def load_or_create_pfc_session_splits(
         "n_test_trials": len(test_idx),
     }
 
-    print(f"\nPFC SESSION-BASED SPLIT:")
-    print(f"  Train sessions: {split_info['train_sessions']} ({len(train_idx)} trials)")
-    print(f"  Val sessions: {split_info['val_sessions']} ({len(val_idx)} trials)")
-    print(f"  Test sessions: {split_info['test_sessions']} ({len(test_idx)} trials)")
+    _print_primary(f"\nPFC SESSION-BASED SPLIT:")
+    _print_primary(f"  Train sessions: {split_info['train_sessions']} ({len(train_idx)} trials)")
+    _print_primary(f"  Val sessions: {split_info['val_sessions']} ({len(val_idx)} trials)")
+    _print_primary(f"  Test sessions: {split_info['test_sessions']} ({len(test_idx)} trials)")
 
     # Save
     pfc_session_train.parent.mkdir(parents=True, exist_ok=True)
@@ -1630,9 +1655,9 @@ def prepare_pfc_data(
     - dataset_type: DatasetType.PFC_HPC
     - split_info: (if split_by_session/rat) metadata about splits
     """
-    print(f"\n{'='*60}")
-    print("Loading PFC/Hippocampus Dataset")
-    print(f"{'='*60}")
+    _print_primary(f"\n{'='*60}")
+    _print_primary("Loading PFC/Hippocampus Dataset")
+    _print_primary(f"{'='*60}")
 
     # Load raw signals
     pfc, ca1 = load_pfc_signals(data_path)
@@ -1642,7 +1667,7 @@ def prepare_pfc_data(
     if resample_to_1khz:
         from scipy.signal import resample
         target_len = int(PFC_TIME_POINTS * SAMPLING_RATE_HZ / PFC_SAMPLING_RATE_HZ)
-        print(f"Resampling from {PFC_TIME_POINTS} to {target_len} time points (1250Hz -> 1000Hz)")
+        _print_primary(f"Resampling from {PFC_TIME_POINTS} to {target_len} time points (1250Hz -> 1000Hz)")
         pfc_resampled = np.zeros((num_trials, PFC_CHANNELS, target_len), dtype=np.float32)
         ca1_resampled = np.zeros((num_trials, CA1_CHANNELS, target_len), dtype=np.float32)
         for i in range(num_trials):
@@ -1697,11 +1722,11 @@ def prepare_pfc_data(
     pfc_normalized = normalize(pfc, norm_stats_pfc)
     ca1_normalized = normalize(ca1, norm_stats_ca1)
 
-    print(f"\nFinal shapes:")
-    print(f"  PFC: {pfc_normalized.shape}")
-    print(f"  CA1: {ca1_normalized.shape}")
-    print(f"  Trial types: {len(vocab)} classes - {vocab}")
-    print(f"  Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
+    _print_primary(f"\nFinal shapes:")
+    _print_primary(f"  PFC: {pfc_normalized.shape}")
+    _print_primary(f"  CA1: {ca1_normalized.shape}")
+    _print_primary(f"  Trial types: {len(vocab)} classes - {vocab}")
+    _print_primary(f"  Splits: {len(train_idx)} train, {len(val_idx)} val, {len(test_idx)} test")
 
     result = {
         # Signal arrays (analogous to ob/pcx in olfactory dataset)
@@ -2291,7 +2316,7 @@ class SlidingWindowPFCDataset(Dataset):
             for local_idx in range(self.windows_per_trial):
                 self.window_mapping.append((trial_idx, local_idx))
 
-        print(f"SlidingWindowPFCDataset: {len(trial_indices)} trials, "
+        _print_primary(f"SlidingWindowPFCDataset: {len(trial_indices)} trials, "
               f"{self.windows_per_trial} windows/trial, "
               f"{len(self.window_mapping)} total windows")
 
@@ -2379,12 +2404,12 @@ class MultiSessionSlidingWindowPFCDataset(Dataset):
         # Store unique sessions
         self.unique_sessions = sorted(set(session_ids[trial_indices]))
 
-        print(f"MultiSessionSlidingWindowPFCDataset: {len(trial_indices)} trials, "
+        _print_primary(f"MultiSessionSlidingWindowPFCDataset: {len(trial_indices)} trials, "
               f"{len(self.unique_sessions)} sessions, "
               f"{len(self.window_mapping)} total windows")
         for sess_idx, count in sorted(session_window_counts.items()):
             sess_name = self.idx_to_session.get(sess_idx, f"session_{sess_idx}")
-            print(f"  {sess_name}: {count} windows")
+            _print_primary(f"  {sess_name}: {count} windows")
 
     def __len__(self) -> int:
         return len(self.window_mapping)
@@ -2540,12 +2565,12 @@ def create_pfc_sliding_window_dataloaders(
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
-    print(f"\nPFC Sliding Window DataLoaders created:")
-    print(f"  Window size: {window_size} samples")
-    print(f"  Train stride: {stride}, Val/Test stride: {val_stride}")
-    print(f"  Train: {len(train_dataset)} windows")
-    print(f"  Val: {len(val_dataset)} windows")
-    print(f"  Test: {len(test_dataset)} windows")
+    _print_primary(f"\nPFC Sliding Window DataLoaders created:")
+    _print_primary(f"  Window size: {window_size} samples")
+    _print_primary(f"  Train stride: {stride}, Val/Test stride: {val_stride}")
+    _print_primary(f"  Train: {len(train_dataset)} windows")
+    _print_primary(f"  Val: {len(val_dataset)} windows")
+    _print_primary(f"  Test: {len(test_dataset)} windows")
 
     return {
         "train": train_loader,
@@ -2759,7 +2784,7 @@ def load_pcx1_all_sessions(
 
     all_data = {}
     for session in sessions:
-        print(f"Loading session {session}...")
+        _print_primary(f"Loading session {session}...")
         all_data[session] = load_pcx1_session(session, path, zscore=zscore)
 
     return all_data
@@ -2864,7 +2889,7 @@ class MultiSessionContinuousDataset(Dataset):
             for local_idx in range(n_windows):
                 self.window_mapping.append((sess_idx, local_idx))
 
-        print(f"MultiSessionContinuousDataset: {len(sessions_data)} sessions, "
+        _print_primary(f"MultiSessionContinuousDataset: {len(sessions_data)} sessions, "
               f"{len(self.window_mapping)} total windows")
 
     def __len__(self) -> int:
@@ -2937,9 +2962,9 @@ def create_pcx1_dataloaders(
     # persistent_workers requires num_workers > 0
     use_persistent = persistent_workers and num_workers > 0
     # Load sessions
-    print("Loading training sessions...")
+    _print_primary("Loading training sessions...")
     train_data = [load_pcx1_session(s, path) for s in train_sessions]
-    print("Loading validation sessions...")
+    _print_primary("Loading validation sessions...")
     val_data = [load_pcx1_session(s, path) for s in val_sessions]
 
     # Create datasets (val can use larger stride for faster eval)
@@ -2994,7 +3019,7 @@ def create_pcx1_dataloaders(
         dataloaders['val_sessions'] = val_sessions_loaders
 
     if test_sessions:
-        print("Loading test sessions...")
+        _print_primary("Loading test sessions...")
         test_data = [load_pcx1_session(s, path) for s in test_sessions]
         test_dataset = MultiSessionContinuousDataset(
             test_data, window_size, val_stride, zscore_per_window  # Use val_stride for test too
@@ -3034,10 +3059,10 @@ def get_pcx1_session_splits(
     val_sessions = sessions[n_test:n_test + n_val]
     train_sessions = sessions[n_test + n_val:]
 
-    print(f"PCx1 Session Split (seed={seed}):")
-    print(f"  Train: {train_sessions}")
-    print(f"  Val:   {val_sessions}")
-    print(f"  Test:  {test_sessions}")
+    _print_primary(f"PCx1 Session Split (seed={seed}):")
+    _print_primary(f"  Train: {train_sessions}")
+    _print_primary(f"  Val:   {val_sessions}")
+    _print_primary(f"  Test:  {test_sessions}")
 
     return train_sessions, val_sessions, test_sessions
 
@@ -3086,16 +3111,16 @@ def download_dandi_dataset(
         "-o", str(output_dir),
     ]
 
-    print(f"Downloading DANDI dataset {dandiset_id}...")
-    print(f"Command: {' '.join(cmd)}")
+    _print_primary(f"Downloading DANDI dataset {dandiset_id}...")
+    _print_primary(f"Command: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        print(f"Download failed: {result.stderr}")
+        _print_primary(f"Download failed: {result.stderr}")
         raise RuntimeError(f"Failed to download DANDI dataset: {result.stderr}")
 
-    print(f"Dataset downloaded to: {output_dir}")
+    _print_primary(f"Dataset downloaded to: {output_dir}")
     return output_dir / dandiset_id
 
 
@@ -3202,7 +3227,7 @@ def load_dandi_nwb_file(
                                 break
                             break
             except Exception as e:
-                print(f"Warning: Could not load LFP data: {e}")
+                _print_primary(f"Warning: Could not load LFP data: {e}")
 
         # Load iEEG/macro data (macroelectrodes)
         if load_ieeg:
@@ -3222,7 +3247,7 @@ def load_dandi_nwb_file(
                                 break
                             break
             except Exception as e:
-                print(f"Warning: Could not load iEEG data: {e}")
+                _print_primary(f"Warning: Could not load iEEG data: {e}")
 
         # Load spike data
         if load_spikes:
@@ -3235,7 +3260,7 @@ def load_dandi_nwb_file(
                             result["spikes"][idx] = np.array(row["spike_times"])
                     result["units_metadata"] = units_df.drop(columns=["spike_times"], errors="ignore")
             except Exception as e:
-                print(f"Warning: Could not load spike data: {e}")
+                _print_primary(f"Warning: Could not load spike data: {e}")
 
         # Load behavioral data
         if load_behavior:
@@ -3250,7 +3275,7 @@ def load_dandi_nwb_file(
                                 "timestamps": np.array(ts.timestamps[:]) if hasattr(ts, 'timestamps') and ts.timestamps is not None else None,
                             }
             except Exception as e:
-                print(f"Warning: Could not load behavioral data: {e}")
+                _print_primary(f"Warning: Could not load behavioral data: {e}")
 
     return result
 
@@ -3471,7 +3496,7 @@ class DANDIMovieDataset(Dataset):
         self.subjects_data = subjects_data
 
         if verbose:
-            print(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
+            _print_primary(f"DANDIMovieDataset: {len(subjects_data)} subjects, "
                   f"{len(self.windows)} windows, "
                   f"window_size={window_size}, stride={stride}, "
                   f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}")
@@ -3541,9 +3566,9 @@ def prepare_dandi_data(
         Dictionary containing train/val/test datasets and metadata
     """
     if verbose:
-        print(f"Preparing DANDI 000623 dataset...")
-        print(f"  Source region: {source_region}")
-        print(f"  Target region: {target_region}")
+        _print_primary(f"Preparing DANDI 000623 dataset...")
+        _print_primary(f"  Source region: {source_region}")
+        _print_primary(f"  Target region: {target_region}")
 
     # Get available subjects
     nwb_files = list_dandi_nwb_files(data_dir)
@@ -3560,7 +3585,7 @@ def prepare_dandi_data(
             subject_ids.append(subj_id)
 
     if verbose:
-        print(f"  Found {len(subject_ids)} subjects")
+        _print_primary(f"  Found {len(subject_ids)} subjects")
 
     # Split subjects
     rng = np.random.default_rng(seed)
@@ -3574,9 +3599,9 @@ def prepare_dandi_data(
     test_subjects = subject_ids[n_train + n_val:]
 
     if verbose:
-        print(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
-        print(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
-        print(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+        _print_primary(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
+        _print_primary(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
+        _print_primary(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
 
     # Load data for each split
     def load_subjects(subject_list, split_name=""):
@@ -3591,27 +3616,27 @@ def prepare_dandi_data(
                 n_tgt = subj_data['n_target_channels']
                 if n_src < min_channels or n_tgt < min_channels:
                     if verbose:
-                        print(f"    Skipping {subj_id}: only {n_src} source / {n_tgt} target channels (min={min_channels})")
+                        _print_primary(f"    Skipping {subj_id}: only {n_src} source / {n_tgt} target channels (min={min_channels})")
                     continue
                 data_list.append(subj_data)
                 if verbose:
-                    print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, "
+                    _print_primary(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, "
                           f"{subj_data['n_samples']} samples")
             except Exception as e:
                 if verbose:
-                    print(f"    Warning: Could not load {subj_id}: {e}")
+                    _print_primary(f"    Warning: Could not load {subj_id}: {e}")
         return data_list
 
     if verbose:
-        print("\nLoading training subjects...")
+        _print_primary("\nLoading training subjects...")
     train_data = load_subjects(train_subjects, "train")
 
     if verbose:
-        print("\nLoading validation subjects...")
+        _print_primary("\nLoading validation subjects...")
     val_data = load_subjects(val_subjects, "val")
 
     if verbose:
-        print("\nLoading test subjects...")
+        _print_primary("\nLoading test subjects...")
     test_data = load_subjects(test_subjects, "test")
 
     # Compute minimum channel counts across ALL subjects for consistent batching
@@ -3623,7 +3648,7 @@ def prepare_dandi_data(
     min_target_channels = min(s["n_target_channels"] for s in all_data)
 
     if verbose:
-        print(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
+        _print_primary(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
 
     # Create datasets with consistent channel counts
     train_dataset = DANDIMovieDataset(
@@ -3735,9 +3760,9 @@ def create_dandi_dataloaders(
         ),
     }
 
-    print(f"\nDANDI DataLoaders created:")
-    print(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
-    print(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
-    print(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
+    _print_primary(f"\nDANDI DataLoaders created:")
+    _print_primary(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
+    _print_primary(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
+    _print_primary(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
 
     return dataloaders
