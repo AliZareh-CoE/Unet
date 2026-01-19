@@ -64,7 +64,7 @@ def _is_primary_rank() -> bool:
 def _print_primary(*args, **kwargs):
     """Print only on primary rank to avoid duplicate output in distributed training."""
     if _is_primary_rank():
-        _print_primary(*args, **kwargs)
+        print(*args, **kwargs)
 
 
 # =============================================================================
