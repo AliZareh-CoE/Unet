@@ -1887,14 +1887,17 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 
 class SessionStatisticsEncoder(nn.Module):
-    """Encode session statistics into a conditioning vector.
+    """Encode session statistics into a conditioning vector for FiLM modulation.
 
     Instead of learning arbitrary embeddings per session ID, this computes
     statistics from the input signal and learns to encode them. This approach:
 
     1. Generalizes automatically to new/unseen sessions
     2. Learns meaningful relationships between statistics and predictions
-    3. Aligns with domain adaptation literature (AdaIN, FiLM)
+    3. Implements FiLM (Feature-wise Linear Modulation) conditioning
+
+    NOTE: This does NOT use instance normalization! It computes statistics
+    for conditioning (predicting gamma/beta), not for normalizing the signal.
 
     Based on:
     - Domain-specific batch normalization for EEG transfer learning
@@ -2029,12 +2032,14 @@ class SessionStatisticsEncoder(nn.Module):
 
 
 class SessionAdaptiveScaling(nn.Module):
-    """Session-aware output scaling using AdaIN-style conditioning.
+    """Session-aware output scaling using FiLM-style conditioning.
 
     Instead of fixed learnable scale/bias per channel, predicts them from
-    session statistics. This is similar to:
-    - AdaIN (Adaptive Instance Normalization) from style transfer
-    - FiLM (Feature-wise Linear Modulation)
+    session statistics. This is pure FiLM (Feature-wise Linear Modulation):
+        output = input * gamma + beta
+
+    NOTE: This does NOT use instance normalization! It only applies
+    learned scale/bias without any normalization step.
 
     The key insight: different sessions may need different output scaling
     to match the target distribution due to electrode impedance, baseline
@@ -2232,7 +2237,7 @@ class CondUNet1D(nn.Module):
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
-        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (AdaIN-style)
+        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style, NO instance norm)
         # Session conditioning - statistics-based (literature-recommended approach)
         # Instead of learned embeddings per session ID, computes statistics from
         # input signal and learns to encode them. Generalizes to unseen sessions.
@@ -2409,7 +2414,7 @@ class CondUNet1D(nn.Module):
         self.use_adaptive_scaling = use_adaptive_scaling
 
         if use_adaptive_scaling:
-            # Session-adaptive output scaling (AdaIN-style)
+            # Session-adaptive output scaling (FiLM-style, NO instance normalization)
             # Predicts scale/bias from input statistics - adapts to each session
             self.adaptive_scaler = SessionAdaptiveScaling(
                 n_channels=out_channels,

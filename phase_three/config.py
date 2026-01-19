@@ -236,7 +236,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_session_stats": False,     # Statistics-based conditioning (FiLM style)
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
-    "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style) - tested in ablation
+    "use_adaptive_scaling": False,  # Session-adaptive output scaling (FiLM, NO instance norm) - tested in ablation
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
@@ -499,11 +499,12 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     },
     # =========================================================================
     # PHASE 5: SESSION ADAPTATION (critical for cross-session generalization)
-    # Domain adaptation techniques for neural signal translation
+    # FiLM-based conditioning techniques (NO instance normalization used!)
     # =========================================================================
     # GROUP 18: Session Adaptation Method
-    # Literature: AdaBN (Li et al. 2018), FiLM (Perez et al. 2017), AdaIN (Huang et al. 2017)
-    # Tests different approaches to handle session-to-session variability
+    # Literature: FiLM (Perez et al. 2017) - Feature-wise Linear Modulation
+    # All methods use FiLM-style conditioning: x * gamma + beta (NOT instance norm)
+    # Note: AdaBN is inference-time only, tested separately (not here)
     {
         "group_id": 20,
         "name": "session_adaptation",
@@ -521,7 +522,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             },
             {
                 "name": "adaptive_scaling",
-                "desc": "AdaIN-style session-adaptive output scaling",
+                "desc": "FiLM output scaling (predicts gamma/beta from input stats)",
                 "config": {
                     "use_adaptive_scaling": True,
                     "use_session_stats": False,
@@ -530,7 +531,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             },
             {
                 "name": "session_stats",
-                "desc": "Statistics-based FiLM conditioning (generalizes to new sessions)",
+                "desc": "Statistics-based FiLM throughout encoder (generalizes to new sessions)",
                 "config": {
                     "use_adaptive_scaling": False,
                     "use_session_stats": True,
@@ -539,7 +540,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             },
             {
                 "name": "session_embedding",
-                "desc": "Learnable session embeddings (requires known sessions)",
+                "desc": "Learnable session embeddings as FiLM (requires known sessions)",
                 "config": {
                     "use_adaptive_scaling": False,
                     "use_session_stats": False,
@@ -548,7 +549,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             },
             {
                 "name": "adaptive_plus_stats",
-                "desc": "Adaptive scaling + statistics conditioning (combined)",
+                "desc": "Both adaptive output scaling + stats FiLM (combined)",
                 "config": {
                     "use_adaptive_scaling": True,
                     "use_session_stats": True,
@@ -891,7 +892,7 @@ class AblationConfig:
     use_session_stats: bool = False  # Statistics-based conditioning (FiLM style)
     session_emb_dim: int = 32  # Session statistics embedding dimension
     session_use_spectral: bool = False  # Include spectral features in session stats
-    use_adaptive_scaling: bool = False  # Session-adaptive output scaling (AdaIN style)
+    use_adaptive_scaling: bool = False  # Session-adaptive output scaling (FiLM, NO instance norm)
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
     use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
