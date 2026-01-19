@@ -153,6 +153,7 @@ def run_train_subprocess(
     ablation_config: "AblationConfig",
     epochs: int = 60,
     batch_size: int = 32,
+    learning_rate: float = 1e-3,  # CRITICAL: Learning rate must be passed!
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     seed: int = 42,
@@ -203,6 +204,7 @@ def run_train_subprocess(
         "--arch", "condunet",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
+        "--lr", str(learning_rate),  # CRITICAL: Pass learning rate!
         "--seed", str(seed + fold_idx),  # Different seed per fold
         "--output-results-file", str(output_results_file),
         "--fold", str(fold_idx),
@@ -306,6 +308,9 @@ def run_train_subprocess(
     # Learnable session embedding (requires n_sessions to be set)
     if config.get("use_session_embedding", False):
         cmd.append("--use-session-embedding")
+        # Pass session embedding dimension
+        session_emb_dim = config.get("session_emb_dim", 32)
+        cmd.extend(["--session-emb-dim", str(session_emb_dim)])
         # n_sessions is passed directly as parameter, not from config
         # (because AblationConfig.to_dict() doesn't include n_sessions)
         if n_sessions > 0:
@@ -1124,6 +1129,7 @@ def _run_greedy_forward_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -1432,6 +1438,7 @@ def _run_stage2_greedy_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=effective_batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -1796,6 +1803,7 @@ def _run_additive_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -2085,6 +2093,7 @@ def _run_subtractive_protocol(
                     ablation_config=baseline_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -2206,6 +2215,7 @@ def _run_subtractive_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
