@@ -3,11 +3,15 @@ Phase 3 v2: Bulletproof Ablation Study Runner
 ==============================================
 
 DESIGN PRINCIPLES:
-1. NO SUBPROCESS: Direct Python calls, no CLI string parsing
-2. PRE-FLIGHT VALIDATION: Validate ALL configs before running ANY
-3. EXPERIMENT REGISTRY: Skip duplicates, resume gracefully
-4. FAIL-FAST: Invalid config = immediate crash with clear error
-5. GREEDY FORWARD SELECTION: Efficient hyperparameter search
+1. TYPE-SAFE CONFIG: Validated before training starts
+2. USES EXISTING train.py: No duplicate training loop - consistency!
+3. PRE-FLIGHT VALIDATION: Validate ALL configs before running ANY
+4. EXPERIMENT REGISTRY: Skip duplicates, resume gracefully
+5. FAIL-FAST: Invalid config = immediate crash with clear error
+
+The key insight: We keep the subprocess call to train.py (for FSDP, logging,
+checkpointing, etc.) but we VALIDATE the config BEFORE spawning, and we
+use type-safe configs that generate correct CLI args.
 
 Usage:
     python runner_v2.py --groups 1,2,3 --n-folds 5
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -27,7 +32,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
 import numpy as np
-import torch
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
@@ -47,202 +51,193 @@ from phase_three.config_v2 import (
 
 
 # =============================================================================
-# Direct Training (No Subprocess!)
+# Config to CLI Args (Type-Safe Generation)
 # =============================================================================
 
-def run_experiment_direct(
-    config: ExperimentConfig,
-    fold_idx: int = 0,
-    device: str = "cuda",
-    output_dir: Path = None,
-) -> Dict[str, Any]:
-    """Run a single experiment DIRECTLY in Python - no subprocess.
+def config_to_cli_args(config: ExperimentConfig, fold_idx: int, output_file: Path) -> List[str]:
+    """Convert validated ExperimentConfig to CLI args for train.py.
 
-    This is the KEY IMPROVEMENT: no CLI parsing, no string conversion,
-    just direct Python object passing.
+    This is the ONLY place where CLI args are generated.
+    Since config is type-safe and validated, the CLI args are guaranteed correct.
 
     Args:
         config: Validated experiment configuration
         fold_idx: Cross-validation fold index
-        device: Device to run on
-        output_dir: Directory to save results
+        output_file: Path to save results JSON
 
     Returns:
-        Dictionary with metrics
+        List of CLI arguments for train.py
     """
-    from models import CondUNet1D
-    from data import (
-        OlfactoryTranslationDataset,
-        load_olfactory_data,
-        create_train_val_test_loaders,
-    )
+    args = [
+        # Architecture (from ModelConfig)
+        "--arch", "condunet",
+        "--base-channels", str(config.model.base_channels),
+        "--n-downsample", str(config.model.n_downsample),
+        "--conv-type", config.model.conv_type,
+        "--attention-type", config.model.attention_type,
+        "--n-heads", str(config.model.n_heads),
+        "--cond-mode", config.model.cond_mode,
+        "--activation", config.model.activation,
+        "--norm-type", config.model.norm_type,
+        "--skip-type", config.model.skip_type,
+        "--dropout", str(config.model.dropout),
+
+        # Training (from TrainingConfig)
+        "--optimizer", config.training.optimizer,
+        "--lr", str(config.training.learning_rate),
+        "--weight-decay", str(config.training.weight_decay),
+        "--lr-schedule", config.training.lr_schedule,
+        "--epochs", str(config.training.epochs),
+        "--batch-size", str(config.training.batch_size),
+        "--loss", config.training.loss_type,
+
+        # Data (from DataConfig)
+        "--seed", str(config.data.seed + fold_idx),
+        "--fold", str(fold_idx),
+
+        # Output
+        "--output-results-file", str(output_file),
+        "--no-plots",  # Skip plots for ablation speed
+    ]
+
+    # Augmentation
+    if config.training.aug_strength == "none":
+        args.append("--no-aug")
+    else:
+        args.extend(["--aug-strength", config.training.aug_strength])
+
+    # Bidirectional
+    if not config.training.bidirectional:
+        args.append("--no-bidirectional")
+
+    # Session splits
+    if config.data.split_by_session:
+        args.append("--split-by-session")
+        args.extend(["--n-test-sessions", str(config.data.n_test_sessions)])
+        args.extend(["--n-val-sessions", str(config.data.n_val_sessions)])
+
+    return args
+
+
+def run_experiment_via_train_py(
+    config: ExperimentConfig,
+    fold_idx: int = 0,
+    output_dir: Path = None,
+    use_fsdp: bool = True,
+    fsdp_strategy: str = "full",
+) -> Dict[str, Any]:
+    """Run experiment using existing train.py - CONSISTENT training loop.
+
+    This calls train.py as a subprocess but with TYPE-SAFE, VALIDATED config.
+    We get all the benefits of train.py (FSDP, logging, checkpointing, etc.)
+    without the risk of misconfigured CLI args.
+
+    Args:
+        config: Validated experiment configuration
+        fold_idx: Cross-validation fold index
+        output_dir: Directory to save results
+        use_fsdp: Enable FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+
+    Returns:
+        Dictionary with metrics from train.py
+    """
+    if output_dir is None:
+        output_dir = Path("outputs/phase3_v2")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Output file for results
+    output_file = output_dir / f"{config.config_hash()}_fold{fold_idx}_results.json"
 
     print(f"\n{'='*60}")
     print(f"Running: {config.name} [fold {fold_idx}]")
     print(f"Config hash: {config.config_hash()}")
     print(f"{'='*60}")
 
-    # Set seed for reproducibility
-    seed = config.data.seed + fold_idx
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    # Generate CLI args from validated config
+    cli_args = config_to_cli_args(config, fold_idx, output_file)
 
-    # Create model DIRECTLY from config (no CLI parsing!)
-    model = CondUNet1D(
-        in_channels=config.model.in_channels,
-        out_channels=config.model.out_channels,
-        base=config.model.base_channels,
-        n_downsample=config.model.n_downsample,
-        conv_type=config.model.conv_type,
-        attention_type=config.model.attention_type,
-        n_heads=config.model.n_heads,
-        cond_mode=config.model.cond_mode,
-        activation=config.model.activation,
-        norm_type=config.model.norm_type,
-        skip_type=config.model.skip_type,
-        dropout=config.model.dropout,
-    )
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {n_params:,}")
-
-    # Move to device
-    model = model.to(device)
-
-    # Create optimizer DIRECTLY from config
-    if config.training.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-        )
-    elif config.training.optimizer == "adam":
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-        )
-    elif config.training.optimizer == "sgd":
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            momentum=0.9,
-            weight_decay=config.training.weight_decay,
-        )
+    # Build command
+    if use_fsdp:
+        # Use torchrun for distributed training
+        import torch
+        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={nproc}",
+            "--master_port", str(29500 + fold_idx),  # Unique port per fold
+            str(PROJECT_ROOT / "train.py"),
+            "--fsdp",
+            "--fsdp-strategy", fsdp_strategy,
+        ] + cli_args
     else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
+        cmd = ["python", str(PROJECT_ROOT / "train.py")] + cli_args
+
+    # Log the command (for debugging)
+    print(f"Command: {' '.join(cmd[:10])}...")  # First 10 args
+
+    # Run train.py
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            capture_output=False,  # Let output flow to console
+            text=True,
+            timeout=3600 * 4,  # 4 hour timeout
         )
+        elapsed = time.time() - start_time
 
-    # Create loss DIRECTLY from config
-    if config.training.loss_type in ["l1", "l1_wavelet"]:
-        criterion = torch.nn.L1Loss()
-    elif config.training.loss_type in ["huber", "huber_wavelet"]:
-        criterion = torch.nn.SmoothL1Loss()
+        if result.returncode != 0:
+            print(f"❌ train.py failed with return code {result.returncode}")
+            return {
+                "config_hash": config.config_hash(),
+                "config_name": config.name,
+                "fold": fold_idx,
+                "status": "failed",
+                "return_code": result.returncode,
+                "elapsed_seconds": elapsed,
+            }
+
+    except subprocess.TimeoutExpired:
+        print(f"❌ train.py timed out after 4 hours")
+        return {
+            "config_hash": config.config_hash(),
+            "config_name": config.name,
+            "fold": fold_idx,
+            "status": "timeout",
+            "elapsed_seconds": 3600 * 4,
+        }
+    except Exception as e:
+        print(f"❌ Exception running train.py: {e}")
+        return {
+            "config_hash": config.config_hash(),
+            "config_name": config.name,
+            "fold": fold_idx,
+            "status": "error",
+            "error": str(e),
+        }
+
+    # Read results from output file
+    if output_file.exists():
+        with open(output_file) as f:
+            results = json.load(f)
+        results["config_hash"] = config.config_hash()
+        results["config_name"] = config.name
+        results["fold"] = fold_idx
+        results["status"] = "success"
+        results["elapsed_seconds"] = elapsed
+        print(f"✓ Completed in {elapsed:.1f}s: val_loss={results.get('best_val_loss', 'N/A')}")
+        return results
     else:
-        criterion = torch.nn.L1Loss()
-
-    # Load data
-    train_loader, val_loader, test_loader = create_train_val_test_loaders(
-        batch_size=config.training.batch_size,
-        split_by_session=config.data.split_by_session,
-        n_test_sessions=config.data.n_test_sessions,
-        n_val_sessions=config.data.n_val_sessions,
-        seed=seed,
-    )
-
-    # Training loop
-    best_val_loss = float("inf")
-    patience_counter = 0
-
-    for epoch in range(config.training.epochs):
-        # Training
-        model.train()
-        train_loss = 0.0
-        n_batches = 0
-
-        for batch in train_loader:
-            x, y, cond = batch["ob"], batch["pcx"], batch["odor_idx"]
-            x, y, cond = x.to(device), y.to(device), cond.to(device)
-
-            optimizer.zero_grad()
-            output = model(x, cond)
-            loss = criterion(output, y)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item()
-            n_batches += 1
-
-        train_loss /= max(n_batches, 1)
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        n_val_batches = 0
-
-        with torch.no_grad():
-            for batch in val_loader:
-                x, y, cond = batch["ob"], batch["pcx"], batch["odor_idx"]
-                x, y, cond = x.to(device), y.to(device), cond.to(device)
-
-                output = model(x, cond)
-                loss = criterion(output, y)
-
-                val_loss += loss.item()
-                n_val_batches += 1
-
-        val_loss /= max(n_val_batches, 1)
-
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if patience_counter >= config.training.early_stop_patience:
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
-
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch + 1}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
-
-    # Final evaluation on test set
-    model.eval()
-    test_loss = 0.0
-    n_test_batches = 0
-
-    with torch.no_grad():
-        for batch in test_loader:
-            x, y, cond = batch["ob"], batch["pcx"], batch["odor_idx"]
-            x, y, cond = x.to(device), y.to(device), cond.to(device)
-
-            output = model(x, cond)
-            loss = criterion(output, y)
-
-            test_loss += loss.item()
-            n_test_batches += 1
-
-    test_loss /= max(n_test_batches, 1)
-
-    results = {
-        "config_hash": config.config_hash(),
-        "config_name": config.name,
-        "fold": fold_idx,
-        "best_val_loss": best_val_loss,
-        "test_loss": test_loss,
-        "n_params": n_params,
-        "epochs_trained": epoch + 1,
-    }
-
-    print(f"Results: val_loss={best_val_loss:.4f}, test_loss={test_loss:.4f}")
-
-    return results
+        print(f"⚠ No results file found at {output_file}")
+        return {
+            "config_hash": config.config_hash(),
+            "config_name": config.name,
+            "fold": fold_idx,
+            "status": "no_results_file",
+            "elapsed_seconds": elapsed,
+        }
 
 
 # =============================================================================
@@ -255,6 +250,7 @@ def run_greedy_forward(
     output_dir: Path = None,
     validate_only: bool = False,
     resume: bool = False,
+    use_fsdp: bool = True,
 ) -> Dict[str, Any]:
     """Run greedy forward selection ablation study.
 
@@ -344,16 +340,20 @@ def run_greedy_forward(
                 })
                 continue
 
-            # Run experiment
+            # Run experiment using existing train.py (CONSISTENT!)
             fold_results = []
             for fold_idx in range(n_folds):
                 try:
-                    result = run_experiment_direct(
+                    result = run_experiment_via_train_py(
                         config=config,
                         fold_idx=fold_idx,
                         output_dir=output_dir,
+                        use_fsdp=use_fsdp,
                     )
-                    fold_results.append(result)
+                    if result.get("status") == "success":
+                        fold_results.append(result)
+                    else:
+                        print(f"⚠ {config.name} fold {fold_idx}: {result.get('status')}")
                 except Exception as e:
                     print(f"❌ FAILED: {config.name} fold {fold_idx}: {e}")
                     continue
@@ -489,6 +489,17 @@ Examples:
         action="store_true",
         help="Resume from previous run (skip completed experiments)",
     )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        default=True,
+        help="Enable FSDP distributed training (default: True)",
+    )
+    parser.add_argument(
+        "--no-fsdp",
+        action="store_true",
+        help="Disable FSDP, run on single GPU",
+    )
 
     args = parser.parse_args()
 
@@ -497,6 +508,9 @@ Examples:
     if args.groups:
         groups = [int(g) for g in args.groups.split(",")]
 
+    # FSDP setting
+    use_fsdp = args.fsdp and not args.no_fsdp
+
     # Run
     results = run_greedy_forward(
         groups=groups,
@@ -504,6 +518,7 @@ Examples:
         output_dir=args.output_dir,
         validate_only=args.validate_only,
         resume=args.resume,
+        use_fsdp=use_fsdp,
     )
 
     return 0 if results.get("status") != "preflight_failed" else 1
