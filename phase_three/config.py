@@ -1040,7 +1040,7 @@ class TrainingConfig:
     lr_min: float = 1e-6
 
     # Early stopping
-    patience: int = 15
+    patience: int = 10
     min_delta: float = 1e-4
 
     # Gradient clipping
