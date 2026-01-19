@@ -236,7 +236,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_session_stats": False,     # Statistics-based conditioning (FiLM style)
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
-    "use_adaptive_scaling": True,   # Session-adaptive output scaling (AdaIN style) - ENABLED by default
+    "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style) - tested in ablation
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
@@ -498,12 +498,73 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "conditional_on": None,
     },
     # =========================================================================
-    # PHASE 5: BATCH SIZE (merged from Stage 2)
+    # PHASE 5: SESSION ADAPTATION (critical for cross-session generalization)
+    # Domain adaptation techniques for neural signal translation
+    # =========================================================================
+    # GROUP 18: Session Adaptation Method
+    # Literature: AdaBN (Li et al. 2018), FiLM (Perez et al. 2017), AdaIN (Huang et al. 2017)
+    # Tests different approaches to handle session-to-session variability
+    {
+        "group_id": 20,
+        "name": "session_adaptation",
+        "description": "Session adaptation method for cross-session generalization",
+        "parameter": "session_adaptation_mode",  # Virtual parameter - maps to multiple config keys
+        "variants": [
+            {
+                "name": "no_adaptation",
+                "desc": "No session adaptation - baseline",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": False,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "adaptive_scaling",
+                "desc": "AdaIN-style session-adaptive output scaling",
+                "config": {
+                    "use_adaptive_scaling": True,
+                    "use_session_stats": False,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "session_stats",
+                "desc": "Statistics-based FiLM conditioning (generalizes to new sessions)",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": True,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "session_embedding",
+                "desc": "Learnable session embeddings (requires known sessions)",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": False,
+                    "use_session_embedding": True,
+                }
+            },
+            {
+                "name": "adaptive_plus_stats",
+                "desc": "Adaptive scaling + statistics conditioning (combined)",
+                "config": {
+                    "use_adaptive_scaling": True,
+                    "use_session_stats": True,
+                    "use_session_embedding": False,
+                }
+            },
+        ],
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 6: BATCH SIZE (merged from Stage 2)
     # Critical for training dynamics - test last
     # =========================================================================
-    # GROUP 18: Batch Size
+    # GROUP 19: Batch Size
     {
-        "group_id": 19,
+        "group_id": 21,
         "name": "batch_size",
         "description": "Batch size - affects gradient noise, memory, and convergence",
         "parameter": "batch_size",

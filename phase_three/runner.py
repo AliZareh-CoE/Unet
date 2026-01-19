@@ -3055,13 +3055,17 @@ def main():
             print("Note: ablation_validation requires --use-train-py, enabling it automatically")
             args.use_train_py = True
 
+        # Load dataset to get n_sessions (needed for session_embedding ablation)
+        _, _, _, _, _, _, n_sessions, _, _ = load_dataset_raw(config.dataset)
+        print(f"Detected {n_sessions} sessions from dataset")
+
         result = run_ablation_validation(
             config=config,
             optimal_config=optimal_config,
             use_train_py=args.use_train_py,
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
-            n_sessions=0,  # TODO: get from data if needed
+            n_sessions=n_sessions,
         )
 
         print("\n" + "=" * 80)
