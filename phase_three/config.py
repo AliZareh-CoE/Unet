@@ -1060,6 +1060,54 @@ class AblationConfig:
         )
 
     @classmethod
+    def from_dict(cls, config: Dict[str, Any], study: str = "ablation", variant: str = "custom") -> "AblationConfig":
+        """Create AblationConfig directly from a config dictionary.
+
+        Args:
+            config: Dictionary with model/training parameters
+            study: Study name (default: "ablation")
+            variant: Variant name (default: "custom")
+
+        Returns:
+            AblationConfig instance
+        """
+        return cls(
+            study=study,
+            variant=variant,
+            group_id=-1,
+            conv_type=config.get("conv_type", "standard"),
+            attention_type=config.get("attention_type", "none"),
+            cond_mode=config.get("cond_mode", "none"),
+            use_odor_embedding=config.get("use_odor_embedding", False),
+            base_channels=config.get("base_channels", 128),
+            n_downsample=config.get("n_downsample", 2),
+            n_heads=config.get("n_heads", 4),
+            loss_type=config.get("loss_type", "l1"),
+            use_augmentation=config.get("use_augmentation", False),
+            aug_strength=config.get("aug_strength", "none"),
+            bidirectional=config.get("bidirectional", False),
+            cycle_lambda=config.get("cycle_lambda", 0.5),
+            norm_type=config.get("norm_type", "batch"),
+            skip_type=config.get("skip_type", "add"),
+            activation=config.get("activation", "relu"),
+            dropout=config.get("dropout", 0.0),
+            optimizer=config.get("optimizer", "adamw"),
+            lr_schedule=config.get("lr_schedule", "cosine"),
+            weight_decay=config.get("weight_decay", 1e-4),
+            split_by_session=True,
+            n_test_sessions=0,
+            n_val_sessions=3,
+            use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_cov_augment=config.get("use_cov_augment", False),
+            cov_augment_prob=config.get("cov_augment_prob", 0.5),
+            use_session_embedding=config.get("use_session_embedding", False),
+            use_adabn=config.get("use_adabn", False),
+        )
+
+    @classmethod
     def from_stage(cls, stage_idx: int) -> "AblationConfig":
         """Create config from incremental stage definition."""
         if stage_idx < 0 or stage_idx >= len(INCREMENTAL_STAGES):

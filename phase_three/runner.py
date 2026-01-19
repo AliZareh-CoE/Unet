@@ -2502,7 +2502,7 @@ def run_ablation_validation(
     Returns:
         Dictionary with ablation validation results
     """
-    from phase_three.config import GREEDY_DEFAULTS, ABLATION_GROUPS
+    from phase_three.config import GREEDY_DEFAULTS, ABLATION_GROUPS, AblationConfig
 
     print("\n" + "=" * 80)
     print("ABLATION VALIDATION")
@@ -2614,15 +2614,19 @@ def run_ablation_validation(
         output_results_file = output_dir / "train_results" / "ablation_ref_optimal_results.json"
         output_results_file.parent.mkdir(parents=True, exist_ok=True)
 
+        # Create AblationConfig from dict
+        ref_ablation_config = AblationConfig.from_dict(ref_config, study="ablation_ref", variant="optimal")
+
         ref_results = run_train_subprocess(
             study="ablation_ref",
             variant="optimal",
             fold_idx=0,
             fold_indices_file=fold_indices_file,
             output_results_file=output_results_file,
-            config=ref_config,
-            data_config=data_config,
-            training_config=config.training,
+            ablation_config=ref_ablation_config,
+            epochs=config.training.epochs,
+            batch_size=config.training.batch_size,
+            learning_rate=config.training.learning_rate,
             use_fsdp=use_fsdp,
             fsdp_strategy=fsdp_strategy,
             n_sessions=n_sessions,
@@ -2671,15 +2675,19 @@ def run_ablation_validation(
             output_results_file = output_dir / "train_results" / f"ablation_{variant_name}_results.json"
             output_results_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Create AblationConfig from dict
+            ablated_ablation_config = AblationConfig.from_dict(ablated_config, study="ablation", variant=variant_name)
+
             ablation_results = run_train_subprocess(
                 study="ablation",
                 variant=variant_name,
                 fold_idx=0,
                 fold_indices_file=fold_indices_file,
                 output_results_file=output_results_file,
-                config=ablated_config,
-                data_config=data_config,
-                training_config=config.training,
+                ablation_config=ablated_ablation_config,
+                epochs=config.training.epochs,
+                batch_size=config.training.batch_size,
+                learning_rate=config.training.learning_rate,
                 use_fsdp=use_fsdp,
                 fsdp_strategy=fsdp_strategy,
                 n_sessions=n_sessions,
