@@ -31,7 +31,7 @@ import torch
 # Ablation Protocol Selection
 # =============================================================================
 
-ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward", "stage2_greedy"]
+ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward", "stage2_greedy", "ablation_validation"]
 
 # =============================================================================
 # ADDITIVE PROTOCOL: Incremental Component Analysis
