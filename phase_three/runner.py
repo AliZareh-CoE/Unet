@@ -2515,16 +2515,19 @@ def run_ablation_validation(
     output_dir = config.output_dir / "ablation_validation"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load data once
-    data, data_config = load_data(config.dataset)
-    n_samples = len(data["ob"])
+    # Load data with session-based split (same as greedy_forward)
+    X, y, odor_ids, session_ids, in_channels, out_channels, data_n_sessions, train_idx, val_idx = load_dataset_raw(config.dataset)
 
-    # Create single train/val split (same as greedy)
-    from sklearn.model_selection import train_test_split
-    indices = list(range(n_samples))
-    train_idx, val_idx = train_test_split(
-        indices, test_size=0.2, random_state=config.cv_seed
-    )
+    # Use n_sessions from parameter if provided, else from data
+    if n_sessions == 0:
+        n_sessions = data_n_sessions
+
+    # Build data_config dict for run_train_subprocess
+    data_config = {
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "sampling_rate": 1000,  # Default for olfactory
+    }
 
     print(f"\nData split: {len(train_idx)} train, {len(val_idx)} val")
 
