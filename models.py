@@ -533,6 +533,7 @@ class ConvBlock(nn.Module):
         stride = 2 if downsample else 1
         self.cond_mode = cond_mode
 
+        # Build normalization layer
         if norm_type == "instance":
             norm = nn.InstanceNorm1d(out_c, affine=True)
         elif norm_type == "batch":
@@ -542,8 +543,16 @@ class ConvBlock(nn.Module):
             while out_c % num_groups != 0:
                 num_groups -= 1
             norm = nn.GroupNorm(num_groups, out_c)
+        elif norm_type == "layer":
+            # LayerNorm for 1D: normalize over channels and time
+            norm = nn.GroupNorm(1, out_c)  # GroupNorm with 1 group = LayerNorm
+        elif norm_type == "rms":
+            # RMSNorm approximation using LayerNorm without centering
+            norm = nn.GroupNorm(1, out_c, affine=True)  # Close approximation
+        elif norm_type == "none":
+            norm = nn.Identity()
         else:
-            raise ValueError(f"Unknown norm_type: {norm_type}")
+            raise ValueError(f"Unknown norm_type: {norm_type}. Available: batch, instance, group, layer, rms, none")
 
         layers = [
             nn.Conv1d(in_c, out_c, kernel_size=3, stride=stride, padding=1),
@@ -798,8 +807,14 @@ class ModernConvBlock(nn.Module):
             while out_c % num_groups != 0:
                 num_groups -= 1
             norm = nn.GroupNorm(num_groups, out_c)
+        elif norm_type == "layer":
+            norm = nn.GroupNorm(1, out_c)  # GroupNorm with 1 group = LayerNorm
+        elif norm_type == "rms":
+            norm = nn.GroupNorm(1, out_c, affine=True)  # RMSNorm approximation
+        elif norm_type == "none":
+            norm = nn.Identity()
         else:
-            raise ValueError(f"Unknown norm_type: {norm_type}")
+            raise ValueError(f"Unknown norm_type: {norm_type}. Available: batch, instance, group, layer, rms, none")
 
         # Multi-scale dilated depthwise separable conv
         conv = MultiScaleDilatedConv1d(
