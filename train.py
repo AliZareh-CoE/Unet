@@ -4120,6 +4120,55 @@ def main():
         if is_primary():
             print(f"Convolution type override: {args.conv_type}")
 
+    # Activation function from CLI (for Phase 3 ablation studies)
+    if args.activation is not None:
+        config["activation"] = args.activation
+        if is_primary():
+            print(f"Activation function override: {args.activation}")
+
+    # Normalization type from CLI (for Phase 3 ablation studies)
+    if args.norm_type is not None:
+        config["norm_type"] = args.norm_type
+        if is_primary():
+            print(f"Normalization type override: {args.norm_type}")
+
+    # Skip connection type from CLI (for Phase 3 ablation studies)
+    if args.skip_type is not None:
+        config["skip_type"] = args.skip_type
+        if is_primary():
+            print(f"Skip connection type override: {args.skip_type}")
+
+    # Number of attention heads from CLI (for Phase 3 ablation studies)
+    if args.n_heads is not None:
+        config["n_heads"] = args.n_heads
+        if is_primary():
+            print(f"Number of attention heads override: {args.n_heads}")
+
+    # Number of downsample levels from CLI (for Phase 3 ablation studies)
+    if args.n_downsample is not None:
+        config["n_downsample"] = args.n_downsample
+        if is_primary():
+            print(f"Number of downsample levels override: {args.n_downsample}")
+
+    # Dropout rate from CLI (for Phase 3 ablation studies)
+    if args.dropout is not None:
+        config["dropout"] = args.dropout
+        if is_primary():
+            print(f"Dropout rate override: {args.dropout}")
+
+    # Optimizer from CLI (for Phase 3 ablation studies)
+    if args.optimizer is not None:
+        config["optimizer"] = args.optimizer
+        if is_primary():
+            print(f"Optimizer override: {args.optimizer}")
+
+    # LR schedule from CLI (for Phase 3 ablation studies)
+    # Note: --lr-schedule is the preferred arg, --lr-scheduler is legacy
+    if args.lr_schedule is not None:
+        config["lr_scheduler"] = args.lr_schedule
+        if is_primary():
+            print(f"LR schedule override: {args.lr_schedule}")
+
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
         config["use_bidirectional"] = False
