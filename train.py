@@ -2595,7 +2595,19 @@ def train(
             # running stats, which can cause inplace modification errors when
             # the same model is used multiple times per batch (e.g., cycle consistency)
             ddp_kwargs = {"device_ids": [local_rank], "broadcast_buffers": False}
-            if config.get("gradient_checkpointing", False):
+
+            # Enable find_unused_parameters when:
+            # 1. Gradient checkpointing is enabled
+            # 2. cond_mode=none (embedding layer unused)
+            # 3. attention_type=none (attention modules unused)
+            # 4. Various ablation configurations that may disable components
+            needs_find_unused = (
+                config.get("gradient_checkpointing", False) or
+                config.get("cond_mode", "film") == "none" or
+                config.get("attention_type", "basic") == "none" or
+                not config.get("use_bidirectional", True)  # reverse model unused
+            )
+            if needs_find_unused:
                 ddp_kwargs["find_unused_parameters"] = True
 
             model = model.to(device)
@@ -2612,8 +2624,17 @@ def train(
                 # using sync_gradients_manual() after backward() but before optimizer.step().
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs (broadcast_buffers=False)")
-                if config.get("gradient_checkpointing", False):
-                    print("  (find_unused_parameters=True for gradient checkpointing)")
+                if needs_find_unused:
+                    reasons = []
+                    if config.get("gradient_checkpointing", False):
+                        reasons.append("gradient_checkpointing")
+                    if config.get("cond_mode", "film") == "none":
+                        reasons.append("cond_mode=none")
+                    if config.get("attention_type", "basic") == "none":
+                        reasons.append("attention_type=none")
+                    if not config.get("use_bidirectional", True):
+                        reasons.append("no_bidirectional")
+                    print(f"  (find_unused_parameters=True: {', '.join(reasons)})")
             dist.barrier()
     else:
         model = wrap_model_fsdp(model, local_rank, use_fsdp=False, compile_model=compile_model)
