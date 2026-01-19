@@ -2718,10 +2718,22 @@ def train(
     # Weight decay (L2 regularization)
     weight_decay = config.get("weight_decay", 0.0)
 
-    if is_primary():
-        print(f"Optimizer: {total_params} total params | lr={lr}, weight_decay={weight_decay}")
+    # Optimizer selection (for Phase 3 ablation studies)
+    optimizer_type = config.get("optimizer", "adamw").lower()
 
-    optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    if is_primary():
+        print(f"Optimizer: {optimizer_type.upper()} | {total_params} total params | lr={lr}, weight_decay={weight_decay}")
+
+    if optimizer_type == "adamw":
+        optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    elif optimizer_type == "adam":
+        optimizer = torch.optim.Adam(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    elif optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    elif optimizer_type == "rmsprop":
+        optimizer = torch.optim.RMSprop(param_groups, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type}. Available: adamw, adam, sgd, rmsprop")
 
     # Learning rate scheduler configuration
     num_epochs = config.get("num_epochs", 80)
