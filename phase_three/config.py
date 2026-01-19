@@ -236,7 +236,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_session_stats": False,     # Statistics-based conditioning (FiLM style)
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
-    "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style)
+    "use_adaptive_scaling": True,   # Session-adaptive output scaling (AdaIN style) - ENABLED by default
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
