@@ -561,7 +561,12 @@ class ConvBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Upsampling block with skip connections and FiLM conditioning."""
+    """Upsampling block with skip connections and FiLM conditioning.
+
+    Supports configurable skip connection types:
+    - "concat": Concatenate skip features with upsampled features (default, more capacity)
+    - "add": Add skip features to upsampled features (simpler, fewer parameters)
+    """
     def __init__(
         self,
         in_c: int,
@@ -571,11 +576,28 @@ class UpBlock(nn.Module):
         dropout: float = 0.0,
         norm_type: str = "instance",
         cond_mode: str = "cross_attn_gated",
+        skip_type: str = "concat",  # "concat" or "add"
     ):
         super().__init__()
+        self.skip_type = skip_type
         self.up = nn.ConvTranspose1d(in_c, out_c, kernel_size=4, stride=2, padding=1)
-        self.block = ConvBlock(out_c + skip_c, out_c, emb_dim, downsample=False,
-                               dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+
+        if skip_type == "concat":
+            # Concatenation: input to block is out_c + skip_c channels
+            self.block = ConvBlock(out_c + skip_c, out_c, emb_dim, downsample=False,
+                                   dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+            self.skip_proj = None
+        elif skip_type == "add":
+            # Addition: need to project skip to match out_c channels
+            self.block = ConvBlock(out_c, out_c, emb_dim, downsample=False,
+                                   dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+            # Project skip to out_c channels if dimensions don't match
+            if skip_c != out_c:
+                self.skip_proj = nn.Conv1d(skip_c, out_c, kernel_size=1)
+            else:
+                self.skip_proj = None
+        else:
+            raise ValueError(f"Unknown skip_type: {skip_type}. Available: concat, add")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.up(x)
@@ -588,7 +610,14 @@ class UpBlock(nn.Module):
                 diff = x.shape[-1] - skip.shape[-1]
                 start = diff // 2
                 x = x[..., start : start + skip.shape[-1]]
-        x = torch.cat([x, skip], dim=1)
+
+        if self.skip_type == "concat":
+            x = torch.cat([x, skip], dim=1)
+        else:  # add
+            if self.skip_proj is not None:
+                skip = self.skip_proj(skip)
+            x = x + skip
+
         return self.block(x, emb)
 
 
@@ -801,6 +830,10 @@ class ModernUpBlock(nn.Module):
 
     Uses ConvTranspose1d for upsampling, then modern conv block for refinement.
 
+    Supports configurable skip connection types:
+    - "concat": Concatenate skip features with upsampled features (default, more capacity)
+    - "add": Add skip features to upsampled features (simpler, fewer parameters)
+
     Args:
         in_c: Input channels
         skip_c: Skip connection channels
@@ -812,6 +845,7 @@ class ModernUpBlock(nn.Module):
         use_se: Whether to use SE attention
         kernel_size: Kernel size for depthwise conv
         dilations: Dilation rates for multi-scale conv
+        skip_type: Skip connection type - "concat" or "add"
     """
     def __init__(
         self,
@@ -825,19 +859,44 @@ class ModernUpBlock(nn.Module):
         use_se: bool = True,
         kernel_size: int = 7,
         dilations: Tuple[int, ...] = (1, 4, 16, 32),
+        skip_type: str = "concat",  # "concat" or "add"
     ):
         super().__init__()
+        self.skip_type = skip_type
         self.up = nn.ConvTranspose1d(in_c, out_c, kernel_size=4, stride=2, padding=1)
-        self.block = ModernConvBlock(
-            out_c + skip_c, out_c, emb_dim,
-            downsample=False,
-            dropout=dropout,
-            norm_type=norm_type,
-            cond_mode=cond_mode,
-            use_se=use_se,
-            kernel_size=kernel_size,
-            dilations=dilations,
-        )
+
+        if skip_type == "concat":
+            # Concatenation: input to block is out_c + skip_c channels
+            self.block = ModernConvBlock(
+                out_c + skip_c, out_c, emb_dim,
+                downsample=False,
+                dropout=dropout,
+                norm_type=norm_type,
+                cond_mode=cond_mode,
+                use_se=use_se,
+                kernel_size=kernel_size,
+                dilations=dilations,
+            )
+            self.skip_proj = None
+        elif skip_type == "add":
+            # Addition: need to project skip to match out_c channels
+            self.block = ModernConvBlock(
+                out_c, out_c, emb_dim,
+                downsample=False,
+                dropout=dropout,
+                norm_type=norm_type,
+                cond_mode=cond_mode,
+                use_se=use_se,
+                kernel_size=kernel_size,
+                dilations=dilations,
+            )
+            # Project skip to out_c channels if dimensions don't match
+            if skip_c != out_c:
+                self.skip_proj = nn.Conv1d(skip_c, out_c, kernel_size=1)
+            else:
+                self.skip_proj = None
+        else:
+            raise ValueError(f"Unknown skip_type: {skip_type}. Available: concat, add")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.up(x)
@@ -851,7 +910,14 @@ class ModernUpBlock(nn.Module):
                 diff = x.shape[-1] - skip.shape[-1]
                 start = diff // 2
                 x = x[..., start : start + skip.shape[-1]]
-        x = torch.cat([x, skip], dim=1)
+
+        if self.skip_type == "concat":
+            x = torch.cat([x, skip], dim=1)
+        else:  # add
+            if self.skip_proj is not None:
+                skip = self.skip_proj(skip)
+            x = x + skip
+
         return self.block(x, emb)
 
 
@@ -2274,25 +2340,25 @@ class CondUNet1D(nn.Module):
                 skip_in = channels[n_downsample - i - 1]
                 dec_out = channels[n_downsample - i - 1]
                 self.decoders.append(
-                    ModernUpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
+                    ModernUpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, skip_type=skip_type, **conv_kwargs)
                 )
         else:
             # Standard: original Conv1d(kernel_size=3)
             self.inc = ConvBlock(in_channels, channels[0], emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
-            
+
             self.encoders = nn.ModuleList()
             for i in range(n_downsample):
                 self.encoders.append(
                     ConvBlock(channels[i], channels[i+1], emb_dim, downsample=True, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
                 )
-            
+
             self.decoders = nn.ModuleList()
             for i in range(n_downsample):
                 dec_in = channels[n_downsample - i]
                 skip_in = channels[n_downsample - i - 1]
                 dec_out = channels[n_downsample - i - 1]
                 self.decoders.append(
-                    UpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+                    UpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, skip_type=skip_type)
                 )
 
         # Build bottleneck with configurable attention
