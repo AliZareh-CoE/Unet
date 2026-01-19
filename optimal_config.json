@@ -1,0 +1,36 @@
+{
+  "optimal_config": {
+    "conv_type": "modern",
+    "n_downsample": 2,
+    "base_channels": 128,
+    "attention_type": "none",
+    "n_heads": 2,
+    "cond_mode": "none",
+    "use_odor_embedding": false,
+    "loss_type": "l1",
+    "use_augmentation": false,
+    "aug_strength": "none",
+    "bidirectional": false,
+    "cycle_lambda": 0.5,
+    "norm_type": "batch",
+    "skip_type": "concat",
+    "activation": "gelu",
+    "dropout": 0.3,
+    "optimizer": "adamw",
+    "lr_schedule": "step",
+    "weight_decay": 0.01,
+    "use_session_stats": false,
+    "session_emb_dim": 32,
+    "session_use_spectral": false,
+    "use_adaptive_scaling": true,
+    "use_cov_augment": false,
+    "cov_augment_prob": 0.5,
+    "use_session_embedding": true,
+    "use_adabn": false
+  },
+  "notes": {
+    "session_embedding": "Learnable session embeddings - will be ablated (reset to false)",
+    "adaptive_scaling": "FiLM-style output scaling - will be ablated (reset to false)",
+    "adabn": "AdaBN is INFERENCE-TIME ONLY - cannot ablate during training"
+  }
+}

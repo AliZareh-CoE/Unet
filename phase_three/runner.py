@@ -2531,13 +2531,17 @@ def run_ablation_validation(
     # Build list of parameters to ablate
     # Only ablate parameters that DIFFER from GREEDY_DEFAULTS
     parameters_to_ablate = []
+    ablated_params = set()  # Track which params we've already added
 
-    # Map group names to their parameters
-    group_params = {g["name"]: g["parameter"] for g in ABLATION_GROUPS}
-
+    # First: Check ABLATION_GROUPS for group-level parameters
+    print("\nChecking ABLATION_GROUPS parameters:")
     for group in ABLATION_GROUPS:
         param = group["parameter"]
         group_name = group["name"]
+
+        # Skip virtual parameters (like session_adaptation_mode)
+        if param not in GREEDY_DEFAULTS:
+            continue
 
         optimal_value = optimal_config.get(param)
         default_value = GREEDY_DEFAULTS.get(param)
@@ -2558,7 +2562,30 @@ def run_ablation_validation(
             "optimal_value": optimal_value,
             "baseline_value": default_value,
         })
+        ablated_params.add(param)
         print(f"  [ABLATE] {group_name}: {optimal_value} → {default_value}")
+
+    # Second: Check ALL config keys for individual parameters not covered by groups
+    # This handles use_adaptive_scaling, use_session_embedding, etc.
+    print("\nChecking individual config parameters:")
+    for param, default_value in GREEDY_DEFAULTS.items():
+        if param in ablated_params:
+            continue  # Already handled by group
+        if param == "base_channels":
+            continue  # Locked
+
+        optimal_value = optimal_config.get(param)
+        if optimal_value is None:
+            continue  # Not in optimal config
+
+        if optimal_value != default_value:
+            parameters_to_ablate.append({
+                "group_name": param,  # Use param name as group name
+                "parameter": param,
+                "optimal_value": optimal_value,
+                "baseline_value": default_value,
+            })
+            print(f"  [ABLATE] {param}: {optimal_value} → {default_value}")
 
     print(f"\nTotal parameters to ablate: {len(parameters_to_ablate)}")
 
