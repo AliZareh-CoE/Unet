@@ -208,10 +208,11 @@ COMPONENT_ORDER = [
 # Single split: 8 sessions train, 4 sessions test (no CV during ablation)
 
 # Default configuration (simple baseline to start)
+# NOTE: base_channels=128 is LOCKED IN as optimal (skip width ablation)
 GREEDY_DEFAULTS: Dict[str, Any] = {
     "conv_type": "standard",
     "n_downsample": 2,
-    "base_channels": 64,
+    "base_channels": 128,  # LOCKED: 128 is optimal width
     "attention_type": "none",
     "n_heads": 4,
     "cond_mode": "none",
@@ -297,7 +298,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "conditional_on": None,
     },
     # GROUP 4: Skip Connection Type (core U-Net design)
-    # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
+    # Literature: ResNet (2015), DenseNet (2017)
+    # NOTE: Only "add" and "concat" are implemented in models.py
     {
         "group_id": 6,
         "name": "skip_connection",
@@ -306,8 +308,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "variants": [
             {"value": "add", "name": "residual_add", "desc": "Additive residual (ResNet style)"},
             {"value": "concat", "name": "concat", "desc": "Concatenation (original U-Net)"},
-            {"value": "attention", "name": "attention_gate", "desc": "Attention-gated skip (Attention U-Net)"},
-            {"value": "dense", "name": "dense", "desc": "Dense connections (all previous layers)"},
+            # "attention" and "dense" removed - NOT IMPLEMENTED in models.py
         ],
         "conditional_on": None,
     },
@@ -324,19 +325,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 6: Network Width
-    {
-        "group_id": 5,
-        "name": "width",
-        "description": "Base channel count",
-        "parameter": "base_channels",
-        "variants": [
-            {"value": 32, "name": "narrow", "desc": "32 base channels"},
-            {"value": 64, "name": "medium", "desc": "64 base channels"},
-            {"value": 128, "name": "wide", "desc": "128 base channels"},
-        ],
-        "conditional_on": None,
-    },
+    # GROUP 6: Network Width - REMOVED (128 is LOCKED as optimal)
+    # base_channels=128 is the winner, no need to search
     # =========================================================================
     # PHASE 2: ATTENTION & CONDITIONING (Groups 7-9)
     # Optional enhancements to the base architecture
@@ -449,7 +439,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # Optimizer and learning rate strategies
     # =========================================================================
     # GROUP 14: Optimizer
-    # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
+    # Literature: Adam (2014), AdamW (2017)
+    # NOTE: Only adamw, adam, sgd, rmsprop are implemented in train.py
     {
         "group_id": 13,
         "name": "optimizer",
@@ -459,8 +450,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": "adamw", "name": "adamw", "desc": "AdamW - decoupled weight decay, standard"},
             {"value": "adam", "name": "adam", "desc": "Adam - original adaptive moments"},
             {"value": "sgd", "name": "sgd_momentum", "desc": "SGD + Momentum - classic, often better generalization"},
-            {"value": "lion", "name": "lion", "desc": "Lion - Google 2023, memory efficient"},
-            {"value": "adafactor", "name": "adafactor", "desc": "Adafactor - memory efficient, used in T5"},
+            {"value": "rmsprop", "name": "rmsprop", "desc": "RMSprop - adaptive learning rate"},
+            # "lion" and "adafactor" removed - NOT IMPLEMENTED in train.py
         ],
         "conditional_on": None,
     },
@@ -504,24 +495,39 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
             {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
         ],
-        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 5: BATCH SIZE (merged from Stage 2)
+    # Critical for training dynamics - test last
+    # =========================================================================
+    # GROUP 18: Batch Size
+    {
+        "group_id": 19,
+        "name": "batch_size",
+        "description": "Batch size - affects gradient noise, memory, and convergence",
+        "parameter": "batch_size",
+        "variants": [
+            {"value": 16, "name": "batch_16", "desc": "Batch 16 - more gradient noise, less memory"},
+            {"value": 32, "name": "batch_32", "desc": "Batch 32 - balanced"},
+            {"value": 64, "name": "batch_64", "desc": "Batch 64 - smoother gradients"},
+            {"value": 128, "name": "batch_128", "desc": "Batch 128 - very smooth, needs more memory"},
+        ],
+        "conditional_on": None,
     },
 ]
 
 # =============================================================================
-# STAGE 2 GREEDY: Fine-tuning after Stage 1
+# STAGE 2 GREEDY: DEPRECATED - Merged into Stage 1
 # =============================================================================
-# After Stage 1 greedy forward selection identifies optimal architecture/training choices,
-# Stage 2 explores scaling and fine-tuning parameters that interact with each other:
-# - Width (model capacity)
-# - Augmentation strength (regularization)
-# - Depth (model complexity)
-# - Bidirectional (confirm always on)
-# - Batch size (training dynamics)
+# Stage 2 has been MERGED into the main ABLATION_GROUPS above.
+# - Width exploration REMOVED (128 is locked as optimal)
+# - Batch size ADDED to main groups
+# - Other Stage 2 parameters already covered in Stage 1
 #
-# Total: 5 + 3 + 4 + 1 + 4 = 17 runs
+# Keep this for backward compatibility but it's no longer used.
 
-STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
+STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [  # DEPRECATED
     # GROUP 1: WIDTH - model capacity scaling
     {
         "group_id": 1,
