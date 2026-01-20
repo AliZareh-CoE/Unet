@@ -4,7 +4,7 @@
     "n_downsample": 2,
     "base_channels": 128,
     "attention_type": "none",
-    "n_heads": 2,
+    "n_heads": 4,
     "cond_mode": "none",
     "use_odor_embedding": false,
     "loss_type": "l1",
@@ -14,7 +14,7 @@
     "cycle_lambda": 0.5,
     "norm_type": "batch",
     "skip_type": "concat",
-    "activation": "gelu",
+    "activation": "relu",
     "dropout": 0.3,
     "optimizer": "adamw",
     "lr_schedule": "step",
@@ -29,8 +29,9 @@
     "use_adabn": false
   },
   "notes": {
+    "n_heads": "Set to default (4) - not ablated since attention_type=none",
+    "activation": "Set to default (relu) - not ablated",
     "session_embedding": "Learnable session embeddings - will be ablated (reset to false)",
-    "adaptive_scaling": "FiLM-style output scaling - will be ablated (reset to false)",
-    "adabn": "AdaBN is INFERENCE-TIME ONLY - cannot ablate during training"
+    "adaptive_scaling": "FiLM-style output scaling - will be ablated (reset to false)"
   }
 }
