@@ -3088,6 +3088,9 @@ def main():
             n_workers=args.workers,
         )
 
+        # Setup logging to capture all output
+        log_path, tee_logger = setup_logging(config.output_dir / "ablation_validation")
+
         # Run ablation validation
         if not args.use_train_py:
             print("Note: ablation_validation requires --use-train-py, enabling it automatically")
@@ -3109,6 +3112,8 @@ def main():
         print("\n" + "=" * 80)
         print("ABLATION VALIDATION COMPLETE")
         print("=" * 80)
+        print(f"\nFull log saved to: {log_path}")
+        tee_logger.close()
         return
 
     if args.protocol == "greedy_forward":
