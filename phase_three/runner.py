@@ -153,6 +153,7 @@ def run_train_subprocess(
     ablation_config: "AblationConfig",
     epochs: int = 60,
     batch_size: int = 32,
+    learning_rate: float = 1e-3,  # CRITICAL: Learning rate must be passed!
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
     seed: int = 42,
@@ -203,6 +204,7 @@ def run_train_subprocess(
         "--arch", "condunet",
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
+        "--lr", str(learning_rate),  # CRITICAL: Pass learning rate!
         "--seed", str(seed + fold_idx),  # Different seed per fold
         "--output-results-file", str(output_results_file),
         "--fold", str(fold_idx),
@@ -306,6 +308,9 @@ def run_train_subprocess(
     # Learnable session embedding (requires n_sessions to be set)
     if config.get("use_session_embedding", False):
         cmd.append("--use-session-embedding")
+        # Pass session embedding dimension
+        session_emb_dim = config.get("session_emb_dim", 32)
+        cmd.extend(["--session-emb-dim", str(session_emb_dim)])
         # n_sessions is passed directly as parameter, not from config
         # (because AblationConfig.to_dict() doesn't include n_sessions)
         if n_sessions > 0:
@@ -633,8 +638,14 @@ def load_dataset_raw(
     try:
         from data import prepare_data
 
-        print(f"Loading {dataset_name} dataset...")
-        data = prepare_data(split_by_session=split_by_session)
+        print(f"Loading {dataset_name} dataset (cross-subject: 3 held-out val sessions, no test set)...")
+        data = prepare_data(
+            split_by_session=split_by_session,
+            n_test_sessions=0,   # No separate test set
+            n_val_sessions=3,    # 3 sessions held out for validation
+            no_test_set=True,    # All held-out sessions for validation
+            force_recreate_splits=True,  # Override any cached splits
+        )
 
         ob = data["ob"]    # [N, C, T]
         pcx = data["pcx"]  # [N, C, T]
@@ -1118,6 +1129,7 @@ def _run_greedy_forward_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -1426,6 +1438,7 @@ def _run_stage2_greedy_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=effective_batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -1790,6 +1803,7 @@ def _run_additive_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -2079,6 +2093,7 @@ def _run_subtractive_protocol(
                     ablation_config=baseline_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -2200,6 +2215,7 @@ def _run_subtractive_protocol(
                     ablation_config=ablation_config,
                     epochs=config.training.epochs,
                     batch_size=config.training.batch_size,
+                    learning_rate=config.training.learning_rate,
                     use_fsdp=use_fsdp,
                     fsdp_strategy=fsdp_strategy,
                     seed=config.cv_seed,
@@ -2444,6 +2460,345 @@ def print_summary(result: Phase3Result):
 
 
 # =============================================================================
+# ABLATION VALIDATION: Verify Greedy Forward Selection Results
+# =============================================================================
+# After greedy forward selection completes, run ablation validation to confirm
+# that each winner actually contributes to the final performance.
+#
+# For each parameter in the optimal config:
+#   1. Run training with that parameter reset to baseline/default
+#   2. Compare R² to the full optimal config
+#   3. Report the contribution (Δ R²) of each parameter
+#
+# This catches:
+#   - Parameters that don't actually matter (Δ ≈ 0)
+#   - Negative interactions (Δ > 0 when removed = winner hurts!)
+#   - Confirms the greedy results are valid
+
+
+def run_ablation_validation(
+    config: Phase3Config,
+    optimal_config: Dict[str, Any],
+    use_train_py: bool = True,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    n_sessions: int = 0,
+) -> Dict[str, Any]:
+    """Run ablation validation on the optimal config from greedy forward selection.
+
+    For each parameter that differs from GREEDY_DEFAULTS:
+      1. Run training with the FULL optimal config (reference)
+      2. Run training with that ONE parameter reset to baseline
+      3. Report the R² drop (contribution of that parameter)
+
+    Args:
+        config: Phase3Config with training settings
+        optimal_config: The optimal config from greedy forward selection
+        use_train_py: Use train.py subprocess
+        use_fsdp: Enable FSDP distributed training
+        fsdp_strategy: FSDP sharding strategy
+        n_sessions: Number of sessions for session embedding
+
+    Returns:
+        Dictionary with ablation validation results
+    """
+    from phase_three.config import GREEDY_DEFAULTS, ABLATION_GROUPS, AblationConfig
+
+    print("\n" + "=" * 80)
+    print("ABLATION VALIDATION")
+    print("=" * 80)
+    print("Validating that each parameter in optimal config actually contributes.")
+    print("For each parameter: reset to baseline, measure R² drop.")
+    print("=" * 80)
+
+    # Create output directory
+    output_dir = config.output_dir / "ablation_validation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load data with session-based split (same as greedy_forward)
+    X, y, odor_ids, session_ids, in_channels, out_channels, data_n_sessions, train_idx, val_idx = load_dataset_raw(config.dataset)
+
+    # Use n_sessions from parameter if provided, else from data
+    if n_sessions == 0:
+        n_sessions = data_n_sessions
+
+    # Build data_config dict for run_train_subprocess
+    data_config = {
+        "in_channels": in_channels,
+        "out_channels": out_channels,
+        "sampling_rate": 1000,  # Default for olfactory
+    }
+
+    print(f"\nData split: {len(train_idx)} train, {len(val_idx)} val")
+
+    # Build list of parameters to ablate
+    # Only ablate parameters that DIFFER from GREEDY_DEFAULTS
+    parameters_to_ablate = []
+    ablated_params = set()  # Track which params we've already added
+
+    # First: Check ABLATION_GROUPS for group-level parameters
+    print("\nChecking ABLATION_GROUPS parameters:")
+    for group in ABLATION_GROUPS:
+        param = group["parameter"]
+        group_name = group["name"]
+
+        # Skip virtual parameters (like session_adaptation_mode)
+        if param not in GREEDY_DEFAULTS:
+            continue
+
+        optimal_value = optimal_config.get(param)
+        default_value = GREEDY_DEFAULTS.get(param)
+
+        # Skip if optimal == default (nothing to ablate)
+        if optimal_value == default_value:
+            print(f"  [SKIP] {group_name}: optimal ({optimal_value}) == default")
+            continue
+
+        # Skip base_channels (locked)
+        if param == "base_channels":
+            print(f"  [SKIP] {group_name}: base_channels is locked")
+            continue
+
+        parameters_to_ablate.append({
+            "group_name": group_name,
+            "parameter": param,
+            "optimal_value": optimal_value,
+            "baseline_value": default_value,
+        })
+        ablated_params.add(param)
+        print(f"  [ABLATE] {group_name}: {optimal_value} → {default_value}")
+
+    # Second: Check ALL config keys for individual parameters not covered by groups
+    # This handles use_adaptive_scaling, use_session_embedding, etc.
+    print("\nChecking individual config parameters:")
+    for param, default_value in GREEDY_DEFAULTS.items():
+        if param in ablated_params:
+            continue  # Already handled by group
+        if param == "base_channels":
+            continue  # Locked
+
+        optimal_value = optimal_config.get(param)
+        if optimal_value is None:
+            continue  # Not in optimal config
+
+        if optimal_value != default_value:
+            parameters_to_ablate.append({
+                "group_name": param,  # Use param name as group name
+                "parameter": param,
+                "optimal_value": optimal_value,
+                "baseline_value": default_value,
+            })
+            print(f"  [ABLATE] {param}: {optimal_value} → {default_value}")
+
+    print(f"\nTotal parameters to ablate: {len(parameters_to_ablate)}")
+
+    results = {
+        "optimal_config": optimal_config,
+        "baseline_defaults": dict(GREEDY_DEFAULTS),
+        "ablations": [],
+        "reference_r2": None,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # STEP 1: Run reference (full optimal config)
+    print("\n" + "-" * 60)
+    print("STEP 1: Running REFERENCE (full optimal config)")
+    print("-" * 60)
+
+    ref_config = dict(optimal_config)
+
+    if use_train_py:
+        fold_indices_file = save_fold_indices(
+            output_dir, "ablation_ref", "optimal", 0, train_idx, val_idx
+        )
+        output_results_file = output_dir / "train_results" / "ablation_ref_optimal_results.json"
+        output_results_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create AblationConfig from dict
+        ref_ablation_config = AblationConfig.from_dict(ref_config, study="ablation_ref", variant="optimal")
+
+        ref_results = run_train_subprocess(
+            study="ablation_ref",
+            variant="optimal",
+            fold_idx=0,
+            fold_indices_file=fold_indices_file,
+            output_results_file=output_results_file,
+            ablation_config=ref_ablation_config,
+            epochs=config.training.epochs,
+            batch_size=config.training.batch_size,
+            learning_rate=config.training.learning_rate,
+            use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
+            n_sessions=n_sessions,
+        )
+
+        if ref_results and ref_results.get("best_val_r2"):
+            reference_r2 = ref_results["best_val_r2"]
+        else:
+            print("ERROR: Reference run failed!")
+            return results
+    else:
+        raise NotImplementedError("Ablation validation requires --use-train-py")
+
+    results["reference_r2"] = reference_r2
+    print(f"\n  REFERENCE R²: {reference_r2:.4f}")
+
+    # STEP 2: Ablate each parameter
+    print("\n" + "-" * 60)
+    print("STEP 2: Ablating each parameter (reset to baseline)")
+    print("-" * 60)
+
+    for i, ablation in enumerate(parameters_to_ablate):
+        group_name = ablation["group_name"]
+        param = ablation["parameter"]
+        optimal_val = ablation["optimal_value"]
+        baseline_val = ablation["baseline_value"]
+
+        print(f"\n[{i+1}/{len(parameters_to_ablate)}] Ablating {group_name}")
+        print(f"    {param}: {optimal_val} → {baseline_val}")
+
+        # Create ablated config (optimal with ONE param reset to baseline)
+        ablated_config = dict(optimal_config)
+        ablated_config[param] = baseline_val
+
+        # Handle special cases
+        if param == "use_augmentation" and baseline_val is False:
+            ablated_config["aug_strength"] = "none"
+        elif param == "use_augmentation" and baseline_val is True:
+            ablated_config["aug_strength"] = optimal_config.get("aug_strength", "medium")
+
+        if use_train_py:
+            variant_name = f"ablate_{group_name}"
+            fold_indices_file = save_fold_indices(
+                output_dir, "ablation", variant_name, 0, train_idx, val_idx
+            )
+            output_results_file = output_dir / "train_results" / f"ablation_{variant_name}_results.json"
+            output_results_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Create AblationConfig from dict
+            ablated_ablation_config = AblationConfig.from_dict(ablated_config, study="ablation", variant=variant_name)
+
+            ablation_results = run_train_subprocess(
+                study="ablation",
+                variant=variant_name,
+                fold_idx=0,
+                fold_indices_file=fold_indices_file,
+                output_results_file=output_results_file,
+                ablation_config=ablated_ablation_config,
+                epochs=config.training.epochs,
+                batch_size=config.training.batch_size,
+                learning_rate=config.training.learning_rate,
+                use_fsdp=use_fsdp,
+                fsdp_strategy=fsdp_strategy,
+                n_sessions=n_sessions,
+            )
+
+            if ablation_results and ablation_results.get("best_val_r2"):
+                ablated_r2 = ablation_results["best_val_r2"]
+                delta = reference_r2 - ablated_r2  # Positive = winner helps
+
+                results["ablations"].append({
+                    "group_name": group_name,
+                    "parameter": param,
+                    "optimal_value": optimal_val,
+                    "baseline_value": baseline_val,
+                    "ablated_r2": ablated_r2,
+                    "delta_r2": delta,
+                    "contribution_pct": (delta / reference_r2) * 100 if reference_r2 > 0 else 0,
+                })
+
+                # Print result
+                delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
+                status = "✓ VALIDATED" if delta > 0.005 else ("≈ MARGINAL" if delta > 0 else "✗ NEGATIVE!")
+                print(f"    R²: {ablated_r2:.4f} (Δ = {delta_str}) {status}")
+            else:
+                print(f"    ERROR: Ablation run failed!")
+                results["ablations"].append({
+                    "group_name": group_name,
+                    "parameter": param,
+                    "optimal_value": optimal_val,
+                    "baseline_value": baseline_val,
+                    "ablated_r2": None,
+                    "delta_r2": None,
+                    "error": "Run failed",
+                })
+
+    # STEP 3: Generate report
+    print("\n" + "=" * 80)
+    print("ABLATION VALIDATION REPORT")
+    print("=" * 80)
+
+    print(f"\nReference (full optimal config): R² = {reference_r2:.4f}")
+    print(f"\n{'Parameter':<20} {'Optimal':<15} {'Baseline':<15} {'Ablated R²':<12} {'Δ R²':<10} {'Status':<15}")
+    print("-" * 90)
+
+    total_contribution = 0
+    validated_count = 0
+    marginal_count = 0
+    negative_count = 0
+
+    # Sort by delta (largest contribution first)
+    sorted_ablations = sorted(
+        [a for a in results["ablations"] if a.get("delta_r2") is not None],
+        key=lambda x: x["delta_r2"],
+        reverse=True
+    )
+
+    for ablation in sorted_ablations:
+        delta = ablation["delta_r2"]
+        total_contribution += delta
+
+        if delta > 0.005:
+            status = "✓ VALIDATED"
+            validated_count += 1
+        elif delta > 0:
+            status = "≈ MARGINAL"
+            marginal_count += 1
+        else:
+            status = "✗ NEGATIVE!"
+            negative_count += 1
+
+        delta_str = f"+{delta:.4f}" if delta >= 0 else f"{delta:.4f}"
+
+        opt_str = str(ablation["optimal_value"])[:13]
+        base_str = str(ablation["baseline_value"])[:13]
+
+        print(f"{ablation['parameter']:<20} {opt_str:<15} {base_str:<15} "
+              f"{ablation['ablated_r2']:<12.4f} {delta_str:<10} {status:<15}")
+
+    print("-" * 90)
+    print(f"\nSummary:")
+    print(f"  - Validated (Δ > 0.5%):  {validated_count}")
+    print(f"  - Marginal (0 < Δ < 0.5%): {marginal_count}")
+    print(f"  - Negative (Δ < 0):      {negative_count}")
+    print(f"  - Total contribution:    {total_contribution:+.4f}")
+
+    if negative_count > 0:
+        print(f"\n⚠️  WARNING: {negative_count} parameter(s) have NEGATIVE contribution!")
+        print("    These parameters may have negative interactions in the final config.")
+        print("    Consider removing them from the optimal config.")
+
+    # Save results
+    results_path = output_dir / "ablation_validation_results.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved to: {results_path}")
+
+    return results
+
+
+def load_optimal_config_from_results(results_path: Path) -> Dict[str, Any]:
+    """Load optimal config from phase3_results.json or phase3_combined_results.json."""
+    with open(results_path) as f:
+        data = json.load(f)
+
+    if "optimal_config" in data:
+        return data["optimal_config"]
+    else:
+        raise ValueError(f"No optimal_config found in {results_path}")
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -2460,8 +2815,19 @@ def main():
         "--protocol",
         type=str,
         default="greedy_forward",
-        choices=["additive", "subtractive", "greedy_forward", "stage2_greedy"],
-        help="Ablation protocol: 'greedy_forward' (recommended), 'stage2_greedy' (after stage1), 'additive', or 'subtractive'",
+        choices=["additive", "subtractive", "greedy_forward", "stage2_greedy", "ablation_validation"],
+        help="Ablation protocol: 'greedy_forward' (recommended), 'ablation_validation' (verify greedy results), "
+             "'stage2_greedy' (after stage1), 'additive', or 'subtractive'",
+    )
+
+    # Optimal config for ablation_validation protocol
+    parser.add_argument(
+        "--optimal-config",
+        type=str,
+        default=None,
+        help="Path to optimal config JSON for ablation_validation protocol. "
+             "Can be phase3_results.json or phase3_combined_results.json. "
+             "If not specified, looks for phase3_combined_results.json in output-dir.",
     )
 
     # Studies to run (for subtractive protocol)
@@ -2512,7 +2878,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=80, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
 
     # Cross-validation
     parser.add_argument(
@@ -2671,6 +3037,84 @@ def main():
     # Handle protocol-specific options
     # --fast runs ALL groups/stages but with 1 epoch (quick full validation)
     from phase_three.config import STAGE2_GREEDY_GROUPS
+
+    # Handle ablation_validation protocol separately (early return)
+    if args.protocol == "ablation_validation":
+        print("\n" + "=" * 80)
+        print("ABLATION VALIDATION PROTOCOL")
+        print("=" * 80)
+
+        # Load optimal config
+        if args.optimal_config:
+            optimal_config_path = Path(args.optimal_config)
+        else:
+            # Auto-detect from output-dir
+            optimal_config_path = Path(args.output_dir) / "phase3_combined_results.json"
+            if not optimal_config_path.exists():
+                optimal_config_path = Path(args.output_dir) / "phase3_results.json"
+
+        if not optimal_config_path.exists():
+            print(f"ERROR: Cannot find optimal config file!")
+            print(f"  Tried: {args.optimal_config or 'auto-detect'}")
+            print(f"  Use --optimal-config to specify the path to phase3_results.json or phase3_combined_results.json")
+            return
+
+        print(f"Loading optimal config from: {optimal_config_path}")
+        optimal_config = load_optimal_config_from_results(optimal_config_path)
+        print(f"Optimal config: {optimal_config}")
+
+        # Build training config
+        training_config = TrainingConfig(
+            epochs=epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            patience=3 if (args.dry_run or args.fast) else args.patience,
+        )
+
+        # Build phase3 config
+        config = Phase3Config(
+            dataset=args.dataset,
+            protocol="ablation_validation",
+            studies=[],
+            stages=[],
+            groups=[],
+            stage2_groups=[],
+            stage1_results_path=None,
+            n_folds=1,
+            cv_seed=args.cv_seed,
+            training=training_config,
+            output_dir=Path(args.output_dir),
+            device=args.device,
+            n_workers=args.workers,
+        )
+
+        # Setup logging to capture all output
+        log_path, tee_logger = setup_logging(config.output_dir / "ablation_validation")
+
+        # Run ablation validation
+        if not args.use_train_py:
+            print("Note: ablation_validation requires --use-train-py, enabling it automatically")
+            args.use_train_py = True
+
+        # Load dataset to get n_sessions (needed for session_embedding ablation)
+        _, _, _, _, _, _, n_sessions, _, _ = load_dataset_raw(config.dataset)
+        print(f"Detected {n_sessions} sessions from dataset")
+
+        result = run_ablation_validation(
+            config=config,
+            optimal_config=optimal_config,
+            use_train_py=args.use_train_py,
+            use_fsdp=args.fsdp,
+            fsdp_strategy=args.fsdp_strategy,
+            n_sessions=n_sessions,
+        )
+
+        print("\n" + "=" * 80)
+        print("ABLATION VALIDATION COMPLETE")
+        print("=" * 80)
+        print(f"\nFull log saved to: {log_path}")
+        tee_logger.close()
+        return
 
     if args.protocol == "greedy_forward":
         groups = args.groups if args.groups else list(range(1, len(ABLATION_GROUPS) + 1))

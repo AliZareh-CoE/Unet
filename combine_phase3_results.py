@@ -4,9 +4,10 @@ Combine Phase 3 JSON Results
 ============================
 Combines all Phase 3 result JSON files into a single comprehensive summary.
 
-Handles two formats:
+Handles:
 1. Individual training results from train.py (g{group_id}_{variant}_results.json)
 2. Combined phase3_results.json from the runner
+3. Greedy forward selection results with 17 unified groups
 
 The script extracts group_id and variant from file names, aggregates results,
 and identifies the winner (best R²) for each ablation group.
@@ -18,15 +19,42 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
-from phase_three.config import ABLATION_GROUPS
+from phase_three.config import ABLATION_GROUPS, GREEDY_DEFAULTS
+
+
+# Build lookup from group_id to group info
+GROUP_INFO = {g["group_id"]: g for g in ABLATION_GROUPS}
+# Build lookup from list index to group info (for proper ordering)
+GROUP_BY_INDEX = {i: g for i, g in enumerate(ABLATION_GROUPS)}
+
+
+def get_group_info(group_id: int) -> Dict[str, Any]:
+    """Get group info from ABLATION_GROUPS config."""
+    return GROUP_INFO.get(group_id, {"name": f"group_{group_id}", "parameter": "unknown"})
 
 
 def get_group_name(group_id: int) -> str:
     """Get group name from ABLATION_GROUPS config."""
-    for group in ABLATION_GROUPS:
-        if group["group_id"] == group_id:
-            return group["name"]
-    return f"group_{group_id}"
+    return get_group_info(group_id).get("name", f"group_{group_id}")
+
+
+def get_group_parameter(group_id: int) -> str:
+    """Get the config parameter name for a group."""
+    return get_group_info(group_id).get("parameter", "unknown")
+
+
+def get_variant_value(group_id: int, variant_name: str) -> Any:
+    """Get the actual config value for a variant name."""
+    group = GROUP_INFO.get(group_id)
+    if not group:
+        return variant_name
+
+    for v in group.get("variants", []):
+        if v.get("name") == variant_name:
+            return v.get("value")
+
+    # Fallback: return variant name
+    return variant_name
 
 
 def parse_result_filename(filename: str) -> Optional[Dict[str, Any]]:
@@ -49,7 +77,7 @@ def parse_result_filename(filename: str) -> Optional[Dict[str, Any]]:
             "stage": 1,
         }
 
-    # Format: s2g{group_id}_{variant}_results.json (Stage 2 greedy)
+    # Format: s2g{group_id}_{variant}_results.json (Stage 2 greedy - deprecated but handle)
     match = re.match(r's2g(\d+)_(.+)_results(?:-checkpoint)?\.json', filename)
     if match:
         return {
@@ -115,7 +143,7 @@ def combine_results(results_dir: Path = Path("results/phase3")):
         "generated_at": datetime.now().isoformat(),
         "source_files": [str(f.relative_to(results_dir)) for f in json_files],
         "group_results": {},  # group_id -> {variants: {variant: {r2, mae, corr, ...}}, winner: ...}
-        "optimal_config": {},
+        "optimal_config": dict(GREEDY_DEFAULTS),  # Start with defaults
         "winner_summary": [],
         "raw_results": [],  # All individual results
     }
@@ -206,7 +234,9 @@ def combine_results(results_dir: Path = Path("results/phase3")):
 
     # Build group results with statistics
     for group_id in sorted(group_variants.keys()):
-        group_name = get_group_name(group_id) if group_id > 0 else "baseline"
+        group_info = get_group_info(group_id)
+        group_name = group_info.get("name", f"group_{group_id}") if group_id > 0 else "baseline"
+        parameter = group_info.get("parameter", "unknown")
 
         variants_data = {}
         best_variant = None
@@ -231,6 +261,7 @@ def combine_results(results_dir: Path = Path("results/phase3")):
                 "n_folds": n_folds,
                 "all_completed": all_completed,
                 "fold_r2s": [r["best_val_r2"] for r in fold_results],
+                "value": get_variant_value(group_id, variant),
             }
 
             # Track best variant
@@ -240,20 +271,23 @@ def combine_results(results_dir: Path = Path("results/phase3")):
 
         combined["group_results"][str(group_id)] = {
             "group_name": group_name,
+            "parameter": parameter,
             "variants": variants_data,
             "winner": best_variant,
             "winner_r2": best_r2,
+            "winner_value": get_variant_value(group_id, best_variant) if best_variant else None,
         }
 
-        # Update optimal config
+        # Update optimal config with the actual parameter value
         if group_id > 0 and best_variant:
-            combined["optimal_config"][group_name] = best_variant
+            winner_value = get_variant_value(group_id, best_variant)
+            combined["optimal_config"][parameter] = winner_value
 
-    # Calculate improvements (relative to baseline or previous group)
-    baseline_r2 = combined["group_results"].get("0", {}).get("winner_r2", None)
-    prev_r2 = baseline_r2
+    # Calculate improvements (relative to first completed group)
+    sorted_group_ids = sorted(group_variants.keys())
+    prev_r2 = None
 
-    for group_id in sorted(group_variants.keys()):
+    for group_id in sorted_group_ids:
         group_data = combined["group_results"][str(group_id)]
         current_r2 = group_data["winner_r2"]
 
@@ -265,13 +299,19 @@ def combine_results(results_dir: Path = Path("results/phase3")):
 
         prev_r2 = current_r2
 
-    # Build winner summary table
-    for group_id in sorted(group_variants.keys()):
+    # Build winner summary table (ordered by list index, not group_id)
+    # First, map group_ids to their list index for proper ordering
+    group_id_to_index = {g["group_id"]: i for i, g in enumerate(ABLATION_GROUPS)}
+
+    for group_id in sorted(group_variants.keys(), key=lambda gid: group_id_to_index.get(gid, 999)):
         group_data = combined["group_results"][str(group_id)]
         combined["winner_summary"].append({
-            "group": group_id,
+            "group_id": group_id,
+            "index": group_id_to_index.get(group_id, -1),
             "name": group_data["group_name"],
+            "parameter": group_data["parameter"],
             "winner": group_data["winner"],
+            "winner_value": group_data.get("winner_value"),
             "r2": group_data["winner_r2"],
             "improvement": group_data.get("improvement", 0),
         })
@@ -290,43 +330,70 @@ def combine_results(results_dir: Path = Path("results/phase3")):
 
 def print_summary(combined: Dict[str, Any]):
     """Print a formatted summary of the combined results."""
-    print("\n" + "=" * 80)
-    print("PHASE 3 COMBINED RESULTS SUMMARY")
-    print("=" * 80)
+    print("\n" + "=" * 100)
+    print("PHASE 3 GREEDY FORWARD SELECTION - COMBINED RESULTS")
+    print("=" * 100)
+
+    # Count completed groups
+    n_completed = len(combined["winner_summary"])
+    n_total = len(ABLATION_GROUPS)
+    print(f"\nProgress: {n_completed}/{n_total} groups completed")
 
     # Print winner summary table
-    print(f"\n{'Group':<6} {'Name':<22} {'Winner':<20} {'R²':<10} {'Δ R²':<10}")
-    print("-" * 80)
+    print(f"\n{'#':<3} {'Group':<20} {'Parameter':<18} {'Winner':<22} {'Value':<12} {'R²':<10} {'Δ R²':<10}")
+    print("-" * 100)
 
-    baseline_r2 = None
+    first_r2 = None
     final_r2 = None
 
-    for row in combined["winner_summary"]:
-        if baseline_r2 is None:
-            baseline_r2 = row["r2"]
+    for i, row in enumerate(combined["winner_summary"], 1):
+        if first_r2 is None:
+            first_r2 = row["r2"]
         final_r2 = row["r2"]
 
         # Format improvement
         imp_str = f"{row['improvement']:+.4f}" if row['improvement'] != 0 else "-"
 
-        print(f"{row['group']:<6} {row['name']:<22} {row['winner']:<20} "
-              f"{row['r2']:<10.4f} {imp_str:<10}")
+        # Format value (handle different types)
+        value = row.get("winner_value", "")
+        if isinstance(value, bool):
+            value_str = "Yes" if value else "No"
+        elif isinstance(value, float):
+            value_str = f"{value:.0e}" if value < 0.01 else f"{value}"
+        else:
+            value_str = str(value)[:12]
 
-    print("-" * 80)
+        print(f"{i:<3} {row['name']:<20} {row['parameter']:<18} {row['winner']:<22} "
+              f"{value_str:<12} {row['r2']:<10.4f} {imp_str:<10}")
 
-    if baseline_r2 and final_r2:
-        total_improvement = final_r2 - baseline_r2
-        print(f"Total: {baseline_r2:.4f} → {final_r2:.4f} (Δ = {total_improvement:+.4f})")
+    print("-" * 100)
+
+    if first_r2 and final_r2:
+        total_improvement = final_r2 - first_r2
+        print(f"Cumulative: {first_r2:.4f} → {final_r2:.4f} (Δ = {total_improvement:+.4f})")
+
+    # Print remaining groups
+    completed_ids = {row["group_id"] for row in combined["winner_summary"]}
+    remaining = [(i, g) for i, g in enumerate(ABLATION_GROUPS) if g["group_id"] not in completed_ids]
+
+    if remaining:
+        print(f"\n{'='*100}")
+        print(f"REMAINING GROUPS ({len(remaining)})")
+        print("=" * 100)
+        for idx, group in remaining:
+            print(f"  {idx+1}. {group['name']} ({group['parameter']})")
 
     # Print variant details for each group
-    print("\n" + "=" * 80)
-    print("DETAILED VARIANT RESULTS")
-    print("=" * 80)
+    print("\n" + "=" * 100)
+    print("DETAILED VARIANT RESULTS BY GROUP")
+    print("=" * 100)
 
-    for group_id_str in sorted(combined["group_results"].keys(), key=lambda x: int(x)):
+    for row in combined["winner_summary"]:
+        group_id_str = str(row["group_id"])
         group_data = combined["group_results"][group_id_str]
-        print(f"\n[Group {group_id_str}] {group_data['group_name']}")
-        print("-" * 50)
+
+        print(f"\n[{row['name']}] parameter: {row['parameter']}")
+        print("-" * 60)
 
         # Sort variants by R²
         variants = sorted(
@@ -337,16 +404,83 @@ def print_summary(combined: Dict[str, Any]):
 
         for variant, stats in variants:
             marker = " ★ WINNER" if variant == group_data["winner"] else ""
+            value = stats.get("value", "")
             print(f"  {variant:<25} R²={stats['mean_r2']:.4f} "
-                  f"(MAE={stats['mean_mae']:.4f}, corr={stats['mean_corr']:.4f}){marker}")
+                  f"(MAE={stats['mean_mae']:.4f}, corr={stats['mean_corr']:.4f}) "
+                  f"[{value}]{marker}")
 
     # Print optimal configuration
-    print("\n" + "=" * 80)
-    print("OPTIMAL CONFIGURATION")
-    print("=" * 80)
+    print("\n" + "=" * 100)
+    print("OPTIMAL CONFIGURATION (for train.py)")
+    print("=" * 100)
 
-    for key, value in sorted(combined["optimal_config"].items()):
-        print(f"  {key}: {value}")
+    # Group by category for readability
+    arch_params = ["base_channels", "norm_type", "skip_type", "activation", "conv_type",
+                   "n_downsample", "attention_type", "n_heads", "cond_mode", "dropout"]
+    train_params = ["optimizer", "lr_schedule", "weight_decay", "loss_type", "batch_size",
+                    "bidirectional", "cycle_lambda"]
+    session_params = ["use_adaptive_scaling", "use_session_stats", "session_use_spectral"]
+    aug_params = ["use_augmentation", "aug_strength"]
+
+    def print_param_group(name: str, params: List[str]):
+        print(f"\n  # {name}")
+        for p in params:
+            if p in combined["optimal_config"]:
+                v = combined["optimal_config"][p]
+                print(f"  {p}: {v}")
+
+    print_param_group("Architecture", arch_params)
+    print_param_group("Training", train_params)
+    print_param_group("Session Adaptation", session_params)
+    print_param_group("Augmentation", aug_params)
+
+    # Print CLI command
+    print("\n" + "=" * 100)
+    print("CLI COMMAND (copy-paste ready)")
+    print("=" * 100)
+
+    cli_args = []
+    cfg = combined["optimal_config"]
+
+    # Map config keys to CLI args
+    cli_mapping = {
+        "base_channels": "--base-channels",
+        "norm_type": "--norm-type",
+        "skip_type": "--skip-type",
+        "activation": "--activation",
+        "conv_type": "--conv-type",
+        "n_downsample": "--n-downsample",
+        "attention_type": "--attention-type",
+        "n_heads": "--n-heads",
+        "cond_mode": "--cond-mode",
+        "dropout": "--dropout",
+        "optimizer": "--optimizer",
+        "lr_schedule": "--lr-schedule",
+        "weight_decay": "--weight-decay",
+        "loss_type": "--loss",
+        "batch_size": "--batch-size",
+    }
+
+    for key, flag in cli_mapping.items():
+        if key in cfg and cfg[key] is not None:
+            cli_args.append(f"{flag} {cfg[key]}")
+
+    # Boolean flags
+    if cfg.get("use_adaptive_scaling"):
+        cli_args.append("--use-adaptive-scaling")
+    if cfg.get("bidirectional") is False:
+        cli_args.append("--no-bidirectional")
+    if cfg.get("use_augmentation") is False:
+        cli_args.append("--no-aug")
+    elif cfg.get("aug_strength"):
+        cli_args.append(f"--aug-strength {cfg['aug_strength']}")
+
+    print(f"\npython train.py --arch condunet \\")
+    for i, arg in enumerate(cli_args):
+        if i < len(cli_args) - 1:
+            print(f"    {arg} \\")
+        else:
+            print(f"    {arg}")
 
 
 if __name__ == "__main__":

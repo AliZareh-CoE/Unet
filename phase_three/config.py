@@ -31,7 +31,7 @@ import torch
 # Ablation Protocol Selection
 # =============================================================================
 
-ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward", "stage2_greedy"]
+ABLATION_PROTOCOLS = ["additive", "subtractive", "greedy_forward", "stage2_greedy", "ablation_validation"]
 
 # =============================================================================
 # ADDITIVE PROTOCOL: Incremental Component Analysis
@@ -208,10 +208,11 @@ COMPONENT_ORDER = [
 # Single split: 8 sessions train, 4 sessions test (no CV during ablation)
 
 # Default configuration (simple baseline to start)
+# NOTE: base_channels=128 is LOCKED IN as optimal (skip width ablation)
 GREEDY_DEFAULTS: Dict[str, Any] = {
     "conv_type": "standard",
     "n_downsample": 2,
-    "base_channels": 64,
+    "base_channels": 128,  # LOCKED: 128 is optimal width
     "attention_type": "none",
     "n_heads": 4,
     "cond_mode": "none",
@@ -235,7 +236,7 @@ GREEDY_DEFAULTS: Dict[str, Any] = {
     "use_session_stats": False,     # Statistics-based conditioning (FiLM style)
     "session_emb_dim": 32,          # Session statistics embedding dimension
     "session_use_spectral": False,  # Include spectral features in session stats
-    "use_adaptive_scaling": False,  # Session-adaptive output scaling (AdaIN style)
+    "use_adaptive_scaling": False,  # Session-adaptive output scaling (FiLM, NO instance norm) - tested in ablation
     "use_cov_augment": False,       # Covariance expansion augmentation
     "cov_augment_prob": 0.5,        # Probability of applying cov augmentation
     "use_session_embedding": False, # Learnable session embedding (lookup table → FiLM)
@@ -297,7 +298,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "conditional_on": None,
     },
     # GROUP 4: Skip Connection Type (core U-Net design)
-    # Literature: ResNet (2015), DenseNet (2017), Attention U-Net (2018)
+    # Literature: ResNet (2015), DenseNet (2017)
+    # NOTE: Only "add" and "concat" are implemented in models.py
     {
         "group_id": 6,
         "name": "skip_connection",
@@ -306,8 +308,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         "variants": [
             {"value": "add", "name": "residual_add", "desc": "Additive residual (ResNet style)"},
             {"value": "concat", "name": "concat", "desc": "Concatenation (original U-Net)"},
-            {"value": "attention", "name": "attention_gate", "desc": "Attention-gated skip (Attention U-Net)"},
-            {"value": "dense", "name": "dense", "desc": "Dense connections (all previous layers)"},
+            # "attention" and "dense" removed - NOT IMPLEMENTED in models.py
         ],
         "conditional_on": None,
     },
@@ -324,19 +325,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
         ],
         "conditional_on": None,
     },
-    # GROUP 6: Network Width
-    {
-        "group_id": 5,
-        "name": "width",
-        "description": "Base channel count",
-        "parameter": "base_channels",
-        "variants": [
-            {"value": 32, "name": "narrow", "desc": "32 base channels"},
-            {"value": 64, "name": "medium", "desc": "64 base channels"},
-            {"value": 128, "name": "wide", "desc": "128 base channels"},
-        ],
-        "conditional_on": None,
-    },
+    # GROUP 6: Network Width - REMOVED (128 is LOCKED as optimal)
+    # base_channels=128 is the winner, no need to search
     # =========================================================================
     # PHASE 2: ATTENTION & CONDITIONING (Groups 7-9)
     # Optional enhancements to the base architecture
@@ -449,7 +439,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     # Optimizer and learning rate strategies
     # =========================================================================
     # GROUP 14: Optimizer
-    # Literature: Adam (2014), AdamW (2017), Lion (2023), Shampoo (2015)
+    # Literature: Adam (2014), AdamW (2017)
+    # NOTE: Only adamw, adam, sgd, rmsprop are implemented in train.py
     {
         "group_id": 13,
         "name": "optimizer",
@@ -459,8 +450,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": "adamw", "name": "adamw", "desc": "AdamW - decoupled weight decay, standard"},
             {"value": "adam", "name": "adam", "desc": "Adam - original adaptive moments"},
             {"value": "sgd", "name": "sgd_momentum", "desc": "SGD + Momentum - classic, often better generalization"},
-            {"value": "lion", "name": "lion", "desc": "Lion - Google 2023, memory efficient"},
-            {"value": "adafactor", "name": "adafactor", "desc": "Adafactor - memory efficient, used in T5"},
+            {"value": "rmsprop", "name": "rmsprop", "desc": "RMSprop - adaptive learning rate"},
+            # "lion" and "adafactor" removed - NOT IMPLEMENTED in train.py
         ],
         "conditional_on": None,
     },
@@ -504,24 +495,101 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": 0.5, "name": "medium_cycle", "desc": "λ=0.5 (medium)"},
             {"value": 1.0, "name": "strong_cycle", "desc": "λ=1.0 (strong)"},
         ],
-        "conditional_on": None,  # Run unconditionally - greedy will handle appropriately
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 5: SESSION ADAPTATION (critical for cross-session generalization)
+    # FiLM-based conditioning techniques (NO instance normalization used!)
+    # =========================================================================
+    # GROUP 18: Session Adaptation Method
+    # Literature: FiLM (Perez et al. 2017) - Feature-wise Linear Modulation
+    # All methods use FiLM-style conditioning: x * gamma + beta (NOT instance norm)
+    # Note: AdaBN is inference-time only, tested separately (not here)
+    {
+        "group_id": 20,
+        "name": "session_adaptation",
+        "description": "Session adaptation method for cross-session generalization",
+        "parameter": "session_adaptation_mode",  # Virtual parameter - maps to multiple config keys
+        "variants": [
+            {
+                "name": "no_adaptation",
+                "desc": "No session adaptation - baseline",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": False,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "adaptive_scaling",
+                "desc": "FiLM output scaling (predicts gamma/beta from input stats)",
+                "config": {
+                    "use_adaptive_scaling": True,
+                    "use_session_stats": False,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "session_stats",
+                "desc": "Statistics-based FiLM throughout encoder (generalizes to new sessions)",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": True,
+                    "use_session_embedding": False,
+                }
+            },
+            {
+                "name": "session_embedding",
+                "desc": "Learnable session embeddings as FiLM (requires known sessions)",
+                "config": {
+                    "use_adaptive_scaling": False,
+                    "use_session_stats": False,
+                    "use_session_embedding": True,
+                }
+            },
+            {
+                "name": "adaptive_plus_stats",
+                "desc": "Both adaptive output scaling + stats FiLM (combined)",
+                "config": {
+                    "use_adaptive_scaling": True,
+                    "use_session_stats": True,
+                    "use_session_embedding": False,
+                }
+            },
+        ],
+        "conditional_on": None,
+    },
+    # =========================================================================
+    # PHASE 6: BATCH SIZE (merged from Stage 2)
+    # Critical for training dynamics - test last
+    # =========================================================================
+    # GROUP 19: Batch Size
+    {
+        "group_id": 21,
+        "name": "batch_size",
+        "description": "Batch size - affects gradient noise, memory, and convergence",
+        "parameter": "batch_size",
+        "variants": [
+            {"value": 16, "name": "batch_16", "desc": "Batch 16 - more gradient noise, less memory"},
+            {"value": 32, "name": "batch_32", "desc": "Batch 32 - balanced"},
+            {"value": 64, "name": "batch_64", "desc": "Batch 64 - smoother gradients"},
+            {"value": 128, "name": "batch_128", "desc": "Batch 128 - very smooth, needs more memory"},
+        ],
+        "conditional_on": None,
     },
 ]
 
 # =============================================================================
-# STAGE 2 GREEDY: Fine-tuning after Stage 1
+# STAGE 2 GREEDY: DEPRECATED - Merged into Stage 1
 # =============================================================================
-# After Stage 1 greedy forward selection identifies optimal architecture/training choices,
-# Stage 2 explores scaling and fine-tuning parameters that interact with each other:
-# - Width (model capacity)
-# - Augmentation strength (regularization)
-# - Depth (model complexity)
-# - Bidirectional (confirm always on)
-# - Batch size (training dynamics)
+# Stage 2 has been MERGED into the main ABLATION_GROUPS above.
+# - Width exploration REMOVED (128 is locked as optimal)
+# - Batch size ADDED to main groups
+# - Other Stage 2 parameters already covered in Stage 1
 #
-# Total: 5 + 3 + 4 + 1 + 4 = 17 runs
+# Keep this for backward compatibility but it's no longer used.
 
-STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [
+STAGE2_GREEDY_GROUPS: List[Dict[str, Any]] = [  # DEPRECATED
     # GROUP 1: WIDTH - model capacity scaling
     {
         "group_id": 1,
@@ -824,7 +892,7 @@ class AblationConfig:
     use_session_stats: bool = False  # Statistics-based conditioning (FiLM style)
     session_emb_dim: int = 32  # Session statistics embedding dimension
     session_use_spectral: bool = False  # Include spectral features in session stats
-    use_adaptive_scaling: bool = False  # Session-adaptive output scaling (AdaIN style)
+    use_adaptive_scaling: bool = False  # Session-adaptive output scaling (FiLM, NO instance norm)
     use_cov_augment: bool = False  # Covariance expansion augmentation
     cov_augment_prob: float = 0.5  # Probability of applying cov augmentation
     use_session_embedding: bool = False  # Learnable session embedding (lookup table → FiLM)
@@ -992,6 +1060,54 @@ class AblationConfig:
         )
 
     @classmethod
+    def from_dict(cls, config: Dict[str, Any], study: str = "ablation", variant: str = "custom") -> "AblationConfig":
+        """Create AblationConfig directly from a config dictionary.
+
+        Args:
+            config: Dictionary with model/training parameters
+            study: Study name (default: "ablation")
+            variant: Variant name (default: "custom")
+
+        Returns:
+            AblationConfig instance
+        """
+        return cls(
+            study=study,
+            variant=variant,
+            group_id=-1,
+            conv_type=config.get("conv_type", "standard"),
+            attention_type=config.get("attention_type", "none"),
+            cond_mode=config.get("cond_mode", "none"),
+            use_odor_embedding=config.get("use_odor_embedding", False),
+            base_channels=config.get("base_channels", 128),
+            n_downsample=config.get("n_downsample", 2),
+            n_heads=config.get("n_heads", 4),
+            loss_type=config.get("loss_type", "l1"),
+            use_augmentation=config.get("use_augmentation", False),
+            aug_strength=config.get("aug_strength", "none"),
+            bidirectional=config.get("bidirectional", False),
+            cycle_lambda=config.get("cycle_lambda", 0.5),
+            norm_type=config.get("norm_type", "batch"),
+            skip_type=config.get("skip_type", "add"),
+            activation=config.get("activation", "relu"),
+            dropout=config.get("dropout", 0.0),
+            optimizer=config.get("optimizer", "adamw"),
+            lr_schedule=config.get("lr_schedule", "cosine"),
+            weight_decay=config.get("weight_decay", 1e-4),
+            split_by_session=True,
+            n_test_sessions=0,
+            n_val_sessions=3,
+            use_session_stats=config.get("use_session_stats", False),
+            session_emb_dim=config.get("session_emb_dim", 32),
+            session_use_spectral=config.get("session_use_spectral", False),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            use_cov_augment=config.get("use_cov_augment", False),
+            cov_augment_prob=config.get("cov_augment_prob", 0.5),
+            use_session_embedding=config.get("use_session_embedding", False),
+            use_adabn=config.get("use_adabn", False),
+        )
+
+    @classmethod
     def from_stage(cls, stage_idx: int) -> "AblationConfig":
         """Create config from incremental stage definition."""
         if stage_idx < 0 or stage_idx >= len(INCREMENTAL_STAGES):
@@ -1034,7 +1150,7 @@ class TrainingConfig:
     lr_min: float = 1e-6
 
     # Early stopping
-    patience: int = 15
+    patience: int = 10
     min_delta: float = 1e-4
 
     # Gradient clipping

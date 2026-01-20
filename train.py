@@ -2406,6 +2406,10 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            # NEW: Ablation-configurable parameters
+            activation=config.get("activation", "relu"),
+            n_heads=config.get("n_heads", 4),
+            skip_type=config.get("skip_type", "add"),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -2462,6 +2466,10 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            # NEW: Ablation-configurable parameters (same as forward)
+            activation=config.get("activation", "relu"),
+            n_heads=config.get("n_heads", 4),
+            skip_type=config.get("skip_type", "add"),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2587,7 +2595,19 @@ def train(
             # running stats, which can cause inplace modification errors when
             # the same model is used multiple times per batch (e.g., cycle consistency)
             ddp_kwargs = {"device_ids": [local_rank], "broadcast_buffers": False}
-            if config.get("gradient_checkpointing", False):
+
+            # Enable find_unused_parameters when:
+            # 1. Gradient checkpointing is enabled
+            # 2. cond_mode=none (embedding layer unused)
+            # 3. attention_type=none (attention modules unused)
+            # 4. Various ablation configurations that may disable components
+            needs_find_unused = (
+                config.get("gradient_checkpointing", False) or
+                config.get("cond_mode", "film") == "none" or
+                config.get("attention_type", "basic") == "none" or
+                not config.get("use_bidirectional", True)  # reverse model unused
+            )
+            if needs_find_unused:
                 ddp_kwargs["find_unused_parameters"] = True
 
             model = model.to(device)
@@ -2604,8 +2624,17 @@ def train(
                 # using sync_gradients_manual() after backward() but before optimizer.step().
             if is_primary():
                 print(f"Using DDP with {get_world_size()} GPUs (broadcast_buffers=False)")
-                if config.get("gradient_checkpointing", False):
-                    print("  (find_unused_parameters=True for gradient checkpointing)")
+                if needs_find_unused:
+                    reasons = []
+                    if config.get("gradient_checkpointing", False):
+                        reasons.append("gradient_checkpointing")
+                    if config.get("cond_mode", "film") == "none":
+                        reasons.append("cond_mode=none")
+                    if config.get("attention_type", "basic") == "none":
+                        reasons.append("attention_type=none")
+                    if not config.get("use_bidirectional", True):
+                        reasons.append("no_bidirectional")
+                    print(f"  (find_unused_parameters=True: {', '.join(reasons)})")
             dist.barrier()
     else:
         model = wrap_model_fsdp(model, local_rank, use_fsdp=False, compile_model=compile_model)
@@ -2710,10 +2739,22 @@ def train(
     # Weight decay (L2 regularization)
     weight_decay = config.get("weight_decay", 0.0)
 
-    if is_primary():
-        print(f"Optimizer: {total_params} total params | lr={lr}, weight_decay={weight_decay}")
+    # Optimizer selection (for Phase 3 ablation studies)
+    optimizer_type = config.get("optimizer", "adamw").lower()
 
-    optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    if is_primary():
+        print(f"Optimizer: {optimizer_type.upper()} | {total_params} total params | lr={lr}, weight_decay={weight_decay}")
+
+    if optimizer_type == "adamw":
+        optimizer = AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    elif optimizer_type == "adam":
+        optimizer = torch.optim.Adam(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    elif optimizer_type == "sgd":
+        optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    elif optimizer_type == "rmsprop":
+        optimizer = torch.optim.RMSprop(param_groups, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_type}. Available: adamw, adam, sgd, rmsprop")
 
     # Learning rate scheduler configuration
     num_epochs = config.get("num_epochs", 80)
@@ -4120,6 +4161,55 @@ def main():
         if is_primary():
             print(f"Convolution type override: {args.conv_type}")
 
+    # Activation function from CLI (for Phase 3 ablation studies)
+    if args.activation is not None:
+        config["activation"] = args.activation
+        if is_primary():
+            print(f"Activation function override: {args.activation}")
+
+    # Normalization type from CLI (for Phase 3 ablation studies)
+    if args.norm_type is not None:
+        config["norm_type"] = args.norm_type
+        if is_primary():
+            print(f"Normalization type override: {args.norm_type}")
+
+    # Skip connection type from CLI (for Phase 3 ablation studies)
+    if args.skip_type is not None:
+        config["skip_type"] = args.skip_type
+        if is_primary():
+            print(f"Skip connection type override: {args.skip_type}")
+
+    # Number of attention heads from CLI (for Phase 3 ablation studies)
+    if args.n_heads is not None:
+        config["n_heads"] = args.n_heads
+        if is_primary():
+            print(f"Number of attention heads override: {args.n_heads}")
+
+    # Number of downsample levels from CLI (for Phase 3 ablation studies)
+    if args.n_downsample is not None:
+        config["n_downsample"] = args.n_downsample
+        if is_primary():
+            print(f"Number of downsample levels override: {args.n_downsample}")
+
+    # Dropout rate from CLI (for Phase 3 ablation studies)
+    if args.dropout is not None:
+        config["dropout"] = args.dropout
+        if is_primary():
+            print(f"Dropout rate override: {args.dropout}")
+
+    # Optimizer from CLI (for Phase 3 ablation studies)
+    if args.optimizer is not None:
+        config["optimizer"] = args.optimizer
+        if is_primary():
+            print(f"Optimizer override: {args.optimizer}")
+
+    # LR schedule from CLI (for Phase 3 ablation studies)
+    # Note: --lr-schedule is the preferred arg, --lr-scheduler is legacy
+    if args.lr_schedule is not None:
+        config["lr_scheduler"] = args.lr_schedule
+        if is_primary():
+            print(f"LR schedule override: {args.lr_schedule}")
+
     # Disable bidirectional training if requested (for fair architecture comparison)
     if args.no_bidirectional:
         config["use_bidirectional"] = False
@@ -4234,6 +4324,75 @@ def main():
     config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
     if is_primary():
         print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
+
+    # =========================================================================
+    # SAFEGUARD: Validate CLI args were properly applied to config
+    # This catches bugs where CLI args are defined but never used
+    # =========================================================================
+    def validate_cli_args_applied(args, config):
+        """Validate that CLI args were properly applied to config.
+
+        Raises RuntimeError if any critical arg was passed but not applied.
+        This catches bugs like defining --activation but never using it.
+        """
+        errors = []
+        warnings = []
+
+        # Critical training hyperparameters
+        if args.lr is not None and config.get("learning_rate") != args.lr:
+            errors.append(f"--lr={args.lr} but config['learning_rate']={config.get('learning_rate')}")
+        if args.batch_size is not None and config.get("batch_size") != args.batch_size:
+            errors.append(f"--batch-size={args.batch_size} but config['batch_size']={config.get('batch_size')}")
+        if args.epochs is not None and config.get("num_epochs") != args.epochs:
+            errors.append(f"--epochs={args.epochs} but config['num_epochs']={config.get('num_epochs')}")
+
+        # Architecture parameters
+        if args.activation is not None and config.get("activation") != args.activation:
+            errors.append(f"--activation={args.activation} but config['activation']={config.get('activation')}")
+        if args.norm_type is not None and config.get("norm_type") != args.norm_type:
+            errors.append(f"--norm-type={args.norm_type} but config['norm_type']={config.get('norm_type')}")
+        if args.skip_type is not None and config.get("skip_type") != args.skip_type:
+            errors.append(f"--skip-type={args.skip_type} but config['skip_type']={config.get('skip_type')}")
+        if args.n_heads is not None and config.get("n_heads") != args.n_heads:
+            errors.append(f"--n-heads={args.n_heads} but config['n_heads']={config.get('n_heads')}")
+        if args.n_downsample is not None and config.get("n_downsample") != args.n_downsample:
+            errors.append(f"--n-downsample={args.n_downsample} but config['n_downsample']={config.get('n_downsample')}")
+        if args.dropout is not None and config.get("dropout") != args.dropout:
+            errors.append(f"--dropout={args.dropout} but config['dropout']={config.get('dropout')}")
+        if args.conv_type is not None and config.get("conv_type") != args.conv_type:
+            errors.append(f"--conv-type={args.conv_type} but config['conv_type']={config.get('conv_type')}")
+        if args.attention_type is not None and config.get("attention_type") != args.attention_type:
+            errors.append(f"--attention-type={args.attention_type} but config['attention_type']={config.get('attention_type')}")
+
+        # Training options
+        if args.optimizer is not None and config.get("optimizer") != args.optimizer:
+            errors.append(f"--optimizer={args.optimizer} but config['optimizer']={config.get('optimizer')}")
+        if args.lr_schedule is not None and config.get("lr_scheduler") != args.lr_schedule:
+            errors.append(f"--lr-schedule={args.lr_schedule} but config['lr_scheduler']={config.get('lr_scheduler')}")
+        if args.weight_decay is not None and config.get("weight_decay") != args.weight_decay:
+            errors.append(f"--weight-decay={args.weight_decay} but config['weight_decay']={config.get('weight_decay')}")
+        if args.base_channels is not None and config.get("base_channels") != args.base_channels:
+            errors.append(f"--base-channels={args.base_channels} but config['base_channels']={config.get('base_channels')}")
+
+        if errors:
+            error_msg = "\n".join([f"  - {e}" for e in errors])
+            raise RuntimeError(
+                f"\n{'='*70}\n"
+                f"CRITICAL: CLI arguments were NOT properly applied to config!\n"
+                f"{'='*70}\n"
+                f"The following CLI args were passed but did NOT update the config:\n"
+                f"{error_msg}\n"
+                f"{'='*70}\n"
+                f"This is a BUG in train.py - CLI arg handling is broken!\n"
+                f"{'='*70}"
+            )
+
+        return True
+
+    # Run validation on primary rank only (to avoid duplicate error messages)
+    if is_primary():
+        validate_cli_args_applied(args, config)
+        print("[SAFEGUARD] CLI args validated - all arguments properly applied to config")
 
     if is_primary():
         arch_name = config.get('arch', 'condunet').upper()

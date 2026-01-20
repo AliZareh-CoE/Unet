@@ -44,6 +44,31 @@ NEURAL_FREQ_BANDS = [
 
 
 # =============================================================================
+# Activation Function Helper
+# =============================================================================
+
+def get_activation(name: str) -> nn.Module:
+    """Get activation function by name.
+
+    Args:
+        name: Activation name - one of: relu, leaky_relu, gelu, silu, mish
+
+    Returns:
+        PyTorch activation module
+    """
+    activations = {
+        "relu": nn.ReLU(inplace=True),
+        "leaky_relu": nn.LeakyReLU(0.2, inplace=True),
+        "gelu": nn.GELU(),
+        "silu": nn.SiLU(inplace=True),
+        "mish": nn.Mish(inplace=True),
+    }
+    if name not in activations:
+        raise ValueError(f"Unknown activation: {name}. Available: {list(activations.keys())}")
+    return activations[name]
+
+
+# =============================================================================
 # Core Building Blocks
 # =============================================================================
 
@@ -508,6 +533,7 @@ class ConvBlock(nn.Module):
         stride = 2 if downsample else 1
         self.cond_mode = cond_mode
 
+        # Build normalization layer
         if norm_type == "instance":
             norm = nn.InstanceNorm1d(out_c, affine=True)
         elif norm_type == "batch":
@@ -517,8 +543,16 @@ class ConvBlock(nn.Module):
             while out_c % num_groups != 0:
                 num_groups -= 1
             norm = nn.GroupNorm(num_groups, out_c)
+        elif norm_type == "layer":
+            # LayerNorm for 1D: normalize over channels and time
+            norm = nn.GroupNorm(1, out_c)  # GroupNorm with 1 group = LayerNorm
+        elif norm_type == "rms":
+            # RMSNorm approximation using LayerNorm without centering
+            norm = nn.GroupNorm(1, out_c, affine=True)  # Close approximation
+        elif norm_type == "none":
+            norm = nn.Identity()
         else:
-            raise ValueError(f"Unknown norm_type: {norm_type}")
+            raise ValueError(f"Unknown norm_type: {norm_type}. Available: batch, instance, group, layer, rms, none")
 
         layers = [
             nn.Conv1d(in_c, out_c, kernel_size=3, stride=stride, padding=1),
@@ -536,7 +570,12 @@ class ConvBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Upsampling block with skip connections and FiLM conditioning."""
+    """Upsampling block with skip connections and FiLM conditioning.
+
+    Supports configurable skip connection types:
+    - "concat": Concatenate skip features with upsampled features (default, more capacity)
+    - "add": Add skip features to upsampled features (simpler, fewer parameters)
+    """
     def __init__(
         self,
         in_c: int,
@@ -546,11 +585,28 @@ class UpBlock(nn.Module):
         dropout: float = 0.0,
         norm_type: str = "instance",
         cond_mode: str = "cross_attn_gated",
+        skip_type: str = "concat",  # "concat" or "add"
     ):
         super().__init__()
+        self.skip_type = skip_type
         self.up = nn.ConvTranspose1d(in_c, out_c, kernel_size=4, stride=2, padding=1)
-        self.block = ConvBlock(out_c + skip_c, out_c, emb_dim, downsample=False,
-                               dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+
+        if skip_type == "concat":
+            # Concatenation: input to block is out_c + skip_c channels
+            self.block = ConvBlock(out_c + skip_c, out_c, emb_dim, downsample=False,
+                                   dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+            self.skip_proj = None
+        elif skip_type == "add":
+            # Addition: need to project skip to match out_c channels
+            self.block = ConvBlock(out_c, out_c, emb_dim, downsample=False,
+                                   dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+            # Project skip to out_c channels if dimensions don't match
+            if skip_c != out_c:
+                self.skip_proj = nn.Conv1d(skip_c, out_c, kernel_size=1)
+            else:
+                self.skip_proj = None
+        else:
+            raise ValueError(f"Unknown skip_type: {skip_type}. Available: concat, add")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.up(x)
@@ -563,7 +619,14 @@ class UpBlock(nn.Module):
                 diff = x.shape[-1] - skip.shape[-1]
                 start = diff // 2
                 x = x[..., start : start + skip.shape[-1]]
-        x = torch.cat([x, skip], dim=1)
+
+        if self.skip_type == "concat":
+            x = torch.cat([x, skip], dim=1)
+        else:  # add
+            if self.skip_proj is not None:
+                skip = self.skip_proj(skip)
+            x = x + skip
+
         return self.block(x, emb)
 
 
@@ -744,8 +807,14 @@ class ModernConvBlock(nn.Module):
             while out_c % num_groups != 0:
                 num_groups -= 1
             norm = nn.GroupNorm(num_groups, out_c)
+        elif norm_type == "layer":
+            norm = nn.GroupNorm(1, out_c)  # GroupNorm with 1 group = LayerNorm
+        elif norm_type == "rms":
+            norm = nn.GroupNorm(1, out_c, affine=True)  # RMSNorm approximation
+        elif norm_type == "none":
+            norm = nn.Identity()
         else:
-            raise ValueError(f"Unknown norm_type: {norm_type}")
+            raise ValueError(f"Unknown norm_type: {norm_type}. Available: batch, instance, group, layer, rms, none")
 
         # Multi-scale dilated depthwise separable conv
         conv = MultiScaleDilatedConv1d(
@@ -776,6 +845,10 @@ class ModernUpBlock(nn.Module):
 
     Uses ConvTranspose1d for upsampling, then modern conv block for refinement.
 
+    Supports configurable skip connection types:
+    - "concat": Concatenate skip features with upsampled features (default, more capacity)
+    - "add": Add skip features to upsampled features (simpler, fewer parameters)
+
     Args:
         in_c: Input channels
         skip_c: Skip connection channels
@@ -787,6 +860,7 @@ class ModernUpBlock(nn.Module):
         use_se: Whether to use SE attention
         kernel_size: Kernel size for depthwise conv
         dilations: Dilation rates for multi-scale conv
+        skip_type: Skip connection type - "concat" or "add"
     """
     def __init__(
         self,
@@ -800,19 +874,44 @@ class ModernUpBlock(nn.Module):
         use_se: bool = True,
         kernel_size: int = 7,
         dilations: Tuple[int, ...] = (1, 4, 16, 32),
+        skip_type: str = "concat",  # "concat" or "add"
     ):
         super().__init__()
+        self.skip_type = skip_type
         self.up = nn.ConvTranspose1d(in_c, out_c, kernel_size=4, stride=2, padding=1)
-        self.block = ModernConvBlock(
-            out_c + skip_c, out_c, emb_dim,
-            downsample=False,
-            dropout=dropout,
-            norm_type=norm_type,
-            cond_mode=cond_mode,
-            use_se=use_se,
-            kernel_size=kernel_size,
-            dilations=dilations,
-        )
+
+        if skip_type == "concat":
+            # Concatenation: input to block is out_c + skip_c channels
+            self.block = ModernConvBlock(
+                out_c + skip_c, out_c, emb_dim,
+                downsample=False,
+                dropout=dropout,
+                norm_type=norm_type,
+                cond_mode=cond_mode,
+                use_se=use_se,
+                kernel_size=kernel_size,
+                dilations=dilations,
+            )
+            self.skip_proj = None
+        elif skip_type == "add":
+            # Addition: need to project skip to match out_c channels
+            self.block = ModernConvBlock(
+                out_c, out_c, emb_dim,
+                downsample=False,
+                dropout=dropout,
+                norm_type=norm_type,
+                cond_mode=cond_mode,
+                use_se=use_se,
+                kernel_size=kernel_size,
+                dilations=dilations,
+            )
+            # Project skip to out_c channels if dimensions don't match
+            if skip_c != out_c:
+                self.skip_proj = nn.Conv1d(skip_c, out_c, kernel_size=1)
+            else:
+                self.skip_proj = None
+        else:
+            raise ValueError(f"Unknown skip_type: {skip_type}. Available: concat, add")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.up(x)
@@ -826,7 +925,14 @@ class ModernUpBlock(nn.Module):
                 diff = x.shape[-1] - skip.shape[-1]
                 start = diff // 2
                 x = x[..., start : start + skip.shape[-1]]
-        x = torch.cat([x, skip], dim=1)
+
+        if self.skip_type == "concat":
+            x = torch.cat([x, skip], dim=1)
+        else:  # add
+            if self.skip_proj is not None:
+                skip = self.skip_proj(skip)
+            x = x + skip
+
         return self.block(x, emb)
 
 
@@ -1781,14 +1887,17 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
 # =============================================================================
 
 class SessionStatisticsEncoder(nn.Module):
-    """Encode session statistics into a conditioning vector.
+    """Encode session statistics into a conditioning vector for FiLM modulation.
 
     Instead of learning arbitrary embeddings per session ID, this computes
     statistics from the input signal and learns to encode them. This approach:
 
     1. Generalizes automatically to new/unseen sessions
     2. Learns meaningful relationships between statistics and predictions
-    3. Aligns with domain adaptation literature (AdaIN, FiLM)
+    3. Implements FiLM (Feature-wise Linear Modulation) conditioning
+
+    NOTE: This does NOT use instance normalization! It computes statistics
+    for conditioning (predicting gamma/beta), not for normalizing the signal.
 
     Based on:
     - Domain-specific batch normalization for EEG transfer learning
@@ -1923,12 +2032,14 @@ class SessionStatisticsEncoder(nn.Module):
 
 
 class SessionAdaptiveScaling(nn.Module):
-    """Session-aware output scaling using AdaIN-style conditioning.
+    """Session-aware output scaling using FiLM-style conditioning.
 
     Instead of fixed learnable scale/bias per channel, predicts them from
-    session statistics. This is similar to:
-    - AdaIN (Adaptive Instance Normalization) from style transfer
-    - FiLM (Feature-wise Linear Modulation)
+    session statistics. This is pure FiLM (Feature-wise Linear Modulation):
+        output = input * gamma + beta
+
+    NOTE: This does NOT use instance normalization! It only applies
+    learned scale/bias without any normalization step.
 
     The key insight: different sessions may need different output scaling
     to match the target distribution due to electrode impedance, baseline
@@ -2126,7 +2237,7 @@ class CondUNet1D(nn.Module):
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
         # Output scaling correction (helps match target distribution)
         use_output_scaling: bool = True,  # Learnable per-channel scale and bias
-        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (AdaIN-style)
+        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style, NO instance norm)
         # Session conditioning - statistics-based (literature-recommended approach)
         # Instead of learned embeddings per session ID, computes statistics from
         # input signal and learns to encode them. Generalizes to unseen sessions.
@@ -2138,6 +2249,10 @@ class CondUNet1D(nn.Module):
         # Requires session IDs at training time. Does NOT generalize to unseen sessions.
         use_session_embedding: bool = False,  # Enable learnable session embedding lookup
         n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
+        # NEW: Ablation-configurable parameters
+        activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
+        n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
+        skip_type: str = "add",  # Skip connection type: add, concat (future: attention, dense)
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2149,6 +2264,10 @@ class CondUNet1D(nn.Module):
         self.use_session_embedding = use_session_embedding
         self.session_emb_dim = session_emb_dim
         self.n_sessions = n_sessions
+        # NEW: Store ablation parameters
+        self.activation_name = activation
+        self.n_heads = n_heads
+        self.skip_type = skip_type
 
         if cond_mode != "none":
             self.embed = nn.Embedding(n_odors, emb_dim)
@@ -2169,7 +2288,7 @@ class CondUNet1D(nn.Module):
             # Project combined embedding (session stats + condition) to emb_dim
             self.session_proj = nn.Sequential(
                 nn.Linear(session_emb_dim + emb_dim, emb_dim),
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(emb_dim, emb_dim),
             )
         else:
@@ -2189,7 +2308,7 @@ class CondUNet1D(nn.Module):
             # Separate projection from session_proj to allow both to be enabled
             self.session_embed_proj = nn.Sequential(
                 nn.Linear(session_emb_dim + emb_dim, emb_dim),
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(emb_dim, emb_dim),
             )
             # NEW: Statistics-based session matcher for generalization to unseen sessions
@@ -2198,7 +2317,7 @@ class CondUNet1D(nn.Module):
             stat_dim = 64  # Dimension of statistics encoding
             self.session_stat_encoder = nn.Sequential(
                 nn.Linear(in_channels * 4, stat_dim),  # 4 stats: mean, std, min, max per channel
-                nn.GELU(),
+                get_activation(activation),
                 nn.Linear(stat_dim, stat_dim),
             )
             # Attention over session embeddings based on statistics
@@ -2241,38 +2360,38 @@ class CondUNet1D(nn.Module):
                 skip_in = channels[n_downsample - i - 1]
                 dec_out = channels[n_downsample - i - 1]
                 self.decoders.append(
-                    ModernUpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, **conv_kwargs)
+                    ModernUpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, skip_type=skip_type, **conv_kwargs)
                 )
         else:
             # Standard: original Conv1d(kernel_size=3)
             self.inc = ConvBlock(in_channels, channels[0], emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
-            
+
             self.encoders = nn.ModuleList()
             for i in range(n_downsample):
                 self.encoders.append(
                     ConvBlock(channels[i], channels[i+1], emb_dim, downsample=True, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
                 )
-            
+
             self.decoders = nn.ModuleList()
             for i in range(n_downsample):
                 dec_in = channels[n_downsample - i]
                 skip_in = channels[n_downsample - i - 1]
                 dec_out = channels[n_downsample - i - 1]
                 self.decoders.append(
-                    UpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode)
+                    UpBlock(dec_in, skip_in, dec_out, emb_dim, dropout=dropout, norm_type=norm_type, cond_mode=cond_mode, skip_type=skip_type)
                 )
 
         # Build bottleneck with configurable attention
         bottleneck_ch = channels[n_downsample]
         mid_layers = [
             nn.Conv1d(bottleneck_ch, bottleneck_ch, kernel_size=3, padding=1),
-            nn.GELU(),
+            get_activation(activation),
         ]
         if use_attention and attention_type != "none":
             mid_layers.append(self._build_attention(bottleneck_ch, attention_type))
         mid_layers.extend([
             nn.Conv1d(bottleneck_ch, bottleneck_ch, kernel_size=3, padding=1),
-            nn.GELU(),
+            get_activation(activation),
         ])
         self.mid = nn.Sequential(*mid_layers)
 
@@ -2295,7 +2414,7 @@ class CondUNet1D(nn.Module):
         self.use_adaptive_scaling = use_adaptive_scaling
 
         if use_adaptive_scaling:
-            # Session-adaptive output scaling (AdaIN-style)
+            # Session-adaptive output scaling (FiLM-style, NO instance normalization)
             # Predicts scale/bias from input statistics - adapts to each session
             self.adaptive_scaler = SessionAdaptiveScaling(
                 n_channels=out_channels,
@@ -2401,10 +2520,10 @@ class CondUNet1D(nn.Module):
             return SelfAttention1D(channels)
 
         if attention_type == "cross_freq":
-            return CrossFrequencyCouplingAttention(channels)
+            return CrossFrequencyCouplingAttention(channels, n_heads=self.n_heads)
 
         if attention_type == "cross_freq_v2":
-            return CrossFrequencyCouplingAttentionV2(channels)
+            return CrossFrequencyCouplingAttentionV2(channels, n_heads=self.n_heads)
 
         raise ValueError(f"Unknown attention_type: {attention_type}. Available: none, basic, cross_freq, cross_freq_v2")
 
