@@ -1418,6 +1418,31 @@ def evaluate(
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
 
+    # Accumulators for TRUE POOLED R² and correlation (not per-batch averaged)
+    # These accumulate sufficient statistics across all batches for exact computation
+    # R² = 1 - SS_res / SS_tot where:
+    #   SS_res = Σ(pred - target)²
+    #   SS_tot = Σ(target - mean(target))² = Σtarget² - (Σtarget)²/n
+    # Correlation = Cov(pred, target) / (std(pred) * std(target))
+    pooled_n = 0  # Total number of elements
+    pooled_sum_target = 0.0  # Σ target
+    pooled_sum_target_sq = 0.0  # Σ target²
+    pooled_sum_pred = 0.0  # Σ pred
+    pooled_sum_pred_sq = 0.0  # Σ pred²
+    pooled_sum_pred_target = 0.0  # Σ (pred * target)
+    pooled_sum_squared_error = 0.0  # Σ (pred - target)²
+    pooled_sum_abs_error = 0.0  # Σ |pred - target|
+
+    # Same for reverse direction
+    pooled_n_rev = 0
+    pooled_sum_target_rev = 0.0
+    pooled_sum_target_sq_rev = 0.0
+    pooled_sum_pred_rev = 0.0
+    pooled_sum_pred_sq_rev = 0.0
+    pooled_sum_pred_target_rev = 0.0
+    pooled_sum_squared_error_rev = 0.0
+    pooled_sum_abs_error_rev = 0.0
+
     # Reverse direction (PCx→OB)
     mse_list_rev, mae_list_rev, corr_list_rev = [], [], []
     wavelet_list_rev = []
@@ -1516,6 +1541,7 @@ def evaluate(
                 pcx_f32 = pcx_c.float()
                 ob_f32 = ob_c.float()
 
+                # Legacy per-batch metrics (kept for backwards compatibility)
                 mse_list.append(F.mse_loss(pred_f32, pcx_f32).item())
                 mae_list.append(F.l1_loss(pred_f32, pcx_f32).item())
                 corr_list.append(pearson_batch(pred_f32, pcx_f32).item())
@@ -1523,6 +1549,21 @@ def evaluate(
                 # Skip nrmse in fast_mode (redundant with mse/r2)
                 if not fast_mode:
                     nrmse_list.append(normalized_rmse_torch(pred_f32, pcx_f32).item())
+
+                # Accumulate statistics for TRUE POOLED metrics
+                # Flatten to compute over all elements
+                pred_flat = pred_f32.flatten()
+                target_flat = pcx_f32.flatten()
+                n = pred_flat.numel()
+
+                pooled_n += n
+                pooled_sum_target += target_flat.sum().item()
+                pooled_sum_target_sq += (target_flat ** 2).sum().item()
+                pooled_sum_pred += pred_flat.sum().item()
+                pooled_sum_pred_sq += (pred_flat ** 2).sum().item()
+                pooled_sum_pred_target += (pred_flat * target_flat).sum().item()
+                pooled_sum_squared_error += ((pred_flat - target_flat) ** 2).sum().item()
+                pooled_sum_abs_error += (pred_flat - target_flat).abs().sum().item()
 
             if wavelet_loss is not None:
                 wavelet_list.append(wavelet_loss(pred_f32, pcx_f32).item())
@@ -1593,6 +1634,20 @@ def evaluate(
                     if not fast_mode:
                         nrmse_list_rev.append(normalized_rmse_torch(pred_rev_f32, ob_f32).item())
 
+                    # Accumulate statistics for TRUE POOLED metrics (reverse)
+                    pred_flat_rev = pred_rev_f32.flatten()
+                    target_flat_rev = ob_f32.flatten()
+                    n_rev = pred_flat_rev.numel()
+
+                    pooled_n_rev += n_rev
+                    pooled_sum_target_rev += target_flat_rev.sum().item()
+                    pooled_sum_target_sq_rev += (target_flat_rev ** 2).sum().item()
+                    pooled_sum_pred_rev += pred_flat_rev.sum().item()
+                    pooled_sum_pred_sq_rev += (pred_flat_rev ** 2).sum().item()
+                    pooled_sum_pred_target_rev += (pred_flat_rev * target_flat_rev).sum().item()
+                    pooled_sum_squared_error_rev += ((pred_flat_rev - target_flat_rev) ** 2).sum().item()
+                    pooled_sum_abs_error_rev += (pred_flat_rev - target_flat_rev).abs().sum().item()
+
                 if wavelet_loss is not None:
                     wavelet_list_rev.append(wavelet_loss(pred_rev_f32, ob_f32).item())
 
@@ -1615,11 +1670,83 @@ def evaluate(
             "corr": 0.0,
             "r2": 0.0,
         }
+
+    # ==========================================================================
+    # Compute TRUE POOLED R² and Correlation (mathematically correct)
+    # ==========================================================================
+    # For distributed training, aggregate statistics across all GPUs
+    if dist.is_initialized():
+        # Create tensor with all statistics for efficient all_reduce
+        stats_tensor = torch.tensor([
+            pooled_n,
+            pooled_sum_target,
+            pooled_sum_target_sq,
+            pooled_sum_pred,
+            pooled_sum_pred_sq,
+            pooled_sum_pred_target,
+            pooled_sum_squared_error,
+            pooled_sum_abs_error,
+        ], dtype=torch.float64, device=device)
+
+        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+
+        pooled_n = stats_tensor[0].item()
+        pooled_sum_target = stats_tensor[1].item()
+        pooled_sum_target_sq = stats_tensor[2].item()
+        pooled_sum_pred = stats_tensor[3].item()
+        pooled_sum_pred_sq = stats_tensor[4].item()
+        pooled_sum_pred_target = stats_tensor[5].item()
+        pooled_sum_squared_error = stats_tensor[6].item()
+        pooled_sum_abs_error = stats_tensor[7].item()
+
+    # Compute true pooled metrics
+    if pooled_n > 0:
+        # True pooled MSE and MAE
+        pooled_mse = pooled_sum_squared_error / pooled_n
+        pooled_mae = pooled_sum_abs_error / pooled_n
+
+        # True pooled R² = 1 - SS_res / SS_tot
+        # SS_res = Σ(pred - target)² = pooled_sum_squared_error
+        # SS_tot = Σ(target - mean)² = Σtarget² - (Σtarget)²/n
+        target_mean = pooled_sum_target / pooled_n
+        ss_tot = pooled_sum_target_sq - (pooled_sum_target ** 2) / pooled_n
+        ss_res = pooled_sum_squared_error
+
+        if ss_tot > 1e-12:
+            pooled_r2 = 1.0 - ss_res / ss_tot
+        else:
+            pooled_r2 = 0.0  # No variance in target
+
+        # True pooled Pearson correlation
+        # Corr = Cov(X,Y) / (std(X) * std(Y))
+        # Cov = E[XY] - E[X]E[Y] = (Σxy)/n - (Σx/n)(Σy/n)
+        # Var(X) = E[X²] - E[X]² = (Σx²)/n - (Σx/n)²
+        pred_mean = pooled_sum_pred / pooled_n
+        cov_xy = pooled_sum_pred_target / pooled_n - pred_mean * target_mean
+        var_pred = pooled_sum_pred_sq / pooled_n - pred_mean ** 2
+        var_target = pooled_sum_target_sq / pooled_n - target_mean ** 2
+
+        if var_pred > 1e-12 and var_target > 1e-12:
+            pooled_corr = cov_xy / (np.sqrt(var_pred) * np.sqrt(var_target))
+            # Clamp to [-1, 1] for numerical stability
+            pooled_corr = max(-1.0, min(1.0, pooled_corr))
+        else:
+            pooled_corr = 0.0
+    else:
+        pooled_mse = 0.0
+        pooled_mae = 0.0
+        pooled_r2 = 0.0
+        pooled_corr = 0.0
+
+    # Use TRUE POOLED metrics as the primary results
     results = {
-        "mse": float(np.mean(mse_list)),
-        "mae": float(np.mean(mae_list)),
-        "corr": float(np.mean(corr_list)),
-        "r2": float(np.mean(r2_list)),
+        "mse": float(pooled_mse),
+        "mae": float(pooled_mae),
+        "corr": float(pooled_corr),
+        "r2": float(pooled_r2),
+        # Also keep per-batch averaged versions for reference (legacy)
+        "corr_batch_avg": float(np.mean(corr_list)),
+        "r2_batch_avg": float(np.mean(r2_list)),
     }
     
     if nrmse_list:
@@ -1635,12 +1762,65 @@ def evaluate(
     if pli_list:
         results["pli"] = float(np.mean(pli_list))
 
-    # Reverse results (PCx→OB)
+    # Reverse results (PCx→OB) - also use TRUE POOLED metrics
     if mse_list_rev:
-        results["mse_rev"] = float(np.mean(mse_list_rev))
-        results["mae_rev"] = float(np.mean(mae_list_rev))
-        results["corr_rev"] = float(np.mean(corr_list_rev))
-        results["r2_rev"] = float(np.mean(r2_list_rev))
+        # For distributed training, aggregate reverse statistics
+        if dist.is_initialized() and pooled_n_rev > 0:
+            stats_tensor_rev = torch.tensor([
+                pooled_n_rev,
+                pooled_sum_target_rev,
+                pooled_sum_target_sq_rev,
+                pooled_sum_pred_rev,
+                pooled_sum_pred_sq_rev,
+                pooled_sum_pred_target_rev,
+                pooled_sum_squared_error_rev,
+                pooled_sum_abs_error_rev,
+            ], dtype=torch.float64, device=device)
+
+            dist.all_reduce(stats_tensor_rev, op=dist.ReduceOp.SUM)
+
+            pooled_n_rev = stats_tensor_rev[0].item()
+            pooled_sum_target_rev = stats_tensor_rev[1].item()
+            pooled_sum_target_sq_rev = stats_tensor_rev[2].item()
+            pooled_sum_pred_rev = stats_tensor_rev[3].item()
+            pooled_sum_pred_sq_rev = stats_tensor_rev[4].item()
+            pooled_sum_pred_target_rev = stats_tensor_rev[5].item()
+            pooled_sum_squared_error_rev = stats_tensor_rev[6].item()
+            pooled_sum_abs_error_rev = stats_tensor_rev[7].item()
+
+        if pooled_n_rev > 0:
+            pooled_mse_rev = pooled_sum_squared_error_rev / pooled_n_rev
+            pooled_mae_rev = pooled_sum_abs_error_rev / pooled_n_rev
+
+            target_mean_rev = pooled_sum_target_rev / pooled_n_rev
+            ss_tot_rev = pooled_sum_target_sq_rev - (pooled_sum_target_rev ** 2) / pooled_n_rev
+            ss_res_rev = pooled_sum_squared_error_rev
+
+            if ss_tot_rev > 1e-12:
+                pooled_r2_rev = 1.0 - ss_res_rev / ss_tot_rev
+            else:
+                pooled_r2_rev = 0.0
+
+            pred_mean_rev = pooled_sum_pred_rev / pooled_n_rev
+            cov_xy_rev = pooled_sum_pred_target_rev / pooled_n_rev - pred_mean_rev * target_mean_rev
+            var_pred_rev = pooled_sum_pred_sq_rev / pooled_n_rev - pred_mean_rev ** 2
+            var_target_rev = pooled_sum_target_sq_rev / pooled_n_rev - target_mean_rev ** 2
+
+            if var_pred_rev > 1e-12 and var_target_rev > 1e-12:
+                pooled_corr_rev = cov_xy_rev / (np.sqrt(var_pred_rev) * np.sqrt(var_target_rev))
+                pooled_corr_rev = max(-1.0, min(1.0, pooled_corr_rev))
+            else:
+                pooled_corr_rev = 0.0
+
+            results["mse_rev"] = float(pooled_mse_rev)
+            results["mae_rev"] = float(pooled_mae_rev)
+            results["corr_rev"] = float(pooled_corr_rev)
+            results["r2_rev"] = float(pooled_r2_rev)
+        else:
+            results["mse_rev"] = float(np.mean(mse_list_rev))
+            results["mae_rev"] = float(np.mean(mae_list_rev))
+            results["corr_rev"] = float(np.mean(corr_list_rev))
+            results["r2_rev"] = float(np.mean(r2_list_rev))
     if nrmse_list_rev:
         results["nrmse_rev"] = float(np.mean(nrmse_list_rev))
     if psd_err_list_rev:
