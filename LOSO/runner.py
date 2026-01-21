@@ -278,8 +278,6 @@ def run_single_fold(
         cmd.extend(["--cond-mode", config.cond_mode])
     if config.conv_type:
         cmd.extend(["--conv-type", config.conv_type])
-    if config.norm_type:
-        cmd.extend(["--norm-type", config.norm_type])
     if config.activation:
         cmd.extend(["--activation", config.activation])
     if config.skip_type:
@@ -299,8 +297,6 @@ def run_single_fold(
         cmd.extend(["--weight-decay", str(config.weight_decay)])
     if config.dropout > 0:
         cmd.extend(["--dropout", str(config.dropout)])
-    if config.loss_type:
-        cmd.extend(["--loss", config.loss_type])
 
     if not config.use_bidirectional:
         cmd.append("--no-bidirectional")
@@ -545,8 +541,8 @@ def parse_args() -> argparse.Namespace:
 
     # Model architecture
     parser.add_argument("--arch", type=str, default="condunet", help="Model architecture")
-    parser.add_argument("--base-channels", type=int, default=64, help="Base channel count")
-    parser.add_argument("--n-downsample", type=int, default=4, help="Downsample layers")
+    parser.add_argument("--base-channels", type=int, default=128, help="Base channel count")
+    parser.add_argument("--n-downsample", type=int, default=2, help="Downsample layers")
     parser.add_argument(
         "--attention-type",
         type=str,
@@ -567,7 +563,6 @@ def parse_args() -> argparse.Namespace:
         choices=["standard", "modern"],
         help="Convolution type",
     )
-    parser.add_argument("--norm-type", type=str, default="batch", help="Normalization type")
     parser.add_argument("--activation", type=str, default="gelu", help="Activation function")
     parser.add_argument("--skip-type", type=str, default="add", choices=["add", "concat"], help="Skip connection type")
     parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads")
@@ -578,13 +573,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-schedule", type=str, default="cosine_warmup", help="LR schedule")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate")
-    parser.add_argument(
-        "--loss",
-        type=str,
-        default="l1",
-        choices=["l1", "huber"],
-        help="Loss function",
-    )
 
     # Session adaptation
     parser.add_argument("--use-session-stats", action="store_true", help="Use session statistics")
@@ -627,7 +615,6 @@ def main():
         attention_type=args.attention_type,
         cond_mode=args.cond_mode,
         conv_type=args.conv_type,
-        norm_type=args.norm_type,
         activation=args.activation,
         skip_type=args.skip_type,
         n_heads=args.n_heads,
@@ -636,7 +623,6 @@ def main():
         lr_schedule=args.lr_schedule,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
-        loss_type=args.loss,
         use_session_stats=args.use_session_stats,
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,

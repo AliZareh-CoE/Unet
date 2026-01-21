@@ -165,66 +165,51 @@ DEFAULT_CONFIG = {
     "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
     "beta2": 0.920298282605139,
-    "weight_decay": 0.0,            # L2 regularization (0.01-0.1 typical)
-    "lr_scheduler": "none",         # "none", "cosine", "cosine_warmup"
-    "lr_warmup_epochs": 5,          # Warmup epochs for cosine_warmup
-    "lr_min_ratio": 0.01,           # Min lr as ratio of initial (for cosine)
-    "early_stop_patience": 15,  # Increased for better PSD convergence
+    "weight_decay": 0.0,
+    "lr_scheduler": "none",
+    "lr_warmup_epochs": 5,
+    "lr_min_ratio": 0.01,
+    "early_stop_patience": 15,
     "seed": 42,
-    "generate_plots": True,         # Generate validation plots at end of training
+    "generate_plots": True,
 
     # Loss weights
-    "weight_l1": 1.0,  # Also used for Huber weight
-    "weight_spectral": 5.0,  # Increased for better PSD matching
-    "cycle_lambda": 1.0,  # Cycle consistency weight
-
-    # Loss type selection
-    # Options: "l1", "huber"
-    #   - "l1": L1/MAE only
-    #   - "huber": Huber only (smooth L1, robust to outliers)
-    "loss_type": "l1",
+    "weight_l1": 1.0,
+    "weight_spectral": 5.0,
+    "cycle_lambda": 1.0,
 
     # Model
-    "base_channels": 64,
+    "base_channels": 128,
     "dropout": 0.0,
     "use_attention": True,
-    "attention_type": "cross_freq_v2",  # Cross-frequency coupling attention (theta-gamma)
-    "norm_type": "batch",
-    "cond_mode": "cross_attn_gated",  # Cross-attention with gating (uses auto-conditioning from --conditioning)
-    
-    # U-Net depth (controls frequency resolution at bottleneck)
-    # n_downsample=2: 4x downsample → 125 Hz Nyquist (full gamma, uses more memory)
-    # n_downsample=3: 8x downsample → 62 Hz Nyquist (low gamma)
-    # n_downsample=4: 16x downsample → 31 Hz Nyquist (default)
-    "n_downsample": 4,
+    "attention_type": "cross_freq_v2",
+    "cond_mode": "cross_attn_gated",
+    "n_downsample": 2,
 
-    # Modern convolutions (for improved correlation in Stage 1)
-    "conv_type": "modern",  # "standard" (Conv1d k=3) or "modern" (multi-scale dilated depthwise sep + SE)
-    "use_se": True,  # SE channel attention in modern conv blocks
-    "conv_kernel_size": 7,  # Kernel size for modern convs (ConvNeXt-style)
-    "conv_dilations": (1, 4, 16, 32),  # Multi-scale dilation rates tuned for LFP bands
+    # Convolutions
+    "conv_type": "modern",
+    "use_se": True,
+    "conv_kernel_size": 7,
+    "conv_dilations": (1, 4, 16, 32),
 
     # Bidirectional training
-    "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
+    "use_bidirectional": True,
 
-    # Recording system (for Nature Methods publication)
-    # WARNING: Recording is VERY slow - only enable for final runs!
-    "enable_recording": False,  # Enable comprehensive recording
-    "record_saliency": False,   # Compute saliency maps and Grad-CAM
-    "record_neuroscience": False,  # Compute PAC, coherence, ERP, burst analysis
-    "saliency_epoch_interval": 5,  # Compute saliency every N epochs
-    "neuroscience_epoch_interval": 10,  # Compute neuroscience metrics every N epochs
-    "recording_output_dir": "artifacts/recordings",  # Output directory for recordings
+    # Recording (slow - for final runs only)
+    "enable_recording": False,
+    "record_saliency": False,
+    "record_neuroscience": False,
+    "saliency_epoch_interval": 5,
+    "neuroscience_epoch_interval": 10,
+    "recording_output_dir": "artifacts/recordings",
 
-    # Session-based splitting (for cross-session generalization)
-    # When True, entire recording sessions are held out for val/test
-    # This tests true cross-session generalization (harder but more realistic)
-    "split_by_session": False,  # Use session-based holdout instead of random splits
-    "n_test_sessions": 1,       # Number of sessions to hold out for testing
-    "n_val_sessions": 3,        # Number of sessions to hold out for validation
-    "session_column": "recording_id",  # CSV column containing session/recording IDs
-    "no_test_set": True,        # If True, no test set - all held-out sessions for validation
-    "separate_val_sessions": True,  # If True, evaluate each val session separately
+    # Session-based splitting
+    "split_by_session": False,
+    "n_test_sessions": 1,
+    "n_val_sessions": 3,
+    "session_column": "recording_id",
+    "no_test_set": True,
+    "separate_val_sessions": True,
 }
 
 
@@ -747,22 +732,17 @@ def evaluate(
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
 
-    # Accumulators for TRUE POOLED R² and correlation (not per-batch averaged)
-    # These accumulate sufficient statistics across all batches for exact computation
-    # R² = 1 - SS_res / SS_tot where:
-    #   SS_res = Σ(pred - target)²
-    #   SS_tot = Σ(target - mean(target))² = Σtarget² - (Σtarget)²/n
-    # Correlation = Cov(pred, target) / (std(pred) * std(target))
-    pooled_n = 0  # Total number of elements
-    pooled_sum_target = 0.0  # Σ target
-    pooled_sum_target_sq = 0.0  # Σ target²
-    pooled_sum_pred = 0.0  # Σ pred
-    pooled_sum_pred_sq = 0.0  # Σ pred²
-    pooled_sum_pred_target = 0.0  # Σ (pred * target)
-    pooled_sum_squared_error = 0.0  # Σ (pred - target)²
-    pooled_sum_abs_error = 0.0  # Σ |pred - target|
+    # Accumulators for pooled R² and correlation
+    pooled_n = 0
+    pooled_sum_target = 0.0
+    pooled_sum_target_sq = 0.0
+    pooled_sum_pred = 0.0
+    pooled_sum_pred_sq = 0.0
+    pooled_sum_pred_target = 0.0
+    pooled_sum_squared_error = 0.0
+    pooled_sum_abs_error = 0.0
 
-    # Same for reverse direction
+    # Reverse direction accumulators
     pooled_n_rev = 0
     pooled_sum_target_rev = 0.0
     pooled_sum_target_sq_rev = 0.0
@@ -778,31 +758,20 @@ def evaluate(
     r2_list_rev, nrmse_list_rev = [], []
     psd_err_list_rev, psd_diff_list_rev = [], []
 
-    # Baseline: Raw OB vs PCx (natural difference between brain regions)
-    # This provides context - how similar are the regions naturally?
+    # Baseline metrics
     baseline_corr_list, baseline_r2_list, baseline_nrmse_list = [], [], []
     baseline_psd_err_list, baseline_psd_diff_list = [], []
     baseline_plv_list, baseline_pli_list = [], []
 
-    # Per-channel metrics (for channel correspondence analysis)
-    # Only computed in non-fast mode
-    per_channel_corr_list = []  # List of [C] tensors
-    cross_channel_corr_accumulated = None  # [C, C] accumulated cross-channel correlation
+    # Per-channel metrics (computed in non-fast mode only)
+    per_channel_corr_list = []
+    cross_channel_corr_accumulated = None
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    # Debug: Track data statistics across batches
-    debug_eval = config.get("debug_eval", False) if config else False
-    batch_count = 0
-    total_samples = 0
-    ob_means, pcx_means = [], []
-    ob_stds, pcx_stds = [], []
-    raw_corrs = []
-
-    # Use no_grad instead of inference_mode for FSDP compatibility
-    # inference_mode marks tensors as "inference tensors" which breaks FSDP checkpoint saving
+    # Use no_grad for FSDP compatibility
     with torch.no_grad():
         for batch in loader:
             # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
@@ -816,8 +785,7 @@ def evaluate(
             odor = odor.to(device, non_blocking=True)
             session_ids_batch = session_ids_batch.to(device, non_blocking=True)
 
-            # Normalize target (PCx) for loss computation
-            # NOTE: Input (OB) is normalized inside the model's forward()
+            # Normalize target (input is normalized in model's forward())
             pcx = per_channel_normalize(pcx)
 
             # Compute conditioning embedding if using auto-conditioning
@@ -1295,15 +1263,10 @@ def train_epoch(
         odor = odor.to(device, non_blocking=True)
         session_ids_batch = session_ids_batch.to(device, non_blocking=True)
 
-        # Normalize target (PCx) for loss computation
-        # NOTE: Input (OB) is normalized inside the model's forward()
+        # Normalize target (input is normalized inside model's forward())
         pcx = per_channel_normalize(pcx)
 
         # Compute conditioning embedding
-        # IMPORTANT: Set cond_encoder to eval mode during forward pass to prevent
-        # BatchNorm running stats from being updated in-place. This avoids version
-        # tracking conflicts during backward() when cond_emb is used in multiple
-        # model calls. Gradients still flow for weight/bias training.
         cond_emb = None
         cond_loss = 0.0
         if cond_encoder is not None:
@@ -1311,34 +1274,23 @@ def train_epoch(
             cond_encoder.eval()  # Prevent BatchNorm running stats updates
             cond_source = config.get("conditioning_source", "odor_onehot")
             if cond_source == "spectro_temporal":
-                # SpectroTemporalEncoder: signal -> embedding
                 cond_emb = cond_encoder(ob)
             elif cond_source == "cpc":
-                # CPCEncoder: returns (embedding, z_seq, context_seq)
                 cond_emb, z_seq, context_seq = cond_encoder(ob)
-                # CPC InfoNCE contrastive loss - learns predictive representations
                 cond_loss = 0.1 * cond_encoder.cpc_loss(z_seq, context_seq)
             elif cond_source == "vqvae":
-                # VQVAEEncoder: returns (embedding, losses_dict)
                 cond_emb, vq_losses = cond_encoder(ob)
-                # Add VQ-VAE auxiliary losses (vq + commitment + reconstruction)
                 cond_loss = (vq_losses["vq_loss"] +
                             0.25 * vq_losses["commitment_loss"] +
                             0.1 * vq_losses["recon_loss"])
             elif cond_source == "freq_disentangled":
-                # FreqDisentangledEncoder: signal -> (embedding, band_info)
-                # IMPORTANT: FFT operations require float32, cast input if bfloat16
                 ob_fft = ob.float() if ob.dtype == torch.bfloat16 else ob
                 cond_emb, band_info = cond_encoder(ob_fft)
-                # Cast output back to compute dtype for consistency
                 if ob.dtype == torch.bfloat16:
                     cond_emb = cond_emb.to(torch.bfloat16)
-                # Add band power reconstruction loss (ensures meaningful embeddings)
                 cond_loss = 0.1 * cond_encoder.recon_loss(band_info)
             elif cond_source == "cycle_consistent":
-                # CycleConsistentEncoder: (input, target) -> (embedding, losses_dict)
                 cond_emb, cycle_losses = cond_encoder(ob, pcx)
-                # Add cycle consistency + reconstruction losses
                 cond_loss = 0.0
                 if "cycle_loss" in cycle_losses:
                     cond_loss = cond_loss + 0.1 * cycle_losses["cycle_loss"]
@@ -1370,12 +1322,8 @@ def train_epoch(
         pcx_c = crop_to_target_torch(pcx)
         ob_c = crop_to_target_torch(ob)
 
-        # L1/Huber loss
-        loss_type = config.get("loss_type", "l1")
-        if loss_type == "huber":
-            recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
-        else:
-            recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
+        # L1 loss (forward)
+        recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
         loss = recon_loss
         loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
 
@@ -1387,10 +1335,7 @@ def train_epoch(
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
             # Reverse: PCx → OB
-            # IMPORTANT: Detach cond_emb for reverse_model to prevent computation graph
-            # interconnection that causes BatchNorm version tracking conflicts.
-            # The conditioning encoder still receives gradients from the forward model,
-            # which provides sufficient supervision for learning.
+            # Detach cond_emb for reverse to prevent computation graph interconnection
             cond_emb_rev = cond_emb.detach() if cond_emb is not None else None
             if cond_emb_rev is not None:
                 pred_rev_raw = reverse_model(pcx, cond_emb=cond_emb_rev, session_ids=session_ids)
@@ -1399,19 +1344,10 @@ def train_epoch(
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
-            # L1/Huber (reverse)
-            loss_type = config.get("loss_type", "l1")
-            if loss_type == "huber":
-                rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
-            else:
-                rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
+            # L1 loss (reverse)
+            rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
             loss = loss + rev_loss
             loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
-
-            # Cycle consistency: OB → PCx → OB and PCx → OB → PCx
-            # Models are already in eval mode (set at batch start) to prevent BatchNorm
-            # running stats updates. Detached inputs break gradient flow back to main
-            # predictions, but gradients DO flow through cycle_ob/cycle_pcx.
 
             # Cycle consistency: OB → PCx → OB
             if cond_emb_rev is not None:
@@ -1433,8 +1369,7 @@ def train_epoch(
             loss = loss + cycle_loss_pcx
             loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
-        # NaN detection before backward to prevent silent failures
-        # Local check is cheap; if NaN detected, raise immediately
+        # NaN detection
         if torch.isnan(loss) or torch.isinf(loss):
             raise ValueError(f"NaN/Inf loss detected at epoch {epoch}, batch {batch_idx}. Training aborted.")
 
@@ -1444,18 +1379,16 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
-            # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-        # Accumulate loss as tensor - NO .item() call to avoid GPU sync
         total_loss = total_loss + loss.detach()
 
     pbar.close()
     sys.stdout.flush()
 
-    # Convert to floats ONLY at end of epoch (single GPU sync point)
+    # Convert to floats at end of epoch
     n_batches = len(loader)
     if n_batches == 0:
         # No batches processed (can happen with small datasets and many GPUs)
@@ -1715,11 +1648,9 @@ def train(
             dropout=config.get("dropout", 0.0),
             use_attention=config.get("use_attention", True),
             attention_type=attention_type,
-            norm_type=config.get("norm_type", "batch"),
+            norm_type="batch",
             cond_mode=config.get("cond_mode", "film"),
-            # U-Net depth for frequency resolution
             n_downsample=config.get("n_downsample", 2),
-            # Modern convolution options
             conv_type=conv_type,
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
@@ -1773,11 +1704,9 @@ def train(
             dropout=config.get("dropout", 0.0),
             use_attention=config.get("use_attention", True),
             attention_type=attention_type,
-            norm_type=config.get("norm_type", "batch"),
+            norm_type="batch",
             cond_mode=config.get("cond_mode", "film"),
-            # U-Net depth (same as forward)
             n_downsample=config.get("n_downsample", 2),
-            # Modern convolution options (same as forward)
             conv_type=conv_type,
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
@@ -2943,12 +2872,6 @@ def parse_args():
     # Phase 3 Ablation Study Arguments (Nature Methods level)
     # =========================================================================
 
-    # Normalization type
-    NORM_TYPES = ["batch", "layer", "instance", "group", "rms", "none"]
-    parser.add_argument("--norm-type", type=str, default=None,
-                        choices=NORM_TYPES,
-                        help="Normalization layer type for ablation studies")
-
     # Skip connection type
     SKIP_TYPES = ["add", "concat", "attention", "dense"]
     parser.add_argument("--skip-type", type=str, default=None,
@@ -3006,13 +2929,6 @@ def parse_args():
                         help="Generate validation plots at end of training (default: True)")
     parser.add_argument("--no-plots", action="store_false", dest="generate_plots",
                         help="Skip validation plot generation")
-
-    # Loss function selection (for tier1 fair comparison)
-    LOSS_CHOICES = ["l1", "huber"]
-    parser.add_argument("--loss", type=str, default=None,
-                        choices=LOSS_CHOICES,
-                        help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only). "
-                             "If not specified, uses config default (l1)")
 
     # Phase 2 cross-validation integration
     parser.add_argument("--fold-indices-file", type=str, default=None,
@@ -3412,12 +3328,6 @@ def main():
         if is_primary():
             print(f"Activation function override: {args.activation}")
 
-    # Normalization type from CLI (for Phase 3 ablation studies)
-    if args.norm_type is not None:
-        config["norm_type"] = args.norm_type
-        if is_primary():
-            print(f"Normalization type override: {args.norm_type}")
-
     # Skip connection type from CLI (for Phase 3 ablation studies)
     if args.skip_type is not None:
         config["skip_type"] = args.skip_type
@@ -3467,24 +3377,6 @@ def main():
     if is_primary() and not config.get("generate_plots", True):
         print("Validation plot generation DISABLED (--no-plots)")
 
-    # Loss function selection (for tier1 fair comparison)
-    # Only override config if --loss is explicitly provided
-    # --loss l1: L1 only
-    # --loss huber: Huber only
-    if args.loss is not None:
-        config["loss_type"] = args.loss
-        if args.loss == "l1":
-            if is_primary():
-                print("Loss: L1 only (--loss l1)")
-        elif args.loss == "huber":
-            if is_primary():
-                print("Loss: Huber only (--loss huber)")
-    else:
-        # Use config default - print what's being used
-        loss_type = config.get("loss_type", "l1")
-        if is_primary():
-            print(f"Loss: {loss_type} (from config)")
-
     # =========================================================================
     # SAFEGUARD: Validate CLI args were properly applied to config
     # This catches bugs where CLI args are defined but never used
@@ -3509,8 +3401,6 @@ def main():
         # Architecture parameters
         if args.activation is not None and config.get("activation") != args.activation:
             errors.append(f"--activation={args.activation} but config['activation']={config.get('activation')}")
-        if args.norm_type is not None and config.get("norm_type") != args.norm_type:
-            errors.append(f"--norm-type={args.norm_type} but config['norm_type']={config.get('norm_type')}")
         if args.skip_type is not None and config.get("skip_type") != args.skip_type:
             errors.append(f"--skip-type={args.skip_type} but config['skip_type']={config.get('skip_type')}")
         if args.n_heads is not None and config.get("n_heads") != args.n_heads:

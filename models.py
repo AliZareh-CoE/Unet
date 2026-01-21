@@ -526,7 +526,7 @@ class ConvBlock(nn.Module):
         emb_dim: int,
         downsample: bool = False,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
     ):
         super().__init__()
@@ -583,7 +583,7 @@ class UpBlock(nn.Module):
         out_c: int,
         emb_dim: int,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         skip_type: str = "concat",  # "concat" or "add"
     ):
@@ -787,7 +787,7 @@ class ModernConvBlock(nn.Module):
         emb_dim: int,
         downsample: bool = False,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         use_se: bool = True,
         kernel_size: int = 7,
@@ -869,7 +869,7 @@ class ModernUpBlock(nn.Module):
         out_c: int,
         emb_dim: int,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         use_se: bool = True,
         kernel_size: int = 7,
@@ -987,28 +987,10 @@ def make_uniform_bands(band_width_hz: float, min_freq_hz: float = 1.0, max_freq_
 # =============================================================================
 
 class EnvelopeHistogramMatching(nn.Module):
-    """Closed-form envelope scaling correction (mean/std matching).
+    """Closed-form envelope scaling correction using mean/std matching.
 
-    NOTE: Full histogram matching DESTROYS temporal structure because it's a
-    global statistical operation - it matches amplitude distributions without
-    considering WHEN amplitudes occur. This breaks the signal!
-
-    Instead, we use simple MEAN/STD SCALING which:
-    1. Preserves temporal structure (peaks stay at same times)
-    2. Adjusts overall amplitude scale to match target statistics
-
-    The correction is:
-        corrected = (pred_envelope - pred_mean) * (target_std / pred_std) + target_mean
-
-    This is a linear transformation that preserves the SHAPE of the envelope
-    while matching its mean and variability to the target.
-
-    Usage:
-        matcher = EnvelopeHistogramMatching()
-        # Compute target statistics from training data
-        matcher.fit(target_signals, odor_ids)
-        # Apply correction during inference
-        corrected = matcher(pred, odor_ids)
+    Applies linear scaling to match target amplitude statistics while preserving
+    temporal structure. Call fit() with target data, then use forward() during inference.
     """
 
     def __init__(
@@ -1889,26 +1871,8 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
 class SessionStatisticsEncoder(nn.Module):
     """Encode session statistics into a conditioning vector for FiLM modulation.
 
-    Instead of learning arbitrary embeddings per session ID, this computes
-    statistics from the input signal and learns to encode them. This approach:
-
-    1. Generalizes automatically to new/unseen sessions
-    2. Learns meaningful relationships between statistics and predictions
-    3. Implements FiLM (Feature-wise Linear Modulation) conditioning
-
-    NOTE: This does NOT use instance normalization! It computes statistics
-    for conditioning (predicting gamma/beta), not for normalizing the signal.
-
-    Based on:
-    - Domain-specific batch normalization for EEG transfer learning
-    - FiLM (Feature-wise Linear Modulation) conditioning
-
-    The encoder computes per-channel statistics (mean, std) from the raw input
-    BEFORE normalization, capturing session-specific characteristics like:
-    - Electrode impedance differences
-    - Baseline activity levels
-    - Signal amplitude variations
-    - Recording condition effects
+    Computes per-channel statistics from raw input and encodes them into an embedding.
+    Generalizes to unseen sessions by learning from signal characteristics.
     """
 
     def __init__(
@@ -2034,16 +1998,8 @@ class SessionStatisticsEncoder(nn.Module):
 class SessionAdaptiveScaling(nn.Module):
     """Session-aware output scaling using FiLM-style conditioning.
 
-    Instead of fixed learnable scale/bias per channel, predicts them from
-    session statistics. This is pure FiLM (Feature-wise Linear Modulation):
+    Predicts scale (gamma) and bias (beta) from session statistics:
         output = input * gamma + beta
-
-    NOTE: This does NOT use instance normalization! It only applies
-    learned scale/bias without any normalization step.
-
-    The key insight: different sessions may need different output scaling
-    to match the target distribution due to electrode impedance, baseline
-    activity, and recording condition differences.
     """
 
     def __init__(
@@ -2192,28 +2148,8 @@ class CovarianceExpansionAugmentation(nn.Module):
 class CondUNet1D(nn.Module):
     """Conditional U-Net for neural signal translation with FiLM modulation.
 
-    This is the primary architecture for OB->PCx translation, supporting:
-    - Feature-wise Linear Modulation (FiLM) for odor conditioning
-    - Self-attention in the bottleneck for long-range dependencies
-    - Multi-scale skip connections for detail preservation
-    - OptimalSpectralBias for fixed per-odor PSD correction (applied externally)
-    - Modern convolutions (multi-scale dilated depthwise separable + SE attention)
-    - Configurable depth (n_downsample) to control frequency resolution
-
-    Frequency Resolution:
-    - n_downsample=4: 16x downsampling → bottleneck Nyquist = 31 Hz (loses gamma)
-    - n_downsample=3: 8x downsampling → bottleneck Nyquist = 62 Hz (low gamma)
-    - n_downsample=2: 4x downsampling → bottleneck Nyquist = 125 Hz (full gamma) ✓
-
-    Attention types:
-    - "basic": Original SelfAttention1D (default)
-    - "none": No attention
-    - "cross_freq": Cross-frequency coupling attention
-    - "cross_freq_v2": Optimized cross-frequency attention with Flash Attention
-
-    Convolution types:
-    - "standard": Original Conv1d(kernel_size=3) - backward compatible
-    - "modern": Multi-scale dilated depthwise separable + SE attention
+    Supports FiLM conditioning, self-attention in bottleneck, multi-scale skip connections,
+    modern convolutions (multi-scale dilated + SE), and configurable depth.
     """
     def __init__(
         self,
@@ -2225,28 +2161,19 @@ class CondUNet1D(nn.Module):
         dropout: float = 0.0,
         use_attention: bool = True,
         attention_type: str = "basic",
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
-        # Depth control for frequency resolution
-        n_downsample: int = 2,  # 2 = 4x downsample (125 Hz Nyquist), 4 = 16x (31 Hz)
-        # Modern convolution options
-        conv_type: str = "standard",  # "standard" or "modern"
-        use_se: bool = True,  # SE attention in conv blocks (only for modern)
-        conv_kernel_size: int = 7,  # Kernel size for modern convs
-        dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
-        # Output scaling correction (helps match target distribution)
-        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style)
-        # Session conditioning - statistics-based (literature-recommended approach)
-        # Instead of learned embeddings per session ID, computes statistics from
-        # input signal and learns to encode them. Generalizes to unseen sessions.
-        use_session_stats: bool = False,  # Enable statistics-based session conditioning
-        session_emb_dim: int = 32,  # Session embedding dimension
-        session_use_spectral: bool = False,  # Include spectral features in session stats
-        # Learnable session embedding (lookup table approach)
-        # Unlike statistics-based, this learns a unique embedding per session ID.
-        # Requires session IDs at training time. Does NOT generalize to unseen sessions.
-        use_session_embedding: bool = False,  # Enable learnable session embedding lookup
-        n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
+        n_downsample: int = 2,
+        conv_type: str = "standard",
+        use_se: bool = True,
+        conv_kernel_size: int = 7,
+        dilations: Tuple[int, ...] = (1, 4, 16, 32),
+        use_adaptive_scaling: bool = False,
+        use_session_stats: bool = False,
+        session_emb_dim: int = 32,
+        session_use_spectral: bool = False,
+        use_session_embedding: bool = False,
+        n_sessions: int = 0,
         # NEW: Ablation-configurable parameters
         activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
         n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
