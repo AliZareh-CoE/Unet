@@ -2586,6 +2586,9 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_version=config.get("adaptive_scaling_version", 2),
+            adaptive_scaling_dropout=config.get("adaptive_scaling_dropout", 0.1),
+            adaptive_scaling_spectral=config.get("adaptive_scaling_spectral", False),
             # NEW: Ablation-configurable parameters
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
@@ -2646,6 +2649,9 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Other session adaptation methods
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_version=config.get("adaptive_scaling_version", 2),
+            adaptive_scaling_dropout=config.get("adaptive_scaling_dropout", 0.1),
+            adaptive_scaling_spectral=config.get("adaptive_scaling_spectral", False),
             # NEW: Ablation-configurable parameters (same as forward)
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
@@ -3948,6 +3954,12 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (AdaIN style)")
+    parser.add_argument("--adaptive-scaling-version", type=int, default=2, choices=[1, 2],
+                        help="Adaptive scaling version: 1=MLP, 2=per-channel cross-attention (default: 2)")
+    parser.add_argument("--adaptive-scaling-dropout", type=float, default=0.1,
+                        help="Dropout for adaptive scaling V2 (default: 0.1)")
+    parser.add_argument("--adaptive-scaling-spectral", action="store_true",
+                        help="Use spectral features in adaptive scaling V2")
     parser.add_argument("--use-cov-augment", action="store_true",
                         help="Use covariance expansion augmentation for synthetic sessions")
     parser.add_argument("--cov-augment-prob", type=float, default=0.5,
@@ -4081,6 +4093,9 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
+    config["adaptive_scaling_version"] = args.adaptive_scaling_version
+    config["adaptive_scaling_dropout"] = args.adaptive_scaling_dropout
+    config["adaptive_scaling_spectral"] = args.adaptive_scaling_spectral
     config["use_cov_augment"] = args.use_cov_augment
     config["cov_augment_prob"] = args.cov_augment_prob
 

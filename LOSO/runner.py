@@ -317,6 +317,10 @@ def run_single_fold(
         cmd.append("--session-use-spectral")
     if config.use_adaptive_scaling:
         cmd.append("--use-adaptive-scaling")
+        cmd.extend(["--adaptive-scaling-version", str(config.adaptive_scaling_version)])
+        cmd.extend(["--adaptive-scaling-dropout", str(config.adaptive_scaling_dropout)])
+        if config.adaptive_scaling_spectral:
+            cmd.append("--adaptive-scaling-spectral")
 
     # FSDP
     if config.use_fsdp:
