@@ -216,6 +216,53 @@ GRAD_CLIP = 5.0
 
 
 # =============================================================================
+# Config Formatting
+# =============================================================================
+
+def print_config(config: Dict[str, Any], title: str = "Configuration") -> None:
+    """Print configuration in a nicely formatted way."""
+    # Group config keys by category
+    groups = {
+        "Training": ["batch_size", "num_epochs", "learning_rate", "weight_decay",
+                     "lr_scheduler", "lr_warmup_epochs", "lr_min_ratio", "early_stop_patience",
+                     "optimizer", "seed"],
+        "Model": ["arch", "base_channels", "n_downsample", "dropout", "use_attention",
+                  "attention_type", "cond_mode", "conditioning_source", "activation",
+                  "skip_type", "n_heads", "conv_type", "use_se", "conv_kernel_size", "conv_dilations"],
+        "Session": ["use_session_stats", "session_use_spectral", "use_adaptive_scaling",
+                    "n_sessions", "session_emb_dim", "use_bidirectional"],
+        "Data Split": ["split_by_session", "n_test_sessions", "n_val_sessions",
+                       "session_column", "no_test_set", "separate_val_sessions"],
+        "Loss": ["weight_l1", "cycle_lambda"],
+    }
+
+    # Collect keys that don't fit into predefined groups
+    all_grouped = set()
+    for keys in groups.values():
+        all_grouped.update(keys)
+
+    other_keys = [k for k in config.keys() if k not in all_grouped and not k.startswith("_")]
+
+    print(f"\n{'='*60}")
+    print(f" {title}")
+    print(f"{'='*60}")
+
+    for group_name, keys in groups.items():
+        present = [(k, config[k]) for k in keys if k in config]
+        if present:
+            print(f"\n  {group_name}:")
+            for k, v in present:
+                print(f"    {k:28s} = {v}")
+
+    if other_keys:
+        print(f"\n  Other:")
+        for k in sorted(other_keys):
+            print(f"    {k:28s} = {config[k]}")
+
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
 # Logging
 # =============================================================================
 
@@ -2941,11 +2988,71 @@ def parse_args():
     parser.add_argument("--checkpoint-prefix", type=str, default=None,
                         help="Prefix for checkpoint file names (e.g., 'wavenet_fold0')")
 
+    # =========================================================================
+    # LOSO (Leave-One-Session-Out) Cross-Validation
+    # =========================================================================
+    parser.add_argument("--loso", action="store_true",
+                        help="Run LOSO cross-validation instead of single training run")
+    parser.add_argument("--loso-output-dir", type=str, default="artifacts/loso",
+                        help="Output directory for LOSO results (default: artifacts/loso)")
+    parser.add_argument("--loso-folds", type=int, nargs="+", default=None,
+                        help="Specific fold indices to run (default: all folds)")
+    parser.add_argument("--loso-resume", action="store_true", default=True,
+                        help="Resume LOSO from checkpoint (default: True)")
+    parser.add_argument("--loso-no-resume", action="store_true",
+                        help="Start LOSO fresh (ignore checkpoint)")
+    parser.add_argument("--loso-verbose", action="store_true", default=True,
+                        help="Show verbose output during LOSO folds")
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Handle LOSO cross-validation mode
+    if args.loso:
+        from LOSO.runner import run_loso
+        from LOSO.config import LOSOConfig
+
+        config = LOSOConfig(
+            dataset=args.dataset,
+            output_dir=Path(args.loso_output_dir),
+            epochs=args.epochs or 60,
+            batch_size=args.batch_size or 32,
+            learning_rate=args.lr or 1e-3,
+            seed=args.seed or 42,
+            arch=args.arch,
+            base_channels=args.base_channels or 128,
+            n_downsample=args.n_downsample or 2,
+            attention_type=args.attention_type or "cross_freq_v2",
+            cond_mode=args.cond_mode or "cross_attn_gated",
+            conv_type=args.conv_type or "modern",
+            activation=args.activation or "gelu",
+            skip_type=args.skip_type or "add",
+            n_heads=args.n_heads or 4,
+            conditioning=args.conditioning or "spectro_temporal",
+            optimizer=args.optimizer or "adamw",
+            lr_schedule=args.lr_schedule or "cosine_warmup",
+            weight_decay=args.weight_decay or 0.0,
+            dropout=args.dropout or 0.0,
+            use_session_stats=args.use_session_stats,
+            session_use_spectral=args.session_use_spectral,
+            use_adaptive_scaling=args.use_adaptive_scaling,
+            use_bidirectional=not args.no_bidirectional,
+            use_fsdp=args.fsdp,
+            fsdp_strategy=args.fsdp_strategy,
+            resume=not args.loso_no_resume,
+            verbose=args.loso_verbose,
+            generate_plots=args.generate_plots if args.generate_plots is not None else False,
+        )
+
+        print("=" * 60)
+        print(" LOSO Cross-Validation Mode")
+        print("=" * 60)
+        result = run_loso(config, folds_to_run=args.loso_folds)
+        print(f"\nLOSO complete! Mean R²: {result.mean_r2:.4f} ± {result.std_r2:.4f}")
+        return 0
 
     # Initialize distributed
     dist_init_if_needed()
@@ -3444,16 +3551,7 @@ def main():
         print("[SAFEGUARD] CLI args validated - all arguments properly applied to config")
 
     if is_primary():
-        arch_name = config.get('arch', 'condunet').upper()
-        print(f"\nTraining {arch_name} for {config['num_epochs']} epochs...")
-        if config.get('arch', 'condunet') == 'condunet':
-            print(f"Attention type: {config['attention_type']}")
-            print(f"Convolution type: {config['conv_type']}")
-            if config['conv_type'] == 'modern':
-                print(f"  -> Multi-scale dilated depthwise separable + SE attention")
-                print(f"  -> Dilations: {config['conv_dilations']}, Kernel: {config['conv_kernel_size']}")
-        print(f"Config: {config}")
-        print()
+        print_config(config, f"Training {config.get('arch', 'condunet').upper()}")
 
     # Train
     results = train(
