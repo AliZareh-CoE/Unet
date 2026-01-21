@@ -2891,13 +2891,29 @@ def train(
             val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
             per_session_metrics = {}
 
-        # Sync val_loss across ranks (for early stopping)
+        # Sync val_loss and ALL metrics across ranks (for consistent reporting)
         val_loss = val_metrics.get("loss", val_metrics.get("mae", float("inf")))  # fallback to mae if no composite
         if dist.is_initialized():
             val_loss_tensor = torch.tensor(val_loss, device=device)
             dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
             val_loss = val_loss_tensor.item()
             val_metrics["loss"] = val_loss
+
+            # Sync all numeric metrics across ranks for accurate reporting
+            # Without this, only rank 0's partial metrics would be reported
+            for metric_name in ["corr", "r2", "mae", "mse", "nrmse"]:
+                if metric_name in val_metrics and isinstance(val_metrics[metric_name], (int, float)):
+                    metric_tensor = torch.tensor(val_metrics[metric_name], device=device)
+                    dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
+                    val_metrics[metric_name] = metric_tensor.item()
+
+            # Also sync per-session metrics for consistent reporting
+            for sess_name, sess_m in per_session_metrics.items():
+                for metric_name in ["corr", "r2", "mae", "mse", "loss", "nrmse"]:
+                    if metric_name in sess_m and isinstance(sess_m[metric_name], (int, float)):
+                        metric_tensor = torch.tensor(sess_m[metric_name], device=device)
+                        dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
+                        sess_m[metric_name] = metric_tensor.item()
 
         # Track best (lower loss is better)
         is_best = val_loss < best_val_loss
@@ -4492,6 +4508,30 @@ def main():
                     else:
                         n_params = sum(p.numel() for p in model_obj.parameters() if p.requires_grad)
 
+            # Extract per-session metrics from history if available
+            # These are stored as "val_{session}_{metric}" in history entries
+            per_session_r2 = {}
+            per_session_corr = {}
+            per_session_loss = {}
+            if history:
+                # Look through history entries for per-session metrics
+                # Use the best epoch's per-session metrics
+                best_entry = history[best_epoch - 1] if best_epoch <= len(history) else history[-1]
+                for key, value in best_entry.items():
+                    if key.startswith("val_") and "_r2" in key and key != "val_r2":
+                        # Extract session name: "val_{session}_r2" -> "{session}"
+                        session = key[4:-3]  # Remove "val_" prefix and "_r2" suffix
+                        if session:  # Avoid empty session names
+                            per_session_r2[session] = value
+                    elif key.startswith("val_") and "_corr" in key and key != "val_corr":
+                        session = key[4:-5]  # Remove "val_" prefix and "_corr" suffix
+                        if session:
+                            per_session_corr[session] = value
+                    elif key.startswith("val_") and "_loss" in key and key != "val_loss":
+                        session = key[4:-5]  # Remove "val_" prefix and "_loss" suffix
+                        if session:
+                            per_session_loss[session] = value
+
             output_results = {
                 "architecture": args.arch,
                 "fold": args.fold if args.fold is not None else 0,
@@ -4504,6 +4544,9 @@ def main():
                 "val_losses": val_losses,
                 "val_r2s": val_r2s,
                 "val_corrs": val_corrs,
+                "per_session_r2": per_session_r2,
+                "per_session_corr": per_session_corr,
+                "per_session_loss": per_session_loss,
                 "total_time": results.get("total_time", 0.0),
                 "epochs_trained": len(history),
                 "n_parameters": n_params,

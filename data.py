@@ -1941,8 +1941,10 @@ def create_single_session_dataloader(
         DataLoader for the specified session's data
     """
     # Create dataset for this session's indices
+    # Pass session_ids for consistency with main val loader (fixes R² gap issue)
     dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], indices,
+        session_ids=data.get("session_ids"),
     )
 
     # Create sampler for distributed training
