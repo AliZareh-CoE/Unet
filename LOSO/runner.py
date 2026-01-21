@@ -283,6 +283,12 @@ def run_single_fold(
         cmd.extend(["--norm-type", config.norm_type])
     if config.activation:
         cmd.extend(["--activation", config.activation])
+    if config.skip_type:
+        cmd.extend(["--skip-type", config.skip_type])
+    if config.n_heads is not None:
+        cmd.extend(["--n-heads", str(config.n_heads)])
+    if config.conditioning:
+        cmd.extend(["--conditioning", config.conditioning])
 
     # Training arguments
     if config.optimizer:
@@ -297,7 +303,9 @@ def run_single_fold(
         cmd.extend(["--loss", config.loss_type])
 
     # Augmentation
-    if config.aug_strength:
+    if config.disable_aug:
+        cmd.append("--no-aug")
+    elif config.aug_strength:
         cmd.extend(["--aug-strength", config.aug_strength])
     if not config.use_bidirectional:
         cmd.append("--no-bidirectional")
@@ -566,6 +574,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--norm-type", type=str, default="batch", help="Normalization type")
     parser.add_argument("--activation", type=str, default="gelu", help="Activation function")
+    parser.add_argument("--skip-type", type=str, default="add", choices=["add", "concat"], help="Skip connection type")
+    parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads")
+    parser.add_argument("--conditioning", type=str, default="spectro_temporal", help="Auto-conditioning type (none, spectro_temporal, etc.)")
 
     # Training configuration
     parser.add_argument("--optimizer", type=str, default="adamw", help="Optimizer")
@@ -593,6 +604,7 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "light", "medium", "heavy"],
         help="Augmentation strength",
     )
+    parser.add_argument("--no-aug", action="store_true", help="Disable all augmentation")
     parser.add_argument("--no-bidirectional", action="store_true", help="Disable bidirectional training")
 
     # FSDP
@@ -630,6 +642,9 @@ def main():
         conv_type=args.conv_type,
         norm_type=args.norm_type,
         activation=args.activation,
+        skip_type=args.skip_type,
+        n_heads=args.n_heads,
+        conditioning=args.conditioning,
         optimizer=args.optimizer,
         lr_schedule=args.lr_schedule,
         weight_decay=args.weight_decay,
@@ -639,6 +654,7 @@ def main():
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,
         aug_strength=args.aug_strength,
+        disable_aug=args.no_aug,
         use_bidirectional=not args.no_bidirectional,
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,

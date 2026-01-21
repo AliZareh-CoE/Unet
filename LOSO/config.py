@@ -70,6 +70,9 @@ class LOSOConfig:
     conv_type: str = "modern"
     norm_type: str = "batch"
     activation: str = "gelu"
+    skip_type: str = "add"  # Skip connection type: add, concat
+    n_heads: int = 4  # Number of attention heads
+    conditioning: str = "spectro_temporal"  # Auto-conditioning: none, spectro_temporal, etc.
 
     # Training configuration
     optimizer: str = "adamw"
@@ -85,6 +88,7 @@ class LOSOConfig:
 
     # Data augmentation
     aug_strength: str = "medium"  # none, light, medium, heavy
+    disable_aug: bool = False  # Disable all augmentation
     use_bidirectional: bool = True
 
     # FSDP distributed training
@@ -119,6 +123,9 @@ class LOSOConfig:
             "conv_type": self.conv_type,
             "norm_type": self.norm_type,
             "activation": self.activation,
+            "skip_type": self.skip_type,
+            "n_heads": self.n_heads,
+            "conditioning": self.conditioning,
             "optimizer": self.optimizer,
             "lr_schedule": self.lr_schedule,
             "weight_decay": self.weight_decay,
@@ -128,6 +135,7 @@ class LOSOConfig:
             "use_adaptive_scaling": self.use_adaptive_scaling,
             "session_use_spectral": self.session_use_spectral,
             "aug_strength": self.aug_strength,
+            "disable_aug": self.disable_aug,
             "use_bidirectional": self.use_bidirectional,
             "use_fsdp": self.use_fsdp,
             "fsdp_strategy": self.fsdp_strategy,
