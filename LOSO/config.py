@@ -43,7 +43,7 @@ class LOSOConfig:
     use_session_stats: bool = False
     use_adaptive_scaling: bool = False
     session_use_spectral: bool = False
-    use_bidirectional: bool = True
+    use_bidirectional: bool = False
 
     # FSDP
     use_fsdp: bool = False

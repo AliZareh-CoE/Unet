@@ -175,7 +175,6 @@ DEFAULT_CONFIG = {
 
     # Loss weights
     "weight_l1": 1.0,
-    "weight_spectral": 5.0,
     "cycle_lambda": 1.0,
 
     # Model
@@ -193,7 +192,7 @@ DEFAULT_CONFIG = {
     "conv_dilations": (1, 4, 16, 32),
 
     # Bidirectional training
-    "use_bidirectional": True,
+    "use_bidirectional": False,
 
     # Recording (slow - for final runs only)
     "enable_recording": False,
