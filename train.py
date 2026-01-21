@@ -2880,7 +2880,6 @@ def train(
                     val_ds = loaders["val"].dataset
                     sess_ds = loaders["val_sessions"][sess_name].dataset
                     if hasattr(val_ds, 'ob') and hasattr(sess_ds, 'ob'):
-                        import torch
                         val_first = val_ds[0][0]  # First OB sample
                         sess_first = sess_ds[0][0]  # First OB sample
                         match = torch.allclose(val_first, sess_first, rtol=1e-5, atol=1e-6)
