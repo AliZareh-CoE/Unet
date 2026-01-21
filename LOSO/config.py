@@ -84,9 +84,6 @@ class LOSOConfig:
     # Session adaptation (generalizes to new sessions)
     use_session_stats: bool = False
     use_adaptive_scaling: bool = False
-    adaptive_scaling_version: int = 2  # 1=MLP, 2=per-channel cross-attention
-    adaptive_scaling_dropout: float = 0.1  # Dropout for V2
-    adaptive_scaling_spectral: bool = False  # Use spectral features in V2
     session_use_spectral: bool = False
 
     # Data augmentation
@@ -136,9 +133,6 @@ class LOSOConfig:
             "loss_type": self.loss_type,
             "use_session_stats": self.use_session_stats,
             "use_adaptive_scaling": self.use_adaptive_scaling,
-            "adaptive_scaling_version": self.adaptive_scaling_version,
-            "adaptive_scaling_dropout": self.adaptive_scaling_dropout,
-            "adaptive_scaling_spectral": self.adaptive_scaling_spectral,
             "session_use_spectral": self.session_use_spectral,
             "aug_strength": self.aug_strength,
             "disable_aug": self.disable_aug,

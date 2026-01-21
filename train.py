@@ -254,10 +254,6 @@ DEFAULT_CONFIG = {
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
 
-    # Output scaling correction (learnable per-channel scale and bias)
-    # Helps match target distribution, especially important for probabilistic losses
-    "use_output_scaling": True,
-
     # Recording system (for Nature Methods publication)
     # WARNING: Recording is VERY slow - only enable for final runs!
     "enable_recording": False,  # Enable comprehensive recording
@@ -2575,8 +2571,6 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction (disabled if using adaptive scaling)
-            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Statistics-based session adaptation (Phase 3 Group 18)
             use_session_stats=config.get("use_session_stats", False),
             session_emb_dim=config.get("session_emb_dim", 32),
@@ -2584,11 +2578,8 @@ def train(
             # Learnable session embedding (lookup table approach)
             use_session_embedding=config.get("use_session_embedding", False),
             n_sessions=config.get("n_sessions", 0),
-            # Other session adaptation methods
+            # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            adaptive_scaling_version=config.get("adaptive_scaling_version", 2),
-            adaptive_scaling_dropout=config.get("adaptive_scaling_dropout", 0.1),
-            adaptive_scaling_spectral=config.get("adaptive_scaling_spectral", False),
             # NEW: Ablation-configurable parameters
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
@@ -2638,8 +2629,6 @@ def train(
             use_se=config.get("use_se", True),
             conv_kernel_size=config.get("conv_kernel_size", 7),
             dilations=config.get("conv_dilations", (1, 4, 16, 32)),
-            # Output scaling correction (disabled if using adaptive scaling)
-            use_output_scaling=config.get("use_output_scaling", True) and not config.get("use_adaptive_scaling", False),
             # Statistics-based session adaptation (same as forward)
             use_session_stats=config.get("use_session_stats", False),
             session_emb_dim=config.get("session_emb_dim", 32),
@@ -2647,11 +2636,8 @@ def train(
             # Learnable session embedding (same as forward model)
             use_session_embedding=config.get("use_session_embedding", False),
             n_sessions=config.get("n_sessions", 0),
-            # Other session adaptation methods
+            # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
-            adaptive_scaling_version=config.get("adaptive_scaling_version", 2),
-            adaptive_scaling_dropout=config.get("adaptive_scaling_dropout", 0.1),
-            adaptive_scaling_spectral=config.get("adaptive_scaling_spectral", False),
             # NEW: Ablation-configurable parameters (same as forward)
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
@@ -3953,13 +3939,7 @@ def parse_args():
     parser.add_argument("--session-use-spectral", action="store_true",
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
-                        help="Use session-adaptive output scaling (AdaIN style)")
-    parser.add_argument("--adaptive-scaling-version", type=int, default=2, choices=[1, 2],
-                        help="Adaptive scaling version: 1=MLP, 2=per-channel cross-attention (default: 2)")
-    parser.add_argument("--adaptive-scaling-dropout", type=float, default=0.1,
-                        help="Dropout for adaptive scaling V2 (default: 0.1)")
-    parser.add_argument("--adaptive-scaling-spectral", action="store_true",
-                        help="Use spectral features in adaptive scaling V2")
+                        help="Use session-adaptive output scaling (FiLM style)")
     parser.add_argument("--use-cov-augment", action="store_true",
                         help="Use covariance expansion augmentation for synthetic sessions")
     parser.add_argument("--cov-augment-prob", type=float, default=0.5,
@@ -3970,12 +3950,6 @@ def parse_args():
                         help="Generate validation plots at end of training (default: True)")
     parser.add_argument("--no-plots", action="store_false", dest="generate_plots",
                         help="Skip validation plot generation")
-
-    # Output scaling correction (learnable per-channel scale and bias in model)
-    parser.add_argument("--output-scaling", action="store_true", default=True,
-                        help="Enable learnable per-channel output scaling in model (default: True)")
-    parser.add_argument("--no-output-scaling", action="store_false", dest="output_scaling",
-                        help="Disable output scaling correction in model")
 
     # Loss function selection (for tier1 fair comparison)
     LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
@@ -4093,9 +4067,6 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
-    config["adaptive_scaling_version"] = args.adaptive_scaling_version
-    config["adaptive_scaling_dropout"] = args.adaptive_scaling_dropout
-    config["adaptive_scaling_spectral"] = args.adaptive_scaling_spectral
     config["use_cov_augment"] = args.use_cov_augment
     config["cov_augment_prob"] = args.cov_augment_prob
 
@@ -4541,11 +4512,6 @@ def main():
         loss_type = config.get("loss_type", "huber_wavelet")
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
-
-    # Output scaling correction in model (default: enabled)
-    config["use_output_scaling"] = args.output_scaling if hasattr(args, 'output_scaling') else True
-    if is_primary():
-        print(f"Output scaling correction: {'ENABLED' if config['use_output_scaling'] else 'DISABLED'}")
 
     # =========================================================================
     # SAFEGUARD: Validate CLI args were properly applied to config

@@ -2112,182 +2112,6 @@ class SessionAdaptiveScaling(nn.Module):
         return x * gamma + beta
 
 
-
-class SessionAdaptiveScalingV2(nn.Module):
-    """Enhanced session-aware output scaling with per-channel cross-attention.
-
-    Improvements over V1:
-    1. Per-channel cross-attention: Each output channel attends to input channel
-       statistics to determine its scale/bias (learns channel correspondence)
-    2. Richer statistics: Mean, std, min, max, and optionally spectral features
-    3. Regularization: Dropout and scale clamping to prevent overfitting
-    4. Residual design: Predicts delta from identity transform
-
-    This allows the model to learn which input channels are most relevant for
-    scaling each output channel - useful when channel mappings aren't 1:1.
-    """
-
-    def __init__(
-        self,
-        n_channels: int,
-        n_input_channels: int = 32,
-        hidden_dim: int = 64,
-        n_heads: int = 4,
-        dropout: float = 0.1,
-        scale_clamp: float = 2.0,
-        use_spectral_stats: bool = False,
-    ):
-        """Initialize SessionAdaptiveScalingV2.
-
-        Args:
-            n_channels: Number of output channels to scale
-            n_input_channels: Number of input channels (for computing stats)
-            hidden_dim: Hidden dimension for attention and MLPs
-            n_heads: Number of attention heads
-            dropout: Dropout probability for regularization
-            scale_clamp: Clamp predicted scale to [1/clamp, clamp] range
-            use_spectral_stats: If True, also compute spectral band powers
-        """
-        super().__init__()
-        self.n_channels = n_channels
-        self.n_input_channels = n_input_channels
-        self.scale_clamp = scale_clamp
-        self.use_spectral_stats = use_spectral_stats
-
-        # Statistics per input channel: mean, std, min, max = 4 features
-        # Optionally + 5 spectral band powers = 9 features
-        stats_per_channel = 9 if use_spectral_stats else 4
-
-        # Project input channel statistics to hidden dim
-        self.input_proj = nn.Linear(stats_per_channel, hidden_dim)
-
-        # Learnable query embeddings for each output channel
-        # Each output channel has its own query to attend to input statistics
-        self.output_queries = nn.Parameter(torch.randn(1, n_channels, hidden_dim) * 0.02)
-
-        # Cross-attention: output channels attend to input channel statistics
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.attn_norm = nn.LayerNorm(hidden_dim)
-
-        # Per-channel MLP to predict scale and bias
-        self.channel_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 2),  # scale_delta and bias per channel
-        )
-
-        # Initialize to predict near-identity transform
-        nn.init.zeros_(self.channel_mlp[-1].weight)
-        nn.init.zeros_(self.channel_mlp[-1].bias)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        raw_input: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply per-channel adaptive scaling with cross-attention.
-
-        Args:
-            x: Output to scale [B, C_out, T]
-            raw_input: Raw input signal [B, C_in, T] for computing statistics
-
-        Returns:
-            Scaled output [B, C_out, T]
-        """
-        B = x.shape[0]
-
-        # Compute rich per-channel statistics from input
-        # [B, C_in, 4] or [B, C_in, 9] with spectral
-        stats = self._compute_channel_stats(raw_input)
-
-        # Project to hidden dim: [B, C_in, hidden_dim]
-        input_features = self.input_proj(stats)
-        input_features = self.dropout(input_features)
-
-        # Expand queries for batch: [B, C_out, hidden_dim]
-        queries = self.output_queries.expand(B, -1, -1)
-
-        # Cross-attention: each output channel attends to input channel stats
-        # Q: [B, C_out, hidden_dim], K,V: [B, C_in, hidden_dim]
-        attn_out, _ = self.cross_attn(queries, input_features, input_features)
-        attn_out = self.attn_norm(queries + attn_out)  # Residual connection
-
-        # Predict scale and bias per channel: [B, C_out, 2]
-        params = self.channel_mlp(attn_out)
-
-        # Extract scale (with residual from 1.0) and bias
-        scale_delta = params[:, :, 0]  # [B, C_out]
-        bias = params[:, :, 1]         # [B, C_out]
-
-        # Scale = 1 + delta, then clamp to prevent extreme values
-        scale = 1.0 + scale_delta
-        scale = torch.clamp(scale, 1.0 / self.scale_clamp, self.scale_clamp)
-
-        # Reshape for broadcasting: [B, C_out, 1]
-        scale = scale.unsqueeze(-1)
-        bias = bias.unsqueeze(-1)
-
-        # Apply adaptive scaling
-        return x * scale + bias
-
-    def _compute_channel_stats(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute per-channel statistics.
-
-        Args:
-            x: Input tensor [B, C, T]
-
-        Returns:
-            Statistics tensor [B, C, num_stats]
-        """
-        # Basic statistics
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        min_val = x.min(dim=-1, keepdim=True).values
-        max_val = x.max(dim=-1, keepdim=True).values
-
-        stats = torch.cat([mean, std, min_val, max_val], dim=-1)  # [B, C, 4]
-
-        if self.use_spectral_stats:
-            # Add spectral band powers (delta, theta, alpha, beta, gamma)
-            # Simplified: use FFT to compute band powers
-            # This is approximate but fast
-            T = x.shape[-1]
-            fft = torch.fft.rfft(x, dim=-1)
-            power = (fft.real ** 2 + fft.imag ** 2)
-
-            # Assuming ~1000 Hz sampling, normalize frequency bins
-            n_freqs = power.shape[-1]
-            # Define bands as fractions of Nyquist
-            bands = [
-                (0, int(0.008 * n_freqs)),      # Delta: 0-4 Hz (approx)
-                (int(0.008 * n_freqs), int(0.016 * n_freqs)),  # Theta: 4-8 Hz
-                (int(0.016 * n_freqs), int(0.026 * n_freqs)),  # Alpha: 8-13 Hz
-                (int(0.026 * n_freqs), int(0.06 * n_freqs)),   # Beta: 13-30 Hz
-                (int(0.06 * n_freqs), int(0.16 * n_freqs)),    # Gamma: 30-80 Hz
-            ]
-
-            band_powers = []
-            for low, high in bands:
-                high = max(high, low + 1)  # Ensure at least 1 bin
-                bp = power[:, :, low:high].mean(dim=-1, keepdim=True)
-                # Log transform for stability
-                bp = torch.log1p(bp)
-                band_powers.append(bp)
-
-            spectral_stats = torch.cat(band_powers, dim=-1)  # [B, C, 5]
-            stats = torch.cat([stats, spectral_stats], dim=-1)  # [B, C, 9]
-
-        return stats
-
-
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
 
@@ -2411,11 +2235,7 @@ class CondUNet1D(nn.Module):
         conv_kernel_size: int = 7,  # Kernel size for modern convs
         dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
         # Output scaling correction (helps match target distribution)
-        use_output_scaling: bool = True,  # Learnable per-channel scale and bias
-        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style, NO instance norm)
-        adaptive_scaling_version: int = 1,  # 1 = original MLP, 2 = per-channel cross-attention
-        adaptive_scaling_dropout: float = 0.1,  # Dropout for V2 regularization
-        adaptive_scaling_spectral: bool = False,  # Use spectral features in V2
+        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style)
         # Session conditioning - statistics-based (literature-recommended approach)
         # Instead of learned embeddings per session ID, computes statistics from
         # input signal and learns to encode them. Generalizes to unseen sessions.
@@ -2586,34 +2406,14 @@ class CondUNet1D(nn.Module):
         nn.init.zeros_(self.outc.weight)
         nn.init.zeros_(self.outc.bias)
 
-        # Output scaling correction: learnable per-channel scale and bias
-        # Helps match target distribution, especially important for probabilistic losses
-        self.use_output_scaling = use_output_scaling
+        # Session-adaptive output scaling (FiLM-style)
+        # Predicts scale/bias from input statistics - adapts to each session
         self.use_adaptive_scaling = use_adaptive_scaling
-
-        self.adaptive_scaling_version = adaptive_scaling_version
         if use_adaptive_scaling:
-            # Session-adaptive output scaling (FiLM-style, NO instance normalization)
-            # Predicts scale/bias from input statistics - adapts to each session
-            if adaptive_scaling_version == 2:
-                # V2: Per-channel cross-attention (more powerful, learns channel correspondence)
-                self.adaptive_scaler = SessionAdaptiveScalingV2(
-                    n_channels=out_channels,
-                    n_input_channels=in_channels,
-                    dropout=adaptive_scaling_dropout,
-                    use_spectral_stats=adaptive_scaling_spectral,
-                )
-            else:
-                # V1: Original MLP (simpler, lower overfitting risk)
-                self.adaptive_scaler = SessionAdaptiveScaling(
-                    n_channels=out_channels,
-                    n_input_channels=in_channels,
-                )
-        elif use_output_scaling:
-            # Fixed learnable scale/bias (original approach)
-            # Initialize scale to 1.0 and bias to 0.0 (identity at init)
-            self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
-            self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
+            self.adaptive_scaler = SessionAdaptiveScaling(
+                n_channels=out_channels,
+                n_input_channels=in_channels,
+            )
 
         # Store in_channels for adaptive scaling
         self.in_channels = in_channels
@@ -2903,14 +2703,9 @@ class CondUNet1D(nn.Module):
         else:
             out = self.residual_conv(ob) + delta
 
-        # Apply output scaling correction if enabled
-        # This helps match the target distribution, especially for probabilistic losses
+        # Apply session-adaptive output scaling if enabled
         if self.use_adaptive_scaling:
-            # Session-adaptive scaling: predicts scale/bias from input statistics
             out = self.adaptive_scaler(out, raw_input)
-        elif self.use_output_scaling:
-            # Fixed learnable scale/bias
-            out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
         if return_bottleneck or return_bottleneck_temporal:
