@@ -2865,6 +2865,31 @@ def train(
         should_validate = (epoch % val_every == 0) or (epoch == num_epochs) or (epoch == 1)
 
         if should_validate:
+            # DEBUG: Print loader info on first epoch to debug R² gap
+            if epoch == 1 and is_primary():
+                print(f"\n[DEBUG R² Gap] Validation loader info:")
+                print(f"  Combined val loader: {len(loaders['val'].dataset)} samples, "
+                      f"{len(loaders['val'])} batches")
+                if "val_sessions" in loaders:
+                    for sess_name, sess_loader in loaders["val_sessions"].items():
+                        print(f"  Per-session '{sess_name}': {len(sess_loader.dataset)} samples, "
+                              f"{len(sess_loader)} batches")
+                # Check if datasets have same underlying data
+                if "val_sessions" in loaders and len(loaders["val_sessions"]) == 1:
+                    sess_name = list(loaders["val_sessions"].keys())[0]
+                    val_ds = loaders["val"].dataset
+                    sess_ds = loaders["val_sessions"][sess_name].dataset
+                    if hasattr(val_ds, 'ob') and hasattr(sess_ds, 'ob'):
+                        import torch
+                        val_first = val_ds[0][0]  # First OB sample
+                        sess_first = sess_ds[0][0]  # First OB sample
+                        match = torch.allclose(val_first, sess_first, rtol=1e-5, atol=1e-6)
+                        print(f"  First sample match: {match}")
+                        if not match:
+                            print(f"    val_first mean: {val_first.mean():.6f}, std: {val_first.std():.6f}")
+                            print(f"    sess_first mean: {sess_first.mean():.6f}, std: {sess_first.std():.6f}")
+                print()
+
             val_metrics = evaluate(
                 model, loaders["val"], device, wavelet_loss,
                 compute_phase=False, reverse_model=reverse_model, config=config,
@@ -2891,29 +2916,16 @@ def train(
             val_metrics = last_val_metrics if 'last_val_metrics' in dir() else {"loss": float("inf"), "corr": 0, "r2": 0}
             per_session_metrics = {}
 
-        # Sync val_loss and ALL metrics across ranks (for consistent reporting)
+        # Sync val_loss across ranks (for early stopping)
+        # NOTE: Other metrics (corr, r2) are NOT synchronized - they represent
+        # metrics computed on rank 0's data shard only. For accurate cross-GPU
+        # metrics, we would need to accumulate raw statistics and compute pooled metrics.
         val_loss = val_metrics.get("loss", val_metrics.get("mae", float("inf")))  # fallback to mae if no composite
         if dist.is_initialized():
             val_loss_tensor = torch.tensor(val_loss, device=device)
             dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
             val_loss = val_loss_tensor.item()
             val_metrics["loss"] = val_loss
-
-            # Sync all numeric metrics across ranks for accurate reporting
-            # Without this, only rank 0's partial metrics would be reported
-            for metric_name in ["corr", "r2", "mae", "mse", "nrmse"]:
-                if metric_name in val_metrics and isinstance(val_metrics[metric_name], (int, float)):
-                    metric_tensor = torch.tensor(val_metrics[metric_name], device=device)
-                    dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
-                    val_metrics[metric_name] = metric_tensor.item()
-
-            # Also sync per-session metrics for consistent reporting
-            for sess_name, sess_m in per_session_metrics.items():
-                for metric_name in ["corr", "r2", "mae", "mse", "loss", "nrmse"]:
-                    if metric_name in sess_m and isinstance(sess_m[metric_name], (int, float)):
-                        metric_tensor = torch.tensor(sess_m[metric_name], device=device)
-                        dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
-                        sess_m[metric_name] = metric_tensor.item()
 
         # Track best (lower loss is better)
         is_best = val_loss < best_val_loss

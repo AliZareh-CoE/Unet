@@ -1904,6 +1904,21 @@ def create_dataloaders(
     # Add per-session validation loaders if available
     if "val_idx_per_session" in data and data["val_idx_per_session"] is not None:
         val_session_loaders = {}
+
+        # DEBUG: Check if val_idx matches per-session indices (for single session case)
+        val_idx = data["val_idx"]
+        if len(data["val_idx_per_session"]) == 1:
+            sess_name_debug, sess_indices_debug = list(data["val_idx_per_session"].items())[0]
+            indices_match = np.array_equal(val_idx, sess_indices_debug)
+            _print_primary(f"\n[DEBUG R² Gap] Index comparison:")
+            _print_primary(f"  val_idx shape: {val_idx.shape}, per_session shape: {sess_indices_debug.shape}")
+            _print_primary(f"  Indices are IDENTICAL: {indices_match}")
+            if not indices_match:
+                _print_primary(f"  val_idx[:10]: {val_idx[:10]}")
+                _print_primary(f"  per_session[:10]: {sess_indices_debug[:10]}")
+                overlap = len(set(val_idx.tolist()) & set(sess_indices_debug.tolist()))
+                _print_primary(f"  Overlap: {overlap}/{len(val_idx)} ({100*overlap/len(val_idx):.1f}%)")
+
         for sess_name, sess_indices in data["val_idx_per_session"].items():
             val_session_loaders[sess_name] = create_single_session_dataloader(
                 data, sess_name, sess_indices,
