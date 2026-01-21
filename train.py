@@ -75,7 +75,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.distribute
 # Local imports
 from models import (
     CondUNet1D,
-    build_wavelet_loss,
     pearson_batch,
     pearson_per_channel,
     cross_channel_correlation,
@@ -176,18 +175,14 @@ DEFAULT_CONFIG = {
 
     # Loss weights
     "weight_l1": 1.0,  # Also used for Huber weight
-    "weight_wavelet": 3.0,  # Reduced from 10.0 for better balance
     "weight_spectral": 5.0,  # Increased for better PSD matching
     "cycle_lambda": 1.0,  # Cycle consistency weight
 
     # Loss type selection
-    # Options: "l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"
+    # Options: "l1", "huber"
     #   - "l1": L1/MAE only
     #   - "huber": Huber only (smooth L1, robust to outliers)
-    #   - "wavelet": Wavelet only (time-frequency)
-    #   - "l1_wavelet": L1 + Wavelet combined (default)
-    #   - "huber_wavelet": Huber + Wavelet combined
-    "loss_type": "l1_wavelet",
+    "loss_type": "l1",
 
     # Model
     "base_channels": 64,
@@ -208,48 +203,6 @@ DEFAULT_CONFIG = {
     "use_se": True,  # SE channel attention in modern conv blocks
     "conv_kernel_size": 7,  # Kernel size for modern convs (ConvNeXt-style)
     "conv_dilations": (1, 4, 16, 32),  # Multi-scale dilation rates tuned for LFP bands
-
-    # Wavelet loss configuration
-    "wavelet_family": "morlet",
-    "wavelet_omega0": 3.0,
-    "use_complex_morlet": False,
-
-    # Loss toggles (set False to disable)
-    "use_wavelet_loss": True,   # Time-frequency matching (Morlet wavelet decomposition)
-
-    # Data augmentation (applied during training only)
-    # Master toggle - set to False to disable ALL augmentations at once
-    "aug_enabled": True,            # Master switch for all augmentations
-    # HEAVY augmentation for cross-session generalization
-    "aug_time_shift": True,         # Random circular time shift
-    "aug_time_shift_max": 0.2,      # Max shift as fraction of signal length (20%)
-    "aug_noise": True,              # Add Gaussian noise
-    "aug_noise_std": 0.1,           # Noise std relative to signal std (heavy)
-    "aug_channel_dropout": True,    # Randomly zero out channels
-    "aug_channel_dropout_p": 0.2,   # Probability of dropping each channel (heavy)
-    "aug_amplitude_scale": True,    # Random amplitude scaling
-    "aug_amplitude_scale_range": (0.5, 1.5),  # Scale factor range (heavy - simulates gain drift)
-    "aug_time_mask": True,          # Randomly mask time segments
-    "aug_time_mask_ratio": 0.15,    # Fraction of time to mask
-    "aug_mixup": True,              # Mixup: blend random sample pairs
-    "aug_mixup_alpha": 0.4,         # Beta distribution alpha
-    "aug_freq_mask": True,          # Frequency masking: zero out random freq bands
-    "aug_freq_mask_max_bands": 3,   # Max number of frequency bands to mask
-    "aug_freq_mask_max_width": 20,  # Max width of each masked band (in freq bins)
-
-    # Session-specific augmentation (simulates cross-session variability)
-    "aug_channel_scale": True,      # Per-channel random scaling (simulates electrode drift)
-    "aug_channel_scale_range": (0.7, 1.4),  # Per-channel scale range
-    "aug_dc_offset": True,          # Random DC offset per channel
-    "aug_dc_offset_range": (-0.3, 0.3),  # DC offset range (relative to signal std)
-
-    # Contrastive learning for session-invariant representations
-    "use_contrastive": False,       # Enable CEBRA-style contrastive learning
-    "contrastive_weight": 0.1,      # Weight for contrastive loss
-    "contrastive_temperature": 0.1, # Temperature for InfoNCE loss
-    "contrastive_mode": "temporal", # "temporal" (true CEBRA) or "label" (behavior-supervised)
-    "contrastive_time_delta": 10,   # Time delta (in samples) for temporal positive pairs
-    "contrastive_num_samples": 32,  # Number of time points to sample per trial
 
     # Bidirectional training
     "use_bidirectional": True,  # Train both OB→PCx and PCx→OB
@@ -489,625 +442,6 @@ def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     std = x.std(dim=-1, keepdim=True).clamp(min=eps)
 
     return (x - mean) / std
-
-
-# =============================================================================
-# Data Augmentation Functions
-# =============================================================================
-
-def aug_time_shift(x: torch.Tensor, max_shift: float = 0.1) -> torch.Tensor:
-    """Apply random circular time shift to each sample in batch.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        max_shift: Maximum shift as fraction of signal length
-
-    Returns:
-        Shifted tensor (same shape)
-    """
-    batch_size, _, time_len = x.shape
-    max_shift_samples = int(time_len * max_shift)
-
-    if max_shift_samples == 0:
-        return x
-
-    # Random shift per sample in batch
-    shifts = torch.randint(-max_shift_samples, max_shift_samples + 1, (batch_size,), device=x.device)
-
-    # Apply circular shift to each sample
-    shifted = torch.zeros_like(x)
-    for i in range(batch_size):
-        shifted[i] = torch.roll(x[i], shifts=shifts[i].item(), dims=-1)
-
-    return shifted
-
-
-def aug_gaussian_noise(x: torch.Tensor, noise_std: float = 0.05) -> torch.Tensor:
-    """Add Gaussian noise scaled relative to signal std.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        noise_std: Noise std as fraction of signal std per channel
-
-    Returns:
-        Noisy tensor (same shape)
-    """
-    # Compute per-channel std
-    signal_std = x.std(dim=-1, keepdim=True).clamp(min=1e-6)
-    noise = torch.randn_like(x) * signal_std * noise_std
-    return x + noise
-
-
-def aug_channel_dropout(x: torch.Tensor, dropout_p: float = 0.1) -> torch.Tensor:
-    """Randomly zero out entire channels.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        dropout_p: Probability of dropping each channel
-
-    Returns:
-        Tensor with some channels zeroed (same shape)
-    """
-    batch_size, n_channels, _ = x.shape
-    # Create dropout mask (batch, channels, 1)
-    mask = torch.bernoulli(torch.full((batch_size, n_channels, 1), 1 - dropout_p, device=x.device))
-    return x * mask
-
-
-def aug_amplitude_scale(x: torch.Tensor, scale_range: tuple = (0.8, 1.2)) -> torch.Tensor:
-    """Apply random amplitude scaling per sample.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        scale_range: (min_scale, max_scale) tuple
-
-    Returns:
-        Scaled tensor (same shape)
-    """
-    batch_size = x.shape[0]
-    min_scale, max_scale = scale_range
-    # Random scale per sample (batch, 1, 1)
-    scales = torch.empty(batch_size, 1, 1, device=x.device).uniform_(min_scale, max_scale)
-    return x * scales
-
-
-def aug_time_mask(x: torch.Tensor, mask_ratio: float = 0.1) -> torch.Tensor:
-    """Randomly mask contiguous time segments with zeros.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        mask_ratio: Fraction of time to mask
-
-    Returns:
-        Masked tensor (same shape)
-    """
-    batch_size, _, time_len = x.shape
-    mask_len = int(time_len * mask_ratio)
-
-    if mask_len == 0:
-        return x
-
-    result = x.clone()
-    for i in range(batch_size):
-        # Random start position for mask
-        start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
-        result[i, :, start:start + mask_len] = 0
-
-    return result
-
-
-def aug_mixup(
-    ob: torch.Tensor,
-    pcx: torch.Tensor,
-    alpha: float = 0.4
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply Mixup augmentation: blend random pairs of samples.
-
-    Mixup creates virtual training examples by linearly interpolating
-    between pairs of samples and their targets.
-
-    Args:
-        ob: Input tensor (batch, channels, time)
-        pcx: Target tensor (batch, channels, time)
-        alpha: Beta distribution parameter (higher = more mixing)
-
-    Returns:
-        Tuple of (mixed_ob, mixed_pcx)
-    """
-    batch_size = ob.shape[0]
-    if batch_size < 2:
-        return ob, pcx
-
-    # Sample mixing coefficients from Beta distribution
-    # lam ~ Beta(alpha, alpha), typically alpha in [0.2, 0.4]
-    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size,)).to(ob.device)
-    lam = lam.view(-1, 1, 1)  # Shape for broadcasting
-
-    # Random permutation for pairing
-    perm = torch.randperm(batch_size, device=ob.device)
-
-    # Mix samples: x_mix = lam * x + (1 - lam) * x[perm]
-    ob_mixed = lam * ob + (1 - lam) * ob[perm]
-    pcx_mixed = lam * pcx + (1 - lam) * pcx[perm]
-
-    return ob_mixed, pcx_mixed
-
-
-def aug_freq_mask(
-    x: torch.Tensor,
-    max_bands: int = 2,
-    max_width: int = 10
-) -> torch.Tensor:
-    """Apply frequency masking: zero out random frequency bands.
-
-    Similar to SpecAugment for audio, but applied to neural signals.
-    Operates in frequency domain via FFT.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        max_bands: Maximum number of frequency bands to mask
-        max_width: Maximum width of each masked band (in freq bins)
-
-    Returns:
-        Frequency-masked tensor (same shape)
-    """
-    batch_size, n_channels, time_len = x.shape
-
-    # FFT to frequency domain
-    x_fft = torch.fft.rfft(x, dim=-1)
-    n_freqs = x_fft.shape[-1]
-
-    if n_freqs <= max_width:
-        return x  # Signal too short for meaningful masking
-
-    # Create frequency mask
-    for i in range(batch_size):
-        n_bands = torch.randint(1, max_bands + 1, (1,)).item()
-        for _ in range(n_bands):
-            width = torch.randint(1, max_width + 1, (1,)).item()
-            start = torch.randint(0, n_freqs - width, (1,)).item()
-            x_fft[i, :, start:start + width] = 0
-
-    # Inverse FFT back to time domain
-    x_masked = torch.fft.irfft(x_fft, n=time_len, dim=-1)
-
-    return x_masked
-
-
-def aug_channel_scale(
-    x: torch.Tensor,
-    scale_range: Tuple[float, float] = (0.7, 1.4)
-) -> torch.Tensor:
-    """Apply random per-channel scaling (simulates electrode drift/impedance changes).
-
-    Each channel gets a different random scale factor, simulating how electrodes
-    drift differently across recording sessions.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        scale_range: (min_scale, max_scale) range for per-channel scaling
-
-    Returns:
-        Channel-scaled tensor (same shape)
-    """
-    batch_size, n_channels, _ = x.shape
-    min_scale, max_scale = scale_range
-
-    # Generate per-channel scales (same for all samples in batch for consistency)
-    scales = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_scale, max_scale)
-    scales = scales.expand(batch_size, -1, -1)
-
-    return x * scales
-
-
-def aug_dc_offset(
-    x: torch.Tensor,
-    offset_range: Tuple[float, float] = (-0.3, 0.3)
-) -> torch.Tensor:
-    """Apply random per-channel DC offset (simulates baseline drift).
-
-    Each channel gets a different random offset, simulating how electrode
-    baselines drift differently across sessions.
-
-    Args:
-        x: Input tensor (batch, channels, time)
-        offset_range: (min_offset, max_offset) range relative to signal std
-
-    Returns:
-        Offset-adjusted tensor (same shape)
-    """
-    batch_size, n_channels, _ = x.shape
-    min_offset, max_offset = offset_range
-
-    # Compute signal std for reference scaling
-    signal_std = x.std(dim=-1, keepdim=True).mean()
-
-    # Generate per-channel offsets
-    offsets = torch.empty(1, n_channels, 1, device=x.device).uniform_(min_offset, max_offset)
-    offsets = offsets.expand(batch_size, -1, -1) * signal_std
-
-    return x + offsets
-
-
-def apply_augmentations(
-    ob: torch.Tensor,
-    pcx: torch.Tensor,
-    config: Dict[str, Any]
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply configured augmentations to input/target pairs.
-
-    IMPORTANT: Augmentations that change timing (time_shift) are applied
-    identically to both input and target to maintain correspondence.
-    Other augmentations are applied independently or only to input.
-
-    Args:
-        ob: Input (OB) tensor (batch, channels, time)
-        pcx: Target (PCx) tensor (batch, channels, time)
-        config: Config dict with aug_* keys
-
-    Returns:
-        Tuple of (augmented_ob, augmented_pcx)
-    """
-    # Master toggle - if disabled, skip ALL augmentations
-    if not config.get("aug_enabled", True):
-        return ob, pcx
-
-    # Time shift: apply same shift to both (maintains correspondence)
-    if config.get("aug_time_shift", False):
-        max_shift = config.get("aug_time_shift_max", 0.1)
-        # Generate shifts once, apply to both
-        batch_size, _, time_len = ob.shape
-        max_shift_samples = int(time_len * max_shift)
-        if max_shift_samples > 0:
-            shifts = torch.randint(-max_shift_samples, max_shift_samples + 1, (batch_size,), device=ob.device)
-            # Use list + stack to avoid inplace assignment on autograd-tracked tensors
-            ob_shifted_list = []
-            pcx_shifted_list = []
-            for i in range(batch_size):
-                ob_shifted_list.append(torch.roll(ob[i], shifts=shifts[i].item(), dims=-1))
-                pcx_shifted_list.append(torch.roll(pcx[i], shifts=shifts[i].item(), dims=-1))
-            ob = torch.stack(ob_shifted_list, dim=0)
-            pcx = torch.stack(pcx_shifted_list, dim=0)
-
-    # Noise: add independently to both (realistic noise augmentation)
-    if config.get("aug_noise", False):
-        noise_std = config.get("aug_noise_std", 0.05)
-        ob = aug_gaussian_noise(ob, noise_std)
-        pcx = aug_gaussian_noise(pcx, noise_std)
-
-    # Channel dropout: apply independently (channels may differ between input/output)
-    if config.get("aug_channel_dropout", False):
-        dropout_p = config.get("aug_channel_dropout_p", 0.1)
-        batch_size, n_channels_ob, _ = ob.shape
-        _, n_channels_pcx, _ = pcx.shape
-        mask_ob = torch.bernoulli(torch.full((batch_size, n_channels_ob, 1), 1 - dropout_p, device=ob.device))
-        mask_pcx = torch.bernoulli(torch.full((batch_size, n_channels_pcx, 1), 1 - dropout_p, device=pcx.device))
-        ob = ob * mask_ob
-        pcx = pcx * mask_pcx
-
-    # Amplitude scale: apply same scale to both (maintains relative amplitude)
-    if config.get("aug_amplitude_scale", False):
-        scale_range = config.get("aug_amplitude_scale_range", (0.8, 1.2))
-        batch_size = ob.shape[0]
-        min_scale, max_scale = scale_range
-        scales = torch.empty(batch_size, 1, 1, device=ob.device).uniform_(min_scale, max_scale)
-        ob = ob * scales
-        pcx = pcx * scales
-
-    # Time mask: apply same mask to both (maintains correspondence)
-    if config.get("aug_time_mask", False):
-        mask_ratio = config.get("aug_time_mask_ratio", 0.1)
-        batch_size, n_ch_ob, time_len = ob.shape
-        _, n_ch_pcx, _ = pcx.shape
-        mask_len = int(time_len * mask_ratio)
-        if mask_len > 0:
-            # Create binary mask (1 = keep, 0 = zero out) - NO inplace operations
-            mask_ob = torch.ones(batch_size, 1, time_len, device=ob.device, dtype=ob.dtype)
-            mask_pcx = torch.ones(batch_size, 1, time_len, device=pcx.device, dtype=pcx.dtype)
-            for i in range(batch_size):
-                start = torch.randint(0, time_len - mask_len + 1, (1,)).item()
-                mask_ob[i, :, start:start + mask_len] = 0
-                mask_pcx[i, :, start:start + mask_len] = 0
-            # Apply mask via multiplication (creates new tensor, no inplace)
-            ob = ob * mask_ob
-            pcx = pcx * mask_pcx
-
-    # Mixup: blend random pairs (applied to both input and target coherently)
-    if config.get("aug_mixup", False):
-        alpha = config.get("aug_mixup_alpha", 0.4)
-        ob, pcx = aug_mixup(ob, pcx, alpha)
-
-    # Frequency masking: zero out random freq bands (same bands for both)
-    if config.get("aug_freq_mask", False):
-        max_bands = config.get("aug_freq_mask_max_bands", 2)
-        max_width = config.get("aug_freq_mask_max_width", 10)
-        batch_size, n_ch_ob, _ = ob.shape
-        _, n_ch_pcx, _ = pcx.shape
-        # Apply same frequency mask pattern to both tensors
-        ob_fft = torch.fft.rfft(ob, dim=-1)
-        pcx_fft = torch.fft.rfft(pcx, dim=-1)
-        n_freqs = ob_fft.shape[-1]
-        if n_freqs > max_width:
-            # Create frequency mask (1 = keep, 0 = zero out) - NO inplace on FFT tensors
-            freq_mask_ob = torch.ones(batch_size, 1, n_freqs, device=ob.device, dtype=ob_fft.dtype)
-            freq_mask_pcx = torch.ones(batch_size, 1, n_freqs, device=pcx.device, dtype=pcx_fft.dtype)
-            for i in range(batch_size):
-                n_bands_to_mask = torch.randint(1, max_bands + 1, (1,)).item()
-                for _ in range(n_bands_to_mask):
-                    width = torch.randint(1, max_width + 1, (1,)).item()
-                    start = torch.randint(0, n_freqs - width, (1,)).item()
-                    freq_mask_ob[i, :, start:start + width] = 0
-                    freq_mask_pcx[i, :, start:start + width] = 0
-            # Apply mask via multiplication (no inplace operation on FFT tensors)
-            ob_fft = ob_fft * freq_mask_ob
-            pcx_fft = pcx_fft * freq_mask_pcx
-            ob = torch.fft.irfft(ob_fft, n=ob.shape[-1], dim=-1)
-            pcx = torch.fft.irfft(pcx_fft, n=pcx.shape[-1], dim=-1)
-
-    # Session-specific augmentations (simulate cross-session variability)
-
-    # Per-channel scaling: apply independently (simulates electrode drift)
-    if config.get("aug_channel_scale", False):
-        scale_range = config.get("aug_channel_scale_range", (0.7, 1.4))
-        batch_size, n_channels_ob, _ = ob.shape
-        _, n_channels_pcx, _ = pcx.shape
-        min_scale, max_scale = scale_range
-        # Per-channel scale for OB
-        scales_ob = torch.empty(1, n_channels_ob, 1, device=ob.device).uniform_(min_scale, max_scale)
-        scales_ob = scales_ob.expand(batch_size, -1, -1)
-        ob = ob * scales_ob
-        # Per-channel scale for PCx (different electrodes, different channel count)
-        scales_pcx = torch.empty(1, n_channels_pcx, 1, device=pcx.device).uniform_(min_scale, max_scale)
-        scales_pcx = scales_pcx.expand(batch_size, -1, -1)
-        pcx = pcx * scales_pcx
-
-    # DC offset: apply independently (baseline drift is independent per electrode)
-    if config.get("aug_dc_offset", False):
-        offset_range = config.get("aug_dc_offset_range", (-0.3, 0.3))
-        ob = aug_dc_offset(ob, offset_range)
-        pcx = aug_dc_offset(pcx, offset_range)
-
-    # Covariance expansion augmentation: create synthetic sessions via random per-channel scale/shift
-    # This helps the model learn session-invariant representations by exposing it to
-    # more diverse covariance structures during training (from statistics literature)
-    if config.get("use_cov_augment", False):
-        cov_prob = config.get("cov_augment_prob", 0.5)
-        if torch.rand(1).item() < cov_prob:
-            batch_size, n_channels_ob, _ = ob.shape
-            _, n_channels_pcx, _ = pcx.shape
-            # Random per-channel scale (simulates different electrode impedances across sessions)
-            scale_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(0.8, 1.2)
-            scale_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(0.8, 1.2)
-            # Random per-channel shift relative to std (simulates baseline drift)
-            shift_ob = torch.empty(batch_size, n_channels_ob, 1, device=ob.device).uniform_(-0.2, 0.2)
-            shift_pcx = torch.empty(batch_size, n_channels_pcx, 1, device=pcx.device).uniform_(-0.2, 0.2)
-            # Apply: x_aug = x * scale + shift * std(x)
-            ob_std = ob.std(dim=-1, keepdim=True).clamp(min=1e-6)
-            pcx_std = pcx.std(dim=-1, keepdim=True).clamp(min=1e-6)
-            ob = ob * scale_ob + shift_ob * ob_std
-            pcx = pcx * scale_pcx + shift_pcx * pcx_std
-
-    return ob, pcx
-
-
-# =============================================================================
-# Contrastive Learning for Session-Invariant Representations
-# =============================================================================
-
-class ProjectionHead(nn.Module):
-    """MLP projection head for contrastive learning.
-
-    Projects encoder features to a lower-dimensional embedding space
-    where contrastive loss is applied.
-    """
-    def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-def info_nce_loss(
-    embeddings: torch.Tensor,
-    labels: torch.Tensor,
-    temperature: float = 0.1
-) -> torch.Tensor:
-    """InfoNCE contrastive loss (CEBRA-style).
-
-    Pulls together samples with the same label (odor), pushes apart different labels.
-    This encourages the model to learn odor-specific representations that are
-    invariant to session-specific noise (since different augmentations simulate
-    different sessions).
-
-    Args:
-        embeddings: (batch, embedding_dim) normalized embeddings
-        labels: (batch,) odor labels
-        temperature: Temperature for softmax (lower = sharper)
-
-    Returns:
-        Scalar InfoNCE loss
-    """
-    # Normalize embeddings
-    embeddings = F.normalize(embeddings, dim=1)
-
-    batch_size = embeddings.shape[0]
-    if batch_size < 2:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    # Compute similarity matrix
-    sim_matrix = torch.mm(embeddings, embeddings.t()) / temperature
-
-    # Create mask for positive pairs (same odor)
-    labels = labels.view(-1, 1)
-    pos_mask = (labels == labels.t()).float()
-
-    # Remove diagonal (self-similarity)
-    eye_mask = torch.eye(batch_size, device=embeddings.device)
-    pos_mask = pos_mask - eye_mask
-
-    # Check if there are any positive pairs
-    if pos_mask.sum() == 0:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    # For numerical stability, subtract max
-    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
-
-    # Compute log-softmax over all pairs (excluding self)
-    exp_sim = torch.exp(sim_matrix) * (1 - eye_mask)
-    log_prob = sim_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
-
-    # Mean log-probability over positive pairs
-    pos_log_prob = (log_prob * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-8)
-
-    # Only include samples that have at least one positive pair
-    valid_mask = pos_mask.sum(dim=1) > 0
-    if valid_mask.sum() == 0:
-        return torch.tensor(0.0, device=embeddings.device)
-
-    loss = -pos_log_prob[valid_mask].mean()
-
-    return loss
-
-
-def temporal_info_nce_loss(
-    features: torch.Tensor,
-    temperature: float = 0.1,
-    time_delta: int = 10,
-    num_samples: int = 32,
-) -> torch.Tensor:
-    """True CEBRA temporal contrastive loss.
-
-    Forms positive pairs from time points that are close in time (within delta),
-    and negative pairs from time points that are far apart.
-
-    This is the core innovation of CEBRA: learning embeddings where temporally
-    adjacent neural states map to similar embeddings, capturing the smooth
-    temporal dynamics of neural activity.
-
-    Args:
-        features: (batch, channels, time) bottleneck features (NOT pooled)
-        temperature: Temperature for softmax (lower = sharper)
-        time_delta: Maximum time offset for positive pairs (in samples)
-        num_samples: Number of time points to sample per trial
-
-    Returns:
-        Scalar InfoNCE loss
-    """
-    batch_size, n_channels, time_len = features.shape
-    device = features.device
-
-    if time_len < 2 * time_delta + 1:
-        # Signal too short for temporal contrastive learning
-        return torch.tensor(0.0, device=device)
-
-    # Sample anchor time indices (avoid edges to allow positive sampling)
-    # Valid range: [time_delta, time_len - time_delta - 1]
-    valid_start = time_delta
-    valid_end = time_len - time_delta
-    valid_range = valid_end - valid_start
-
-    if valid_range <= 0:
-        return torch.tensor(0.0, device=device)
-
-    # Limit number of samples to available range
-    actual_num_samples = min(num_samples, valid_range)
-
-    # Sample random anchor indices for each item in batch
-    # Shape: (batch, num_samples)
-    anchor_indices = torch.randint(
-        valid_start, valid_end, (batch_size, actual_num_samples), device=device
-    )
-
-    # Sample positive indices (within time_delta of anchor)
-    # For each anchor, sample a positive within [-time_delta, +time_delta] (excluding 0)
-    pos_offsets = torch.randint(-time_delta, time_delta + 1, (batch_size, actual_num_samples), device=device)
-    # Avoid sampling the anchor itself
-    pos_offsets = torch.where(pos_offsets == 0, torch.ones_like(pos_offsets), pos_offsets)
-    positive_indices = anchor_indices + pos_offsets
-
-    # Clamp to valid range
-    positive_indices = positive_indices.clamp(0, time_len - 1)
-
-    # Extract features at anchor and positive positions
-    # features: (batch, channels, time) -> need to gather at specific time indices
-    batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, actual_num_samples)
-
-    # Gather anchor features: (batch, num_samples, channels)
-    anchor_feats = features.permute(0, 2, 1)[batch_idx, anchor_indices]  # (batch, num_samples, channels)
-    positive_feats = features.permute(0, 2, 1)[batch_idx, positive_indices]  # (batch, num_samples, channels)
-
-    # Flatten batch and samples: (batch * num_samples, channels)
-    anchor_flat = anchor_feats.reshape(-1, n_channels)
-    positive_flat = positive_feats.reshape(-1, n_channels)
-
-    # Normalize embeddings
-    anchor_flat = F.normalize(anchor_flat, dim=1)
-    positive_flat = F.normalize(positive_flat, dim=1)
-
-    n_total = anchor_flat.shape[0]
-    if n_total < 2:
-        return torch.tensor(0.0, device=device)
-
-    # Compute similarity matrix: each anchor against all positives
-    # Using all positives from all anchors as the candidate pool (contrastive negatives)
-    sim_matrix = torch.mm(anchor_flat, positive_flat.t()) / temperature
-
-    # The diagonal contains the positive pairs (anchor_i with positive_i)
-    # All off-diagonal entries are negatives (from different anchors or different trials)
-
-    # For numerical stability
-    sim_matrix = sim_matrix - sim_matrix.max(dim=1, keepdim=True)[0].detach()
-
-    # Create labels: each anchor should match its corresponding positive (diagonal)
-    labels = torch.arange(n_total, device=device)
-
-    # Cross-entropy loss (each anchor should be closest to its positive)
-    loss = F.cross_entropy(sim_matrix, labels)
-
-    return loss
-
-
-def get_encoder_features(
-    model: nn.Module,
-    x: torch.Tensor,
-    cond: torch.Tensor
-) -> torch.Tensor:
-    """Extract bottleneck features from the UNet encoder.
-
-    Runs the encoder part of the UNet and returns the bottleneck features
-    (before the decoder). These features are used for contrastive learning.
-
-    Args:
-        model: CondUNet1D model
-        x: Input tensor (batch, channels, time)
-        cond: Conditioning tensor
-
-    Returns:
-        Bottleneck features (batch, feature_dim)
-    """
-    # Get conditioning embedding
-    cond_embed = model.cond_encoder(cond)
-
-    # Run through encoder blocks
-    skips = []
-    h = x
-    for down in model.encoder:
-        h = down(h, cond_embed)
-        skips.append(h)
-
-    # Bottleneck
-    h = model.bottleneck(h, cond_embed)
-
-    # Global average pool to get fixed-size features
-    # h shape: (batch, channels, time)
-    features = h.mean(dim=-1)  # (batch, channels)
-
-    return features
 
 
 def load_checkpoint(
@@ -1383,7 +717,6 @@ def evaluate(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
-    wavelet_loss: Optional[nn.Module] = None,
     compute_phase: bool = False,
     reverse_model: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
@@ -1410,7 +743,7 @@ def evaluate(
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
-    wavelet_list, plv_list, pli_list = [], [], []
+    plv_list, pli_list = [], []
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
 
@@ -1441,7 +774,6 @@ def evaluate(
 
     # Reverse direction (PCx→OB)
     mse_list_rev, mae_list_rev, corr_list_rev = [], [], []
-    wavelet_list_rev = []
     plv_list_rev, pli_list_rev = [], []
     r2_list_rev, nrmse_list_rev = [], []
     psd_err_list_rev, psd_diff_list_rev = [], []
@@ -1561,9 +893,6 @@ def evaluate(
                 pooled_sum_squared_error += ((pred_flat - target_flat) ** 2).sum().item()
                 pooled_sum_abs_error += (pred_flat - target_flat).abs().sum().item()
 
-            if wavelet_loss is not None:
-                wavelet_list.append(wavelet_loss(pred_f32, pcx_f32).item())
-
             # Skip expensive phase metrics in fast_mode
             if compute_phase and not fast_mode:
                 plv_list.append(plv_torch(pred_f32, pcx_f32).item())
@@ -1643,9 +972,6 @@ def evaluate(
                     pooled_sum_pred_target_rev += (pred_flat_rev * target_flat_rev).sum().item()
                     pooled_sum_squared_error_rev += ((pred_flat_rev - target_flat_rev) ** 2).sum().item()
                     pooled_sum_abs_error_rev += (pred_flat_rev - target_flat_rev).abs().sum().item()
-
-                if wavelet_loss is not None:
-                    wavelet_list_rev.append(wavelet_loss(pred_rev_f32, ob_f32).item())
 
                 # Skip expensive phase metrics in fast_mode
                 if compute_phase and not fast_mode:
@@ -1751,8 +1077,6 @@ def evaluate(
         results["psd_err_db"] = float(np.mean(psd_err_list))
     if psd_diff_list:
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
-    if wavelet_list:
-        results["wavelet"] = float(np.mean(wavelet_list))
     if plv_list:
         results["plv"] = float(np.mean(plv_list))
     if pli_list:
@@ -1823,8 +1147,6 @@ def evaluate(
         results["psd_err_db_rev"] = float(np.mean(psd_err_list_rev))
     if psd_diff_list_rev:
         results["psd_diff_db_rev"] = float(np.mean(psd_diff_list_rev))
-    if wavelet_list_rev:
-        results["wavelet_rev"] = float(np.mean(wavelet_list_rev))
     if plv_list_rev:
         results["plv_rev"] = float(np.mean(plv_list_rev))
     if pli_list_rev:
@@ -1873,20 +1195,15 @@ def evaluate(
     # Compute composite validation loss (mirrors training loss)
     # This allows early stopping based on overall objective, not just correlation
     if config is not None:
-        # L1 + wavelet
+        # L1 loss
         w_l1 = config.get("weight_l1", 1.0)
-        w_wav = config.get("weight_wavelet", 1.0) if config.get("use_wavelet_loss", True) else 0.0
 
         # Forward loss
         val_loss = w_l1 * results["mae"]
-        if "wavelet" in results:
-            val_loss += w_wav * results["wavelet"]
 
         # Reverse loss (if bidirectional)
         if "mae_rev" in results:
             val_loss += w_l1 * results["mae_rev"]
-            if "wavelet_rev" in results:
-                val_loss += w_wav * results["wavelet_rev"]
 
         results["loss"] = val_loss
 
@@ -1930,13 +1247,10 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     config: Dict[str, Any],
-    wavelet_loss: Optional[nn.Module] = None,
     reverse_model: Optional[nn.Module] = None,
     epoch: int = 0,
     num_epochs: int = 0,
     cond_encoder: Optional[nn.Module] = None,
-    projection_head_fwd: Optional[nn.Module] = None,
-    projection_head_rev: Optional[nn.Module] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1948,10 +1262,6 @@ def train_epoch(
         reverse_model.train()
     if cond_encoder is not None:
         cond_encoder.train()
-    if projection_head_fwd is not None:
-        projection_head_fwd.train()
-    if projection_head_rev is not None:
-        projection_head_rev.train()
 
     # Use tensors for accumulation to avoid GPU-CPU sync during training
     # Only convert to floats at end of epoch for logging
@@ -1988,15 +1298,6 @@ def train_epoch(
         # Normalize target (PCx) for loss computation
         # NOTE: Input (OB) is normalized inside the model's forward()
         pcx = per_channel_normalize(pcx)
-
-        # Apply data augmentation (training only)
-        ob, pcx = apply_augmentations(ob, pcx, config)
-
-        # IMPORTANT: Clone tensors after augmentation to avoid autograd inplace errors
-        # This ensures ob/pcx are fresh tensors with no shared memory when used in
-        # both cond_encoder(ob) and model(ob, ...) - prevents version tracking conflicts
-        ob = ob.clone()
-        pcx = pcx.clone()
 
         # Compute conditioning embedding
         # IMPORTANT: Set cond_encoder to eval mode during forward pass to prevent
@@ -2052,59 +1353,31 @@ def train_epoch(
         # For CondUNet: use cond_emb if available, otherwise odor_ids
         # For other architectures: just pass input directly
         arch = config.get("arch", "condunet")
-        contrastive_mode = config.get("contrastive_mode", "temporal")  # "temporal" (true CEBRA) or "label"
-        use_contrastive = config.get("use_contrastive", False)
-        # For label mode, require projection heads; for temporal mode, no projection heads needed
-        if contrastive_mode == "label" and projection_head_fwd is None:
-            use_contrastive = False
-        use_temporal_cebra = use_contrastive and contrastive_mode == "temporal"
 
         if arch == "condunet":
             # CondUNet with conditioning
             # Use proper session_ids from dataloader (only needed for learnable session embedding)
             session_ids = session_ids_batch if config.get("use_session_embedding", False) else None
             if cond_emb is not None:
-                fwd_result = model(
-                    ob, cond_emb=cond_emb,
-                    session_ids=session_ids,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
+                pred_raw = model(ob, cond_emb=cond_emb, session_ids=session_ids)
             else:
-                fwd_result = model(
-                    ob, odor,
-                    session_ids=session_ids,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
+                pred_raw = model(ob, odor, session_ids=session_ids)
         else:
             # Other architectures: just pass input
-            fwd_result = model(ob)
-
-        if use_contrastive and arch == "condunet":
-            pred_raw, bottleneck_fwd = fwd_result
-        else:
-            pred_raw = fwd_result
-            bottleneck_fwd = None
+            pred_raw = model(ob)
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
         ob_c = crop_to_target_torch(ob)
 
-        # L1/Huber + wavelet loss
-        loss_type = config.get("loss_type", "huber_wavelet")
-        if loss_type in ("huber", "huber_wavelet"):
+        # L1/Huber loss
+        loss_type = config.get("loss_type", "l1")
+        if loss_type == "huber":
             recon_loss = config["weight_l1"] * F.huber_loss(pred_raw_c, pcx_c)
         else:
             recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
         loss = recon_loss
         loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
-
-        # Wavelet loss (forward)
-        if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-            w_loss = config["weight_wavelet"] * wavelet_loss(pred_raw_c, pcx_c)
-            loss = loss + w_loss
-            loss_components["wavelet_fwd"] = loss_components["wavelet_fwd"] + w_loss.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -2112,7 +1385,6 @@ def train_epoch(
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
 
         # Bidirectional training with cycle consistency
-        bottleneck_rev = None  # Initialize for contrastive loss check later
         if reverse_model is not None:
             # Reverse: PCx → OB
             # IMPORTANT: Detach cond_emb for reverse_model to prevent computation graph
@@ -2120,43 +1392,21 @@ def train_epoch(
             # The conditioning encoder still receives gradients from the forward model,
             # which provides sufficient supervision for learning.
             cond_emb_rev = cond_emb.detach() if cond_emb is not None else None
-            # If contrastive learning enabled, also get bottleneck features
             if cond_emb_rev is not None:
-                rev_result = reverse_model(
-                    pcx, cond_emb=cond_emb_rev,
-                    session_ids=session_ids,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
+                pred_rev_raw = reverse_model(pcx, cond_emb=cond_emb_rev, session_ids=session_ids)
             else:
-                rev_result = reverse_model(
-                    pcx, odor,
-                    session_ids=session_ids,
-                    return_bottleneck=(use_contrastive and not use_temporal_cebra),
-                    return_bottleneck_temporal=use_temporal_cebra
-                )
-
-            if use_contrastive:
-                pred_rev_raw, bottleneck_rev = rev_result
-            else:
-                pred_rev_raw = rev_result
+                pred_rev_raw = reverse_model(pcx, odor, session_ids=session_ids)
 
             pred_rev_raw_c = crop_to_target_torch(pred_rev_raw)
 
-            # L1/Huber + wavelet (reverse)
-            loss_type = config.get("loss_type", "huber_wavelet")
-            if loss_type in ("huber", "huber_wavelet"):
+            # L1/Huber (reverse)
+            loss_type = config.get("loss_type", "l1")
+            if loss_type == "huber":
                 rev_loss = config["weight_l1"] * F.huber_loss(pred_rev_raw_c, ob_c)
             else:
                 rev_loss = config["weight_l1"] * F.l1_loss(pred_rev_raw_c, ob_c)
             loss = loss + rev_loss
             loss_components["l1_rev"] = loss_components["l1_rev"] + rev_loss.detach()
-
-            # Wavelet loss (reverse)
-            if config.get("use_wavelet_loss", True) and wavelet_loss is not None:
-                w_loss_rev = config["weight_wavelet"] * wavelet_loss(pred_rev_raw_c, ob_c)
-                loss = loss + w_loss_rev
-                loss_components["wavelet_rev"] = loss_components["wavelet_rev"] + w_loss_rev.detach()
 
             # Cycle consistency: OB → PCx → OB and PCx → OB → PCx
             # Models are already in eval mode (set at batch start) to prevent BatchNorm
@@ -2183,99 +1433,6 @@ def train_epoch(
             loss = loss + cycle_loss_pcx
             loss_components["cycle_pcx"] = loss_components["cycle_pcx"] + cycle_loss_pcx.detach()
 
-        # Contrastive loss for session-invariant learning (CEBRA-style)
-        # Two modes:
-        # 1. "temporal" (True CEBRA): positive pairs from nearby time points
-        # 2. "label": positive pairs from same odor label
-        if use_contrastive and bottleneck_fwd is not None:
-            contrastive_weight = config.get("contrastive_weight", 0.1)
-            contrastive_temp = config.get("contrastive_temperature", 0.1)
-            time_delta = config.get("contrastive_time_delta", 10)
-            num_samples = config.get("contrastive_num_samples", 32)
-
-            # Debug: Print shapes and stats on first batch of first epoch
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"\n{'='*60}")
-                print(f"CEBRA CONTRASTIVE LEARNING - First Batch Debug")
-                print(f"{'='*60}")
-                print(f"  Mode: {contrastive_mode}")
-                print(f"  Bottleneck features shape: {bottleneck_fwd.shape}")
-                print(f"  Bottleneck dtype: {bottleneck_fwd.dtype}")
-                print(f"  Bottleneck stats: mean={bottleneck_fwd.float().mean().item():.4f}, std={bottleneck_fwd.float().std().item():.4f}")
-
-            if use_temporal_cebra:
-                # TEMPORAL CEBRA: Positive pairs from time points within delta
-                # bottleneck_fwd: (batch, channels, time) - unpooled temporal features
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Time delta: {time_delta} samples")
-                    print(f"  Num samples per trial: {num_samples}")
-                    if bottleneck_fwd.ndim == 3:
-                        print(f"  Temporal extent: {bottleneck_fwd.shape[-1]} time steps")
-
-                # Cast to float32 for stable loss computation
-                contrastive_loss_fwd = temporal_info_nce_loss(
-                    bottleneck_fwd.float(),
-                    temperature=contrastive_temp,
-                    time_delta=time_delta,
-                    num_samples=num_samples
-                )
-            else:
-                # LABEL-BASED: Positive pairs from same odor
-                # bottleneck_fwd: (batch, channels) - pooled features
-                fwd_embed = projection_head_fwd(bottleneck_fwd)  # -> (batch, 128)
-
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Projected embedding shape: {fwd_embed.shape}")
-                    print(f"  Embedding stats: mean={fwd_embed.float().mean().item():.4f}, std={fwd_embed.float().std().item():.4f}")
-                    print(f"  Odor labels in batch: {odor.tolist()}")
-                    print(f"  Unique odors: {odor.unique().tolist()} (n={odor.unique().numel()})")
-                    # Count positive pairs
-                    labels = odor.view(-1, 1)
-                    pos_mask = (labels == labels.t()).float()
-                    n_pos_pairs = (pos_mask.sum() - pos_mask.shape[0]).item()  # Exclude diagonal
-                    print(f"  Positive pairs in batch: {int(n_pos_pairs)} (same odor, different sample)")
-
-                # Cast to float32 for stable loss computation
-                contrastive_loss_fwd = info_nce_loss(fwd_embed.float(), odor, temperature=contrastive_temp)
-
-            loss = loss + contrastive_weight * contrastive_loss_fwd
-            loss_components["contrastive_fwd"] = loss_components["contrastive_fwd"] + contrastive_loss_fwd.detach()
-
-            # Debug: Print loss on first batch of first epoch
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"  Contrastive loss (fwd): {contrastive_loss_fwd.item():.4f}")
-                print(f"  Weighted contrastive (fwd): {(contrastive_weight * contrastive_loss_fwd).item():.4f}")
-
-            # Periodic print every 10 batches on first epoch
-            if is_primary() and epoch == 1 and batch_idx > 0 and batch_idx % 10 == 0:
-                print(f"  [Batch {batch_idx}] Contrastive fwd: {contrastive_loss_fwd.item():.4f}")
-
-            # Reverse direction contrastive loss (on reverse model's bottleneck)
-            if reverse_model is not None and bottleneck_rev is not None:
-                if use_temporal_cebra:
-                    contrastive_loss_rev = temporal_info_nce_loss(
-                        bottleneck_rev.float(),
-                        temperature=contrastive_temp,
-                        time_delta=time_delta,
-                        num_samples=num_samples
-                    )
-                elif projection_head_rev is not None:
-                    rev_embed = projection_head_rev(bottleneck_rev)
-                    contrastive_loss_rev = info_nce_loss(rev_embed.float(), odor, temperature=contrastive_temp)
-                else:
-                    contrastive_loss_rev = torch.tensor(0.0, device=device)
-
-                loss = loss + contrastive_weight * contrastive_loss_rev
-                loss_components["contrastive_rev"] = loss_components["contrastive_rev"] + contrastive_loss_rev.detach()
-
-                if is_primary() and batch_idx == 0 and epoch == 1:
-                    print(f"  Contrastive loss (rev): {contrastive_loss_rev.item():.4f}")
-                    print(f"  Weighted contrastive (rev): {(contrastive_weight * contrastive_loss_rev).item():.4f}")
-
-            if is_primary() and batch_idx == 0 and epoch == 1:
-                print(f"  Total loss (with contrastive): {loss.item():.4f}")
-                print(f"{'='*60}\n")
-
         # NaN detection before backward to prevent silent failures
         # Local check is cheap; if NaN detected, raise immediately
         if torch.isnan(loss) or torch.isinf(loss):
@@ -2287,10 +1444,6 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
         if cond_encoder is not None:
             torch.nn.utils.clip_grad_norm_(cond_encoder.parameters(), GRAD_CLIP)
-        if projection_head_fwd is not None:
-            torch.nn.utils.clip_grad_norm_(projection_head_fwd.parameters(), GRAD_CLIP)
-        if projection_head_rev is not None:
-            torch.nn.utils.clip_grad_norm_(projection_head_rev.parameters(), GRAD_CLIP)
             # Manual gradient sync for cond_encoder (not wrapped in DDP)
             sync_gradients_manual(cond_encoder)
         optimizer.step()
@@ -2818,75 +1971,8 @@ def train(
     # Import EnvelopeHistogramMatching for post-processing
     from models import EnvelopeHistogramMatching
 
-    # Create projection heads for contrastive learning (if enabled)
-    projection_head_fwd = None
-    projection_head_rev = None
-    use_contrastive = config.get("use_contrastive", False)
-    contrastive_mode = config.get("contrastive_mode", "temporal")
-
-    if use_contrastive:
-        # CEBRA-style: Apply contrastive loss on BOTTLENECK features (encoder output)
-        # This encourages the encoder to learn session-invariant representations
-        # Bottleneck dim = min(base_channels * 2^n_downsample, base_channels * 8)
-        base_ch = config.get("base_channels", 64)
-        n_downsample = config.get("n_downsample", 4)
-        bottleneck_dim = min(base_ch * (2 ** n_downsample), base_ch * 8)
-
-        if contrastive_mode == "label":
-            # Label-based mode: need projection heads for pooled features
-            # Create projection heads (small MLP: bottleneck -> 256 -> 128)
-            projection_head_fwd = ProjectionHead(
-                in_dim=bottleneck_dim,  # Bottleneck channels (512 for default config)
-                hidden_dim=256,
-                out_dim=128,
-            )
-            projection_head_rev = ProjectionHead(
-                in_dim=bottleneck_dim,  # Same for reverse (symmetric architecture)
-                hidden_dim=256,
-                out_dim=128,
-            )
-
-            # Handle device placement and dtype for FSDP compatibility
-            if is_fsdp_wrapped and check_bf16_support():
-                projection_head_fwd = projection_head_fwd.to(device, dtype=torch.bfloat16)
-                projection_head_rev = projection_head_rev.to(device, dtype=torch.bfloat16)
-            else:
-                projection_head_fwd = projection_head_fwd.to(device)
-                projection_head_rev = projection_head_rev.to(device)
-
-            # Wrap with DDP for gradient sync (too small for FSDP sharding)
-            if is_distributed and not is_fsdp_wrapped:
-                projection_head_fwd = DDP(projection_head_fwd, device_ids=[local_rank])
-                projection_head_rev = DDP(projection_head_rev, device_ids=[local_rank])
-
-            if is_primary():
-                contrastive_weight = config.get("contrastive_weight", 0.1)
-                contrastive_temp = config.get("contrastive_temperature", 0.1)
-                print(f"Contrastive learning ENABLED (label-based): weight={contrastive_weight}, temperature={contrastive_temp}")
-                print(f"  Projection heads: {bottleneck_dim}->256->128 (bottleneck features)")
-        else:
-            # Temporal CEBRA mode: no projection heads needed
-            # Loss is applied directly on normalized bottleneck features
-            if is_primary():
-                contrastive_weight = config.get("contrastive_weight", 0.1)
-                contrastive_temp = config.get("contrastive_temperature", 0.1)
-                time_delta = config.get("contrastive_time_delta", 10)
-                num_samples = config.get("contrastive_num_samples", 32)
-                print(f"Contrastive learning ENABLED (temporal CEBRA): weight={contrastive_weight}, temperature={contrastive_temp}")
-                print(f"  Temporal params: time_delta={time_delta} samples, num_samples={num_samples} per trial")
-                print(f"  No projection heads (loss on raw {bottleneck_dim}-dim bottleneck features)")
-
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
-
-    # Create loss functions
-    wavelet_loss = None
-    if config.get("use_wavelet_loss", True):
-        wavelet_loss = build_wavelet_loss(
-            wavelet=config.get("wavelet_family", "morlet"),
-            use_complex_morlet=config.get("use_complex_morlet", True),
-            omega0=config.get("wavelet_omega0", 5.0),
-        ).to(device)
 
     # Create optimizer with parameter groups
     lr = config.get("learning_rate", 1e-4)
@@ -2900,11 +1986,6 @@ def train(
     if cond_encoder is not None:
         # Conditioning encoder uses same lr as model
         param_groups.append({"params": list(cond_encoder.parameters()), "lr": lr, "name": "cond_encoder"})
-    # Projection heads for contrastive learning (use same lr as model)
-    if projection_head_fwd is not None:
-        param_groups.append({"params": list(projection_head_fwd.parameters()), "lr": lr, "name": "projection_head_fwd"})
-    if projection_head_rev is not None:
-        param_groups.append({"params": list(projection_head_rev.parameters()), "lr": lr, "name": "projection_head_rev"})
 
     total_params = sum(len(list(pg["params"])) if not isinstance(pg["params"], list) else len(pg["params"]) for pg in param_groups)
 
@@ -3023,11 +2104,8 @@ def train(
 
         train_metrics = train_epoch(
             model, loaders["train"], optimizer, device, config,
-            wavelet_loss,
             reverse_model, epoch, num_epochs,
             cond_encoder=cond_encoder,
-            projection_head_fwd=projection_head_fwd,
-            projection_head_rev=projection_head_rev,
         )
 
         barrier()
@@ -3062,7 +2140,7 @@ def train(
                 print()
 
             val_metrics = evaluate(
-                model, loaders["val"], device, wavelet_loss,
+                model, loaders["val"], device,
                 compute_phase=False, reverse_model=reverse_model, config=config,
                 fast_mode=True,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3075,7 +2153,7 @@ def train(
             if "val_sessions" in loaders and config.get("separate_val_sessions", False):
                 for sess_name, sess_loader in loaders["val_sessions"].items():
                     sess_metrics = evaluate(
-                        model, sess_loader, device, wavelet_loss,
+                        model, sess_loader, device,
                         compute_phase=False, reverse_model=reverse_model, config=config,
                         fast_mode=True,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3123,16 +2201,9 @@ def train(
             if "corr_rev" in val_metrics:
                 rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
-            # Add contrastive loss if present
-            contr_str = ""
-            if "contrastive_fwd" in train_metrics:
-                contr_str = f" | Contr: {train_metrics['contrastive_fwd']:.3f}"
-                if "contrastive_rev" in train_metrics:
-                    contr_str += f"/{train_metrics['contrastive_rev']:.3f}"
-
             print(f"Epoch {epoch}/{num_epochs} | "
                   f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str}{contr_str} | "
+                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
                   f"Best: {best_val_loss:.3f}")
 
             # Print per-session metrics if available
@@ -3318,7 +2389,7 @@ def train(
 
             # Evaluate on VALIDATION set - ALL ranks must call this (FSDP requirement)
             val_metrics_stage1 = evaluate(
-                model, loaders["val"], device, wavelet_loss,
+                model, loaders["val"], device,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3328,7 +2399,7 @@ def train(
 
             # Evaluate on TEST set - ALL ranks must call this (FSDP requirement)
             test_metrics_stage1 = evaluate(
-                model, loaders["test"], device, wavelet_loss,
+                model, loaders["test"], device,
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3386,7 +2457,7 @@ def train(
     has_test_set = len(data.get("test_idx", [])) > 0
     if has_test_set:
         test_metrics = evaluate(
-            model, loaders["test"], device, wavelet_loss,
+            model, loaders["test"], device,
             compute_phase=True, reverse_model=reverse_model, config=config,
             fast_mode=False,  # Full metrics for final evaluation
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3513,7 +2584,7 @@ def train(
 
                 # Evaluate this session
                 session_metrics = evaluate(
-                    model, session_loader, device, wavelet_loss,
+                    model, session_loader, device,
                     compute_phase=False, reverse_model=None, config=config,
                     fast_mode=False,  # Need full metrics for baseline
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
@@ -3868,17 +2939,6 @@ def parse_args():
     parser.add_argument("--no-bidirectional", action="store_true",
                         help="Disable bidirectional training (only train OB→PCx, no cycle consistency)")
 
-    # Data augmentation
-    parser.add_argument("--no-aug", action="store_true",
-                        help="Disable all data augmentations")
-    parser.add_argument("--aug-strength", type=str, default=None,
-                        choices=["none", "light", "medium", "heavy"],
-                        help="Augmentation strength level: "
-                             "'none' = no augmentation, "
-                             "'light' = time shift + noise only, "
-                             "'medium' = + channel dropout + amplitude scale, "
-                             "'heavy' = all augmentations (default)")
-
     # =========================================================================
     # Phase 3 Ablation Study Arguments (Nature Methods level)
     # =========================================================================
@@ -3940,10 +3000,6 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (FiLM style)")
-    parser.add_argument("--use-cov-augment", action="store_true",
-                        help="Use covariance expansion augmentation for synthetic sessions")
-    parser.add_argument("--cov-augment-prob", type=float, default=0.5,
-                        help="Probability of applying covariance augmentation (default: 0.5)")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3952,13 +3008,11 @@ def parse_args():
                         help="Skip validation plot generation")
 
     # Loss function selection (for tier1 fair comparison)
-    LOSS_CHOICES = ["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"]
+    LOSS_CHOICES = ["l1", "huber"]
     parser.add_argument("--loss", type=str, default=None,
                         choices=LOSS_CHOICES,
-                        help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only), "
-                             "'wavelet' (Wavelet only), 'l1_wavelet' (L1 + Wavelet), "
-                             "'huber_wavelet' (Huber + Wavelet combined). "
-                             "If not specified, uses config default (huber_wavelet)")
+                        help="Loss function: 'l1' (L1/MAE only), 'huber' (Huber only). "
+                             "If not specified, uses config default (l1)")
 
     # Phase 2 cross-validation integration
     parser.add_argument("--fold-indices-file", type=str, default=None,
@@ -4067,8 +3121,6 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
-    config["use_cov_augment"] = args.use_cov_augment
-    config["cov_augment_prob"] = args.cov_augment_prob
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -4409,107 +3461,27 @@ def main():
         if is_primary():
             print("Bidirectional training DISABLED (--no-bidirectional)")
 
-    # Data augmentation - strength levels
-    if args.no_aug or args.aug_strength == "none":
-        config["aug_enabled"] = False
-    elif args.aug_strength is not None:
-        # Apply augmentation strength presets
-        config["aug_enabled"] = True
-        if args.aug_strength == "light":
-            # Light: only time shift + noise (minimal but effective)
-            config["aug_time_shift"] = True
-            config["aug_noise"] = True
-            config["aug_channel_dropout"] = False
-            config["aug_amplitude_scale"] = False
-            config["aug_time_mask"] = False
-            config["aug_mixup"] = False
-            config["aug_freq_mask"] = False
-            config["aug_channel_scale"] = False
-            config["aug_dc_offset"] = False
-        elif args.aug_strength == "medium":
-            # Medium: + channel dropout + amplitude scale
-            config["aug_time_shift"] = True
-            config["aug_noise"] = True
-            config["aug_channel_dropout"] = True
-            config["aug_amplitude_scale"] = True
-            config["aug_time_mask"] = False
-            config["aug_mixup"] = False
-            config["aug_freq_mask"] = False
-            config["aug_channel_scale"] = True
-            config["aug_dc_offset"] = False
-        elif args.aug_strength == "heavy":
-            # Heavy: all augmentations (default config behavior)
-            config["aug_time_shift"] = True
-            config["aug_noise"] = True
-            config["aug_channel_dropout"] = True
-            config["aug_amplitude_scale"] = True
-            config["aug_time_mask"] = True
-            config["aug_mixup"] = True
-            config["aug_freq_mask"] = True
-            config["aug_channel_scale"] = True
-            config["aug_dc_offset"] = True
-        if is_primary():
-            print(f"Augmentation strength: {args.aug_strength.upper()}")
-
     # Plot generation config
     if args.generate_plots is not None:
         config["generate_plots"] = args.generate_plots
     if is_primary() and not config.get("generate_plots", True):
         print("Validation plot generation DISABLED (--no-plots)")
 
-    # Print augmentation config
-    if is_primary():
-        if not config.get("aug_enabled", True):
-            print("Data augmentation DISABLED (master toggle off)")
-        else:
-            aug_active = [
-                k for k in [
-                    "aug_time_shift", "aug_noise", "aug_channel_dropout", "aug_amplitude_scale",
-                    "aug_time_mask", "aug_mixup", "aug_freq_mask",
-                    "aug_channel_scale", "aug_dc_offset",  # Session-specific augmentations
-                ]
-                if config.get(k, False)
-            ]
-            if aug_active:
-                print(f"Data augmentation ENABLED: {', '.join(aug_active)}")
-                if config.get("aug_channel_scale", False) or config.get("aug_dc_offset", False):
-                    print("  [Session-invariance augmentations active: channel_scale, dc_offset]")
-            else:
-                print("Data augmentation: all individual augmentations disabled")
-
     # Loss function selection (for tier1 fair comparison)
     # Only override config if --loss is explicitly provided
-    # --loss l1: L1 only (no wavelet)
-    # --loss huber: Huber only (no wavelet)
-    # --loss wavelet: Wavelet only (no L1)
-    # --loss l1_wavelet: L1 + Wavelet combined
-    # --loss huber_wavelet: Huber + Wavelet combined
+    # --loss l1: L1 only
+    # --loss huber: Huber only
     if args.loss is not None:
         config["loss_type"] = args.loss
         if args.loss == "l1":
-            config["use_wavelet_loss"] = False
             if is_primary():
                 print("Loss: L1 only (--loss l1)")
         elif args.loss == "huber":
-            config["use_wavelet_loss"] = False
             if is_primary():
                 print("Loss: Huber only (--loss huber)")
-        elif args.loss == "wavelet":
-            config["use_wavelet_loss"] = True
-            config["weight_l1"] = 0.0  # Disable L1/Huber, use only wavelet
-            if is_primary():
-                print("Loss: Wavelet only (--loss wavelet)")
-        elif args.loss == "l1_wavelet":
-            config["use_wavelet_loss"] = True
-            if is_primary():
-                print("Loss: L1 + Wavelet combined (--loss l1_wavelet)")
-        elif args.loss == "huber_wavelet":
-            config["use_wavelet_loss"] = True
-            if is_primary():
-                print(f"Loss: Huber + Wavelet combined (--loss huber_wavelet, wavelet_weight={config['weight_wavelet']})")
     else:
         # Use config default - print what's being used
-        loss_type = config.get("loss_type", "huber_wavelet")
+        loss_type = config.get("loss_type", "l1")
         if is_primary():
             print(f"Loss: {loss_type} (from config)")
 

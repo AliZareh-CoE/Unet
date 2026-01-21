@@ -302,11 +302,6 @@ def run_single_fold(
     if config.loss_type:
         cmd.extend(["--loss", config.loss_type])
 
-    # Augmentation
-    if config.disable_aug:
-        cmd.append("--no-aug")
-    elif config.aug_strength:
-        cmd.extend(["--aug-strength", config.aug_strength])
     if not config.use_bidirectional:
         cmd.append("--no-bidirectional")
 
@@ -586,8 +581,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--loss",
         type=str,
-        default="l1_wavelet",
-        choices=["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"],
+        default="l1",
+        choices=["l1", "huber"],
         help="Loss function",
     )
 
@@ -596,15 +591,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-use-spectral", action="store_true", help="Include spectral features")
     parser.add_argument("--use-adaptive-scaling", action="store_true", help="Use adaptive scaling")
 
-    # Augmentation
-    parser.add_argument(
-        "--aug-strength",
-        type=str,
-        default="medium",
-        choices=["none", "light", "medium", "heavy"],
-        help="Augmentation strength",
-    )
-    parser.add_argument("--no-aug", action="store_true", help="Disable all augmentation")
+    # Training options
     parser.add_argument("--no-bidirectional", action="store_true", help="Disable bidirectional training")
 
     # FSDP
@@ -653,8 +640,6 @@ def main():
         use_session_stats=args.use_session_stats,
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,
-        aug_strength=args.aug_strength,
-        disable_aug=args.no_aug,
         use_bidirectional=not args.no_bidirectional,
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,

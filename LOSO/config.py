@@ -35,7 +35,7 @@ class LOSOConfig:
         lr_schedule: LR schedule (cosine, cosine_warmup, step, plateau, constant)
         weight_decay: L2 regularization weight
         dropout: Dropout rate
-        loss_type: Loss function (l1, huber, l1_wavelet, huber_wavelet)
+        loss_type: Loss function (l1, huber)
 
         # Session adaptation
         use_session_stats: Use statistics-based FiLM conditioning
@@ -79,16 +79,13 @@ class LOSOConfig:
     lr_schedule: str = "cosine_warmup"
     weight_decay: float = 0.0
     dropout: float = 0.0
-    loss_type: str = "l1_wavelet"
+    loss_type: str = "l1"
 
     # Session adaptation (generalizes to new sessions)
     use_session_stats: bool = False
     use_adaptive_scaling: bool = False
     session_use_spectral: bool = False
 
-    # Data augmentation
-    aug_strength: str = "medium"  # none, light, medium, heavy
-    disable_aug: bool = False  # Disable all augmentation
     use_bidirectional: bool = True
 
     # FSDP distributed training
@@ -134,8 +131,6 @@ class LOSOConfig:
             "use_session_stats": self.use_session_stats,
             "use_adaptive_scaling": self.use_adaptive_scaling,
             "session_use_spectral": self.session_use_spectral,
-            "aug_strength": self.aug_strength,
-            "disable_aug": self.disable_aug,
             "use_bidirectional": self.use_bidirectional,
             "use_fsdp": self.use_fsdp,
             "fsdp_strategy": self.fsdp_strategy,
