@@ -599,6 +599,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-session-stats", action="store_true", help="Use session statistics")
     parser.add_argument("--session-use-spectral", action="store_true", help="Include spectral features")
     parser.add_argument("--use-adaptive-scaling", action="store_true", help="Use adaptive scaling")
+    parser.add_argument("--adaptive-scaling-version", type=int, default=2, choices=[1, 2],
+                        help="Adaptive scaling version: 1=MLP, 2=cross-attention (default: 2)")
+    parser.add_argument("--adaptive-scaling-dropout", type=float, default=0.1,
+                        help="Dropout for adaptive scaling V2 (default: 0.1)")
+    parser.add_argument("--adaptive-scaling-spectral", action="store_true",
+                        help="Use spectral features in adaptive scaling V2")
 
     # Augmentation
     parser.add_argument(
@@ -657,6 +663,9 @@ def main():
         use_session_stats=args.use_session_stats,
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,
+        adaptive_scaling_version=args.adaptive_scaling_version,
+        adaptive_scaling_dropout=args.adaptive_scaling_dropout,
+        adaptive_scaling_spectral=args.adaptive_scaling_spectral,
         aug_strength=args.aug_strength,
         disable_aug=args.no_aug,
         use_bidirectional=not args.no_bidirectional,
