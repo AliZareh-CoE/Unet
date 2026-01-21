@@ -287,7 +287,8 @@ def run_single_fold(
         cmd.extend(["--skip-type", config.skip_type])
     if config.n_heads is not None:
         cmd.extend(["--n-heads", str(config.n_heads)])
-    if config.conditioning:
+    # Only pass --conditioning if it's not "none" (to disable conditioning, omit the arg)
+    if config.conditioning and config.conditioning.lower() != "none":
         cmd.extend(["--conditioning", config.conditioning])
 
     # Training arguments
