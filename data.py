@@ -626,19 +626,8 @@ def load_or_create_session_splits(
     train_idx = all_indices[np.isin(session_ids, list(train_session_ids))]
     test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
 
-    # For validation, either combined or per-session
-    if separate_val_sessions:
-        # Create per-session validation indices (dict: session_name -> indices)
-        val_idx_per_session = {}
-        for sess_id in val_session_ids:
-            sess_name = idx_to_session[sess_id] if idx_to_session is not None else str(sess_id)
-            sess_indices = all_indices[session_ids == sess_id]
-            val_idx_per_session[sess_name] = sess_indices
-        # Also create combined val_idx for backward compatibility
-        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
-    else:
-        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
-        val_idx_per_session = None
+    # Create combined val_idx first (will be shuffled later)
+    val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
 
     # CRITICAL VALIDATION: Ensure no overlap between splits
     train_set = set(train_idx.tolist())
@@ -668,6 +657,23 @@ def load_or_create_session_splits(
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
     rng.shuffle(test_idx)
+
+    # CRITICAL FIX: Create per-session validation indices AFTER shuffling val_idx
+    # This ensures that per-session indices have the same ordering as val_idx,
+    # so DistributedSampler gives each rank the same samples for both the
+    # combined val loader and per-session loaders. Without this, the R² metrics
+    # would differ because rank 0 would see different samples from each loader.
+    if separate_val_sessions:
+        val_idx_per_session = {}
+        for sess_id in val_session_ids:
+            sess_name = idx_to_session[sess_id] if idx_to_session is not None else str(sess_id)
+            # Extract indices from SHUFFLED val_idx that belong to this session
+            # This preserves the random order established by the shuffle
+            sess_mask = session_ids[val_idx] == sess_id
+            sess_indices = val_idx[sess_mask]
+            val_idx_per_session[sess_name] = sess_indices
+    else:
+        val_idx_per_session = None
 
     # Convert integer indices back to original session names for display
     def ids_to_names(ids):
