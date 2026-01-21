@@ -261,12 +261,11 @@ def run_single_fold(
     if config.dataset != "olfactory":
         cmd.extend(["--dataset", config.dataset])
 
-    # Session-based splitting with explicit test session
+    # Session-based splitting: hold out one session for validation (LOSO)
     cmd.append("--split-by-session")
     cmd.append("--force-recreate-splits")
-    cmd.extend(["--test-sessions", test_session])
-    cmd.extend(["--n-val-sessions", "0"])  # No separate val set - use test session
-    cmd.append("--no-test-set")  # All held-out = validation
+    cmd.extend(["--val-sessions", test_session])  # Held-out session becomes validation
+    cmd.append("--no-test-set")  # No separate test set needed
 
     # Model architecture arguments
     if config.base_channels:
