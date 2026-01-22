@@ -140,8 +140,8 @@ def run_single_variant(
     result_dict = {
         "group": group_name,
         "variant": variant_name,
-        "best_r2": train_results.get("best_r2", 0.0),
-        "best_mae": train_results.get("best_mae", 0.0),
+        "best_r2": train_results.get("best_val_r2", 0.0),
+        "best_mae": train_results.get("best_val_mae", 0.0),
         "best_epoch": train_results.get("best_epoch", 0),
         "config": config,
         "timestamp": datetime.now().isoformat(),
