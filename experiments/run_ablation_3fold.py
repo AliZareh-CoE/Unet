@@ -15,17 +15,18 @@ This gives us:
 
 Baseline: Original default (n_downsample=2) as the reference point
 
-Ablation configurations to test:
-1. Baseline (n_downsample=2 with all components)
-2. conv_type: standard vs modern
-3. conditioning: none vs spectro_temporal
-4. adaptive_scaling: off vs on
-5. attention_type: none, basic vs cross_freq_v2
-6. skip_type: add vs concat
-7. bidirectional: off vs on
-8. dropout: 0.0, 0.1, 0.2
-9. depth: n_downsample=3 (medium), n_downsample=4 (deep)
-10. width: base_channels=64 (narrow), base_channels=256 (wide)
+Ablation configurations (11 total, ordered logically):
+1. baseline: Original default (n_downsample=2) with all components
+2. depth_medium: n_downsample=3
+3. depth_deep: n_downsample=4
+4. width_narrow: base_channels=64
+5. width_wide: base_channels=256
+6. conv_type_standard: standard convolutions
+7. attention_none: no attention
+8. attention_basic: basic attention
+9. skip_type_concat: concatenation skip connections
+10. conditioning_none: no conditioning (cond_mode=none)
+11. adaptive_scaling_off: no adaptive scaling
 """
 
 from __future__ import annotations
@@ -256,48 +257,139 @@ def filter_ablations_by_sweep_state(
 
 
 # =============================================================================
-# Define Ablation Configurations
+# Define Ablation Configurations (ORDERED)
 # =============================================================================
 
 def get_ablation_configs() -> Dict[str, AblationConfig]:
     """Define all ablation configurations to test.
 
-    Baseline: depth_deep with modern convs, cross_freq_v2 attention,
-              adaptive scaling, spectro_temporal conditioning.
+    Baseline: Original default (n_downsample=2) with modern convs, cross_freq_v2
+              attention, adaptive scaling, spectro_temporal conditioning.
+
+    ORDER MATTERS: Configs are ordered logically from fundamental architecture
+    choices (depth, width) to component-level choices (conv, attention, etc.)
+
+    Total: 11 ablations (baseline + 10 variants)
     """
-    configs = {}
+    # Use list to preserve insertion order, then convert to dict
+    configs_list = []
 
     # =========================================================================
-    # BASELINE (original default - n_downsample=2)
+    # 1. BASELINE (original default - n_downsample=2)
     # =========================================================================
-    configs["baseline"] = AblationConfig(
+    configs_list.append(AblationConfig(
         name="baseline",
         description="Original default baseline (n_downsample=2) with all components",
-        n_downsample=2,  # Original default
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
         use_bidirectional=False,
-    )
+    ))
 
     # =========================================================================
-    # CONVOLUTION TYPE ABLATION
+    # 2-3. DEPTH ABLATIONS (fundamental architecture choice)
     # =========================================================================
-    configs["conv_type_standard"] = AblationConfig(
-        name="conv_type_standard",
-        description="Standard convolutions instead of modern (dilated depthwise separable)",
-        n_downsample=2,
-        conv_type="standard",  # Changed
+    configs_list.append(AblationConfig(
+        name="depth_medium",
+        description="Medium depth (n_downsample=3) vs baseline",
+        n_downsample=3,
+        conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
-    )
+    ))
+
+    configs_list.append(AblationConfig(
+        name="depth_deep",
+        description="Deep network (n_downsample=4) vs baseline",
+        n_downsample=4,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
 
     # =========================================================================
-    # CONDITIONING ABLATION
+    # 4-5. WIDTH ABLATIONS (fundamental architecture choice)
     # =========================================================================
-    configs["conditioning_none"] = AblationConfig(
+    configs_list.append(AblationConfig(
+        name="width_narrow",
+        description="Narrow network (base_channels=64) vs default 128",
+        n_downsample=2,
+        base_channels=64,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    configs_list.append(AblationConfig(
+        name="width_wide",
+        description="Wide network (base_channels=256) vs default 128",
+        n_downsample=2,
+        base_channels=256,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    # =========================================================================
+    # 6. CONVOLUTION TYPE ABLATION
+    # =========================================================================
+    configs_list.append(AblationConfig(
+        name="conv_type_standard",
+        description="Standard convolutions instead of modern (dilated depthwise separable)",
+        n_downsample=2,
+        conv_type="standard",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    # =========================================================================
+    # 7-8. ATTENTION ABLATIONS
+    # =========================================================================
+    configs_list.append(AblationConfig(
+        name="attention_none",
+        description="No attention mechanism",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="none",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    configs_list.append(AblationConfig(
+        name="attention_basic",
+        description="Basic attention instead of cross_freq_v2",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="basic",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    # =========================================================================
+    # 9. SKIP CONNECTION ABLATION
+    # =========================================================================
+    configs_list.append(AblationConfig(
+        name="skip_type_concat",
+        description="Concatenation skip connections instead of addition",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        skip_type="concat",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    ))
+
+    # =========================================================================
+    # 10. CONDITIONING ABLATION
+    # =========================================================================
+    configs_list.append(AblationConfig(
         name="conditioning_none",
         description="No conditioning (cond_mode=none bypasses conditioning entirely)",
         n_downsample=2,
@@ -305,150 +397,24 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",  # Source doesn't matter when cond_mode=none
-        cond_mode="none",  # This bypasses conditioning in forward pass
-    )
+        cond_mode="none",
+    ))
 
     # =========================================================================
-    # ADAPTIVE SCALING ABLATION
+    # 11. ADAPTIVE SCALING ABLATION
     # =========================================================================
-    configs["adaptive_scaling_off"] = AblationConfig(
+    configs_list.append(AblationConfig(
         name="adaptive_scaling_off",
         description="Disable adaptive output scaling",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
-        use_adaptive_scaling=False,  # Changed
+        use_adaptive_scaling=False,
         conditioning="spectro_temporal",
-    )
+    ))
 
-    # =========================================================================
-    # DEPTH ABLATIONS (compare with baseline n_downsample=2)
-    # =========================================================================
-    configs["depth_medium"] = AblationConfig(
-        name="depth_medium",
-        description="Medium depth (n_downsample=3) vs baseline",
-        n_downsample=3,  # depth_medium
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    configs["depth_deep"] = AblationConfig(
-        name="depth_deep",
-        description="Deep network (n_downsample=4) vs baseline",
-        n_downsample=4,  # depth_deep
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    # =========================================================================
-    # ATTENTION ABLATIONS
-    # =========================================================================
-    configs["attention_none"] = AblationConfig(
-        name="attention_none",
-        description="No attention mechanism",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="none",  # Changed
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    configs["attention_basic"] = AblationConfig(
-        name="attention_basic",
-        description="Basic attention instead of cross_freq_v2",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="basic",  # Changed
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    # =========================================================================
-    # SKIP CONNECTION ABLATION
-    # =========================================================================
-    configs["skip_type_concat"] = AblationConfig(
-        name="skip_type_concat",
-        description="Concatenation skip connections instead of addition",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        skip_type="concat",  # Changed
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    # =========================================================================
-    # BIDIRECTIONAL TRAINING ABLATION
-    # =========================================================================
-    configs["bidirectional_on"] = AblationConfig(
-        name="bidirectional_on",
-        description="Enable bidirectional training (OB->PCx and PCx->OB)",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-        use_bidirectional=True,  # Changed
-    )
-
-    # =========================================================================
-    # DROPOUT ABLATION
-    # =========================================================================
-    configs["dropout_01"] = AblationConfig(
-        name="dropout_01",
-        description="Add 10% dropout for regularization",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-        dropout=0.1,  # Changed
-    )
-
-    configs["dropout_02"] = AblationConfig(
-        name="dropout_02",
-        description="Add 20% dropout for regularization",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-        dropout=0.2,  # Changed
-    )
-
-    # NOTE: cond_mode only supports "none" and "cross_attn_gated" in the model
-    # The conditioning_none ablation tests disabling conditioning entirely
-    # No additional cond_mode ablations needed since only 2 modes exist
-
-    # =========================================================================
-    # WIDTH ABLATIONS (base_channels)
-    # =========================================================================
-    configs["width_narrow"] = AblationConfig(
-        name="width_narrow",
-        description="Narrow network (base_channels=64) vs default 128",
-        n_downsample=2,
-        base_channels=64,  # Half the default
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
-    configs["width_wide"] = AblationConfig(
-        name="width_wide",
-        description="Wide network (base_channels=256) vs default 128",
-        n_downsample=2,
-        base_channels=256,  # Double the default
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    )
-
+    # Convert to ordered dict
+    configs = {c.name: c for c in configs_list}
     return configs
 
 

@@ -21,24 +21,25 @@ For 9 sessions [s0, s1, ..., s8]:
 - Fold 1: test=[s3,s4,s5], train=[s0-s2,s6-s8]
 - Fold 2: test=[s6,s7,s8], train=[s0-s5]
 
-## Ablation Configurations
+## Ablation Configurations (Ordered)
 
-| Name | Description | Key Change |
-|------|-------------|------------|
-| `baseline` | Original default with all components | n_downsample=2 |
-| `conv_type_standard` | Standard convolutions | conv_type=standard |
-| `conditioning_none` | No auto-conditioning | conditioning=none, cond_mode=none |
-| `adaptive_scaling_off` | No adaptive scaling | use_adaptive_scaling=False |
-| `depth_medium` | Medium depth | n_downsample=3 |
-| `depth_deep` | Deep network | n_downsample=4 |
-| `attention_none` | No attention | attention_type=none |
-| `attention_basic` | Basic attention | attention_type=basic |
-| `skip_type_concat` | Concat skips | skip_type=concat |
-| `bidirectional_on` | Bidirectional training | use_bidirectional=True |
-| `dropout_01` | 10% dropout | dropout=0.1 |
-| `dropout_02` | 20% dropout | dropout=0.2 |
-| `width_narrow` | Narrow network | base_channels=64 |
-| `width_wide` | Wide network | base_channels=256 |
+The ablations are ordered logically from fundamental architecture choices to component-level choices:
+
+| # | Name | Description | Key Change |
+|---|------|-------------|------------|
+| 1 | `baseline` | Original default with all components | n_downsample=2 |
+| 2 | `depth_medium` | Medium depth | n_downsample=3 |
+| 3 | `depth_deep` | Deep network | n_downsample=4 |
+| 4 | `width_narrow` | Narrow network | base_channels=64 |
+| 5 | `width_wide` | Wide network | base_channels=256 |
+| 6 | `conv_type_standard` | Standard convolutions | conv_type=standard |
+| 7 | `attention_none` | No attention | attention_type=none |
+| 8 | `attention_basic` | Basic attention | attention_type=basic |
+| 9 | `skip_type_concat` | Concat skips | skip_type=concat |
+| 10 | `conditioning_none` | No conditioning | cond_mode=none |
+| 11 | `adaptive_scaling_off` | No adaptive scaling | use_adaptive_scaling=False |
+
+**Total: 11 ablations** (1 baseline + 10 variants)
 
 Note: `cond_mode` only supports `"none"` and `"cross_attn_gated"` in the model.
 The `conditioning_none` ablation tests disabling conditioning via `cond_mode=none`.
@@ -237,12 +238,12 @@ rm results/ablation_3fold/sweep_state.json
 ### Workflow Example
 
 ```bash
-# Run 1: All 14 ablations run
+# Run 1: All 11 ablations run
 python experiments/run_ablation_3fold.py
 # -> Eliminates conv_type_standard (significantly worse)
 # -> Upgrades to depth_deep (significantly better)
 
-# Run 2: Only 13 ablations run (conv_type_standard skipped)
+# Run 2: Only 10 ablations run (conv_type_standard skipped)
 python experiments/run_ablation_3fold.py
 # -> Further refinement based on new baseline
 
