@@ -316,8 +316,10 @@ def run_single_fold(
 
     # Set NCCL environment variables for stability with FSDP
     env = os.environ.copy()
+    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"  # Disable watchdog completely
     env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
     env["NCCL_TIMEOUT"] = "1800"
+    env["NCCL_DEBUG"] = "WARN"
 
     # Run subprocess
     start_time = time.time()
