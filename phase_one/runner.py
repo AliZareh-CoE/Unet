@@ -182,31 +182,37 @@ def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List, Dict,
 class FoldSeedResult:
     """Result from a single fold+seed combination.
 
-    This is the atomic unit of evaluation in the 3-fold × 3-seed strategy.
+    IMPORTANT: Proper separation of val vs test metrics (NO data leakage):
+    - val_* metrics: From 70/30 trial-wise split on training sessions
+    - test_* metrics: From held-out test sessions (PRIMARY metric)
     """
     fold_idx: int
     seed: int
     test_sessions: List[str]
     train_sessions: List[str]
 
-    # Primary metrics
-    r2: float
-    mae: float = 0.0
-    pearson: float = 0.0
-    spearman: float = 0.0
+    # Validation metrics (from 70/30 split on training sessions)
+    val_r2: float = 0.0
+    val_mae: float = 0.0
+    val_pearson: float = 0.0
 
-    # Per-session R² (CRITICAL for session-level analysis)
-    per_session_r2: Dict[str, float] = field(default_factory=dict)
-    per_session_mae: Dict[str, float] = field(default_factory=dict)
-    per_session_corr: Dict[str, float] = field(default_factory=dict)
+    # TEST metrics (from held-out sessions - PRIMARY, NO leakage)
+    test_r2: float = 0.0
+    test_mae: float = 0.0
+    test_pearson: float = 0.0
 
-    # DSP metrics
+    # Per-session TEST R² (CRITICAL for session-level analysis)
+    per_session_test_r2: Dict[str, float] = field(default_factory=dict)
+    per_session_test_mae: Dict[str, float] = field(default_factory=dict)
+    per_session_test_corr: Dict[str, float] = field(default_factory=dict)
+
+    # DSP metrics (from test)
     plv: float = 0.0
     coherence: float = 0.0
     reconstruction_snr_db: float = 0.0
     envelope_corr: float = 0.0
 
-    # Band R²
+    # Band R² (from test)
     band_r2: Dict[str, float] = field(default_factory=dict)
 
     # Timing
@@ -218,13 +224,19 @@ class FoldSeedResult:
             "seed": self.seed,
             "test_sessions": self.test_sessions,
             "train_sessions": self.train_sessions,
-            "r2": self.r2,
-            "mae": self.mae,
-            "pearson": self.pearson,
-            "spearman": self.spearman,
-            "per_session_r2": self.per_session_r2,
-            "per_session_mae": self.per_session_mae,
-            "per_session_corr": self.per_session_corr,
+            # Validation metrics
+            "val_r2": self.val_r2,
+            "val_mae": self.val_mae,
+            "val_pearson": self.val_pearson,
+            # TEST metrics (PRIMARY)
+            "test_r2": self.test_r2,
+            "test_mae": self.test_mae,
+            "test_pearson": self.test_pearson,
+            # Per-session TEST metrics
+            "per_session_test_r2": self.per_session_test_r2,
+            "per_session_test_mae": self.per_session_test_mae,
+            "per_session_test_corr": self.per_session_test_corr,
+            # DSP metrics
             "plv": self.plv,
             "coherence": self.coherence,
             "reconstruction_snr_db": self.reconstruction_snr_db,
@@ -238,45 +250,50 @@ class FoldSeedResult:
 class MethodResult:
     """Aggregated results for one baseline method across all folds and seeds.
 
-    This mirrors the AblationResult structure from run_ablation_3fold.py.
+    IMPORTANT: Uses TEST metrics (from held-out sessions) as PRIMARY metrics.
+    Val metrics are only for reference. This mirrors AblationResult design.
     """
     method: str
     fold_seed_results: List[FoldSeedResult]
 
-    # Primary statistics (computed after all fold+seed runs)
-    mean_r2: float = 0.0
+    # PRIMARY statistics - TEST metrics (from held-out sessions, NO leakage)
+    mean_r2: float = 0.0  # Mean TEST R² across all fold+seed runs
     std_r2: float = 0.0
     sem_r2: float = 0.0
     median_r2: float = 0.0
     min_r2: float = 0.0
     max_r2: float = 0.0
 
-    # Confidence intervals (95%)
+    # Confidence intervals (95%) for TEST R²
     ci_lower_r2: float = 0.0
     ci_upper_r2: float = 0.0
 
-    # Correlation statistics
+    # TEST correlation statistics
     mean_pearson: float = 0.0
     std_pearson: float = 0.0
 
-    # MAE statistics
+    # TEST MAE statistics
     mean_mae: float = 0.0
     std_mae: float = 0.0
 
-    # DSP metrics aggregated
+    # Validation statistics (for reference - from 70/30 split)
+    mean_val_r2: float = 0.0
+    std_val_r2: float = 0.0
+
+    # DSP metrics aggregated (from test)
     mean_plv: float = 0.0
     mean_coherence: float = 0.0
     mean_snr: float = 0.0
 
-    # Per-session aggregated statistics (each session evaluated once per fold)
-    all_session_r2s: Dict[str, float] = field(default_factory=dict)
+    # Per-session TEST R² (each session evaluated once per fold, 3 seeds)
+    all_session_r2s: Dict[str, float] = field(default_factory=dict)  # Mean TEST R² per session
     session_r2_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
-    # Per-fold statistics (for paired tests - average seeds within fold)
-    fold_r2_values: List[float] = field(default_factory=list)  # Mean R² per fold
+    # Per-fold TEST statistics (for paired tests - average seeds within fold)
+    fold_r2_values: List[float] = field(default_factory=list)  # Mean TEST R² per fold
     fold_pearson_values: List[float] = field(default_factory=list)
 
-    # Raw values for statistical tests (all 9 = 3 folds × 3 seeds)
+    # Raw TEST values for statistical tests (all 9 = 3 folds × 3 seeds)
     all_r2_values: List[float] = field(default_factory=list)
     all_pearson_values: List[float] = field(default_factory=list)
 
@@ -284,54 +301,66 @@ class MethodResult:
     total_time: float = 0.0
 
     def compute_statistics(self) -> None:
-        """Compute comprehensive aggregate statistics from fold+seed results."""
+        """Compute comprehensive aggregate statistics from fold+seed results.
+
+        PRIMARY metrics are from TEST (held-out sessions) - NO data leakage.
+        Val metrics are kept for reference.
+        """
         if not self.fold_seed_results:
             return
 
-        # Extract all R² values (3 folds × 3 seeds = 9 values)
-        self.all_r2_values = [r.r2 for r in self.fold_seed_results]
-        self.all_pearson_values = [r.pearson for r in self.fold_seed_results]
+        # Extract all TEST R² values (3 folds × 3 seeds = 9 values) - PRIMARY
+        self.all_r2_values = [r.test_r2 for r in self.fold_seed_results]
+        self.all_pearson_values = [r.test_pearson for r in self.fold_seed_results]
 
-        r2_arr = np.array(self.all_r2_values)
-        pearson_arr = np.array(self.all_pearson_values)
-        mae_arr = np.array([r.mae for r in self.fold_seed_results])
+        # Also track validation metrics
+        val_r2_values = [r.val_r2 for r in self.fold_seed_results]
 
-        # R² statistics
-        self.mean_r2 = float(np.mean(r2_arr))
-        self.std_r2 = float(np.std(r2_arr, ddof=1)) if len(r2_arr) > 1 else 0.0
-        self.sem_r2 = float(self.std_r2 / np.sqrt(len(r2_arr))) if len(r2_arr) > 1 else 0.0
-        self.median_r2 = float(np.median(r2_arr))
-        self.min_r2 = float(np.min(r2_arr))
-        self.max_r2 = float(np.max(r2_arr))
+        test_r2_arr = np.array(self.all_r2_values)
+        test_pearson_arr = np.array(self.all_pearson_values)
+        test_mae_arr = np.array([r.test_mae for r in self.fold_seed_results])
+        val_r2_arr = np.array(val_r2_values)
 
-        # Confidence interval for R² (95%)
-        if len(r2_arr) >= 2:
+        # PRIMARY R² statistics (from TEST - held-out sessions)
+        self.mean_r2 = float(np.mean(test_r2_arr))
+        self.std_r2 = float(np.std(test_r2_arr, ddof=1)) if len(test_r2_arr) > 1 else 0.0
+        self.sem_r2 = float(self.std_r2 / np.sqrt(len(test_r2_arr))) if len(test_r2_arr) > 1 else 0.0
+        self.median_r2 = float(np.median(test_r2_arr))
+        self.min_r2 = float(np.min(test_r2_arr))
+        self.max_r2 = float(np.max(test_r2_arr))
+
+        # Confidence interval for TEST R² (95%)
+        if len(test_r2_arr) >= 2:
             from scipy import stats as scipy_stats
-            t_crit = scipy_stats.t.ppf(0.975, len(r2_arr) - 1)
+            t_crit = scipy_stats.t.ppf(0.975, len(test_r2_arr) - 1)
             margin = t_crit * self.sem_r2
             self.ci_lower_r2 = self.mean_r2 - margin
             self.ci_upper_r2 = self.mean_r2 + margin
 
-        # Correlation statistics
-        self.mean_pearson = float(np.mean(pearson_arr))
-        self.std_pearson = float(np.std(pearson_arr, ddof=1)) if len(pearson_arr) > 1 else 0.0
+        # TEST correlation statistics
+        self.mean_pearson = float(np.mean(test_pearson_arr))
+        self.std_pearson = float(np.std(test_pearson_arr, ddof=1)) if len(test_pearson_arr) > 1 else 0.0
 
-        # MAE statistics
-        self.mean_mae = float(np.mean(mae_arr))
-        self.std_mae = float(np.std(mae_arr, ddof=1)) if len(mae_arr) > 1 else 0.0
+        # TEST MAE statistics
+        self.mean_mae = float(np.mean(test_mae_arr))
+        self.std_mae = float(np.std(test_mae_arr, ddof=1)) if len(test_mae_arr) > 1 else 0.0
 
-        # DSP metrics
+        # Validation statistics (for reference)
+        self.mean_val_r2 = float(np.mean(val_r2_arr))
+        self.std_val_r2 = float(np.std(val_r2_arr, ddof=1)) if len(val_r2_arr) > 1 else 0.0
+
+        # DSP metrics (from test)
         self.mean_plv = float(np.mean([r.plv for r in self.fold_seed_results]))
         self.mean_coherence = float(np.mean([r.coherence for r in self.fold_seed_results]))
         self.mean_snr = float(np.mean([r.reconstruction_snr_db for r in self.fold_seed_results]))
 
-        # Compute per-fold mean R² (for paired statistical tests)
+        # Compute per-fold mean TEST R² (for paired statistical tests)
         # Each fold has 3 seeds, so we average the seeds within each fold
         fold_groups = {}
         for r in self.fold_seed_results:
             if r.fold_idx not in fold_groups:
                 fold_groups[r.fold_idx] = []
-            fold_groups[r.fold_idx].append(r.r2)
+            fold_groups[r.fold_idx].append(r.test_r2)  # Use TEST R²
 
         self.fold_r2_values = [float(np.mean(fold_groups[i])) for i in sorted(fold_groups.keys())]
 
@@ -339,25 +368,25 @@ class MethodResult:
         for r in self.fold_seed_results:
             if r.fold_idx not in fold_pearson_groups:
                 fold_pearson_groups[r.fold_idx] = []
-            fold_pearson_groups[r.fold_idx].append(r.pearson)
+            fold_pearson_groups[r.fold_idx].append(r.test_pearson)  # Use TEST pearson
         self.fold_pearson_values = [float(np.mean(fold_pearson_groups[i])) for i in sorted(fold_pearson_groups.keys())]
 
-        # Aggregate per-session R²s across all fold+seed runs
+        # Aggregate per-session TEST R²s across all fold+seed runs
         # Each session is tested in exactly one fold, but with 3 seeds
         session_r2_lists: Dict[str, List[float]] = {}
 
         for r in self.fold_seed_results:
-            for session, r2 in r.per_session_r2.items():
+            for session, r2 in r.per_session_test_r2.items():  # Use TEST R²
                 if session not in session_r2_lists:
                     session_r2_lists[session] = []
                 session_r2_lists[session].append(r2)
 
-        # Store per-session statistics (mean/std across 3 seeds for that session)
+        # Store per-session TEST statistics (mean/std across 3 seeds for that session)
         for session, r2_list in session_r2_lists.items():
             self.all_session_r2s[session] = float(np.mean(r2_list))
             self.session_r2_stats[session] = {
-                "mean_r2": float(np.mean(r2_list)),
-                "std_r2": float(np.std(r2_list, ddof=1)) if len(r2_list) > 1 else 0.0,
+                "test_r2_mean": float(np.mean(r2_list)),
+                "test_r2_std": float(np.std(r2_list, ddof=1)) if len(r2_list) > 1 else 0.0,
                 "n_seeds": len(r2_list),
                 "values": r2_list,  # All 3 seed values for this session
             }
@@ -1293,36 +1322,43 @@ def get_3fold_session_splits(all_sessions: List[str]) -> List[Dict[str, Any]]:
 
 def run_single_fold_seed(
     baseline_name: str,
-    X_train: NDArray,
-    y_train: NDArray,
+    X_train_all: NDArray,
+    y_train_all: NDArray,
     X_test: NDArray,
     y_test: NDArray,
     fold_idx: int,
     seed: int,
     test_sessions: List[str],
     train_sessions: List[str],
-    session_to_indices: Dict[str, NDArray],
+    session_to_test_indices: Dict[str, NDArray],
     config: Phase1Config,
 ) -> FoldSeedResult:
     """Run evaluation for a single fold+seed combination.
 
+    PROPER DATA SPLIT (NO DATA LEAKAGE):
+    1. X_train_all (from 6 training sessions) → 70/30 trial-wise split → TRAIN / VAL
+    2. Model is fit on TRAIN only
+    3. Evaluate on VAL (validation metric)
+    4. Evaluate on TEST (PRIMARY metric - from held-out sessions)
+
     Args:
         baseline_name: Name of the baseline method
-        X_train: Training input [N_train, C, T]
-        y_train: Training target [N_train, C, T]
+        X_train_all: All training input [N_train, C, T] from 6 training sessions
+        y_train_all: All training target [N_train, C, T]
         X_test: Test input (held-out sessions) [N_test, C, T]
         y_test: Test target [N_test, C, T]
         fold_idx: Fold index (0, 1, or 2)
         seed: Random seed
         test_sessions: List of session names in test set
         train_sessions: List of session names in training set
-        session_to_indices: Dict mapping session name -> indices in test set
+        session_to_test_indices: Dict mapping session name -> indices in test set
         config: Configuration object
 
     Returns:
-        FoldSeedResult with all metrics
+        FoldSeedResult with val and test metrics
     """
     from sklearn.metrics import r2_score, mean_absolute_error
+    from sklearn.model_selection import train_test_split
 
     np.random.seed(seed)
 
@@ -1335,53 +1371,70 @@ def run_single_fold_seed(
     )
 
     try:
-        # Create and fit model
+        # STEP 1: 70/30 trial-wise split on training data
+        n_train_total = len(X_train_all)
+        indices = np.arange(n_train_total)
+        train_idx, val_idx = train_test_split(
+            indices, test_size=0.3, random_state=seed
+        )
+
+        X_train = X_train_all[train_idx]
+        y_train = y_train_all[train_idx]
+        X_val = X_train_all[val_idx]
+        y_val = y_train_all[val_idx]
+
+        # STEP 2: Fit model on TRAIN only (70%)
         model = create_baseline(baseline_name)
         model.fit(X_train, y_train)
 
-        # Evaluate on test set (held-out sessions)
-        y_pred = model.predict(X_test)
+        # STEP 3: Evaluate on VALIDATION (30% of training sessions)
+        y_val_pred = model.predict(X_val)
+        val_r2 = float(r2_score(y_val.flatten(), y_val_pred.flatten()))
+        val_mae = float(mean_absolute_error(y_val.flatten(), y_val_pred.flatten()))
+        val_pearson = float(np.corrcoef(y_val.flatten(), y_val_pred.flatten())[0, 1])
 
-        # Compute overall metrics
-        r2 = float(r2_score(y_test.flatten(), y_pred.flatten()))
-        mae = float(mean_absolute_error(y_test.flatten(), y_pred.flatten()))
-        pearson = float(np.corrcoef(y_test.flatten(), y_pred.flatten())[0, 1])
+        # STEP 4: Evaluate on TEST (held-out sessions) - PRIMARY METRIC
+        y_test_pred = model.predict(X_test)
+        test_r2 = float(r2_score(y_test.flatten(), y_test_pred.flatten()))
+        test_mae = float(mean_absolute_error(y_test.flatten(), y_test_pred.flatten()))
+        test_pearson = float(np.corrcoef(y_test.flatten(), y_test_pred.flatten())[0, 1])
 
-        # Compute per-session metrics
-        per_session_r2 = {}
-        per_session_mae = {}
-        per_session_corr = {}
+        # Compute per-session TEST metrics
+        per_session_test_r2 = {}
+        per_session_test_mae = {}
+        per_session_test_corr = {}
 
-        for session_name, indices in session_to_indices.items():
+        for session_name, indices in session_to_test_indices.items():
             y_sess_true = y_test[indices]
-            y_sess_pred = y_pred[indices]
+            y_sess_pred = y_test_pred[indices]
 
-            per_session_r2[session_name] = float(r2_score(
+            per_session_test_r2[session_name] = float(r2_score(
                 y_sess_true.flatten(), y_sess_pred.flatten()
             ))
-            per_session_mae[session_name] = float(mean_absolute_error(
+            per_session_test_mae[session_name] = float(mean_absolute_error(
                 y_sess_true.flatten(), y_sess_pred.flatten()
             ))
-            per_session_corr[session_name] = float(np.corrcoef(
+            per_session_test_corr[session_name] = float(np.corrcoef(
                 y_sess_true.flatten(), y_sess_pred.flatten()
             )[0, 1])
 
-        # Compute DSP metrics (on aggregated predictions)
-        dsp_metrics = metrics_calc.compute(y_pred, y_test)
+        # Compute DSP metrics (on TEST predictions)
+        dsp_metrics = metrics_calc.compute(y_test_pred, y_test)
         plv = dsp_metrics.get("plv", 0.0)
         coherence = dsp_metrics.get("coherence", 0.0)
         reconstruction_snr = dsp_metrics.get("reconstruction_snr_db", 0.0)
         envelope_corr = dsp_metrics.get("envelope_corr", 0.0)
 
-        # Band R²
+        # Band R² (from test)
         band_r2 = {}
         for band in NEURAL_BANDS.keys():
             band_r2[band] = dsp_metrics.get(f"r2_{band}", 0.0)
 
     except Exception as e:
         print(f"    Warning: Fold {fold_idx} seed {seed} failed for {baseline_name}: {e}")
-        r2, mae, pearson = np.nan, np.nan, np.nan
-        per_session_r2, per_session_mae, per_session_corr = {}, {}, {}
+        val_r2, val_mae, val_pearson = np.nan, np.nan, np.nan
+        test_r2, test_mae, test_pearson = np.nan, np.nan, np.nan
+        per_session_test_r2, per_session_test_mae, per_session_test_corr = {}, {}, {}
         plv, coherence, reconstruction_snr, envelope_corr = 0.0, 0.0, 0.0, 0.0
         band_r2 = {}
 
@@ -1392,12 +1445,19 @@ def run_single_fold_seed(
         seed=seed,
         test_sessions=test_sessions,
         train_sessions=train_sessions,
-        r2=r2,
-        mae=mae,
-        pearson=pearson,
-        per_session_r2=per_session_r2,
-        per_session_mae=per_session_mae,
-        per_session_corr=per_session_corr,
+        # Validation metrics (from 70/30 split)
+        val_r2=val_r2,
+        val_mae=val_mae,
+        val_pearson=val_pearson,
+        # TEST metrics (PRIMARY - from held-out sessions)
+        test_r2=test_r2,
+        test_mae=test_mae,
+        test_pearson=test_pearson,
+        # Per-session TEST metrics
+        per_session_test_r2=per_session_test_r2,
+        per_session_test_mae=per_session_test_mae,
+        per_session_test_corr=per_session_test_corr,
+        # DSP metrics
         plv=plv,
         coherence=coherence,
         reconstruction_snr_db=reconstruction_snr,
@@ -1415,7 +1475,15 @@ def run_3fold_3seed_evaluation(
 ) -> Phase1Result3Fold3Seed:
     """Run complete 3-fold × 3-seed Phase 1 evaluation.
 
-    This is the main evaluation function that aligns with the ablation study strategy.
+    PROPER DATA SPLIT (NO DATA LEAKAGE):
+    For each fold:
+    - 3 sessions → TEST (held out, never seen during training)
+    - 6 sessions → 70/30 trial-wise split:
+      - ~70% trials → TRAIN (fit model)
+      - ~30% trials → VAL (validation metric)
+
+    Classical baselines are fit once on TRAIN, evaluated on VAL and TEST.
+    TEST R² is the PRIMARY metric (true generalization, NO leakage).
 
     Args:
         config: Configuration object
@@ -1502,7 +1570,7 @@ def run_3fold_3seed_evaluation(
                 local_mask = test_session_ids_arr == sess_id
                 session_to_test_indices[sess_name] = np.where(local_mask)[0]
 
-            print(f"\n  Fold {fold_idx}: test={test_sessions}, train={len(train_idx)} samples")
+            print(f"\n  Fold {fold_idx}: test={test_sessions}, train={len(train_idx)} samples (70/30 split)")
 
             # Run with multiple seeds
             for seed_offset in range(n_seeds):
@@ -1511,20 +1579,20 @@ def run_3fold_3seed_evaluation(
 
                 result = run_single_fold_seed(
                     baseline_name=baseline_name,
-                    X_train=X_train,
-                    y_train=y_train,
+                    X_train_all=X_train,  # Will be split 70/30 internally
+                    y_train_all=y_train,
                     X_test=X_test,
                     y_test=y_test,
                     fold_idx=fold_idx,
                     seed=seed,
                     test_sessions=test_sessions,
                     train_sessions=train_sessions,
-                    session_to_indices=session_to_test_indices,
+                    session_to_test_indices=session_to_test_indices,
                     config=config,
                 )
 
                 fold_seed_results.append(result)
-                print(f"R² = {result.r2:.4f}")
+                print(f"TEST R² = {result.test_r2:.4f} (val R² = {result.val_r2:.4f})")
 
         # Create method result and compute statistics
         method_result = MethodResult(
@@ -1536,9 +1604,10 @@ def run_3fold_3seed_evaluation(
 
         # Print method summary
         print(f"\n  {baseline_name} Summary:")
-        print(f"    R² = {method_result.mean_r2:.4f} ± {method_result.std_r2:.4f}")
+        print(f"    TEST R² = {method_result.mean_r2:.4f} ± {method_result.std_r2:.4f} (PRIMARY)")
+        print(f"    Val R² = {method_result.mean_val_r2:.4f} ± {method_result.std_val_r2:.4f} (reference)")
         print(f"    95% CI = [{method_result.ci_lower_r2:.4f}, {method_result.ci_upper_r2:.4f}]")
-        print(f"    Per-session R²: {method_result.all_session_r2s}")
+        print(f"    Per-session TEST R²: {method_result.all_session_r2s}")
 
     total_time = time.time() - total_start_time
 
@@ -1663,32 +1732,38 @@ def compute_method_comparisons(
 
 
 def print_3fold_3seed_summary(result: Phase1Result3Fold3Seed) -> None:
-    """Print comprehensive summary of 3-fold × 3-seed results."""
-    print("\n" + "=" * 80)
-    print("PHASE 1 RESULTS SUMMARY (3-Fold × 3-Seed)")
-    print("=" * 80)
+    """Print comprehensive summary of 3-fold × 3-seed results.
 
-    # Sort by mean R²
+    NOTE: All R² values shown are TEST R² from held-out sessions (NO data leakage).
+    """
+    print("\n" + "=" * 85)
+    print("PHASE 1 RESULTS SUMMARY (3-Fold × 3-Seed)")
+    print("=" * 85)
+    print("NOTE: All R² values are from TEST (held-out sessions) - NO data leakage")
+    print("      Model was fit on 70% of training sessions, val on 30%, test held out")
+    print()
+
+    # Sort by mean TEST R²
     sorted_methods = sorted(
         result.method_results.items(),
         key=lambda x: x[1].mean_r2,
         reverse=True
     )
 
-    print(f"\n{'Method':<18} {'R² (mean±std)':<18} {'95% CI':<22} {'MAE':>8} {'Pearson':>8}")
-    print("-" * 80)
+    print(f"{'Method':<18} {'TEST R² (mean±std)':<20} {'95% CI':<22} {'MAE':>8} {'Pearson':>8}")
+    print("-" * 85)
 
     for method_name, method_result in sorted_methods:
         r2_str = f"{method_result.mean_r2:.4f}±{method_result.std_r2:.4f}"
         ci_str = f"[{method_result.ci_lower_r2:.4f}, {method_result.ci_upper_r2:.4f}]"
         mae_str = f"{method_result.mean_mae:.4f}"
         pearson_str = f"{method_result.mean_pearson:.4f}"
-        print(f"{method_name:<18} {r2_str:<18} {ci_str:<22} {mae_str:>8} {pearson_str:>8}")
+        print(f"{method_name:<18} {r2_str:<20} {ci_str:<22} {mae_str:>8} {pearson_str:>8}")
 
-    # Per-session summary
-    print("\n" + "-" * 80)
-    print("PER-SESSION R² (mean across 3 seeds):")
-    print("-" * 80)
+    # Per-session TEST summary
+    print("\n" + "-" * 85)
+    print("PER-SESSION TEST R² (from held-out sessions, mean across 3 seeds):")
+    print("-" * 85)
 
     # Get all sessions
     all_sessions = set()
@@ -1706,11 +1781,11 @@ def print_3fold_3seed_summary(result: Phase1Result3Fold3Seed) -> None:
         print(f"{method_name:<18}{sess_str}")
 
     # Gate threshold
-    print("\n" + "=" * 80)
-    print(f"CLASSICAL FLOOR: R² = {result.best_r2:.4f} ({result.best_method})")
-    print(f"GATE THRESHOLD: Neural methods must achieve R² >= {result.gate_threshold:.4f}")
+    print("\n" + "=" * 85)
+    print(f"CLASSICAL FLOOR: TEST R² = {result.best_r2:.4f} ({result.best_method})")
+    print(f"GATE THRESHOLD: Neural methods must achieve TEST R² >= {result.gate_threshold:.4f}")
     print(f"Total evaluation time: {result.total_time / 60:.1f} minutes")
-    print("=" * 80)
+    print("=" * 85)
 
 
 # =============================================================================
