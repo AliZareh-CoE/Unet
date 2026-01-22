@@ -94,11 +94,9 @@ class WienerFilter(BaselineModel):
         if spectrum.ndim == 1:
             return np.convolve(spectrum, kernel, mode="same")
 
-        # Handle multi-dimensional: smooth along last axis
-        result = np.zeros_like(spectrum)
-        for i in range(spectrum.shape[0]):
-            result[i] = np.convolve(spectrum[i], kernel, mode="same")
-        return result
+        # Handle multi-dimensional: use scipy for vectorized convolution
+        from scipy.ndimage import convolve1d
+        return convolve1d(spectrum, kernel, axis=-1, mode='reflect')
 
     def fit(self, X: NDArray, y: NDArray) -> "WienerFilter":
         """Fit Wiener filter from input-output pairs.
@@ -141,19 +139,20 @@ class WienerFilter(BaselineModel):
         self.H = np.zeros((C_out, C_in, n_freq), dtype=np.complex128)
         n_matched = min(C_out, C_in)
 
+        # Vectorized computation for diagonal channels
+        # Cross-spectral density: E[Y(f) · X(f)*] for matched channels
+        S_xy_all = np.mean(y_fft[:, :n_matched, :] * np.conj(X_fft[:, :n_matched, :]), axis=0)  # [n_matched, n_freq]
+
+        # Power spectral density: E[X(f) · X(f)*] = |X(f)|² for matched channels
+        S_xx_all = np.mean(np.abs(X_fft[:, :n_matched, :]) ** 2, axis=0)  # [n_matched, n_freq]
+
+        # Apply smoothing (vectorized)
+        S_xy_all = self._smooth_spectrum(S_xy_all)
+        S_xx_all = self._smooth_spectrum(np.real(S_xx_all))
+
+        # Wiener filter: H = S_xy / (S_xx + reg) for each channel
         for c in range(n_matched):
-            # Cross-spectral density: E[Y(f) · X(f)*]
-            S_xy = np.mean(y_fft[:, c, :] * np.conj(X_fft[:, c, :]), axis=0)
-
-            # Power spectral density: E[X(f) · X(f)*] = |X(f)|²
-            S_xx = np.mean(np.abs(X_fft[:, c, :]) ** 2, axis=0)
-
-            # Apply smoothing
-            S_xy = self._smooth_spectrum(S_xy)
-            S_xx = self._smooth_spectrum(np.real(S_xx))
-
-            # Wiener filter: H = S_xy / (S_xx + reg)
-            self.H[c, c, :] = S_xy / (S_xx + self.regularization)
+            self.H[c, c, :] = S_xy_all[c] / (S_xx_all[c] + self.regularization)
 
         self._fitted = True
         return self
@@ -183,12 +182,11 @@ class WienerFilter(BaselineModel):
         # FFT of input
         X_fft = np.fft.rfft(X, n=self.n_fft, axis=-1)  # [N, C_in, n_freq]
 
-        # Apply filter via matrix multiplication
-        y_fft = np.zeros((N, C_out, X_fft.shape[-1]), dtype=np.complex128)
-        for c_out in range(C_out):
-            for c_in in range(C_in):
-                if np.any(self.H[c_out, c_in, :] != 0):
-                    y_fft[:, c_out, :] += self.H[c_out, c_in, :] * X_fft[:, c_in, :]
+        # Apply filter via einsum (vectorized)
+        # H shape: [C_out, C_in, n_freq]
+        # X_fft shape: [N, C_in, n_freq]
+        # Result shape: [N, C_out, n_freq]
+        y_fft = np.einsum('oif,nif->nof', self.H, X_fft)
 
         # Inverse FFT
         y = np.fft.irfft(y_fft, n=self.n_fft, axis=-1)
