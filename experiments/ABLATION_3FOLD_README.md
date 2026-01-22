@@ -75,6 +75,11 @@ python experiments/run_ablation_3fold.py --fsdp
 python experiments/run_ablation_3fold.py --dry-run
 ```
 
+### Disable sweep mode (don't apply permanent decisions)
+```bash
+python experiments/run_ablation_3fold.py --no-sweep
+```
+
 ## Output Structure
 
 ```
@@ -84,6 +89,8 @@ results/ablation_3fold/
 ├── per_session_results.json    # Per-session R² for all ablations
 ├── training_curves.json        # Full training history curves
 ├── results_table.csv           # Publication-ready table
+├── recommendations.json        # Automated recommendations
+├── sweep_state.json            # Persistent sweep decisions
 ├── ablation_run_*.log          # Run logs
 ├── baseline/
 │   ├── baseline_fold0_results.json  # Full metrics per fold
@@ -167,4 +174,78 @@ RECOMMENDATIONS
 FINAL RECOMMENDATION: depth_deep
   Reason: UPGRADE: depth_deep is significantly better (+0.0142 R², p=0.0231)
 ------------------------------------------------------------
+```
+
+## Persistent Sweep State
+
+The system maintains a **persistent sweep state** that tracks decisions across runs. This enables automatic progressive elimination of poor configurations and upgrades to better ones.
+
+### How It Works
+
+1. **First Run**: All ablations are run, recommendations are computed
+2. **Sweep Decisions Applied**:
+   - **ELIMINATE**: Configs significantly worse than baseline are permanently marked for exclusion
+   - **UPGRADE**: If a config is significantly better, it becomes the new baseline
+3. **Subsequent Runs**: Eliminated configs are automatically skipped
+
+### Sweep State File
+
+The sweep state is saved to `sweep_state.json` in the output directory:
+
+```json
+{
+  "current_baseline": "depth_deep",
+  "eliminated": ["conv_type_standard", "attention_none"],
+  "upgrade_history": [
+    {
+      "timestamp": "2024-01-15T10:30:00",
+      "from": "baseline",
+      "to": "depth_deep",
+      "delta": 0.0142,
+      "p_value": 0.0231
+    }
+  ],
+  "decision_log": [
+    {
+      "timestamp": "2024-01-15T10:30:00",
+      "action": "ELIMINATE",
+      "config": "conv_type_standard",
+      "delta": -0.0755,
+      "p_value": 0.0012,
+      "reason": "Significantly worse (-0.0755 R², p=0.0012)"
+    }
+  ]
+}
+```
+
+### Disabling Sweep Mode
+
+To run without applying permanent decisions (useful for re-running eliminated configs):
+
+```bash
+python experiments/run_ablation_3fold.py --no-sweep
+```
+
+### Resetting Sweep State
+
+To start fresh, delete the sweep state file:
+
+```bash
+rm results/ablation_3fold/sweep_state.json
+```
+
+### Workflow Example
+
+```bash
+# Run 1: All 14 ablations run
+python experiments/run_ablation_3fold.py
+# -> Eliminates conv_type_standard (significantly worse)
+# -> Upgrades to depth_deep (significantly better)
+
+# Run 2: Only 13 ablations run (conv_type_standard skipped)
+python experiments/run_ablation_3fold.py
+# -> Further refinement based on new baseline
+
+# Run with sweep disabled (test eliminated configs again)
+python experiments/run_ablation_3fold.py --no-sweep
 ```

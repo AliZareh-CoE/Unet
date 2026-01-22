@@ -101,6 +101,161 @@ class AblationConfig:
 
 
 # =============================================================================
+# Sweep State Management (Persistent Decisions)
+# =============================================================================
+
+@dataclass
+class SweepState:
+    """Persistent state for sweep decisions.
+
+    Tracks which configurations have been eliminated or promoted.
+    Saved to disk and loaded on subsequent runs.
+    """
+    current_baseline: str = "baseline"
+    eliminated: List[str] = field(default_factory=list)
+    upgrade_history: List[Dict[str, Any]] = field(default_factory=list)
+    decision_log: List[Dict[str, Any]] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current_baseline": self.current_baseline,
+            "eliminated": self.eliminated,
+            "upgrade_history": self.upgrade_history,
+            "decision_log": self.decision_log,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SweepState":
+        return cls(
+            current_baseline=data.get("current_baseline", "baseline"),
+            eliminated=data.get("eliminated", []),
+            upgrade_history=data.get("upgrade_history", []),
+            decision_log=data.get("decision_log", []),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+        )
+
+
+def load_sweep_state(output_dir: Path) -> SweepState:
+    """Load sweep state from disk, or create new if doesn't exist."""
+    state_file = output_dir / "sweep_state.json"
+    if state_file.exists():
+        with open(state_file, 'r') as f:
+            data = json.load(f)
+        state = SweepState.from_dict(data)
+        print(f"\nLoaded sweep state from {state_file}")
+        print(f"  Current baseline: {state.current_baseline}")
+        print(f"  Eliminated: {state.eliminated}")
+        return state
+    else:
+        state = SweepState(created_at=datetime.now().isoformat())
+        print(f"\nNo existing sweep state found. Starting fresh.")
+        return state
+
+
+def save_sweep_state(state: SweepState, output_dir: Path) -> None:
+    """Save sweep state to disk."""
+    state.updated_at = datetime.now().isoformat()
+    state_file = output_dir / "sweep_state.json"
+    with open(state_file, 'w') as f:
+        json.dump(state.to_dict(), f, indent=2)
+    print(f"Sweep state saved to: {state_file}")
+
+
+def apply_sweep_decisions(
+    recommendations: Dict[str, Any],
+    sweep_state: SweepState,
+    auto_apply: bool = True,
+) -> SweepState:
+    """Apply sweep decisions based on recommendations.
+
+    Args:
+        recommendations: Output from compute_recommendations()
+        sweep_state: Current sweep state
+        auto_apply: If True, automatically apply decisions
+
+    Returns:
+        Updated sweep state
+    """
+    timestamp = datetime.now().isoformat()
+
+    # Track eliminations
+    for cand in recommendations.get("eliminate_candidates", []):
+        name = cand["name"]
+        if name not in sweep_state.eliminated:
+            sweep_state.eliminated.append(name)
+            sweep_state.decision_log.append({
+                "timestamp": timestamp,
+                "action": "ELIMINATE",
+                "config": name,
+                "delta": cand["delta"],
+                "p_value": cand["p_value"],
+                "reason": f"Significantly worse ({cand['delta']:.4f} R², p={cand['p_value']:.4f})",
+            })
+            print(f"  [SWEEP] Permanently ELIMINATED: {name}")
+
+    # Track upgrades (pick the best one)
+    if recommendations.get("upgrade_candidates"):
+        best = max(recommendations["upgrade_candidates"], key=lambda x: x["delta"])
+        new_baseline = best["name"]
+
+        if new_baseline != sweep_state.current_baseline:
+            old_baseline = sweep_state.current_baseline
+            sweep_state.upgrade_history.append({
+                "timestamp": timestamp,
+                "from": old_baseline,
+                "to": new_baseline,
+                "delta": best["delta"],
+                "p_value": best["p_value"],
+            })
+            sweep_state.decision_log.append({
+                "timestamp": timestamp,
+                "action": "UPGRADE",
+                "config": new_baseline,
+                "from_baseline": old_baseline,
+                "delta": best["delta"],
+                "p_value": best["p_value"],
+                "reason": f"Significantly better (+{best['delta']:.4f} R², p={best['p_value']:.4f})",
+            })
+            sweep_state.current_baseline = new_baseline
+            print(f"  [SWEEP] UPGRADED baseline: {old_baseline} -> {new_baseline}")
+
+    return sweep_state
+
+
+def filter_ablations_by_sweep_state(
+    configs: Dict[str, AblationConfig],
+    sweep_state: SweepState,
+) -> Dict[str, AblationConfig]:
+    """Filter out eliminated ablations from configs.
+
+    Args:
+        configs: All ablation configurations
+        sweep_state: Current sweep state with eliminations
+
+    Returns:
+        Filtered configs (without eliminated ones)
+    """
+    filtered = {}
+    skipped = []
+
+    for name, config in configs.items():
+        if name in sweep_state.eliminated:
+            skipped.append(name)
+        else:
+            filtered[name] = config
+
+    if skipped:
+        print(f"\n[SWEEP] Skipping {len(skipped)} eliminated ablations: {skipped}")
+
+    return filtered
+
+
+# =============================================================================
 # Define Ablation Configurations
 # =============================================================================
 
@@ -873,6 +1028,7 @@ def run_3fold_ablation_study(
     verbose: bool = True,
     use_fsdp: bool = False,
     dry_run: bool = False,
+    enable_sweep: bool = True,
 ) -> Dict[str, AblationResult]:
     """Run the complete 3-fold ablation study.
 
@@ -884,6 +1040,7 @@ def run_3fold_ablation_study(
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
         dry_run: If True, print commands without running them
+        enable_sweep: If True, apply sweep decisions (eliminate/upgrade permanently)
 
     Returns:
         Dict mapping ablation name to AblationResult
@@ -899,7 +1056,11 @@ def run_3fold_ablation_study(
     print("=" * 70)
     print(f"Output directory: {output_dir}")
     print(f"Log file: {log_file}")
+    print(f"Sweep mode: {'ENABLED' if enable_sweep else 'DISABLED'}")
     print()
+
+    # Load sweep state (persistent decisions)
+    sweep_state = load_sweep_state(output_dir) if enable_sweep else SweepState()
 
     # Get all sessions
     all_sessions = get_all_sessions("olfactory")
@@ -914,6 +1075,10 @@ def run_3fold_ablation_study(
 
     # Get ablation configurations
     all_configs = get_ablation_configs()
+
+    # Filter out eliminated ablations (from previous sweep decisions)
+    if enable_sweep:
+        all_configs = filter_ablations_by_sweep_state(all_configs, sweep_state)
 
     if ablations_to_run is not None:
         configs_to_run = {k: v for k, v in all_configs.items() if k in ablations_to_run}
@@ -947,6 +1112,29 @@ def run_3fold_ablation_study(
 
     # Save summary
     save_summary(results, output_dir)
+
+    # Apply and save sweep decisions (if enabled and not dry run)
+    if enable_sweep and not dry_run:
+        # Compute comparisons and recommendations
+        comparisons = compute_statistical_comparisons(results, "baseline")
+        recommendations = compute_recommendations(results, comparisons, "baseline")
+
+        # Apply sweep decisions (eliminate/upgrade)
+        sweep_state = apply_sweep_decisions(recommendations, sweep_state)
+
+        # Save updated sweep state
+        save_sweep_state(sweep_state, output_dir)
+
+        # Print sweep summary
+        print("\n" + "=" * 60)
+        print("SWEEP STATE UPDATED")
+        print("=" * 60)
+        print(f"  Current baseline: {sweep_state.current_baseline}")
+        print(f"  Total eliminated: {len(sweep_state.eliminated)}")
+        if sweep_state.eliminated:
+            print(f"    {sweep_state.eliminated}")
+        print(f"  Total upgrades: {len(sweep_state.upgrade_history)}")
+        print("=" * 60)
 
     return results
 
@@ -1660,6 +1848,12 @@ def main():
         help="Print commands that would be run without actually running them",
     )
 
+    parser.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="Disable sweep mode (don't apply permanent eliminate/upgrade decisions)",
+    )
+
     args = parser.parse_args()
 
     # List ablations and exit
@@ -1681,6 +1875,7 @@ def main():
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
         dry_run=args.dry_run,
+        enable_sweep=not args.no_sweep,
     )
 
     return 0
