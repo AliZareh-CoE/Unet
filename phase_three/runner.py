@@ -115,8 +115,8 @@ def run_training(
         "--optimizer", config.get("optimizer", "adamw"),
         "--lr-schedule", config.get("lr_schedule", "step"),
         "--weight-decay", str(config.get("weight_decay", 0.01)),
-        # NO --split-by-session: use random trial-wise splits
-        "--exclude-sessions", *test_sessions,  # Exclude test sessions entirely
+        # Hybrid mode: test sessions held out, trial-wise 70/30 for train/val
+        "--test-sessions", *test_sessions,  # Hold out for test evaluation
         "--output-results-file", str(results_file),
         "--no-plots",
         "--no-early-stop",
@@ -133,7 +133,7 @@ def run_training(
         cmd.append("--fsdp")
 
     if ablation_config.verbose:
-        print(f"    Seed {seed}: excluding test sessions {test_sessions}")
+        print(f"    Seed {seed}: test sessions {test_sessions} (70/30 trial-wise train/val on remaining)")
 
     # Set environment variables
     env = os.environ.copy()
@@ -187,8 +187,9 @@ def run_experiment(
     """
     print(f"\n  {name}")
 
-    r2_values = []
+    val_r2_values = []
     mae_values = []
+    test_r2_values = []
     seed_results = []
 
     for seed in ablation_config.seeds:
@@ -203,28 +204,45 @@ def run_experiment(
         seed_results.append(result)
 
         if "error" not in result:
-            r2_values.append(result.get("best_val_r2", 0.0))
+            val_r2_values.append(result.get("best_val_r2", 0.0))
             mae_values.append(result.get("best_val_mae", 0.0))
+            # Collect test metrics if available
+            if result.get("test_avg_r2") is not None:
+                test_r2_values.append(result.get("test_avg_r2"))
 
-    # Compute mean ± std
-    if r2_values:
-        mean_r2 = np.mean(r2_values)
-        std_r2 = np.std(r2_values)
+    # Compute mean ± std for validation
+    if val_r2_values:
+        mean_val_r2 = np.mean(val_r2_values)
+        std_val_r2 = np.std(val_r2_values)
         mean_mae = np.mean(mae_values)
         std_mae = np.std(mae_values)
     else:
-        mean_r2 = std_r2 = mean_mae = std_mae = 0.0
+        mean_val_r2 = std_val_r2 = mean_mae = std_mae = 0.0
 
-    print(f"  -> Mean R² = {mean_r2:.4f} ± {std_r2:.4f}")
+    # Compute mean ± std for test
+    if test_r2_values:
+        mean_test_r2 = np.mean(test_r2_values)
+        std_test_r2 = np.std(test_r2_values)
+    else:
+        mean_test_r2 = std_test_r2 = 0.0
+
+    print(f"  -> Val R²  = {mean_val_r2:.4f} ± {std_val_r2:.4f}")
+    if test_r2_values:
+        print(f"  -> Test R² = {mean_test_r2:.4f} ± {std_test_r2:.4f}")
 
     return {
         "name": name,
         "config": config,
-        "mean_r2": mean_r2,
-        "std_r2": std_r2,
+        "mean_r2": mean_val_r2,  # Keep for backward compatibility
+        "std_r2": std_val_r2,
+        "mean_val_r2": mean_val_r2,
+        "std_val_r2": std_val_r2,
+        "mean_test_r2": mean_test_r2,
+        "std_test_r2": std_test_r2,
         "mean_mae": mean_mae,
         "std_mae": std_mae,
-        "r2_values": r2_values,
+        "val_r2_values": val_r2_values,
+        "test_r2_values": test_r2_values,
         "seed_results": seed_results,
     }
 
@@ -292,18 +310,39 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
     # Print summary
     print_header("Results Summary")
-    print(f"{'Experiment':<25} {'R² (mean±std)':>18} {'Δ R²':>10}")
-    print("-" * 55)
 
-    baseline_r2 = results["baseline"]["mean_r2"]
-    print(f"{'baseline':<25} {baseline_r2:>7.4f} ± {results['baseline']['std_r2']:<7.4f} {'--':>10}")
+    # Check if test results are available
+    has_test = results["baseline"].get("mean_test_r2", 0) > 0
 
-    for name, r in results.items():
-        if name == "baseline":
-            continue
-        delta = r["mean_r2"] - baseline_r2
-        sign = "+" if delta >= 0 else ""
-        print(f"{name:<25} {r['mean_r2']:>7.4f} ± {r['std_r2']:<7.4f} {sign}{delta:>9.4f}")
+    if has_test:
+        print(f"{'Experiment':<25} {'Val R² (mean±std)':>20} {'Test R² (mean±std)':>20} {'Δ Test':>10}")
+        print("-" * 80)
+
+        baseline_val_r2 = results["baseline"]["mean_val_r2"]
+        baseline_test_r2 = results["baseline"]["mean_test_r2"]
+        print(f"{'baseline':<25} {baseline_val_r2:>7.4f} ± {results['baseline']['std_val_r2']:<7.4f}   "
+              f"{baseline_test_r2:>7.4f} ± {results['baseline']['std_test_r2']:<7.4f}   {'--':>10}")
+
+        for name, r in results.items():
+            if name == "baseline":
+                continue
+            delta = r.get("mean_test_r2", 0) - baseline_test_r2
+            sign = "+" if delta >= 0 else ""
+            print(f"{name:<25} {r['mean_val_r2']:>7.4f} ± {r['std_val_r2']:<7.4f}   "
+                  f"{r.get('mean_test_r2', 0):>7.4f} ± {r.get('std_test_r2', 0):<7.4f}   {sign}{delta:>9.4f}")
+    else:
+        print(f"{'Experiment':<25} {'Val R² (mean±std)':>18} {'Δ Val R²':>10}")
+        print("-" * 55)
+
+        baseline_r2 = results["baseline"]["mean_r2"]
+        print(f"{'baseline':<25} {baseline_r2:>7.4f} ± {results['baseline']['std_r2']:<7.4f} {'--':>10}")
+
+        for name, r in results.items():
+            if name == "baseline":
+                continue
+            delta = r["mean_r2"] - baseline_r2
+            sign = "+" if delta >= 0 else ""
+            print(f"{name:<25} {r['mean_r2']:>7.4f} ± {r['std_r2']:<7.4f} {sign}{delta:>9.4f}")
 
     # Save summary
     summary = {

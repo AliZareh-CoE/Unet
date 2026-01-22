@@ -2603,6 +2603,12 @@ def train(
                 print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
 
+                # Store per-session test results for JSON output
+                results["per_session_test_results"] = per_session_results
+                results["test_avg_r2"] = avg_r2
+                results["test_avg_corr"] = avg_corr
+                results["test_avg_delta"] = avg_delta
+
     if is_distributed:
         dist.barrier()
 
@@ -3689,6 +3695,11 @@ def main():
                 "per_session_r2": per_session_r2,
                 "per_session_corr": per_session_corr,
                 "per_session_loss": per_session_loss,
+                # Per-session TEST results (if available)
+                "per_session_test_results": results.get("per_session_test_results", []),
+                "test_avg_r2": results.get("test_avg_r2"),
+                "test_avg_corr": results.get("test_avg_corr"),
+                "test_avg_delta": results.get("test_avg_delta"),
                 "total_time": results.get("total_time", 0.0),
                 "epochs_trained": len(history),
                 "n_parameters": n_params,

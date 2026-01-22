@@ -1613,6 +1613,63 @@ def prepare_data(
             no_test_set=no_test_set,
             separate_val_sessions=separate_val_sessions,
         )
+    elif test_sessions:
+        # Hybrid mode: session-wise test holdout + trial-wise train/val
+        # Load session IDs to identify test trials
+        session_ids, session_to_idx, idx_to_session = load_session_ids(
+            odor_csv_path, session_column, num_trials
+        )
+
+        # Identify test session indices
+        test_session_ids = set()
+        test_session_names = []
+        for sess_name in test_sessions:
+            if sess_name in session_to_idx:
+                test_session_ids.add(session_to_idx[sess_name])
+                test_session_names.append(sess_name)
+            else:
+                _print_primary(f"Warning: Test session '{sess_name}' not found, skipping")
+
+        # Split trials into test vs non-test
+        test_mask = np.isin(session_ids, list(test_session_ids))
+        test_idx = np.where(test_mask)[0]
+        non_test_idx = np.where(~test_mask)[0]
+
+        # Do trial-wise stratified split on non-test trials (70/30 train/val)
+        non_test_odors = odors[non_test_idx]
+        rng = np.random.default_rng(seed)
+
+        # Stratified split by odor
+        train_idx_local = []
+        val_idx_local = []
+        for odor_id in np.unique(non_test_odors):
+            odor_mask = non_test_odors == odor_id
+            odor_indices = non_test_idx[odor_mask]
+            rng.shuffle(odor_indices)
+            n_train = int(len(odor_indices) * 0.7)
+            train_idx_local.extend(odor_indices[:n_train])
+            val_idx_local.extend(odor_indices[n_train:])
+
+        train_idx = np.array(sorted(train_idx_local))
+        val_idx = np.array(sorted(val_idx_local))
+
+        # Identify which sessions are in train/val for per-session reporting
+        train_session_ids = set(session_ids[train_idx])
+        train_session_names = [idx_to_session[sid] for sid in sorted(train_session_ids)]
+
+        split_info = {
+            "mode": "hybrid_test_sessions",
+            "test_sessions": test_session_names,
+            "train_val_sessions": train_session_names,
+            "n_test_trials": len(test_idx),
+            "n_train_trials": len(train_idx),
+            "n_val_trials": len(val_idx),
+            "seed": seed,
+        }
+
+        _print_primary(f"Hybrid split: {len(test_session_names)} test sessions ({len(test_idx)} trials)")
+        _print_primary(f"  Train/val sessions: {train_session_names}")
+        _print_primary(f"  Train: {len(train_idx)}, Val: {len(val_idx)} (70/30 trial-wise)")
     else:
         # Random stratified splits (original behavior)
         train_idx, val_idx, test_idx = load_or_create_stratified_splits(
@@ -1652,7 +1709,7 @@ def prepare_data(
         result["excluded_sessions"] = excluded_session_names
 
     # Include session info for per-session evaluation
-    if split_by_session:
+    if split_by_session or test_sessions:
         result["session_ids"] = session_ids  # Integer session ID per trial
         result["idx_to_session"] = idx_to_session  # Map from int ID to session name
 
