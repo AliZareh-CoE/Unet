@@ -85,7 +85,7 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
 class AblationConfig:
     """Configuration for ablation study."""
 
-    output_dir: Path = Path("artifacts/ablation")
+    output_dir: Path = Path("results/ablation")
     n_val_sessions: int = 3
     epochs: int = 100
     batch_size: int = 64

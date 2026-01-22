@@ -248,7 +248,7 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CondUNet ablation study")
-    parser.add_argument("--output-dir", type=str, default="artifacts/ablation")
+    parser.add_argument("--output-dir", type=str, default="results/ablation")
     parser.add_argument("--group", type=str, nargs="+", default=None)
     parser.add_argument("--n-val-sessions", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=100)
