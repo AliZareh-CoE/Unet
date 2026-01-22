@@ -123,8 +123,48 @@ Example output:
 ```
 Ablation                  R2 (mean ± std)      Delta
 ------------------------------------------------------------
-baseline                  0.6821 +/- 0.0038       --
-bidirectional_on          0.6850 +/- 0.0042   +0.0029
-dropout_01                0.6810 +/- 0.0035   -0.0011
-conv_type_standard        0.5924 +/- 0.0062   -0.0897
+baseline                  0.6679 +/- 0.0038       --
+depth_deep                0.6821 +/- 0.0042   +0.0142
+dropout_01                0.6670 +/- 0.0035   -0.0009
+conv_type_standard        0.5924 +/- 0.0062   -0.0755
+```
+
+## Automated Recommendations
+
+The system automatically analyzes results and provides recommendations based on:
+
+### Decision Logic
+
+| Condition | Action | Rationale |
+|-----------|--------|-----------|
+| Significantly better (p < 0.05, delta > 0) | **UPGRADE** | Switch to this config |
+| Significantly worse (p < 0.05, delta < 0) | **ELIMINATE** | Remove from consideration |
+| Equivalent performance + cheaper | **PREFER** | Same quality, lower cost |
+| Equivalent performance + more expensive | **KEEP BASELINE** | No benefit to switch |
+
+### Output Files
+
+The recommendations are saved to:
+- `recommendations.json` - Full decision analysis with reasoning
+- `ablation_summary.json` - Includes recommendations in the summary
+
+### Example Recommendation Output
+```
+================================================================================
+RECOMMENDATIONS
+================================================================================
+
+[UPGRADE] Significantly BETTER than baseline:
+  * depth_deep: +0.0142 R² (p=0.0231)
+
+[ELIMINATE] Significantly WORSE than baseline:
+  * conv_type_standard: -0.0755 R² (p=0.0012)
+
+[PREFER] Equivalent performance but CHEAPER:
+  * width_narrow: -0.0008 R², 50% fewer params
+
+------------------------------------------------------------
+FINAL RECOMMENDATION: depth_deep
+  Reason: UPGRADE: depth_deep is significantly better (+0.0142 R², p=0.0231)
+------------------------------------------------------------
 ```

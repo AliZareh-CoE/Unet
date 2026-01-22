@@ -1083,6 +1083,160 @@ def compute_statistical_comparisons(
     return comparisons
 
 
+def compute_recommendations(
+    results: Dict[str, AblationResult],
+    comparisons: Dict[str, Dict[str, Any]],
+    baseline_name: str = "baseline",
+    significance_threshold: float = 0.05,
+    equivalence_margin: float = 0.01,  # R² difference considered "equivalent"
+) -> Dict[str, Any]:
+    """Compute recommendations based on performance and computational cost.
+
+    Decision logic:
+    1. If ablation is SIGNIFICANTLY BETTER (p < threshold, positive delta): UPGRADE
+    2. If ablation is SIGNIFICANTLY WORSE (p < threshold, negative delta): ELIMINATE
+    3. If ablation is EQUIVALENT (not significant, |delta| < margin) AND cheaper: PREFER
+    4. If ablation is EQUIVALENT but more expensive: KEEP BASELINE
+
+    Args:
+        results: Dict of ablation results
+        comparisons: Statistical comparisons from compute_statistical_comparisons
+        baseline_name: Name of baseline configuration
+        significance_threshold: p-value threshold for significance
+        equivalence_margin: R² difference below which configs are considered equivalent
+
+    Returns:
+        Dict with recommendations and reasoning
+    """
+    if baseline_name not in results:
+        return {"error": "Baseline not found"}
+
+    baseline = results[baseline_name]
+    baseline_params = baseline.n_parameters
+    baseline_time = baseline.mean_time
+
+    recommendations = {
+        "baseline": baseline_name,
+        "baseline_r2": baseline.mean_r2,
+        "baseline_params": baseline_params,
+        "baseline_time_minutes": baseline_time / 60,
+        "decisions": {},
+        "upgrade_candidates": [],  # Significantly better
+        "eliminate_candidates": [],  # Significantly worse
+        "prefer_candidates": [],  # Equivalent but cheaper
+        "keep_baseline_for": [],  # Equivalent but more expensive
+        "recommended_config": baseline_name,
+        "recommended_reason": "Default baseline",
+    }
+
+    for name, result in results.items():
+        if name == baseline_name:
+            continue
+
+        if name not in comparisons:
+            continue
+
+        comp = comparisons[name]
+        delta = comp["mean_diff"]
+        p_value = comp["recommended_pvalue"]
+        is_significant = p_value < significance_threshold
+
+        # Computational cost comparison
+        params = result.n_parameters
+        time_minutes = result.mean_time / 60
+        params_ratio = params / baseline_params if baseline_params > 0 else 1.0
+        time_ratio = result.mean_time / baseline_time if baseline_time > 0 else 1.0
+
+        is_cheaper = params_ratio < 0.9 or time_ratio < 0.9  # At least 10% cheaper
+        is_more_expensive = params_ratio > 1.1 or time_ratio > 1.1
+
+        decision = {
+            "delta_r2": delta,
+            "p_value": p_value,
+            "is_significant": is_significant,
+            "n_parameters": params,
+            "params_ratio": params_ratio,
+            "time_minutes": time_minutes,
+            "time_ratio": time_ratio,
+            "is_cheaper": is_cheaper,
+            "is_more_expensive": is_more_expensive,
+        }
+
+        # Decision logic
+        if is_significant and delta > 0:
+            # SIGNIFICANTLY BETTER - UPGRADE!
+            decision["action"] = "UPGRADE"
+            decision["reason"] = f"Significantly better (+{delta:.4f} R², p={p_value:.4f})"
+            recommendations["upgrade_candidates"].append({
+                "name": name,
+                "delta": delta,
+                "p_value": p_value,
+                "params": params,
+            })
+
+        elif is_significant and delta < 0:
+            # SIGNIFICANTLY WORSE - ELIMINATE
+            decision["action"] = "ELIMINATE"
+            decision["reason"] = f"Significantly worse ({delta:.4f} R², p={p_value:.4f})"
+            recommendations["eliminate_candidates"].append({
+                "name": name,
+                "delta": delta,
+                "p_value": p_value,
+            })
+
+        elif not is_significant and abs(delta) < equivalence_margin:
+            # EQUIVALENT performance
+            if is_cheaper:
+                decision["action"] = "PREFER"
+                decision["reason"] = f"Equivalent performance ({delta:+.4f} R²) but {(1-params_ratio)*100:.0f}% fewer params"
+                recommendations["prefer_candidates"].append({
+                    "name": name,
+                    "delta": delta,
+                    "params_ratio": params_ratio,
+                    "params": params,
+                })
+            else:
+                decision["action"] = "KEEP_BASELINE"
+                decision["reason"] = f"Equivalent performance ({delta:+.4f} R²) but not cheaper"
+                recommendations["keep_baseline_for"].append(name)
+
+        else:
+            # Not significant but notable difference - needs more data
+            decision["action"] = "INCONCLUSIVE"
+            decision["reason"] = f"Not significant (p={p_value:.4f}) but delta={delta:+.4f}"
+
+        recommendations["decisions"][name] = decision
+
+    # Determine final recommendation
+    # Priority: 1) Best significant upgrade, 2) Cheapest equivalent, 3) Baseline
+    if recommendations["upgrade_candidates"]:
+        # Pick the best significant upgrade
+        best_upgrade = max(recommendations["upgrade_candidates"], key=lambda x: x["delta"])
+        recommendations["recommended_config"] = best_upgrade["name"]
+        recommendations["recommended_reason"] = (
+            f"UPGRADE: {best_upgrade['name']} is significantly better "
+            f"(+{best_upgrade['delta']:.4f} R², p={best_upgrade['p_value']:.4f})"
+        )
+    elif recommendations["prefer_candidates"]:
+        # Pick the cheapest equivalent
+        cheapest = min(recommendations["prefer_candidates"], key=lambda x: x["params"])
+        recommendations["recommended_config"] = cheapest["name"]
+        recommendations["recommended_reason"] = (
+            f"PREFER: {cheapest['name']} has equivalent performance "
+            f"({cheapest['delta']:+.4f} R²) with {(1-cheapest['params_ratio'])*100:.0f}% fewer parameters"
+        )
+
+    # Summary statistics
+    recommendations["summary"] = {
+        "n_upgrades": len(recommendations["upgrade_candidates"]),
+        "n_eliminations": len(recommendations["eliminate_candidates"]),
+        "n_equivalent_cheaper": len(recommendations["prefer_candidates"]),
+        "n_equivalent_expensive": len(recommendations["keep_baseline_for"]),
+    }
+
+    return recommendations
+
+
 def print_summary(results: Dict[str, AblationResult], total_time: float) -> None:
     """Print comprehensive summary of ablation study results with statistics."""
     print("\n" + "=" * 80)
@@ -1177,6 +1331,39 @@ def print_summary(results: Dict[str, AblationResult], total_time: float) -> None
 
     # Print timing
     print(f"\nTotal time: {total_time/3600:.1f} hours ({total_time/60:.0f} minutes)")
+
+    # Compute and print recommendations
+    recommendations = compute_recommendations(results, comparisons, "baseline")
+
+    print("\n" + "=" * 80)
+    print("RECOMMENDATIONS")
+    print("=" * 80)
+
+    # Print upgrade candidates (significantly better)
+    if recommendations["upgrade_candidates"]:
+        print("\n[UPGRADE] Significantly BETTER than baseline:")
+        for cand in sorted(recommendations["upgrade_candidates"], key=lambda x: -x["delta"]):
+            print(f"  * {cand['name']}: +{cand['delta']:.4f} R² (p={cand['p_value']:.4f})")
+
+    # Print eliminate candidates (significantly worse)
+    if recommendations["eliminate_candidates"]:
+        print("\n[ELIMINATE] Significantly WORSE than baseline:")
+        for cand in sorted(recommendations["eliminate_candidates"], key=lambda x: x["delta"]):
+            print(f"  * {cand['name']}: {cand['delta']:.4f} R² (p={cand['p_value']:.4f})")
+
+    # Print prefer candidates (equivalent but cheaper)
+    if recommendations["prefer_candidates"]:
+        print("\n[PREFER] Equivalent performance but CHEAPER:")
+        for cand in sorted(recommendations["prefer_candidates"], key=lambda x: x["params"]):
+            savings = (1 - cand["params_ratio"]) * 100
+            print(f"  * {cand['name']}: {cand['delta']:+.4f} R², {savings:.0f}% fewer params")
+
+    # Print final recommendation
+    print("\n" + "-" * 60)
+    print(f"FINAL RECOMMENDATION: {recommendations['recommended_config']}")
+    print(f"  Reason: {recommendations['recommended_reason']}")
+    print("-" * 60)
+
     print("=" * 80)
 
 
@@ -1392,6 +1579,21 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
         print(f"Results table saved to: {csv_file}")
     except Exception as e:
         print(f"Warning: Could not save CSV table: {e}")
+
+    # =========================================================================
+    # 6. RECOMMENDATIONS FILE (recommendations.json)
+    # =========================================================================
+    recommendations = compute_recommendations(results, comparisons, "baseline")
+
+    recommendations_file = output_dir / "recommendations.json"
+    with open(recommendations_file, 'w') as f:
+        json.dump(recommendations, f, indent=2)
+    print(f"Recommendations saved to: {recommendations_file}")
+
+    # Also add recommendations to main summary
+    summary["recommendations"] = recommendations
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
 
 
 # =============================================================================
