@@ -2836,6 +2836,8 @@ def parse_args():
                         help="Warmup epochs for cosine_warmup scheduler (default: 5)")
     parser.add_argument("--lr-min-ratio", type=float, default=None,
                         help="Min LR as ratio of initial for cosine scheduler (default: 0.01)")
+    parser.add_argument("--no-early-stop", action="store_true",
+                        help="Disable early stopping (train for full epochs)")
     parser.add_argument("--base-channels", type=int, default=None, help="Base channels for model (default: from config)")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP for distributed training")
     parser.add_argument("--fsdp-strategy", type=str, default="full",
@@ -3099,6 +3101,8 @@ def main():
         config["lr_warmup_epochs"] = args.lr_warmup_epochs
     if args.lr_min_ratio is not None:
         config["lr_min_ratio"] = args.lr_min_ratio
+    if args.no_early_stop:
+        config["early_stop_patience"] = 99999
     if args.base_channels is not None:
         config["base_channels"] = args.base_channels
     if args.seed is not None:

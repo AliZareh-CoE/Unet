@@ -81,6 +81,7 @@ def run_training(
         "--no-test-set",
         "--output-results-file", str(results_file),
         "--no-plots",
+        "--no-early-stop",
     ])
 
     if config.get("use_adaptive_scaling"):
@@ -251,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="results/ablation")
     parser.add_argument("--group", type=str, nargs="+", default=None)
     parser.add_argument("--n-val-sessions", type=int, default=3)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])

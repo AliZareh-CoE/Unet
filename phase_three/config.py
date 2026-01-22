@@ -87,7 +87,7 @@ class AblationConfig:
 
     output_dir: Path = Path("results/ablation")
     n_val_sessions: int = 3
-    epochs: int = 100
+    epochs: int = 80
     batch_size: int = 64
     learning_rate: float = 1e-3
     seeds: List[int] = None  # Default: [42, 123, 456]
