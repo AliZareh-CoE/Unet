@@ -2,12 +2,12 @@
 Ablation Study Runner
 =====================
 
-Runs ablation with k-fold CV for robust component selection.
+Runs ablation with held-out test sessions and multiple seeds.
 
 Setup:
-- All sessions split into k folds
-- Each fold uses different sessions for validation
-- Proper cross-validation: every session is in validation exactly once
+- 3 sessions held out as TEST (never touched)
+- Remaining 6 sessions: 70% train, 30% val
+- 3 random seeds for variance estimation
 
 Usage:
     python -m phase_three.runner --fsdp
@@ -23,7 +23,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from .config import ABLATION_GROUPS, BASELINE_CONFIG, AblationConfig
@@ -38,7 +38,6 @@ def print_header(text: str, char: str = "=") -> None:
 def get_all_sessions(dataset: str = "olfactory") -> List[str]:
     """Get all available sessions for a dataset."""
     if dataset == "olfactory":
-        # Import from project
         sys.path.insert(0, str(Path(__file__).parent.parent))
         from data import load_session_ids, ODOR_CSV_PATH
         _, session_to_idx, _ = load_session_ids(ODOR_CSV_PATH)
@@ -47,42 +46,57 @@ def get_all_sessions(dataset: str = "olfactory") -> List[str]:
         raise ValueError(f"Unknown dataset: {dataset}")
 
 
-def create_cv_folds(sessions: List[str], n_folds: int, seed: int = 42) -> List[List[str]]:
-    """Split sessions into k folds for cross-validation.
+def create_splits(
+    sessions: List[str],
+    n_test: int = 3,
+    val_ratio: float = 0.3,
+    seed: int = 42,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Split sessions into train/val/test.
+
+    Args:
+        sessions: All available sessions
+        n_test: Number of sessions to hold out for test
+        val_ratio: Fraction of remaining sessions for validation
+        seed: Random seed for reproducibility
 
     Returns:
-        List of k lists, where each inner list contains the validation sessions for that fold.
+        (train_sessions, val_sessions, test_sessions)
     """
     rng = np.random.default_rng(seed)
     shuffled = sessions.copy()
     rng.shuffle(shuffled)
 
-    # Split into n_folds groups
-    folds = []
-    fold_size = len(shuffled) // n_folds
-    remainder = len(shuffled) % n_folds
+    # Hold out test sessions (always the same regardless of seed)
+    # Use a fixed seed for test selection to ensure consistency
+    test_rng = np.random.default_rng(0)
+    test_order = sessions.copy()
+    test_rng.shuffle(test_order)
+    test_sessions = test_order[:n_test]
 
-    start = 0
-    for i in range(n_folds):
-        # Distribute remainder across first few folds
-        size = fold_size + (1 if i < remainder else 0)
-        folds.append(shuffled[start:start + size])
-        start += size
+    # Remaining sessions for train/val
+    remaining = [s for s in shuffled if s not in test_sessions]
 
-    return folds
+    # Split remaining into train/val
+    n_val = max(1, int(len(remaining) * val_ratio))
+    val_sessions = remaining[:n_val]
+    train_sessions = remaining[n_val:]
+
+    return train_sessions, val_sessions, test_sessions
 
 
 def run_training(
     config: Dict[str, Any],
     name: str,
-    fold: int,
+    seed: int,
+    train_sessions: List[str],
     val_sessions: List[str],
     output_dir: Path,
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run a single training fold."""
+    """Run a single training run with specified seed."""
 
-    run_dir = output_dir / name / f"fold_{fold}"
+    run_dir = output_dir / name / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     results_file = run_dir / "results.json"
 
@@ -91,7 +105,7 @@ def run_training(
         with open(results_file) as f:
             existing = json.load(f)
         if existing.get("completed_successfully"):
-            print(f"    fold {fold}: R² = {existing.get('best_val_r2', 0):.4f} (cached)")
+            print(f"    seed {seed}: R² = {existing.get('best_val_r2', 0):.4f} (cached)")
             return existing
 
     # Build base command
@@ -105,7 +119,7 @@ def run_training(
         "--epochs", str(ablation_config.epochs),
         "--batch-size", str(ablation_config.batch_size),
         "--lr", str(ablation_config.learning_rate),
-        "--seed", str(42 + fold),  # Different seed per fold
+        "--seed", str(seed),
         "--arch", config.get("arch", "condunet"),
         "--base-channels", str(config.get("base_channels", 128)),
         "--n-downsample", str(config.get("n_downsample", 2)),
@@ -120,13 +134,12 @@ def run_training(
         "--lr-schedule", config.get("lr_schedule", "step"),
         "--weight-decay", str(config.get("weight_decay", 0.01)),
         "--split-by-session",
-        "--no-test-set",
+        "--no-test-set",  # We handle test separately
         "--output-results-file", str(results_file),
         "--no-plots",
         "--no-early-stop",
-        "--fold", str(fold),
-        "--force-recreate-splits",  # Force new splits with our val sessions
-        "--val-sessions", *val_sessions,  # Explicitly specify validation sessions
+        "--force-recreate-splits",
+        "--val-sessions", *val_sessions,
     ])
 
     if config.get("use_adaptive_scaling"):
@@ -139,13 +152,12 @@ def run_training(
         cmd.append("--fsdp")
 
     if ablation_config.verbose:
-        print(f"    Fold {fold} val sessions: {val_sessions}")
+        print(f"    Seed {seed}: train={train_sessions}, val={val_sessions}")
 
     # Set NCCL environment variables for stability with FSDP
-    # These must be set in the environment, not as command args
     env = os.environ.copy()
-    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"  # Disable watchdog completely
-    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
+    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
     env["NCCL_TIMEOUT"] = "1800"
     env["NCCL_DEBUG"] = "WARN"
 
@@ -158,49 +170,51 @@ def run_training(
             env=env,
         )
         if result.returncode != 0:
-            print(f"    fold {fold}: FAILED")
+            print(f"    seed {seed}: FAILED")
             if not ablation_config.verbose and result.stderr:
                 print(f"    stderr: {result.stderr[-500:]}")
-            return {"fold": fold, "error": "Training failed", "val_sessions": val_sessions}
+            return {"seed": seed, "error": "Training failed"}
     except Exception as e:
-        print(f"    fold {fold}: ERROR - {e}")
-        return {"fold": fold, "error": str(e), "val_sessions": val_sessions}
+        print(f"    seed {seed}: ERROR - {e}")
+        return {"seed": seed, "error": str(e)}
 
     # Load results
     if results_file.exists():
         with open(results_file) as f:
             train_results = json.load(f)
         r2 = train_results.get("best_val_r2", 0.0)
-        print(f"    fold {fold}: R² = {r2:.4f}")
+        print(f"    seed {seed}: R² = {r2:.4f}")
         return train_results
     else:
-        return {"fold": fold, "error": "No results file", "val_sessions": val_sessions}
+        return {"seed": seed, "error": "No results file"}
 
 
 def run_experiment(
     config: Dict[str, Any],
     name: str,
-    cv_folds: List[List[str]],
+    train_sessions: List[str],
+    val_sessions: List[str],
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run experiment with k-fold CV."""
+    """Run experiment with multiple seeds."""
 
     print(f"\n  {name}")
 
     r2_values = []
     mae_values = []
-    fold_results = []
+    seed_results = []
 
-    for fold_idx, val_sessions in enumerate(cv_folds):
+    for seed in ablation_config.seeds:
         result = run_training(
             config=config,
             name=name,
-            fold=fold_idx,
+            seed=seed,
+            train_sessions=train_sessions,
             val_sessions=val_sessions,
             output_dir=ablation_config.output_dir,
             ablation_config=ablation_config,
         )
-        fold_results.append(result)
+        seed_results.append(result)
 
         if "error" not in result:
             r2_values.append(result.get("best_val_r2", 0.0))
@@ -225,7 +239,7 @@ def run_experiment(
         "mean_mae": mean_mae,
         "std_mae": std_mae,
         "r2_values": r2_values,
-        "fold_results": fold_results,
+        "seed_results": seed_results,
     }
 
 
@@ -238,16 +252,22 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
     print_header("CondUNet Ablation Study")
     print(f"Output: {config.output_dir}")
-    print(f"Folds: {config.n_folds}-fold CV")
+    print(f"Seeds: {config.seeds}")
 
-    # Get all sessions and create CV folds
+    # Get all sessions and create splits
     all_sessions = get_all_sessions(config.dataset)
-    cv_folds = create_cv_folds(all_sessions, config.n_folds, seed=42)
+    train_sessions, val_sessions, test_sessions = create_splits(
+        all_sessions,
+        n_test=config.n_test_sessions,
+        val_ratio=config.val_ratio,
+        seed=42,  # Fixed seed for split consistency
+    )
 
     print(f"\nAll sessions ({len(all_sessions)}): {all_sessions}")
-    print(f"\nCV Folds:")
-    for i, fold_sessions in enumerate(cv_folds):
-        print(f"  Fold {i} (val): {fold_sessions}")
+    print(f"\nData Split:")
+    print(f"  Test (held out):  {test_sessions}")
+    print(f"  Train:            {train_sessions}")
+    print(f"  Val:              {val_sessions}")
 
     results = {}
 
@@ -256,7 +276,8 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
     baseline_result = run_experiment(
         config=BASELINE_CONFIG.copy(),
         name="baseline",
-        cv_folds=cv_folds,
+        train_sessions=train_sessions,
+        val_sessions=val_sessions,
         ablation_config=config,
     )
     results["baseline"] = baseline_result
@@ -277,16 +298,15 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
             # Support both single parameter and multi-parameter ablations
             if "parameters" in group:
-                # Multi-parameter: update all at once
                 ablation_cfg.update(group["parameters"])
             else:
-                # Single parameter: use the old format
                 ablation_cfg[group["parameter"]] = variant["value"]
 
             result = run_experiment(
                 config=ablation_cfg,
                 name=f"{group['name']}_{variant['name']}",
-                cv_folds=cv_folds,
+                train_sessions=train_sessions,
+                val_sessions=val_sessions,
                 ablation_config=config,
             )
             results[f"{group['name']}_{variant['name']}"] = result
@@ -310,11 +330,17 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
     summary = {
         "timestamp": datetime.now().isoformat(),
         "config": {
-            "n_folds": config.n_folds,
+            "n_test_sessions": config.n_test_sessions,
+            "val_ratio": config.val_ratio,
+            "seeds": config.seeds,
             "epochs": config.epochs,
         },
-        "all_sessions": all_sessions,
-        "cv_folds": cv_folds,
+        "splits": {
+            "all_sessions": all_sessions,
+            "test_sessions": test_sessions,
+            "train_sessions": train_sessions,
+            "val_sessions": val_sessions,
+        },
         "baseline_config": BASELINE_CONFIG,
         "results": results,
     }
@@ -330,7 +356,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CondUNet ablation study")
     parser.add_argument("--output-dir", type=str, default="results/ablation")
     parser.add_argument("--group", type=str, nargs="+", default=None)
-    parser.add_argument("--n-folds", type=int, default=5, help="k-fold CV (sessions split into k folds)")
+    parser.add_argument("--n-test-sessions", type=int, default=3, help="Sessions held out for test")
+    parser.add_argument("--val-ratio", type=float, default=0.3, help="Fraction of remaining for validation")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -347,14 +375,21 @@ def main():
     if args.dry_run:
         print_header("Ablation Study (DRY RUN)")
 
-        # Show sessions and folds
+        # Show sessions and splits
         all_sessions = get_all_sessions("olfactory")
-        cv_folds = create_cv_folds(all_sessions, args.n_folds, seed=42)
+        train_sessions, val_sessions, test_sessions = create_splits(
+            all_sessions,
+            n_test=args.n_test_sessions,
+            val_ratio=args.val_ratio,
+            seed=42,
+        )
 
         print(f"All sessions ({len(all_sessions)}): {all_sessions}")
-        print(f"\nCV Folds:")
-        for i, fold_sessions in enumerate(cv_folds):
-            print(f"  Fold {i} (val): {fold_sessions}")
+        print(f"\nData Split:")
+        print(f"  Test (held out):  {test_sessions}")
+        print(f"  Train:            {train_sessions}")
+        print(f"  Val:              {val_sessions}")
+        print(f"\nSeeds: {args.seeds}")
 
         groups = ABLATION_GROUPS
         if args.group:
@@ -370,12 +405,14 @@ def main():
         for i, exp in enumerate(experiments, 1):
             print(f"  {i}. {exp}")
 
-        print(f"\n{len(experiments)} experiments × {args.n_folds} folds = {len(experiments) * args.n_folds} total runs")
+        print(f"\n{len(experiments)} experiments × {len(args.seeds)} seeds = {len(experiments) * len(args.seeds)} total runs")
         return 0
 
     ablation_cfg = AblationConfig(
         output_dir=Path(args.output_dir),
-        n_folds=args.n_folds,
+        n_test_sessions=args.n_test_sessions,
+        val_ratio=args.val_ratio,
+        seeds=args.seeds,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,

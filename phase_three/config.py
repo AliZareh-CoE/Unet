@@ -2,16 +2,16 @@
 Ablation Study Configuration
 ============================
 
-Component selection with 5-fold CV.
+Component selection with held-out test sessions.
 
 Setup:
-- 5-fold CV on all sessions (no separate held-out set)
-- Each fold: 4/5 sessions train, 1/5 sessions val
-- Winner = highest mean R² across 5 folds
-- 6 variants × 5 folds = 30 runs total
+- 3 sessions held out as TEST (never touched)
+- Remaining 6 sessions: 70% train, 30% val
+- 3 random seeds for variance estimation
+- 6 variants × 3 seeds = 18 runs total
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -79,11 +79,17 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
 
 @dataclass
 class AblationConfig:
-    """Configuration for ablation with k-fold CV."""
+    """Configuration for ablation with held-out test sessions."""
 
     output_dir: Path = Path("results/ablation")
     dataset: str = "olfactory"
-    n_folds: int = 5  # 5-fold CV
+
+    # Data split
+    n_test_sessions: int = 3  # Held out, never touched
+    val_ratio: float = 0.3  # 30% of remaining for validation
+
+    # Seeds for variance estimation
+    seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
 
     # Training
     epochs: int = 80
