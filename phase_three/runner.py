@@ -94,7 +94,7 @@ def run_training(
             print(f"    fold {fold}: R² = {existing.get('best_val_r2', 0):.4f} (cached)")
             return existing
 
-    # Build command
+    # Build base command
     if ablation_config.use_fsdp:
         cmd = ["torchrun", f"--nproc_per_node={ablation_config.n_gpus}", "train.py"]
     else:
@@ -141,10 +141,13 @@ def run_training(
     if ablation_config.verbose:
         print(f"    Fold {fold} val sessions: {val_sessions}")
 
-    # Set NCCL environment variables for stability
+    # Set NCCL environment variables for stability with FSDP
+    # These must be set in the environment, not as command args
     env = os.environ.copy()
+    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"  # Disable watchdog completely
     env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
     env["NCCL_TIMEOUT"] = "1800"
+    env["NCCL_DEBUG"] = "WARN"
 
     try:
         result = subprocess.run(
@@ -271,7 +274,14 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
         for variant in variants:
             ablation_cfg = BASELINE_CONFIG.copy()
-            ablation_cfg[group["parameter"]] = variant["value"]
+
+            # Support both single parameter and multi-parameter ablations
+            if "parameters" in group:
+                # Multi-parameter: update all at once
+                ablation_cfg.update(group["parameters"])
+            else:
+                # Single parameter: use the old format
+                ablation_cfg[group["parameter"]] = variant["value"]
 
             result = run_experiment(
                 config=ablation_cfg,
