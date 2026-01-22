@@ -113,7 +113,6 @@ def run_training(
         "--activation", config.get("activation", "gelu"),
         "--skip-type", config.get("skip_type", "add"),
         "--n-heads", str(config.get("n_heads", 4)),
-        "--conditioning", config.get("conditioning", "spectro_temporal"),
         "--cond-mode", config.get("cond_mode", "cross_attn_gated"),
         "--optimizer", config.get("optimizer", "adamw"),
         "--lr-schedule", config.get("lr_schedule", "cosine_warmup"),
@@ -126,6 +125,12 @@ def run_training(
         "--no-early-stop",
         "--force-recreate-splits",
     ])
+
+    # Only pass --conditioning when cond_mode is not "none"
+    # (when cond_mode=none, conditioning is bypassed and encoder is unused)
+    cond_mode = config.get("cond_mode", "cross_attn_gated")
+    if cond_mode != "none":
+        cmd.extend(["--conditioning", config.get("conditioning", "spectro_temporal")])
 
     if config.get("use_adaptive_scaling"):
         cmd.append("--use-adaptive-scaling")
