@@ -9,7 +9,7 @@ Usage:
     python -m LOSO.runner
 
     # Specify dataset and output directory
-    python -m LOSO.runner --dataset olfactory --output-dir artifacts/loso_results
+    python -m LOSO.runner --dataset olfactory --output-dir results/loso
 
     # Resume from checkpoint
     python -m LOSO.runner --resume
@@ -266,6 +266,7 @@ def run_single_fold(
     cmd.append("--force-recreate-splits")
     cmd.extend(["--val-sessions", test_session])  # Held-out session becomes validation
     cmd.append("--no-test-set")  # No separate test set needed
+    cmd.append("--no-early-stop")  # Train full epochs, no tuning
 
     # Model architecture arguments
     if config.base_channels:
@@ -529,12 +530,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="artifacts/loso",
+        default="results/loso",
         help="Output directory for results",
     )
 
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=60, help="Training epochs per fold")
+    parser.add_argument("--epochs", type=int, default=80, help="Training epochs per fold (no early stopping)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

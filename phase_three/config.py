@@ -2,16 +2,15 @@
 Ablation Study Configuration
 ============================
 
-Proves each architectural component contributes to performance.
-Uses 3 random seeds for robust mean ± std results.
+Methodology: Pre-specified hyperparameters (no tuning during ablation).
+This is acceptable for CV without separate test set because:
+1. All hyperparameters are fixed before seeing validation results
+2. We only compare architectural components, not tune them
+3. Results used to select final model config for LOSO evaluation
+
+Validation: 3 held-out sessions × 3 random seeds = robust mean ± std
 
 Total: 6 experiments × 3 seeds = 18 runs
-  1. baseline (full model)
-  2. conv_type_standard (remove modern conv)
-  3. conditioning_none (remove conditioning)
-  4. adaptive_scaling_off (remove FiLM scaling)
-  5. depth_medium (3 levels)
-  6. depth_deep (4 levels)
 """
 
 from dataclasses import dataclass
@@ -19,10 +18,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # =============================================================================
-# Baseline Configuration (full model)
+# Baseline Configuration (full model - pre-specified, no tuning)
 # =============================================================================
 
 BASELINE_CONFIG: Dict[str, Any] = {
+    # Architecture (fixed)
     "arch": "condunet",
     "conv_type": "modern",
     "base_channels": 128,
@@ -31,23 +31,30 @@ BASELINE_CONFIG: Dict[str, Any] = {
     "n_heads": 4,
     "skip_type": "add",
     "activation": "relu",
+
+    # Conditioning (fixed)
     "cond_mode": "cross_attn_gated",
     "conditioning": "spectro_temporal",
+
+    # Session adaptation (fixed)
     "use_adaptive_scaling": True,
     "use_session_stats": False,
     "use_bidirectional": False,
+
+    # Training (fixed - no tuning)
     "optimizer": "adamw",
     "lr_schedule": "step",
     "learning_rate": 1e-3,
     "weight_decay": 0.01,
     "batch_size": 64,
-    "epochs": 100,
     "dropout": 0.0,
+
+    # Data
     "dataset": "olfactory",
 }
 
 # =============================================================================
-# Ablation Groups
+# Ablation Groups - test removing each component
 # =============================================================================
 
 ABLATION_GROUPS: List[Dict[str, Any]] = [
@@ -87,7 +94,7 @@ class AblationConfig:
 
     output_dir: Path = Path("results/ablation")
     n_val_sessions: int = 3
-    epochs: int = 80
+    epochs: int = 80  # Fixed, no early stopping
     batch_size: int = 64
     learning_rate: float = 1e-3
     seeds: List[int] = None  # Default: [42, 123, 456]
