@@ -314,6 +314,11 @@ def run_single_fold(
     if config.use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", config.fsdp_strategy])
 
+    # Set NCCL environment variables for stability with FSDP
+    env = os.environ.copy()
+    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
+    env["NCCL_TIMEOUT"] = "1800"
+
     # Run subprocess
     start_time = time.time()
     try:
@@ -326,6 +331,7 @@ def run_single_fold(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=env,
             )
             for line in process.stdout:
                 print(line, end='', flush=True)
@@ -339,6 +345,7 @@ def run_single_fold(
                 capture_output=True,
                 text=True,
                 check=True,
+                env=env,
             )
     except subprocess.CalledProcessError as e:
         print(f"ERROR: train.py failed for fold {fold_idx} (test={test_session})")

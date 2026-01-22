@@ -82,6 +82,7 @@ class AblationConfig:
     """Configuration for ablation with k-fold CV."""
 
     output_dir: Path = Path("results/ablation")
+    dataset: str = "olfactory"
     n_folds: int = 5  # 5-fold CV
 
     # Training
