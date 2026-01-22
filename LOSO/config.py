@@ -82,3 +82,26 @@ class LOSOConfig:
     def __post_init__(self):
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
+
+
+@dataclass
+class LOSOFoldResult:
+    """Result from a single LOSO fold."""
+    fold_idx: int
+    session: str
+    best_val_r2: float
+    best_val_mae: float
+    best_epoch: int
+    train_time: float = 0.0
+
+
+@dataclass
+class LOSOResult:
+    """Aggregated LOSO results."""
+    fold_results: List[LOSOFoldResult]
+    mean_r2: float
+    std_r2: float
+    mean_mae: float
+    std_mae: float
+    fold_r2s: List[float]
+    sessions: List[str]
