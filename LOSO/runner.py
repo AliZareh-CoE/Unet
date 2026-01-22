@@ -9,7 +9,7 @@ Usage:
     python -m LOSO.runner
 
     # Specify dataset and output directory
-    python -m LOSO.runner --dataset olfactory --output-dir artifacts/loso_results
+    python -m LOSO.runner --dataset olfactory --output-dir results/loso
 
     # Resume from checkpoint
     python -m LOSO.runner --resume
@@ -266,6 +266,7 @@ def run_single_fold(
     cmd.append("--force-recreate-splits")
     cmd.extend(["--val-sessions", test_session])  # Held-out session becomes validation
     cmd.append("--no-test-set")  # No separate test set needed
+    cmd.append("--no-early-stop")  # Train full epochs, no tuning
 
     # Model architecture arguments
     if config.base_channels:
@@ -278,8 +279,6 @@ def run_single_fold(
         cmd.extend(["--cond-mode", config.cond_mode])
     if config.conv_type:
         cmd.extend(["--conv-type", config.conv_type])
-    if config.norm_type:
-        cmd.extend(["--norm-type", config.norm_type])
     if config.activation:
         cmd.extend(["--activation", config.activation])
     if config.skip_type:
@@ -299,14 +298,7 @@ def run_single_fold(
         cmd.extend(["--weight-decay", str(config.weight_decay)])
     if config.dropout > 0:
         cmd.extend(["--dropout", str(config.dropout)])
-    if config.loss_type:
-        cmd.extend(["--loss", config.loss_type])
 
-    # Augmentation
-    if config.disable_aug:
-        cmd.append("--no-aug")
-    elif config.aug_strength:
-        cmd.extend(["--aug-strength", config.aug_strength])
     if not config.use_bidirectional:
         cmd.append("--no-bidirectional")
 
@@ -322,6 +314,13 @@ def run_single_fold(
     if config.use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", config.fsdp_strategy])
 
+    # Set NCCL environment variables for stability with FSDP
+    env = os.environ.copy()
+    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"  # Disable watchdog completely
+    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
+    env["NCCL_TIMEOUT"] = "1800"
+    env["NCCL_DEBUG"] = "WARN"
+
     # Run subprocess
     start_time = time.time()
     try:
@@ -334,6 +333,7 @@ def run_single_fold(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=env,
             )
             for line in process.stdout:
                 print(line, end='', flush=True)
@@ -347,6 +347,7 @@ def run_single_fold(
                 capture_output=True,
                 text=True,
                 check=True,
+                env=env,
             )
     except subprocess.CalledProcessError as e:
         print(f"ERROR: train.py failed for fold {fold_idx} (test={test_session})")
@@ -538,20 +539,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="artifacts/loso",
+        default="results/loso",
         help="Output directory for results",
     )
 
     # Training hyperparameters
-    parser.add_argument("--epochs", type=int, default=60, help="Training epochs per fold")
+    parser.add_argument("--epochs", type=int, default=80, help="Training epochs per fold (no early stopping)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     # Model architecture
     parser.add_argument("--arch", type=str, default="condunet", help="Model architecture")
-    parser.add_argument("--base-channels", type=int, default=64, help="Base channel count")
-    parser.add_argument("--n-downsample", type=int, default=4, help="Downsample layers")
+    parser.add_argument("--base-channels", type=int, default=128, help="Base channel count")
+    parser.add_argument("--n-downsample", type=int, default=2, help="Downsample layers")
     parser.add_argument(
         "--attention-type",
         type=str,
@@ -572,7 +573,6 @@ def parse_args() -> argparse.Namespace:
         choices=["standard", "modern"],
         help="Convolution type",
     )
-    parser.add_argument("--norm-type", type=str, default="batch", help="Normalization type")
     parser.add_argument("--activation", type=str, default="gelu", help="Activation function")
     parser.add_argument("--skip-type", type=str, default="add", choices=["add", "concat"], help="Skip connection type")
     parser.add_argument("--n-heads", type=int, default=4, help="Number of attention heads")
@@ -583,28 +583,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-schedule", type=str, default="cosine_warmup", help="LR schedule")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate")
-    parser.add_argument(
-        "--loss",
-        type=str,
-        default="l1_wavelet",
-        choices=["l1", "huber", "wavelet", "l1_wavelet", "huber_wavelet"],
-        help="Loss function",
-    )
 
     # Session adaptation
     parser.add_argument("--use-session-stats", action="store_true", help="Use session statistics")
     parser.add_argument("--session-use-spectral", action="store_true", help="Include spectral features")
     parser.add_argument("--use-adaptive-scaling", action="store_true", help="Use adaptive scaling")
 
-    # Augmentation
-    parser.add_argument(
-        "--aug-strength",
-        type=str,
-        default="medium",
-        choices=["none", "light", "medium", "heavy"],
-        help="Augmentation strength",
-    )
-    parser.add_argument("--no-aug", action="store_true", help="Disable all augmentation")
+    # Training options
     parser.add_argument("--no-bidirectional", action="store_true", help="Disable bidirectional training")
 
     # FSDP
@@ -640,7 +625,6 @@ def main():
         attention_type=args.attention_type,
         cond_mode=args.cond_mode,
         conv_type=args.conv_type,
-        norm_type=args.norm_type,
         activation=args.activation,
         skip_type=args.skip_type,
         n_heads=args.n_heads,
@@ -649,12 +633,9 @@ def main():
         lr_schedule=args.lr_schedule,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
-        loss_type=args.loss,
         use_session_stats=args.use_session_stats,
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,
-        aug_strength=args.aug_strength,
-        disable_aug=args.no_aug,
         use_bidirectional=not args.no_bidirectional,
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,

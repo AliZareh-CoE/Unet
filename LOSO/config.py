@@ -1,195 +1,139 @@
-"""Configuration for LOSO (Leave-One-Subject-Out) Cross-Validation.
+"""
+Nested Cross-Validation for LOSO
+================================
 
-Defines configuration dataclasses and default settings for LOSO evaluation.
+Gold standard methodology for limited subjects/sessions:
+
+OUTER LOOP: LOSO (Leave-One-Session-Out)
+  - Final unbiased evaluation
+  - Each session held out once as test set
+
+INNER LOOP: k-fold CV on remaining sessions
+  - Component/hyperparameter selection
+  - Runs ablation within each outer fold
+  - Winner used to train final model for that fold
+
+This avoids ANY data leakage because:
+1. Test session never seen during inner loop selection
+2. Different sessions may select different optimal configs (that's ok!)
+3. Final metric is mean ± std across outer folds
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 
 @dataclass
 class LOSOConfig:
-    """Configuration for LOSO cross-validation.
-
-    Attributes:
-        dataset: Dataset to use (olfactory, pfc_hpc, dandi_movie)
-        output_dir: Directory to save results and checkpoints
-        epochs: Number of training epochs per fold
-        batch_size: Training batch size
-        learning_rate: Learning rate for optimizer
-        seed: Random seed for reproducibility
-
-        # Model configuration
-        arch: Model architecture (default: condunet)
-        base_channels: Base channel count for model
-        n_downsample: Number of downsampling layers
-        attention_type: Type of attention (none, basic, cross_freq_v2)
-        cond_mode: Conditioning mode (none, cross_attn_gated, film, etc.)
-        conv_type: Convolution type (standard, modern)
-
-        # Training configuration
-        optimizer: Optimizer to use (adamw, adam, sgd)
-        lr_schedule: LR schedule (cosine, cosine_warmup, step, plateau, constant)
-        weight_decay: L2 regularization weight
-        dropout: Dropout rate
-        loss_type: Loss function (l1, huber, l1_wavelet, huber_wavelet)
-
-        # Session adaptation
-        use_session_stats: Use statistics-based FiLM conditioning
-        use_adaptive_scaling: Use adaptive output scaling
-
-        # FSDP settings
-        use_fsdp: Enable FSDP distributed training
-        fsdp_strategy: FSDP sharding strategy
-
-        # Execution settings
-        resume: Resume from checkpoint
-        verbose: Print detailed output
-        save_models: Save model checkpoints for each fold
-    """
+    """Configuration for nested LOSO cross-validation."""
 
     # Dataset
     dataset: str = "olfactory"
-    output_dir: Path = field(default_factory=lambda: Path("artifacts/loso"))
+    output_dir: Path = field(default_factory=lambda: Path("results/loso"))
 
-    # Training hyperparameters
-    epochs: int = 60
-    batch_size: int = 32
+    # Training (fixed across all experiments)
+    epochs: int = 80
+    batch_size: int = 64
     learning_rate: float = 1e-3
     seed: int = 42
 
-    # Model architecture
+    # Model defaults (may be overridden by inner CV winner)
     arch: str = "condunet"
-    base_channels: int = 64
-    n_downsample: int = 4
-    attention_type: str = "cross_freq_v2"
+    base_channels: int = 128
+    n_downsample: int = 2
+    attention_type: str = "none"
     cond_mode: str = "cross_attn_gated"
     conv_type: str = "modern"
-    norm_type: str = "batch"
-    activation: str = "gelu"
-    skip_type: str = "add"  # Skip connection type: add, concat
-    n_heads: int = 4  # Number of attention heads
-    conditioning: str = "spectro_temporal"  # Auto-conditioning: none, spectro_temporal, etc.
+    activation: str = "relu"
+    skip_type: str = "add"
+    n_heads: int = 4
+    conditioning: str = "spectro_temporal"
 
-    # Training configuration
+    # Optimizer (fixed)
     optimizer: str = "adamw"
-    lr_schedule: str = "cosine_warmup"
-    weight_decay: float = 0.0
+    lr_schedule: str = "step"
+    weight_decay: float = 0.01
     dropout: float = 0.0
-    loss_type: str = "l1_wavelet"
 
-    # Session adaptation (generalizes to new sessions)
+    # Session adaptation
     use_session_stats: bool = False
-    use_adaptive_scaling: bool = False
+    use_adaptive_scaling: bool = True
     session_use_spectral: bool = False
+    use_bidirectional: bool = False
 
-    # Data augmentation
-    aug_strength: str = "medium"  # none, light, medium, heavy
-    disable_aug: bool = False  # Disable all augmentation
-    use_bidirectional: bool = True
-
-    # FSDP distributed training
+    # FSDP
     use_fsdp: bool = False
-    fsdp_strategy: str = "grad_op"
+    fsdp_strategy: str = "full"
 
-    # Execution settings
+    # Nested CV settings
+    inner_cv_folds: int = 3  # k-fold CV for inner loop
+    run_inner_cv: bool = False  # Set True to run nested CV with ablation
+
+    # Execution
     resume: bool = True
     verbose: bool = True
     save_models: bool = True
-    generate_plots: bool = False  # Skip plots by default for speed
+    generate_plots: bool = False
+    folds_to_run: Optional[List[int]] = None
 
     def __post_init__(self):
-        """Convert output_dir to Path if string."""
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary."""
-        return {
-            "dataset": self.dataset,
-            "output_dir": str(self.output_dir),
-            "epochs": self.epochs,
-            "batch_size": self.batch_size,
-            "learning_rate": self.learning_rate,
-            "seed": self.seed,
-            "arch": self.arch,
-            "base_channels": self.base_channels,
-            "n_downsample": self.n_downsample,
-            "attention_type": self.attention_type,
-            "cond_mode": self.cond_mode,
-            "conv_type": self.conv_type,
-            "norm_type": self.norm_type,
-            "activation": self.activation,
-            "skip_type": self.skip_type,
-            "n_heads": self.n_heads,
-            "conditioning": self.conditioning,
-            "optimizer": self.optimizer,
-            "lr_schedule": self.lr_schedule,
-            "weight_decay": self.weight_decay,
-            "dropout": self.dropout,
-            "loss_type": self.loss_type,
-            "use_session_stats": self.use_session_stats,
-            "use_adaptive_scaling": self.use_adaptive_scaling,
-            "session_use_spectral": self.session_use_spectral,
-            "aug_strength": self.aug_strength,
-            "disable_aug": self.disable_aug,
-            "use_bidirectional": self.use_bidirectional,
-            "use_fsdp": self.use_fsdp,
-            "fsdp_strategy": self.fsdp_strategy,
-            "resume": self.resume,
-            "verbose": self.verbose,
-            "save_models": self.save_models,
-            "generate_plots": self.generate_plots,
-        }
+        """Convert config to dictionary for serialization."""
+        result = {}
+        for key, value in asdict(self).items():
+            if isinstance(value, Path):
+                result[key] = str(value)
+            else:
+                result[key] = value
+        return result
 
 
 @dataclass
 class LOSOFoldResult:
-    """Result from a single LOSO fold (one held-out session).
-
-    Attributes:
-        fold_idx: Fold index (0-indexed)
-        test_session: Name of the held-out session
-        train_sessions: List of sessions used for training
-
-        # Performance metrics
-        val_r2: Best validation R² score
-        val_loss: Best validation loss
-        train_loss: Final training loss
-
-        # Per-session metrics (if multiple val sessions)
-        per_session_r2: Dict mapping session name to R²
-        per_session_loss: Dict mapping session name to loss
-
-        # Training metadata
-        epochs_trained: Number of epochs trained
-        total_time: Training time in seconds
-        config: Configuration used for this fold
-    """
-
+    """Result from a single LOSO fold."""
     fold_idx: int
     test_session: str
     train_sessions: List[str]
-
-    # Performance metrics
     val_r2: float
     val_loss: float
     train_loss: float = 0.0
-
-    # Per-session metrics
     per_session_r2: Dict[str, float] = field(default_factory=dict)
     per_session_loss: Dict[str, float] = field(default_factory=dict)
-
-    # Training metadata
     epochs_trained: int = 0
     total_time: float = 0.0
     config: Dict[str, Any] = field(default_factory=dict)
 
+    # Legacy aliases
+    @property
+    def session(self) -> str:
+        return self.test_session
+
+    @property
+    def best_val_r2(self) -> float:
+        return self.val_r2
+
+    @property
+    def best_val_mae(self) -> float:
+        return self.val_loss
+
+    @property
+    def best_epoch(self) -> int:
+        return self.epochs_trained
+
+    @property
+    def train_time(self) -> float:
+        return self.total_time
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert result to dictionary."""
+        """Convert result to dictionary for serialization."""
         return {
             "fold_idx": self.fold_idx,
             "test_session": self.test_session,
@@ -207,90 +151,72 @@ class LOSOFoldResult:
 
 @dataclass
 class LOSOResult:
-    """Aggregated results from LOSO cross-validation.
-
-    Attributes:
-        config: LOSO configuration used
-        fold_results: List of results from each fold
-
-        # Aggregate statistics
-        mean_r2: Mean R² across folds
-        std_r2: Standard deviation of R² across folds
-        mean_loss: Mean loss across folds
-        std_loss: Standard deviation of loss across folds
-
-        # All sessions
-        all_sessions: List of all session names
-
-        # Metadata
-        total_time: Total time for all folds
-        n_folds: Number of folds completed
-    """
-
+    """Aggregated LOSO results."""
     config: LOSOConfig
-    fold_results: List[LOSOFoldResult] = field(default_factory=list)
+    fold_results: List[LOSOFoldResult]
+    all_sessions: List[str]
 
-    # Aggregate statistics (computed after all folds)
+    # Statistics (computed after all folds)
     mean_r2: float = 0.0
     std_r2: float = 0.0
     mean_loss: float = 0.0
     std_loss: float = 0.0
+    fold_r2s: List[float] = field(default_factory=list)
 
-    # Session information
-    all_sessions: List[str] = field(default_factory=list)
+    # Legacy aliases
+    @property
+    def mean_mae(self) -> float:
+        return self.mean_loss
 
-    # Metadata
-    total_time: float = 0.0
-    n_folds: int = 0
+    @property
+    def std_mae(self) -> float:
+        return self.std_loss
 
-    def compute_statistics(self):
+    @property
+    def sessions(self) -> List[str]:
+        return self.all_sessions
+
+    def compute_statistics(self) -> None:
         """Compute aggregate statistics from fold results."""
         if not self.fold_results:
             return
 
-        import numpy as np
+        r2_values = [r.val_r2 for r in self.fold_results]
+        loss_values = [r.val_loss for r in self.fold_results]
 
-        r2_scores = [f.val_r2 for f in self.fold_results]
-        losses = [f.val_loss for f in self.fold_results]
+        self.fold_r2s = r2_values
+        self.mean_r2 = float(np.mean(r2_values))
+        self.std_r2 = float(np.std(r2_values))
+        self.mean_loss = float(np.mean(loss_values))
+        self.std_loss = float(np.std(loss_values))
 
-        self.mean_r2 = float(np.mean(r2_scores))
-        self.std_r2 = float(np.std(r2_scores))
-        self.mean_loss = float(np.mean(losses))
-        self.std_loss = float(np.std(losses))
-        self.n_folds = len(self.fold_results)
-        self.total_time = sum(f.total_time for f in self.fold_results)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert result to dictionary."""
-        return {
-            "config": self.config.to_dict(),
-            "fold_results": [f.to_dict() for f in self.fold_results],
-            "mean_r2": self.mean_r2,
-            "std_r2": self.std_r2,
-            "mean_loss": self.mean_loss,
-            "std_loss": self.std_loss,
-            "all_sessions": self.all_sessions,
-            "total_time": self.total_time,
-            "n_folds": self.n_folds,
-        }
-
-    def print_summary(self):
+    def print_summary(self) -> None:
         """Print summary of LOSO results."""
         print("\n" + "=" * 70)
         print("LOSO CROSS-VALIDATION RESULTS")
         print("=" * 70)
-        print(f"Dataset: {self.config.dataset}")
-        print(f"Number of folds: {self.n_folds}")
-        print(f"Total sessions: {len(self.all_sessions)}")
-        print(f"Total time: {self.total_time / 3600:.2f} hours")
-        print()
-        print(f"Mean R²: {self.mean_r2:.4f} ± {self.std_r2:.4f}")
-        print(f"Mean Loss: {self.mean_loss:.4f} ± {self.std_loss:.4f}")
-        print()
 
-        print("Per-fold results:")
+        print(f"\n{'Fold':<6} {'Test Session':<20} {'R²':>10} {'Loss':>10}")
         print("-" * 50)
-        for result in self.fold_results:
-            print(f"  Fold {result.fold_idx}: Test={result.test_session:15s} "
-                  f"R²={result.val_r2:.4f}  Loss={result.val_loss:.4f}")
-        print("=" * 70)
+
+        for r in self.fold_results:
+            print(f"{r.fold_idx:<6} {r.test_session:<20} {r.val_r2:>10.4f} {r.val_loss:>10.4f}")
+
+        print("-" * 50)
+        print(f"{'Mean':<6} {'':<20} {self.mean_r2:>10.4f} {self.mean_loss:>10.4f}")
+        print(f"{'Std':<6} {'':<20} {self.std_r2:>10.4f} {self.std_loss:>10.4f}")
+        print()
+        print(f"Final: R² = {self.mean_r2:.4f} ± {self.std_r2:.4f}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert result to dictionary for serialization."""
+        return {
+            "config": self.config.to_dict(),
+            "fold_results": [r.to_dict() for r in self.fold_results],
+            "all_sessions": self.all_sessions,
+            "mean_r2": self.mean_r2,
+            "std_r2": self.std_r2,
+            "mean_loss": self.mean_loss,
+            "std_loss": self.std_loss,
+            "fold_r2s": self.fold_r2s,
+        }

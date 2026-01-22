@@ -626,19 +626,8 @@ def load_or_create_session_splits(
     train_idx = all_indices[np.isin(session_ids, list(train_session_ids))]
     test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
 
-    # For validation, either combined or per-session
-    if separate_val_sessions:
-        # Create per-session validation indices (dict: session_name -> indices)
-        val_idx_per_session = {}
-        for sess_id in val_session_ids:
-            sess_name = idx_to_session[sess_id] if idx_to_session is not None else str(sess_id)
-            sess_indices = all_indices[session_ids == sess_id]
-            val_idx_per_session[sess_name] = sess_indices
-        # Also create combined val_idx for backward compatibility
-        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
-    else:
-        val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
-        val_idx_per_session = None
+    # Create combined val_idx first (will be shuffled later)
+    val_idx = all_indices[np.isin(session_ids, list(val_session_ids))]
 
     # CRITICAL VALIDATION: Ensure no overlap between splits
     train_set = set(train_idx.tolist())
@@ -668,6 +657,23 @@ def load_or_create_session_splits(
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
     rng.shuffle(test_idx)
+
+    # CRITICAL FIX: Create per-session validation indices AFTER shuffling val_idx
+    # This ensures that per-session indices have the same ordering as val_idx,
+    # so DistributedSampler gives each rank the same samples for both the
+    # combined val loader and per-session loaders. Without this, the R² metrics
+    # would differ because rank 0 would see different samples from each loader.
+    if separate_val_sessions:
+        val_idx_per_session = {}
+        for sess_id in val_session_ids:
+            sess_name = idx_to_session[sess_id] if idx_to_session is not None else str(sess_id)
+            # Extract indices from SHUFFLED val_idx that belong to this session
+            # This preserves the random order established by the shuffle
+            sess_mask = session_ids[val_idx] == sess_id
+            sess_indices = val_idx[sess_mask]
+            val_idx_per_session[sess_name] = sess_indices
+    else:
+        val_idx_per_session = None
 
     # Convert integer indices back to original session names for display
     def ids_to_names(ids):
@@ -1519,6 +1525,7 @@ def prepare_data(
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
     no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
     separate_val_sessions: bool = False,  # If True, return per-session val indices
+    exclude_sessions: Optional[List[str]] = None,  # Sessions to exclude entirely
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1535,6 +1542,7 @@ def prepare_data(
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
         no_test_set: If True, no test set - all held-out sessions are for validation only
         separate_val_sessions: If True, return per-session validation indices
+        exclude_sessions: Sessions to exclude entirely from all data (for held-out test)
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays
@@ -1544,6 +1552,7 @@ def prepare_data(
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
     - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
+    - excluded_sessions: (only if exclude_sessions) list of excluded session names
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -1551,6 +1560,35 @@ def prepare_data(
 
     # Load odor labels
     odors, vocab = load_odor_labels(odor_csv_path, num_trials)
+
+    # Filter out excluded sessions if specified
+    excluded_session_names = []
+    session_ids = None  # Only load if needed
+    session_to_idx = None
+    idx_to_session = None
+
+    if exclude_sessions:
+        # Load session IDs for filtering
+        session_ids, session_to_idx, idx_to_session = load_session_ids(
+            odor_csv_path, session_column, num_trials
+        )
+        # Get indices of trials to keep (not in excluded sessions)
+        excluded_session_ids = set()
+        for sess_name in exclude_sessions:
+            if sess_name in session_to_idx:
+                excluded_session_ids.add(session_to_idx[sess_name])
+                excluded_session_names.append(sess_name)
+            else:
+                _print_primary(f"Warning: Session '{sess_name}' not found, skipping")
+
+        if excluded_session_ids:
+            keep_mask = ~np.isin(session_ids, list(excluded_session_ids))
+            signals = signals[keep_mask]
+            odors = odors[keep_mask]
+            session_ids = session_ids[keep_mask]
+            num_trials = signals.shape[0]
+            _print_primary(f"Excluded {len(excluded_session_names)} sessions: {excluded_session_names}")
+            _print_primary(f"Remaining trials: {num_trials}")
 
     # Extract window
     windowed = extract_window(signals)
@@ -1575,6 +1613,63 @@ def prepare_data(
             no_test_set=no_test_set,
             separate_val_sessions=separate_val_sessions,
         )
+    elif test_sessions:
+        # Hybrid mode: session-wise test holdout + trial-wise train/val
+        # Load session IDs to identify test trials
+        session_ids, session_to_idx, idx_to_session = load_session_ids(
+            odor_csv_path, session_column, num_trials
+        )
+
+        # Identify test session indices
+        test_session_ids = set()
+        test_session_names = []
+        for sess_name in test_sessions:
+            if sess_name in session_to_idx:
+                test_session_ids.add(session_to_idx[sess_name])
+                test_session_names.append(sess_name)
+            else:
+                _print_primary(f"Warning: Test session '{sess_name}' not found, skipping")
+
+        # Split trials into test vs non-test
+        test_mask = np.isin(session_ids, list(test_session_ids))
+        test_idx = np.where(test_mask)[0]
+        non_test_idx = np.where(~test_mask)[0]
+
+        # Do trial-wise stratified split on non-test trials (70/30 train/val)
+        non_test_odors = odors[non_test_idx]
+        rng = np.random.default_rng(seed)
+
+        # Stratified split by odor
+        train_idx_local = []
+        val_idx_local = []
+        for odor_id in np.unique(non_test_odors):
+            odor_mask = non_test_odors == odor_id
+            odor_indices = non_test_idx[odor_mask]
+            rng.shuffle(odor_indices)
+            n_train = int(len(odor_indices) * 0.7)
+            train_idx_local.extend(odor_indices[:n_train])
+            val_idx_local.extend(odor_indices[n_train:])
+
+        train_idx = np.array(sorted(train_idx_local))
+        val_idx = np.array(sorted(val_idx_local))
+
+        # Identify which sessions are in train/val for per-session reporting
+        train_session_ids = set(session_ids[train_idx])
+        train_session_names = [idx_to_session[sid] for sid in sorted(train_session_ids)]
+
+        split_info = {
+            "mode": "hybrid_test_sessions",
+            "test_sessions": test_session_names,
+            "train_val_sessions": train_session_names,
+            "n_test_trials": len(test_idx),
+            "n_train_trials": len(train_idx),
+            "n_val_trials": len(val_idx),
+            "seed": seed,
+        }
+
+        _print_primary(f"Hybrid split: {len(test_session_names)} test sessions ({len(test_idx)} trials)")
+        _print_primary(f"  Train/val sessions: {train_session_names}")
+        _print_primary(f"  Train: {len(train_idx)}, Val: {len(val_idx)} (70/30 trial-wise)")
     else:
         # Random stratified splits (original behavior)
         train_idx, val_idx, test_idx = load_or_create_stratified_splits(
@@ -1609,8 +1704,12 @@ def prepare_data(
         if "val_idx_per_session" in split_info:
             result["val_idx_per_session"] = split_info["val_idx_per_session"]
 
+    # Include excluded sessions info
+    if excluded_session_names:
+        result["excluded_sessions"] = excluded_session_names
+
     # Include session info for per-session evaluation
-    if split_by_session:
+    if split_by_session or test_sessions:
         result["session_ids"] = session_ids  # Integer session ID per trial
         result["idx_to_session"] = idx_to_session  # Map from int ID to session name
 
@@ -1904,6 +2003,21 @@ def create_dataloaders(
     # Add per-session validation loaders if available
     if "val_idx_per_session" in data and data["val_idx_per_session"] is not None:
         val_session_loaders = {}
+
+        # DEBUG: Check if val_idx matches per-session indices (for single session case)
+        val_idx = data["val_idx"]
+        if len(data["val_idx_per_session"]) == 1:
+            sess_name_debug, sess_indices_debug = list(data["val_idx_per_session"].items())[0]
+            indices_match = np.array_equal(val_idx, sess_indices_debug)
+            _print_primary(f"\n[DEBUG R² Gap] Index comparison:")
+            _print_primary(f"  val_idx shape: {val_idx.shape}, per_session shape: {sess_indices_debug.shape}")
+            _print_primary(f"  Indices are IDENTICAL: {indices_match}")
+            if not indices_match:
+                _print_primary(f"  val_idx[:10]: {val_idx[:10]}")
+                _print_primary(f"  per_session[:10]: {sess_indices_debug[:10]}")
+                overlap = len(set(val_idx.tolist()) & set(sess_indices_debug.tolist()))
+                _print_primary(f"  Overlap: {overlap}/{len(val_idx)} ({100*overlap/len(val_idx):.1f}%)")
+
         for sess_name, sess_indices in data["val_idx_per_session"].items():
             val_session_loaders[sess_name] = create_single_session_dataloader(
                 data, sess_name, sess_indices,
@@ -1941,8 +2055,10 @@ def create_single_session_dataloader(
         DataLoader for the specified session's data
     """
     # Create dataset for this session's indices
+    # Pass session_ids for consistency with main val loader (fixes R² gap issue)
     dataset = PairedConditionalDataset(
         data["ob"], data["pcx"], data["odors"], indices,
+        session_ids=data.get("session_ids"),
     )
 
     # Create sampler for distributed training

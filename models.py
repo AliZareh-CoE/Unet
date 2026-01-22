@@ -526,7 +526,7 @@ class ConvBlock(nn.Module):
         emb_dim: int,
         downsample: bool = False,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
     ):
         super().__init__()
@@ -583,7 +583,7 @@ class UpBlock(nn.Module):
         out_c: int,
         emb_dim: int,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         skip_type: str = "concat",  # "concat" or "add"
     ):
@@ -787,7 +787,7 @@ class ModernConvBlock(nn.Module):
         emb_dim: int,
         downsample: bool = False,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         use_se: bool = True,
         kernel_size: int = 7,
@@ -869,7 +869,7 @@ class ModernUpBlock(nn.Module):
         out_c: int,
         emb_dim: int,
         dropout: float = 0.0,
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
         use_se: bool = True,
         kernel_size: int = 7,
@@ -987,28 +987,10 @@ def make_uniform_bands(band_width_hz: float, min_freq_hz: float = 1.0, max_freq_
 # =============================================================================
 
 class EnvelopeHistogramMatching(nn.Module):
-    """Closed-form envelope scaling correction (mean/std matching).
+    """Closed-form envelope scaling correction using mean/std matching.
 
-    NOTE: Full histogram matching DESTROYS temporal structure because it's a
-    global statistical operation - it matches amplitude distributions without
-    considering WHEN amplitudes occur. This breaks the signal!
-
-    Instead, we use simple MEAN/STD SCALING which:
-    1. Preserves temporal structure (peaks stay at same times)
-    2. Adjusts overall amplitude scale to match target statistics
-
-    The correction is:
-        corrected = (pred_envelope - pred_mean) * (target_std / pred_std) + target_mean
-
-    This is a linear transformation that preserves the SHAPE of the envelope
-    while matching its mean and variability to the target.
-
-    Usage:
-        matcher = EnvelopeHistogramMatching()
-        # Compute target statistics from training data
-        matcher.fit(target_signals, odor_ids)
-        # Apply correction during inference
-        corrected = matcher(pred, odor_ids)
+    Applies linear scaling to match target amplitude statistics while preserving
+    temporal structure. Call fit() with target data, then use forward() during inference.
     """
 
     def __init__(
@@ -1889,26 +1871,8 @@ def hilbert_torch(x: torch.Tensor) -> torch.Tensor:
 class SessionStatisticsEncoder(nn.Module):
     """Encode session statistics into a conditioning vector for FiLM modulation.
 
-    Instead of learning arbitrary embeddings per session ID, this computes
-    statistics from the input signal and learns to encode them. This approach:
-
-    1. Generalizes automatically to new/unseen sessions
-    2. Learns meaningful relationships between statistics and predictions
-    3. Implements FiLM (Feature-wise Linear Modulation) conditioning
-
-    NOTE: This does NOT use instance normalization! It computes statistics
-    for conditioning (predicting gamma/beta), not for normalizing the signal.
-
-    Based on:
-    - Domain-specific batch normalization for EEG transfer learning
-    - FiLM (Feature-wise Linear Modulation) conditioning
-
-    The encoder computes per-channel statistics (mean, std) from the raw input
-    BEFORE normalization, capturing session-specific characteristics like:
-    - Electrode impedance differences
-    - Baseline activity levels
-    - Signal amplitude variations
-    - Recording condition effects
+    Computes per-channel statistics from raw input and encodes them into an embedding.
+    Generalizes to unseen sessions by learning from signal characteristics.
     """
 
     def __init__(
@@ -2034,16 +1998,8 @@ class SessionStatisticsEncoder(nn.Module):
 class SessionAdaptiveScaling(nn.Module):
     """Session-aware output scaling using FiLM-style conditioning.
 
-    Instead of fixed learnable scale/bias per channel, predicts them from
-    session statistics. This is pure FiLM (Feature-wise Linear Modulation):
+    Predicts scale (gamma) and bias (beta) from session statistics:
         output = input * gamma + beta
-
-    NOTE: This does NOT use instance normalization! It only applies
-    learned scale/bias without any normalization step.
-
-    The key insight: different sessions may need different output scaling
-    to match the target distribution due to electrode impedance, baseline
-    activity, and recording condition differences.
     """
 
     def __init__(
@@ -2110,7 +2066,6 @@ class SessionAdaptiveScaling(nn.Module):
 
         # Apply adaptive scaling
         return x * gamma + beta
-
 
 
 class CovarianceExpansionAugmentation(nn.Module):
@@ -2193,28 +2148,8 @@ class CovarianceExpansionAugmentation(nn.Module):
 class CondUNet1D(nn.Module):
     """Conditional U-Net for neural signal translation with FiLM modulation.
 
-    This is the primary architecture for OB->PCx translation, supporting:
-    - Feature-wise Linear Modulation (FiLM) for odor conditioning
-    - Self-attention in the bottleneck for long-range dependencies
-    - Multi-scale skip connections for detail preservation
-    - OptimalSpectralBias for fixed per-odor PSD correction (applied externally)
-    - Modern convolutions (multi-scale dilated depthwise separable + SE attention)
-    - Configurable depth (n_downsample) to control frequency resolution
-
-    Frequency Resolution:
-    - n_downsample=4: 16x downsampling → bottleneck Nyquist = 31 Hz (loses gamma)
-    - n_downsample=3: 8x downsampling → bottleneck Nyquist = 62 Hz (low gamma)
-    - n_downsample=2: 4x downsampling → bottleneck Nyquist = 125 Hz (full gamma) ✓
-
-    Attention types:
-    - "basic": Original SelfAttention1D (default)
-    - "none": No attention
-    - "cross_freq": Cross-frequency coupling attention
-    - "cross_freq_v2": Optimized cross-frequency attention with Flash Attention
-
-    Convolution types:
-    - "standard": Original Conv1d(kernel_size=3) - backward compatible
-    - "modern": Multi-scale dilated depthwise separable + SE attention
+    Supports FiLM conditioning, self-attention in bottleneck, multi-scale skip connections,
+    modern convolutions (multi-scale dilated + SE), and configurable depth.
     """
     def __init__(
         self,
@@ -2226,29 +2161,19 @@ class CondUNet1D(nn.Module):
         dropout: float = 0.0,
         use_attention: bool = True,
         attention_type: str = "basic",
-        norm_type: str = "instance",
+        norm_type: str = "batch",
         cond_mode: str = "cross_attn_gated",
-        # Depth control for frequency resolution
-        n_downsample: int = 2,  # 2 = 4x downsample (125 Hz Nyquist), 4 = 16x (31 Hz)
-        # Modern convolution options
-        conv_type: str = "standard",  # "standard" or "modern"
-        use_se: bool = True,  # SE attention in conv blocks (only for modern)
-        conv_kernel_size: int = 7,  # Kernel size for modern convs
-        dilations: Tuple[int, ...] = (1, 4, 16, 32),  # Multi-scale dilation rates
-        # Output scaling correction (helps match target distribution)
-        use_output_scaling: bool = True,  # Learnable per-channel scale and bias
-        use_adaptive_scaling: bool = False,  # Session-adaptive output scaling (FiLM-style, NO instance norm)
-        # Session conditioning - statistics-based (literature-recommended approach)
-        # Instead of learned embeddings per session ID, computes statistics from
-        # input signal and learns to encode them. Generalizes to unseen sessions.
-        use_session_stats: bool = False,  # Enable statistics-based session conditioning
-        session_emb_dim: int = 32,  # Session embedding dimension
-        session_use_spectral: bool = False,  # Include spectral features in session stats
-        # Learnable session embedding (lookup table approach)
-        # Unlike statistics-based, this learns a unique embedding per session ID.
-        # Requires session IDs at training time. Does NOT generalize to unseen sessions.
-        use_session_embedding: bool = False,  # Enable learnable session embedding lookup
-        n_sessions: int = 0,  # Number of sessions for learnable embedding (required if use_session_embedding=True)
+        n_downsample: int = 2,
+        conv_type: str = "standard",
+        use_se: bool = True,
+        conv_kernel_size: int = 7,
+        dilations: Tuple[int, ...] = (1, 4, 16, 32),
+        use_adaptive_scaling: bool = False,
+        use_session_stats: bool = False,
+        session_emb_dim: int = 32,
+        session_use_spectral: bool = False,
+        use_session_embedding: bool = False,
+        n_sessions: int = 0,
         # NEW: Ablation-configurable parameters
         activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
         n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
@@ -2408,23 +2333,14 @@ class CondUNet1D(nn.Module):
         nn.init.zeros_(self.outc.weight)
         nn.init.zeros_(self.outc.bias)
 
-        # Output scaling correction: learnable per-channel scale and bias
-        # Helps match target distribution, especially important for probabilistic losses
-        self.use_output_scaling = use_output_scaling
+        # Session-adaptive output scaling (FiLM-style)
+        # Predicts scale/bias from input statistics - adapts to each session
         self.use_adaptive_scaling = use_adaptive_scaling
-
         if use_adaptive_scaling:
-            # Session-adaptive output scaling (FiLM-style, NO instance normalization)
-            # Predicts scale/bias from input statistics - adapts to each session
             self.adaptive_scaler = SessionAdaptiveScaling(
                 n_channels=out_channels,
                 n_input_channels=in_channels,
             )
-        elif use_output_scaling:
-            # Fixed learnable scale/bias (original approach)
-            # Initialize scale to 1.0 and bias to 0.0 (identity at init)
-            self.output_scale = nn.Parameter(torch.ones(1, out_channels, 1))
-            self.output_bias = nn.Parameter(torch.zeros(1, out_channels, 1))
 
         # Store in_channels for adaptive scaling
         self.in_channels = in_channels
@@ -2714,14 +2630,9 @@ class CondUNet1D(nn.Module):
         else:
             out = self.residual_conv(ob) + delta
 
-        # Apply output scaling correction if enabled
-        # This helps match the target distribution, especially for probabilistic losses
+        # Apply session-adaptive output scaling if enabled
         if self.use_adaptive_scaling:
-            # Session-adaptive scaling: predicts scale/bias from input statistics
             out = self.adaptive_scaler(out, raw_input)
-        elif self.use_output_scaling:
-            # Fixed learnable scale/bias
-            out = out * self.output_scale + self.output_bias
 
         # Note: SpectralShift is now applied OUTSIDE the model in train.py
         if return_bottleneck or return_bottleneck_temporal:
@@ -3047,379 +2958,6 @@ class SessionMatcher:
 
     def __repr__(self) -> str:
         return f"SessionMatcher(n_sessions={len(self)}, n_channels={self.n_channels})"
-
-
-# =============================================================================
-# Loss Functions
-# =============================================================================
-
-class WaveletLoss(nn.Module):
-    """Continuous Wavelet Transform loss for multi-scale frequency alignment.
-
-    Optimized implementation using batched convolutions for GPU efficiency.
-    Uses explicit frequency bands for proper coverage of the full LFP range (1-100 Hz).
-
-    Args:
-        frequencies: List of center frequencies in Hz (default: NEURAL_FREQ_BANDS)
-                     Covers 1-100 Hz with neuroscience-meaningful spacing.
-        wavelet: Wavelet family to use (default: morlet)
-        level_weights: Optional per-frequency weights
-        use_complex_morlet: Whether to use complex Morlet wavelets
-        omega0: Morlet wavelet parameter (default: 5.0)
-                Lower values = better temporal resolution for fast transients
-                Higher values = better frequency resolution
-                5.0 is a good compromise for neural signals with fast oscillations.
-    """
-
-    def __init__(
-        self,
-        frequencies: Optional[List[float]] = None,
-        wavelet: str = WAVELET_FAMILY,
-        level_weights: Optional[List[float]] = None,
-        use_complex_morlet: bool = USE_COMPLEX_MORLET,
-        omega0: float = 5.0,  # Reduced from 6.0 for better temporal resolution
-    ):
-        super().__init__()
-        # Use explicit neural frequency bands by default
-        self.frequencies = frequencies if frequencies is not None else NEURAL_FREQ_BANDS.copy()
-        self.levels = len(self.frequencies)
-        self.wavelet = wavelet.lower()
-        self.use_complex_morlet = use_complex_morlet
-        self.omega0 = omega0
-        self.is_cwt = True
-
-        bank = self._design_morlet_bank(
-            self.frequencies,
-            omega0=self.omega0,
-            use_complex=self.use_complex_morlet,
-        )
-        lengths = [len(f) for f in bank]
-        max_len = max(lengths)
-
-        # Pad all filters to same length for batched processing
-        padded = []
-        for f in bank:
-            pad_len = max_len - len(f)
-            # Center-pad filters for proper alignment
-            pad_left = pad_len // 2
-            pad_right = pad_len - pad_left
-            padded.append(np.pad(f, (pad_left, pad_right), mode="constant"))
-
-        dtype = np.complex64 if self.use_complex_morlet else np.float32
-        stacked = np.stack(padded, axis=0).astype(dtype)
-        tensor_dtype = torch.complex64 if self.use_complex_morlet else torch.float32
-        self.register_buffer("morlet_bank", torch.tensor(stacked, dtype=tensor_dtype))
-        self.register_buffer("morlet_lengths", torch.tensor(lengths, dtype=torch.int64))
-        self.register_buffer("freq_list", torch.tensor(self.frequencies, dtype=torch.float32))
-        self.max_filter_len = max_len
-
-        if level_weights is None:
-            # Uniform weights - all frequency bands equally important
-            # The explicit frequency spacing already provides proper coverage
-            weights = [1.0] * len(bank)
-        else:
-            weights = level_weights
-        self.register_buffer("level_weights", torch.tensor(weights, dtype=torch.float32))
-
-        # Cache for batched filter kernel (built on first forward pass)
-        self._cached_filters = None
-        self._cached_num_channels = None
-
-    @staticmethod
-    def _design_morlet_bank(
-        frequencies: List[float],
-        omega0: float = 5.0,
-        use_complex: bool = True,
-        max_filter_len: int = 8000,
-    ) -> List[np.ndarray]:
-        """Design a bank of Morlet wavelets at explicit frequencies.
-
-        DSP-compliant implementation with proper sampling and normalization.
-
-        Args:
-            frequencies: List of center frequencies in Hz
-            omega0: Morlet wavelet parameter (time-frequency trade-off)
-                    Lower = better temporal resolution, higher = better frequency resolution
-            use_complex: Whether to use complex Morlet wavelets
-            max_filter_len: Maximum filter length to prevent memory issues
-        """
-        bank = []
-        dt = 1.0 / SAMPLING_RATE_HZ  # Proper sampling interval
-
-        for freq in frequencies:
-            # Morlet wavelet: sigma controls the Gaussian envelope width
-            # sigma = omega0 / (2 * pi * freq) ensures omega0 cycles fit in the envelope
-            sigma = omega0 / (2 * np.pi * freq)
-
-            # Compute filter length: 6 sigma covers 99.7% of Gaussian
-            n_samples = int(np.ceil(6 * sigma * SAMPLING_RATE_HZ))
-            # Ensure odd length for symmetric filter
-            if n_samples % 2 == 0:
-                n_samples += 1
-            # Cap filter length (important for low frequencies)
-            n_samples = min(n_samples, max_filter_len)
-            if n_samples % 2 == 0:
-                n_samples -= 1
-
-            # Proper time vector: exactly sampled at 1/fs intervals, centered at 0
-            half_len = n_samples // 2
-            t = np.arange(-half_len, half_len + 1) * dt
-
-            # Morlet wavelet: complex exponential * Gaussian envelope
-            gaussian_env = np.exp(-t**2 / (2 * sigma**2))
-
-            if use_complex:
-                # Analytic Morlet wavelet
-                wavelet = np.exp(2j * np.pi * freq * t) * gaussian_env
-                # Admissibility correction (remove DC component for proper wavelet)
-                dc_correction = np.exp(-omega0**2 / 2)
-                wavelet = wavelet - dc_correction * gaussian_env
-            else:
-                wavelet = np.cos(2 * np.pi * freq * t) * gaussian_env
-
-            # L2 normalization for consistent energy across frequencies
-            wavelet = wavelet / (np.sqrt(np.sum(np.abs(wavelet)**2) + 1e-12))
-
-            bank.append(wavelet.astype(np.complex64 if use_complex else np.float32))
-
-        return bank
-
-    def _build_batched_filters(self, num_channels: int, device: torch.device) -> torch.Tensor:
-        """Build batched filter kernel for efficient grouped convolution.
-
-        Returns filter tensor of shape [levels * channels, 1, filter_len]
-        for use with groups=levels*channels in conv1d.
-        """
-        # Shape: [levels, filter_len] -> [levels, 1, filter_len]
-        filters = self.morlet_bank.unsqueeze(1)
-
-        # Repeat for each channel: [levels * channels, 1, filter_len]
-        # Interleave so that channel dimension varies fastest
-        filters = filters.repeat(num_channels, 1, 1)
-
-        return filters.to(device)
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        return_details: bool = False,
-        return_coefficients: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, torch.Tensor]]:
-        """Compute wavelet loss with optional coefficient output for phase penalty.
-
-        Args:
-            pred: Predicted signal [B, C, T]
-            target: Target signal [B, C, T]
-            return_details: Return per-level loss breakdown
-            return_coefficients: Return wavelet coefficients for phase computation
-        """
-        loss, per_level, pred_coeffs, target_coeffs = self._cwt_loss_batched(pred, target)
-
-        if return_coefficients:
-            return loss, per_level, pred_coeffs, target_coeffs
-        if return_details:
-            return loss, per_level
-        return loss
-
-    def _cwt_loss_batched(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Compute CWT-based loss using batched convolutions for GPU efficiency."""
-        B, C, T = pred.shape
-        device = pred.device
-        original_dtype = pred.dtype
-
-        # Cache filters AND device to avoid repeated .to(device) calls
-        cache_valid = (
-            self._cached_filters is not None
-            and self._cached_num_channels == C
-            and self._cached_filters.device == device
-        )
-        if not cache_valid:
-            self._cached_filters = self._build_batched_filters(C, device)
-            self._cached_num_channels = C
-            # Also move level_weights to device once
-            self._cached_weights = self.level_weights.to(device)
-
-        filters = self._cached_filters
-        weights = self._cached_weights
-
-        # Determine padding (use max filter length, capped to input size)
-        pad = min(self.max_filter_len // 2, T - 1)
-
-        # Convert to float32 first if BFloat16 (complex64 doesn't support direct BF16 conversion)
-        if pred.dtype in (torch.bfloat16, torch.float16):
-            pred = pred.float()
-            target = target.float()
-
-        # Convert to complex if needed
-        pred_c = pred.to(torch.complex64) if self.use_complex_morlet else pred
-        target_c = target.to(torch.complex64) if self.use_complex_morlet else target
-
-        # Pad inputs using constant (zero) padding to avoid boundary artifacts
-        # Reflect padding creates derivative discontinuities -> spectral leakage
-        # Zero padding is standard for CWT and avoids introducing spurious frequencies
-        pred_padded = F.pad(pred_c, (pad, pad), mode="constant", value=0)
-        target_padded = F.pad(target_c, (pad, pad), mode="constant", value=0)
-
-        # Expand channels for batched conv: [B, C, T] -> [B, levels*C, T]
-        # Each channel gets convolved with all level filters
-        pred_expanded = pred_padded.repeat(1, self.levels, 1)
-        target_expanded = target_padded.repeat(1, self.levels, 1)
-
-        # Single batched convolution for all levels and channels
-        # filters shape: [levels * C, 1, filter_len]
-        # groups = levels * C means each input channel gets its own filter
-        pred_coeffs = F.conv1d(pred_expanded, filters, groups=self.levels * C)
-        target_coeffs = F.conv1d(target_expanded, filters, groups=self.levels * C)
-
-        # Reshape to [B, levels, C, T_out] for per-level loss computation
-        T_out = pred_coeffs.shape[-1]
-        pred_coeffs_reshaped = pred_coeffs.view(B, self.levels, C, T_out)
-        target_coeffs_reshaped = target_coeffs.view(B, self.levels, C, T_out)
-
-        # Compute per-level losses (vectorized)
-        diff = torch.abs(pred_coeffs_reshaped - target_coeffs_reshaped)
-        per_level_losses = diff.mean(dim=(0, 2, 3))  # Average over batch, channels, time
-
-        # Apply level weights
-        weighted_losses = weights[:self.levels] * per_level_losses
-        total_loss = weighted_losses.sum()
-
-        # Extract real part if complex
-        total_loss = total_loss.real if torch.is_complex(total_loss) else total_loss
-
-        # Convert back to original dtype for gradient compatibility
-        total_loss = total_loss.to(original_dtype)
-
-        # Build per-level list for backward compatibility
-        per_level = [
-            (w.real if torch.is_complex(w) else w).detach()
-            for w in weighted_losses
-        ]
-
-        return total_loss, per_level, pred_coeffs, target_coeffs
-
-    def compute_phase_correlation(self, pred_coeffs: torch.Tensor, target_coeffs: torch.Tensor) -> torch.Tensor:
-        """Compute phase correlation from pre-computed wavelet coefficients.
-
-        Args:
-            pred_coeffs: Prediction wavelet coefficients from forward pass
-            target_coeffs: Target wavelet coefficients from forward pass
-
-        Returns:
-            Phase correlation (higher is better, max 1.0)
-        """
-        if not self.use_complex_morlet:
-            # For real wavelets, use correlation instead
-            pred_flat = pred_coeffs.flatten()
-            target_flat = target_coeffs.flatten()
-            corr = F.cosine_similarity(pred_flat.unsqueeze(0), target_flat.unsqueeze(0))
-            return corr.squeeze()
-
-        # Extract phases
-        pred_phase = torch.angle(pred_coeffs)
-        target_phase = torch.angle(target_coeffs)
-
-        # Circular correlation: mean of cos(phase_diff)
-        phase_diff = pred_phase - target_phase
-        corr = torch.mean(torch.cos(phase_diff))
-
-        return corr.real if torch.is_complex(corr) else corr
-
-
-class MultiScaleWaveletLoss(nn.Module):
-    """Thin wrapper around WaveletLoss for backward compatibility.
-
-    With the new explicit frequency-based WaveletLoss design, multi-scale
-    is no longer needed - WaveletLoss already covers all neural frequency bands
-    (1-100 Hz) with neuroscience-meaningful spacing.
-
-    This class now simply delegates to a single WaveletLoss instance.
-    """
-
-    def __init__(
-        self,
-        max_level: int = None,  # Ignored - kept for backward compatibility
-        wavelet: str = WAVELET_FAMILY,
-        use_complex_morlet: bool = USE_COMPLEX_MORLET,
-        base_freq: float = None,  # Ignored - uses NEURAL_FREQ_BANDS
-        frequencies: Optional[List[float]] = None,
-        omega0: float = 5.0,
-    ):
-        super().__init__()
-        # Single WaveletLoss with full neural frequency coverage
-        self.wavelet_loss = WaveletLoss(
-            frequencies=frequencies,
-            wavelet=wavelet,
-            use_complex_morlet=use_complex_morlet,
-            omega0=omega0,
-        )
-
-    @property
-    def levels(self) -> int:
-        return self.wavelet_loss.levels
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        return_details: bool = False,
-        return_coefficients: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        return self.wavelet_loss(pred, target, return_details=return_details, return_coefficients=return_coefficients)
-
-
-class CombinedLoss(nn.Module):
-    """Combined loss with multiple components."""
-    def __init__(self, losses: Dict[str, nn.Module], weights: Dict[str, float]):
-        super().__init__()
-        self.losses = nn.ModuleDict(losses)
-        self.weights = weights
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute combined loss. Returns tensors to avoid GPU-CPU sync.
-
-        Call .item() on returned dict values only when needed for logging.
-        """
-        loss_dict = {}
-        total = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-
-        for name, loss_fn in self.losses.items():
-            loss_val = loss_fn(pred, target)
-            weight = self.weights.get(name, 1.0)
-            total = total + weight * loss_val
-            loss_dict[name] = loss_val  # Keep as tensor - no GPU sync!
-
-        loss_dict["total"] = total
-        return total, loss_dict
-
-
-def build_wavelet_loss(
-    frequencies: Optional[List[float]] = None,
-    wavelet: str = WAVELET_FAMILY,
-    use_complex_morlet: bool = USE_COMPLEX_MORLET,
-    omega0: float = 5.0,
-) -> nn.Module:
-    """Factory function for wavelet loss.
-
-    Creates a WaveletLoss with explicit frequency bands covering the full
-    LFP range (1-100 Hz) with neuroscience-meaningful spacing.
-
-    Args:
-        frequencies: List of center frequencies in Hz (default: NEURAL_FREQ_BANDS)
-        wavelet: Wavelet family to use
-        use_complex_morlet: Whether to use complex Morlet wavelets
-        omega0: Morlet wavelet parameter (5.0 = good temporal resolution)
-
-    Returns:
-        WaveletLoss module with full neural frequency coverage
-    """
-    return WaveletLoss(
-        frequencies=frequencies,
-        wavelet=wavelet,
-        use_complex_morlet=use_complex_morlet,
-        omega0=omega0,
-    )
 
 
 # =============================================================================
