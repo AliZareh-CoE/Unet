@@ -56,9 +56,17 @@ def run_single_variant(
 
     results_file = variant_dir / "results.json"
 
-    # Build command
-    cmd = [
-        "python", "train.py",
+    # Build command - use torchrun for FSDP
+    if ablation_config.use_fsdp:
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={ablation_config.n_gpus}",
+            "train.py",
+        ]
+    else:
+        cmd = ["python", "train.py"]
+
+    cmd.extend([
         "--dataset", config.get("dataset", "olfactory"),
         "--epochs", str(ablation_config.epochs),
         "--batch-size", str(ablation_config.batch_size),
@@ -84,7 +92,7 @@ def run_single_variant(
         # Output
         "--output-results-file", str(results_file),
         "--no-plots",
-    ]
+    ])
 
     # Conditional flags
     if config.get("cond_mode") == "none":
@@ -264,6 +272,8 @@ def parse_args() -> argparse.Namespace:
                         help="Random seed")
     parser.add_argument("--fsdp", action="store_true",
                         help="Use FSDP distributed training")
+    parser.add_argument("--n-gpus", type=int, default=8,
+                        help="Number of GPUs for FSDP (default: 8)")
     parser.add_argument("--quiet", action="store_true",
                         help="Less verbose output")
     parser.add_argument("--dry-run", action="store_true",
@@ -302,6 +312,7 @@ def main():
         learning_rate=args.lr,
         seed=args.seed,
         use_fsdp=args.fsdp,
+        n_gpus=args.n_gpus,
         verbose=not args.quiet,
         groups_to_run=args.group,
     )

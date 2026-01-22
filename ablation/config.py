@@ -125,6 +125,7 @@ class AblationConfig:
 
     # Execution
     use_fsdp: bool = False
+    n_gpus: int = 8
     verbose: bool = True
     groups_to_run: Optional[List[str]] = None
 
