@@ -2561,11 +2561,11 @@ def train(
                     distributed=False,  # Per-session eval on primary only
                 )
 
-                # Evaluate this session
+                # Evaluate this session (fast mode - skip expensive baseline)
                 session_metrics = evaluate(
                     model, session_loader, device,
                     compute_phase=False, reverse_model=None, config=config,
-                    fast_mode=False,  # Need full metrics for baseline
+                    fast_mode=True,  # Fast mode for per-session eval
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
                 )
