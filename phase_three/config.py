@@ -56,8 +56,8 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
     {
         "name": "conditioning",
         "description": "Remove spectro-temporal conditioning",
-        "parameters": {"cond_mode": "none", "conditioning": "none"},  # Disable both
-        "variant": {"name": "none", "desc": "No conditioning"},
+        "parameter": "cond_mode",  # Only disable cond_mode, keep default conditioning encoder
+        "variant": {"value": "none", "name": "none", "desc": "No conditioning"},
     },
     {
         "name": "adaptive_scaling",
