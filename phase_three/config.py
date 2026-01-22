@@ -2,15 +2,13 @@
 Ablation Study Configuration
 ============================
 
-Methodology: Pre-specified hyperparameters (no tuning during ablation).
-This is acceptable for CV without separate test set because:
-1. All hyperparameters are fixed before seeing validation results
-2. We only compare architectural components, not tune them
-3. Results used to select final model config for LOSO evaluation
+Component selection with 5-fold CV.
 
-Validation: 3 held-out sessions × 3 random seeds = robust mean ± std
-
-Total: 6 experiments × 3 seeds = 18 runs
+Setup:
+- 5-fold CV on all sessions (no separate held-out set)
+- Each fold: 4/5 sessions train, 1/5 sessions val
+- Winner = highest mean R² across 5 folds
+- 6 variants × 5 folds = 30 runs total
 """
 
 from dataclasses import dataclass
@@ -18,11 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # =============================================================================
-# Baseline Configuration (full model - pre-specified, no tuning)
+# Baseline Configuration (full model)
 # =============================================================================
 
 BASELINE_CONFIG: Dict[str, Any] = {
-    # Architecture (fixed)
     "arch": "condunet",
     "conv_type": "modern",
     "base_channels": 128,
@@ -31,30 +28,22 @@ BASELINE_CONFIG: Dict[str, Any] = {
     "n_heads": 4,
     "skip_type": "add",
     "activation": "relu",
-
-    # Conditioning (fixed)
     "cond_mode": "cross_attn_gated",
     "conditioning": "spectro_temporal",
-
-    # Session adaptation (fixed)
     "use_adaptive_scaling": True,
     "use_session_stats": False,
     "use_bidirectional": False,
-
-    # Training (fixed - no tuning)
     "optimizer": "adamw",
     "lr_schedule": "step",
     "learning_rate": 1e-3,
     "weight_decay": 0.01,
     "batch_size": 64,
     "dropout": 0.0,
-
-    # Data
     "dataset": "olfactory",
 }
 
 # =============================================================================
-# Ablation Groups - test removing each component
+# Ablation Groups
 # =============================================================================
 
 ABLATION_GROUPS: List[Dict[str, Any]] = [
@@ -90,14 +79,17 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
 
 @dataclass
 class AblationConfig:
-    """Configuration for ablation study."""
+    """Configuration for ablation with k-fold CV."""
 
     output_dir: Path = Path("results/ablation")
-    n_val_sessions: int = 3
-    epochs: int = 80  # Fixed, no early stopping
+    n_folds: int = 5  # 5-fold CV
+
+    # Training
+    epochs: int = 80
     batch_size: int = 64
     learning_rate: float = 1e-3
-    seeds: List[int] = None  # Default: [42, 123, 456]
+
+    # Execution
     use_fsdp: bool = False
     n_gpus: int = 8
     verbose: bool = True
@@ -105,5 +97,3 @@ class AblationConfig:
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)
-        if self.seeds is None:
-            self.seeds = [42, 123, 456]

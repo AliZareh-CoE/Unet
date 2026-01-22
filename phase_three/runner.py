@@ -2,12 +2,16 @@
 Ablation Study Runner
 =====================
 
-Runs each experiment with 3 seeds for robust mean ± std results.
+Runs ablation with k-fold CV for robust component selection.
+
+Setup:
+- 3 sessions held out for final validation
+- 5-fold CV on remaining training sessions
+- 6 variants × 5 folds = 30 runs
 
 Usage:
-    python -m phase_three.runner                    # Run all
-    python -m phase_three.runner --group conv_type  # Run specific
-    python -m phase_three.runner --dry-run          # Preview
+    python -m phase_three.runner --fsdp
+    python -m phase_three.runner --dry-run
 """
 
 from __future__ import annotations
@@ -33,13 +37,13 @@ def print_header(text: str, char: str = "=") -> None:
 def run_training(
     config: Dict[str, Any],
     name: str,
-    seed: int,
+    fold: int,
     output_dir: Path,
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run a single training experiment."""
+    """Run a single training fold."""
 
-    run_dir = output_dir / name / f"seed_{seed}"
+    run_dir = output_dir / name / f"fold_{fold}"
     run_dir.mkdir(parents=True, exist_ok=True)
     results_file = run_dir / "results.json"
 
@@ -48,7 +52,7 @@ def run_training(
         with open(results_file) as f:
             existing = json.load(f)
         if existing.get("completed_successfully"):
-            print(f"    seed {seed}: R² = {existing.get('best_val_r2', 0):.4f} (cached)")
+            print(f"    fold {fold}: R² = {existing.get('best_val_r2', 0):.4f} (cached)")
             return existing
 
     # Build command
@@ -62,7 +66,7 @@ def run_training(
         "--epochs", str(ablation_config.epochs),
         "--batch-size", str(ablation_config.batch_size),
         "--lr", str(ablation_config.learning_rate),
-        "--seed", str(seed),
+        "--seed", str(42 + fold),  # Different seed per fold
         "--arch", config.get("arch", "condunet"),
         "--base-channels", str(config.get("base_channels", 128)),
         "--n-downsample", str(config.get("n_downsample", 2)),
@@ -77,11 +81,11 @@ def run_training(
         "--lr-schedule", config.get("lr_schedule", "step"),
         "--weight-decay", str(config.get("weight_decay", 0.01)),
         "--split-by-session",
-        "--n-val-sessions", str(ablation_config.n_val_sessions),
         "--no-test-set",
         "--output-results-file", str(results_file),
         "--no-plots",
         "--no-early-stop",
+        "--fold", str(fold),
     ])
 
     if config.get("use_adaptive_scaling"):
@@ -101,21 +105,21 @@ def run_training(
             cwd=str(Path(__file__).parent.parent),
         )
         if result.returncode != 0:
-            print(f"    seed {seed}: FAILED")
-            return {"seed": seed, "error": "Training failed"}
+            print(f"    fold {fold}: FAILED")
+            return {"fold": fold, "error": "Training failed"}
     except Exception as e:
-        print(f"    seed {seed}: ERROR - {e}")
-        return {"seed": seed, "error": str(e)}
+        print(f"    fold {fold}: ERROR - {e}")
+        return {"fold": fold, "error": str(e)}
 
     # Load results
     if results_file.exists():
         with open(results_file) as f:
             train_results = json.load(f)
         r2 = train_results.get("best_val_r2", 0.0)
-        print(f"    seed {seed}: R² = {r2:.4f}")
+        print(f"    fold {fold}: R² = {r2:.4f}")
         return train_results
     else:
-        return {"seed": seed, "error": "No results file"}
+        return {"fold": fold, "error": "No results file"}
 
 
 def run_experiment(
@@ -123,23 +127,23 @@ def run_experiment(
     name: str,
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run experiment with multiple seeds."""
+    """Run experiment with k-fold CV."""
 
     print(f"\n  {name}")
 
     r2_values = []
     mae_values = []
-    seed_results = []
+    fold_results = []
 
-    for seed in ablation_config.seeds:
+    for fold in range(ablation_config.n_folds):
         result = run_training(
             config=config,
             name=name,
-            seed=seed,
+            fold=fold,
             output_dir=ablation_config.output_dir,
             ablation_config=ablation_config,
         )
-        seed_results.append(result)
+        fold_results.append(result)
 
         if "error" not in result:
             r2_values.append(result.get("best_val_r2", 0.0))
@@ -164,7 +168,7 @@ def run_experiment(
         "mean_mae": mean_mae,
         "std_mae": std_mae,
         "r2_values": r2_values,
-        "seed_results": seed_results,
+        "fold_results": fold_results,
     }
 
 
@@ -177,8 +181,7 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
 
     print_header("CondUNet Ablation Study")
     print(f"Output: {config.output_dir}")
-    print(f"Seeds: {config.seeds}")
-    print(f"Val sessions: {config.n_val_sessions}")
+    print(f"Folds: {config.n_folds}-fold CV")
 
     results = {}
 
@@ -232,7 +235,7 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
     summary = {
         "timestamp": datetime.now().isoformat(),
         "config": {
-            "seeds": config.seeds,
+            "n_folds": config.n_folds,
             "n_val_sessions": config.n_val_sessions,
             "epochs": config.epochs,
         },
@@ -251,11 +254,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CondUNet ablation study")
     parser.add_argument("--output-dir", type=str, default="results/ablation")
     parser.add_argument("--group", type=str, nargs="+", default=None)
-    parser.add_argument("--n-val-sessions", type=int, default=3)
+    parser.add_argument("--n-folds", type=int, default=5, help="k-fold CV (sessions split into k folds)")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])
     parser.add_argument("--fsdp", action="store_true")
     parser.add_argument("--n-gpus", type=int, default=8)
     parser.add_argument("--quiet", action="store_true")
@@ -282,17 +284,15 @@ def main():
         for i, exp in enumerate(experiments, 1):
             print(f"{i}. {exp}")
 
-        n_seeds = len(args.seeds)
-        print(f"\n{len(experiments)} experiments × {n_seeds} seeds = {len(experiments) * n_seeds} total runs")
+        print(f"\n{len(experiments)} experiments × {args.n_folds} folds = {len(experiments) * args.n_folds} total runs")
         return 0
 
     ablation_cfg = AblationConfig(
         output_dir=Path(args.output_dir),
-        n_val_sessions=args.n_val_sessions,
+        n_folds=args.n_folds,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
-        seeds=args.seeds,
         use_fsdp=args.fsdp,
         n_gpus=args.n_gpus,
         verbose=not args.quiet,
