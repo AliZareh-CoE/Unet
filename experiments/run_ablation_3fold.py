@@ -143,13 +143,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     # =========================================================================
     configs["conditioning_none"] = AblationConfig(
         name="conditioning_none",
-        description="No auto-conditioning (disable spectro_temporal encoder)",
+        description="No conditioning (cond_mode=none bypasses conditioning entirely)",
         n_downsample=4,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
-        conditioning="none",  # Changed
-        cond_mode="none",  # Must also disable cond_mode
+        conditioning="spectro_temporal",  # Source doesn't matter when cond_mode=none
+        cond_mode="none",  # This bypasses conditioning in forward pass
     )
 
     # =========================================================================
@@ -264,30 +264,9 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         dropout=0.2,  # Changed
     )
 
-    # =========================================================================
-    # CONDITIONING MODE ABLATIONS
-    # =========================================================================
-    configs["cond_mode_add"] = AblationConfig(
-        name="cond_mode_add",
-        description="Additive conditioning instead of cross_attn_gated",
-        n_downsample=4,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-        cond_mode="add",  # Changed
-    )
-
-    configs["cond_mode_concat"] = AblationConfig(
-        name="cond_mode_concat",
-        description="Concatenation conditioning instead of cross_attn_gated",
-        n_downsample=4,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-        cond_mode="concat",  # Changed
-    )
+    # NOTE: cond_mode only supports "none" and "cross_attn_gated" in the model
+    # The conditioning_none ablation tests disabling conditioning entirely
+    # No additional cond_mode ablations needed since only 2 modes exist
 
     return configs
 
@@ -420,6 +399,7 @@ def run_single_fold(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    dry_run: bool = False,
 ) -> Optional[FoldResult]:
     """Run training for a single fold.
 
@@ -430,6 +410,7 @@ def run_single_fold(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        dry_run: If True, print commands without running them
 
     Returns:
         FoldResult or None on failure
@@ -490,12 +471,13 @@ def run_single_fold(
     cmd.extend(["--activation", ablation_config.activation])
 
     # Conditioning
-    if ablation_config.conditioning and ablation_config.conditioning.lower() != "none":
+    # Always pass cond_mode explicitly to ensure ablation is applied
+    cmd.extend(["--cond-mode", ablation_config.cond_mode])
+
+    # Only pass conditioning source if cond_mode is not "none"
+    # (when cond_mode=none, conditioning is bypassed regardless of source)
+    if ablation_config.cond_mode != "none":
         cmd.extend(["--conditioning", ablation_config.conditioning])
-        cmd.extend(["--cond-mode", ablation_config.cond_mode])
-    else:
-        # Disable conditioning entirely
-        cmd.extend(["--cond-mode", "none"])
 
     # Training options
     cmd.extend(["--optimizer", ablation_config.optimizer])
@@ -517,6 +499,22 @@ def run_single_fold(
     env = os.environ.copy()
     env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
     env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
+
+    # DRY RUN: Print command and return fake result
+    if dry_run:
+        print(f"\n  [DRY RUN] Command that would be executed:")
+        print(f"  {' '.join(cmd)}")
+        print()
+        # Return fake result for dry run
+        return FoldResult(
+            fold_idx=fold_idx,
+            test_sessions=test_sessions,
+            train_sessions=train_sessions,
+            val_r2=0.0,
+            val_loss=0.0,
+            epochs_trained=0,
+            total_time=0.0,
+        )
 
     # Run training
     start_time = time.time()
@@ -588,6 +586,7 @@ def run_ablation_experiment(
     verbose: bool = True,
     use_fsdp: bool = False,
     folds_to_run: Optional[List[int]] = None,
+    dry_run: bool = False,
 ) -> AblationResult:
     """Run all folds for an ablation configuration.
 
@@ -599,6 +598,7 @@ def run_ablation_experiment(
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
         folds_to_run: Optional list of specific fold indices to run
+        dry_run: If True, print commands without running them
 
     Returns:
         AblationResult with all fold results
@@ -627,6 +627,7 @@ def run_ablation_experiment(
             seed=seed,
             verbose=verbose,
             use_fsdp=use_fsdp,
+            dry_run=dry_run,
         )
 
         if result is not None:
@@ -658,6 +659,7 @@ def run_3fold_ablation_study(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, AblationResult]:
     """Run the complete 3-fold ablation study.
 
@@ -668,6 +670,7 @@ def run_3fold_ablation_study(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        dry_run: If True, print commands without running them
 
     Returns:
         Dict mapping ablation name to AblationResult
@@ -720,6 +723,7 @@ def run_3fold_ablation_study(
             verbose=verbose,
             use_fsdp=use_fsdp,
             folds_to_run=folds_to_run,
+            dry_run=dry_run,
         )
         results[ablation_name] = result
 
@@ -860,6 +864,12 @@ def main():
         help="List all available ablation configurations and exit",
     )
 
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands that would be run without actually running them",
+    )
+
     args = parser.parse_args()
 
     # List ablations and exit
@@ -880,6 +890,7 @@ def main():
         seed=args.seed,
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
+        dry_run=args.dry_run,
     )
 
     return 0

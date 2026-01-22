@@ -37,8 +37,9 @@ For 9 sessions [s0, s1, ..., s8]:
 | `bidirectional_on` | Bidirectional training | use_bidirectional=True |
 | `dropout_01` | 10% dropout | dropout=0.1 |
 | `dropout_02` | 20% dropout | dropout=0.2 |
-| `cond_mode_add` | Additive conditioning | cond_mode=add |
-| `cond_mode_concat` | Concat conditioning | cond_mode=concat |
+
+Note: `cond_mode` only supports `"none"` and `"cross_attn_gated"` in the model.
+The `conditioning_none` ablation tests disabling conditioning via `cond_mode=none`.
 
 ## Usage
 
@@ -65,6 +66,11 @@ python experiments/run_ablation_3fold.py --list-ablations
 ### Multi-GPU with FSDP
 ```bash
 python experiments/run_ablation_3fold.py --fsdp
+```
+
+### Dry run (verify commands without executing)
+```bash
+python experiments/run_ablation_3fold.py --dry-run
 ```
 
 ## Output Structure
