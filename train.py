@@ -80,8 +80,6 @@ from models import (
     cross_channel_correlation,
     explained_variance_torch,
     normalized_rmse_torch,
-    plv_torch,
-    pli_torch,
     psd_error_db_torch,
     psd_diff_db_torch,
     MAX_FREQ_HZ,
@@ -774,7 +772,6 @@ def evaluate(
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
-    plv_list, pli_list = [], []
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
 
@@ -800,14 +797,12 @@ def evaluate(
 
     # Reverse direction (PCx→OB)
     mse_list_rev, mae_list_rev, corr_list_rev = [], [], []
-    plv_list_rev, pli_list_rev = [], []
     r2_list_rev, nrmse_list_rev = [], []
     psd_err_list_rev, psd_diff_list_rev = [], []
 
     # Baseline metrics
     baseline_corr_list, baseline_r2_list, baseline_nrmse_list = [], [], []
     baseline_psd_err_list, baseline_psd_diff_list = [], []
-    baseline_plv_list, baseline_pli_list = [], []
 
     # Per-channel metrics (computed in non-fast mode only)
     per_channel_corr_list = []
@@ -907,11 +902,6 @@ def evaluate(
                 pooled_sum_squared_error += ((pred_flat - target_flat) ** 2).sum().item()
                 pooled_sum_abs_error += (pred_flat - target_flat).abs().sum().item()
 
-            # Skip expensive phase metrics in fast_mode
-            if compute_phase and not fast_mode:
-                plv_list.append(plv_torch(pred_f32, pcx_f32).item())
-                pli_list.append(pli_torch(pred_f32, pcx_f32).item())
-
             # Skip expensive PSD metrics in fast_mode
             if not fast_mode:
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
@@ -935,9 +925,6 @@ def evaluate(
                 baseline_nrmse_list.append(normalized_rmse_torch(ob_baseline, pcx_baseline).item())
                 baseline_psd_err_list.append(psd_error_db_torch(ob_baseline, pcx_baseline, fs=sampling_rate).item())
                 baseline_psd_diff_list.append(psd_diff_db_torch(ob_baseline, pcx_baseline, fs=sampling_rate).item())
-                if compute_phase:
-                    baseline_plv_list.append(plv_torch(ob_baseline, pcx_baseline).item())
-                    baseline_pli_list.append(pli_torch(ob_baseline, pcx_baseline).item())
 
                 # Per-channel correlation analysis (for channel correspondence investigation)
                 per_ch_corr = pearson_per_channel(pred_f32, pcx_f32)  # [C]
@@ -986,11 +973,6 @@ def evaluate(
                     pooled_sum_pred_target_rev += (pred_flat_rev * target_flat_rev).sum().item()
                     pooled_sum_squared_error_rev += ((pred_flat_rev - target_flat_rev) ** 2).sum().item()
                     pooled_sum_abs_error_rev += (pred_flat_rev - target_flat_rev).abs().sum().item()
-
-                # Skip expensive phase metrics in fast_mode
-                if compute_phase and not fast_mode:
-                    plv_list_rev.append(plv_torch(pred_rev_f32, ob_f32).item())
-                    pli_list_rev.append(pli_torch(pred_rev_f32, ob_f32).item())
 
                 # Skip expensive PSD metrics in fast_mode
                 if not fast_mode:
@@ -1091,10 +1073,6 @@ def evaluate(
         results["psd_err_db"] = float(np.mean(psd_err_list))
     if psd_diff_list:
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
-    if plv_list:
-        results["plv"] = float(np.mean(plv_list))
-    if pli_list:
-        results["pli"] = float(np.mean(pli_list))
 
     # Reverse results (PCx→OB) - also use TRUE POOLED metrics
     if mse_list_rev:
@@ -1161,10 +1139,6 @@ def evaluate(
         results["psd_err_db_rev"] = float(np.mean(psd_err_list_rev))
     if psd_diff_list_rev:
         results["psd_diff_db_rev"] = float(np.mean(psd_diff_list_rev))
-    if plv_list_rev:
-        results["plv_rev"] = float(np.mean(plv_list_rev))
-    if pli_list_rev:
-        results["pli_rev"] = float(np.mean(pli_list_rev))
 
     # Baseline results: Raw OB vs PCx (only computed when not in fast_mode)
     if baseline_corr_list:
@@ -1173,10 +1147,6 @@ def evaluate(
         results["baseline_nrmse"] = float(np.mean(baseline_nrmse_list))
         results["baseline_psd_err_db"] = float(np.mean(baseline_psd_err_list))
         results["baseline_psd_diff_db"] = float(np.mean(baseline_psd_diff_list))
-    if baseline_plv_list:
-        results["baseline_plv"] = float(np.mean(baseline_plv_list))
-    if baseline_pli_list:
-        results["baseline_pli"] = float(np.mean(baseline_pli_list))
 
     # Per-channel correlation metrics (for channel correspondence analysis)
     if per_channel_corr_list:
@@ -2474,9 +2444,6 @@ def train(
         print(f"  R²: {base_r2:.4f}")
         print(f"  NRMSE: {base_nrmse:.4f}")
         print(f"  PSD Bias: {base_psd_bias:+.2f} dB (|err|={base_psd_err:.2f}dB)")
-        if "baseline_plv" in test_metrics:
-            print(f"  PLV: {test_metrics['baseline_plv']:.4f}")
-            print(f"  PLI: {test_metrics['baseline_pli']:.4f}")
 
         # Forward direction with delta from baseline
         print("\nForward Direction (OB → PCx):" if config.get("dataset_type") != "pfc" else "\nForward Direction (PFC → CA1):")
@@ -2494,10 +2461,6 @@ def train(
         print(f"  R²: {fwd_r2:.4f} (Δ={delta_r2:+.4f})")
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
-        if "plv" in test_metrics:
-            delta_plv = test_metrics['plv'] - test_metrics.get('baseline_plv', 0)
-            print(f"  PLV: {test_metrics['plv']:.4f} (Δ={delta_plv:+.4f})")
-            print(f"  PLI: {test_metrics['pli']:.4f}")
 
         if "corr_rev" in test_metrics:
             print("\nReverse Direction (PCx → OB):")
@@ -2515,15 +2478,13 @@ def train(
             print(f"  R²: {rev_r2:.4f} (Δ={delta_r2_rev:+.4f})")
             print(f"  NRMSE: {rev_nrmse:.4f} (Δ={delta_nrmse_rev:+.4f})")
             print(f"  PSD Bias: {psd_bias_rev:+.2f} dB (|err|={psd_err_rev:.2f}dB, Δerr={delta_psd_err_rev:+.2f})")
-            if "plv_rev" in test_metrics:
-                delta_plv_rev = test_metrics['plv_rev'] - test_metrics.get('baseline_plv', 0)
-                print(f"  PLV: {test_metrics['plv_rev']:.4f} (Δ={delta_plv_rev:+.4f})")
-                print(f"  PLI: {test_metrics['pli_rev']:.4f}")
 
     # =========================================================================
     # PER-SESSION TEST EVALUATION (for cross-session generalization analysis)
+    # Skip when using FSDP - causes hangs due to sharded model needing all ranks
     # =========================================================================
-    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data:
+    use_fsdp = config.get("fsdp", False)
+    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data and not use_fsdp:
         split_info = data.get("split_info", {})
         test_sessions = split_info.get("test_sessions", [])
         session_ids = data.get("session_ids")
