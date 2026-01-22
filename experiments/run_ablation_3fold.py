@@ -86,7 +86,7 @@ class AblationConfig:
     # Fixed parameters
     base_channels: int = 128
     epochs: int = 80
-    batch_size: int = 32
+    batch_size: int = 64  # Larger batch = fewer iterations per epoch
     learning_rate: float = 1e-3
     optimizer: str = "adamw"
     lr_schedule: str = "cosine_warmup"
