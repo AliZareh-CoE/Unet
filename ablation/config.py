@@ -3,9 +3,9 @@ Ablation Study Configuration
 ============================
 
 Clean, focused ablation to prove each architectural component contributes.
-Uses LOSO cross-validation for robust evaluation.
+Uses held-out session validation for fast comparison.
 
-5 Core Ablation Groups (~15 runs total):
+5 Core Ablation Groups (~11 runs total):
 1. Convolution Type: standard vs modern
 2. Conditioning Mode: none vs cross_attn_gated
 3. Adaptive Scaling: off vs on
@@ -13,7 +13,7 @@ Uses LOSO cross-validation for robust evaluation.
 5. Network Depth: 2 vs 3 vs 4
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,13 +47,11 @@ BASELINE_CONFIG: Dict[str, Any] = {
     "learning_rate": 1e-3,
     "weight_decay": 0.01,
     "batch_size": 64,
-    "epochs": 200,
+    "epochs": 100,
     "dropout": 0.0,
 
     # Data
     "dataset": "olfactory",
-    "split_by_session": True,
-    "no_test_set": True,
 }
 
 # =============================================================================
@@ -61,10 +59,6 @@ BASELINE_CONFIG: Dict[str, Any] = {
 # =============================================================================
 
 ABLATION_GROUPS: List[Dict[str, Any]] = [
-    # -------------------------------------------------------------------------
-    # Group 1: Convolution Type
-    # Tests: Standard Conv1d vs Modern (dilated depthwise-separable + SE)
-    # -------------------------------------------------------------------------
     {
         "name": "conv_type",
         "description": "Convolution architecture",
@@ -74,11 +68,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": "modern", "name": "modern", "desc": "Dilated depthwise-sep + SE (ours)"},
         ],
     },
-
-    # -------------------------------------------------------------------------
-    # Group 2: Conditioning Mode
-    # Tests: No conditioning vs Spectro-temporal auto-conditioning
-    # -------------------------------------------------------------------------
     {
         "name": "conditioning",
         "description": "Conditioning mechanism",
@@ -88,11 +77,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention (ours)"},
         ],
     },
-
-    # -------------------------------------------------------------------------
-    # Group 3: Adaptive Scaling
-    # Tests: No adaptation vs FiLM-style output scaling
-    # -------------------------------------------------------------------------
     {
         "name": "adaptive_scaling",
         "description": "Session-adaptive output scaling",
@@ -102,11 +86,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": True, "name": "on", "desc": "FiLM-style scaling (ours)"},
         ],
     },
-
-    # -------------------------------------------------------------------------
-    # Group 4: Bidirectional Training
-    # Tests: Forward-only vs Bidirectional with cycle consistency
-    # -------------------------------------------------------------------------
     {
         "name": "bidirectional",
         "description": "Bidirectional training with cycle loss",
@@ -116,11 +95,6 @@ ABLATION_GROUPS: List[Dict[str, Any]] = [
             {"value": True, "name": "bidirectional", "desc": "With cycle consistency (ours)"},
         ],
     },
-
-    # -------------------------------------------------------------------------
-    # Group 5: Network Depth
-    # Tests: Different encoder/decoder depths
-    # -------------------------------------------------------------------------
     {
         "name": "depth",
         "description": "Network depth (downsample levels)",
@@ -140,20 +114,18 @@ class AblationConfig:
 
     output_dir: Path = Path("artifacts/ablation")
 
-    # LOSO settings
-    use_loso: bool = True
-    loso_folds: Optional[List[int]] = None  # None = all folds
+    # Validation
+    n_val_sessions: int = 3
 
-    # Training settings (can override baseline)
-    epochs: int = 200
+    # Training
+    epochs: int = 100
     batch_size: int = 64
     learning_rate: float = 1e-3
+    seed: int = 42
 
     # Execution
-    resume: bool = True
+    use_fsdp: bool = False
     verbose: bool = True
-
-    # Which groups to run (None = all)
     groups_to_run: Optional[List[str]] = None
 
     def __post_init__(self):
