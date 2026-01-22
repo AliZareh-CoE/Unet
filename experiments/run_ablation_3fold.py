@@ -268,6 +268,31 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     # The conditioning_none ablation tests disabling conditioning entirely
     # No additional cond_mode ablations needed since only 2 modes exist
 
+    # =========================================================================
+    # WIDTH ABLATIONS (base_channels)
+    # =========================================================================
+    configs["width_narrow"] = AblationConfig(
+        name="width_narrow",
+        description="Narrow network (base_channels=64) vs default 128",
+        n_downsample=4,
+        base_channels=64,  # Half the default
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    )
+
+    configs["width_wide"] = AblationConfig(
+        name="width_wide",
+        description="Wide network (base_channels=256) vs default 128",
+        n_downsample=4,
+        base_channels=256,  # Double the default
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+    )
+
     return configs
 
 

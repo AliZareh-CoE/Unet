@@ -37,6 +37,8 @@ For 9 sessions [s0, s1, ..., s8]:
 | `bidirectional_on` | Bidirectional training | use_bidirectional=True |
 | `dropout_01` | 10% dropout | dropout=0.1 |
 | `dropout_02` | 20% dropout | dropout=0.2 |
+| `width_narrow` | Narrow network | base_channels=64 |
+| `width_wide` | Wide network | base_channels=256 |
 
 Note: `cond_mode` only supports `"none"` and `"cross_attn_gated"` in the model.
 The `conditioning_none` ablation tests disabling conditioning via `cond_mode=none`.
