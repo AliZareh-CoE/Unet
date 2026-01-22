@@ -1561,14 +1561,17 @@ def prepare_data(
     # Load odor labels
     odors, vocab = load_odor_labels(odor_csv_path, num_trials)
 
-    # Load session IDs for filtering
-    session_ids, session_to_idx, idx_to_session = load_session_ids(
-        odor_csv_path, session_column, num_trials
-    )
-
     # Filter out excluded sessions if specified
     excluded_session_names = []
+    session_ids = None  # Only load if needed
+    session_to_idx = None
+    idx_to_session = None
+
     if exclude_sessions:
+        # Load session IDs for filtering
+        session_ids, session_to_idx, idx_to_session = load_session_ids(
+            odor_csv_path, session_column, num_trials
+        )
         # Get indices of trials to keep (not in excluded sessions)
         excluded_session_ids = set()
         for sess_name in exclude_sessions:
