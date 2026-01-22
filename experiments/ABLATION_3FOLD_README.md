@@ -9,11 +9,11 @@ This ablation study uses a proper 3-fold cross-validation approach where:
 
 ## Key Design Decisions
 
-### Baseline: `depth_deep` (n_downsample=4)
-Previous results showed depth_deep outperforms other depths:
-- baseline (n_downsample=2): 0.6679
-- depth_medium (n_downsample=3): 0.6808 (+0.0129)
-- depth_deep (n_downsample=4): 0.6821 (+0.0143)
+### Baseline: Original default (n_downsample=2)
+Using the original default configuration as the reference point:
+- baseline (n_downsample=2): Reference
+- depth_medium (n_downsample=3): Tests deeper network
+- depth_deep (n_downsample=4): Tests deepest network
 
 ### 3-Fold Session Splits
 For 9 sessions [s0, s1, ..., s8]:
@@ -25,12 +25,12 @@ For 9 sessions [s0, s1, ..., s8]:
 
 | Name | Description | Key Change |
 |------|-------------|------------|
-| `baseline` | depth_deep with all best components | n_downsample=4 |
+| `baseline` | Original default with all components | n_downsample=2 |
 | `conv_type_standard` | Standard convolutions | conv_type=standard |
 | `conditioning_none` | No auto-conditioning | conditioning=none, cond_mode=none |
 | `adaptive_scaling_off` | No adaptive scaling | use_adaptive_scaling=False |
 | `depth_medium` | Medium depth | n_downsample=3 |
-| `depth_shallow` | Original shallow | n_downsample=2 |
+| `depth_deep` | Deep network | n_downsample=4 |
 | `attention_none` | No attention | attention_type=none |
 | `attention_basic` | Basic attention | attention_type=basic |
 | `skip_type_concat` | Concat skips | skip_type=concat |

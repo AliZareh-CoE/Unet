@@ -13,18 +13,19 @@ This gives us:
 - Test performance for EVERY session
 - Better understanding of model generalization
 
-Baseline: depth_deep (n_downsample=4) since it showed +0.0143 improvement
+Baseline: Original default (n_downsample=2) as the reference point
 
 Ablation configurations to test:
-1. Baseline (depth_deep with all bells and whistles)
+1. Baseline (n_downsample=2 with all components)
 2. conv_type: standard vs modern
 3. conditioning: none vs spectro_temporal
 4. adaptive_scaling: off vs on
-5. attention_type: none vs cross_freq_v2
+5. attention_type: none, basic vs cross_freq_v2
 6. skip_type: add vs concat
 7. bidirectional: off vs on
-8. dropout: 0.0 vs 0.1
-9. depth: compare with depth_medium (n_downsample=3)
+8. dropout: 0.0, 0.1, 0.2
+9. depth: n_downsample=3 (medium), n_downsample=4 (deep)
+10. width: base_channels=64 (narrow), base_channels=256 (wide)
 """
 
 from __future__ import annotations
@@ -112,12 +113,12 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs = {}
 
     # =========================================================================
-    # BASELINE (depth_deep - best performing from previous study)
+    # BASELINE (original default - n_downsample=2)
     # =========================================================================
     configs["baseline"] = AblationConfig(
         name="baseline",
-        description="depth_deep baseline with all best components",
-        n_downsample=4,  # depth_deep
+        description="Original default baseline (n_downsample=2) with all components",
+        n_downsample=2,  # Original default
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -131,7 +132,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["conv_type_standard"] = AblationConfig(
         name="conv_type_standard",
         description="Standard convolutions instead of modern (dilated depthwise separable)",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="standard",  # Changed
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -144,7 +145,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["conditioning_none"] = AblationConfig(
         name="conditioning_none",
         description="No conditioning (cond_mode=none bypasses conditioning entirely)",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -158,7 +159,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["adaptive_scaling_off"] = AblationConfig(
         name="adaptive_scaling_off",
         description="Disable adaptive output scaling",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=False,  # Changed
@@ -166,11 +167,11 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     )
 
     # =========================================================================
-    # DEPTH ABLATIONS (compare with baseline depth_deep)
+    # DEPTH ABLATIONS (compare with baseline n_downsample=2)
     # =========================================================================
     configs["depth_medium"] = AblationConfig(
         name="depth_medium",
-        description="Medium depth (n_downsample=3) vs deep",
+        description="Medium depth (n_downsample=3) vs baseline",
         n_downsample=3,  # depth_medium
         conv_type="modern",
         attention_type="cross_freq_v2",
@@ -178,10 +179,10 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         conditioning="spectro_temporal",
     )
 
-    configs["depth_shallow"] = AblationConfig(
-        name="depth_shallow",
-        description="Shallow depth (n_downsample=2) - original default",
-        n_downsample=2,  # depth_shallow (original default)
+    configs["depth_deep"] = AblationConfig(
+        name="depth_deep",
+        description="Deep network (n_downsample=4) vs baseline",
+        n_downsample=4,  # depth_deep
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -194,7 +195,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["attention_none"] = AblationConfig(
         name="attention_none",
         description="No attention mechanism",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="none",  # Changed
         use_adaptive_scaling=True,
@@ -204,7 +205,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["attention_basic"] = AblationConfig(
         name="attention_basic",
         description="Basic attention instead of cross_freq_v2",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="basic",  # Changed
         use_adaptive_scaling=True,
@@ -217,7 +218,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["skip_type_concat"] = AblationConfig(
         name="skip_type_concat",
         description="Concatenation skip connections instead of addition",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         skip_type="concat",  # Changed
@@ -231,7 +232,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["bidirectional_on"] = AblationConfig(
         name="bidirectional_on",
         description="Enable bidirectional training (OB->PCx and PCx->OB)",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -245,7 +246,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["dropout_01"] = AblationConfig(
         name="dropout_01",
         description="Add 10% dropout for regularization",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -256,7 +257,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["dropout_02"] = AblationConfig(
         name="dropout_02",
         description="Add 20% dropout for regularization",
-        n_downsample=4,
+        n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
@@ -274,7 +275,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["width_narrow"] = AblationConfig(
         name="width_narrow",
         description="Narrow network (base_channels=64) vs default 128",
-        n_downsample=4,
+        n_downsample=2,
         base_channels=64,  # Half the default
         conv_type="modern",
         attention_type="cross_freq_v2",
@@ -285,7 +286,7 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs["width_wide"] = AblationConfig(
         name="width_wide",
         description="Wide network (base_channels=256) vs default 128",
-        n_downsample=4,
+        n_downsample=2,
         base_channels=256,  # Double the default
         conv_type="modern",
         attention_type="cross_freq_v2",
