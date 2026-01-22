@@ -5,12 +5,8 @@ Ablation Study Configuration
 Clean, focused ablation to prove each architectural component contributes.
 Uses held-out session validation for fast comparison.
 
-5 Core Ablation Groups (~11 runs total):
-1. Convolution Type: standard vs modern
-2. Conditioning Mode: none vs cross_attn_gated
-3. Adaptive Scaling: off vs on
-4. Bidirectional Training: off vs on
-5. Network Depth: 2 vs 3 vs 4
+Runs baseline once, then tests removing each component.
+Total: 8 runs (1 baseline + 5 ablations + 2 depth variants)
 """
 
 from dataclasses import dataclass
@@ -18,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # =============================================================================
-# Baseline Configuration (current best setup)
+# Baseline Configuration (full model - our best setup)
 # =============================================================================
 
 BASELINE_CONFIG: Dict[str, Any] = {
@@ -55,54 +51,46 @@ BASELINE_CONFIG: Dict[str, Any] = {
 }
 
 # =============================================================================
-# Ablation Groups
+# Ablation Groups - only non-baseline variants
 # =============================================================================
 
 ABLATION_GROUPS: List[Dict[str, Any]] = [
     {
         "name": "conv_type",
-        "description": "Convolution architecture",
+        "description": "Remove modern convolutions",
         "parameter": "conv_type",
-        "variants": [
-            {"value": "standard", "name": "standard", "desc": "Standard Conv1d"},
-            {"value": "modern", "name": "modern", "desc": "Dilated depthwise-sep + SE (ours)"},
-        ],
+        "baseline_value": "modern",
+        "variant": {"value": "standard", "name": "standard", "desc": "Standard Conv1d (no SE, no dilation)"},
     },
     {
         "name": "conditioning",
-        "description": "Conditioning mechanism",
+        "description": "Remove spectro-temporal conditioning",
         "parameter": "cond_mode",
-        "variants": [
-            {"value": "none", "name": "none", "desc": "No conditioning"},
-            {"value": "cross_attn_gated", "name": "gated", "desc": "Gated cross-attention (ours)"},
-        ],
+        "baseline_value": "cross_attn_gated",
+        "variant": {"value": "none", "name": "none", "desc": "No conditioning"},
     },
     {
         "name": "adaptive_scaling",
-        "description": "Session-adaptive output scaling",
+        "description": "Remove session-adaptive scaling",
         "parameter": "use_adaptive_scaling",
-        "variants": [
-            {"value": False, "name": "off", "desc": "No session adaptation"},
-            {"value": True, "name": "on", "desc": "FiLM-style scaling (ours)"},
-        ],
+        "baseline_value": True,
+        "variant": {"value": False, "name": "off", "desc": "No session adaptation"},
     },
     {
         "name": "bidirectional",
-        "description": "Bidirectional training with cycle loss",
+        "description": "Remove bidirectional training",
         "parameter": "use_bidirectional",
-        "variants": [
-            {"value": False, "name": "unidirectional", "desc": "Forward only"},
-            {"value": True, "name": "bidirectional", "desc": "With cycle consistency (ours)"},
-        ],
+        "baseline_value": True,
+        "variant": {"value": False, "name": "unidirectional", "desc": "Forward only (no cycle loss)"},
     },
     {
         "name": "depth",
-        "description": "Network depth (downsample levels)",
+        "description": "Test different network depths",
         "parameter": "n_downsample",
+        "baseline_value": 2,
         "variants": [
-            {"value": 2, "name": "shallow", "desc": "2 levels (ours)"},
-            {"value": 3, "name": "medium", "desc": "3 levels"},
-            {"value": 4, "name": "deep", "desc": "4 levels"},
+            {"value": 3, "name": "medium", "desc": "3 downsample levels"},
+            {"value": 4, "name": "deep", "desc": "4 downsample levels"},
         ],
     },
 ]
