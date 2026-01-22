@@ -2874,6 +2874,8 @@ def parse_args():
                         help="Explicit session names for test set (e.g., --test-sessions 141208-1 170614)")
     parser.add_argument("--val-sessions", type=str, nargs="+", default=None,
                         help="Explicit session names for val set (e.g., --val-sessions 170609 170619)")
+    parser.add_argument("--exclude-sessions", type=str, nargs="+", default=None,
+                        help="Sessions to exclude entirely from data (e.g., --exclude-sessions 170614 170618)")
     parser.add_argument("--force-recreate-splits", action="store_true",
                         help="Force recreation of data splits even if they exist on disk")
     parser.add_argument("--no-test-set", action="store_true", default=None,
@@ -3391,6 +3393,7 @@ def main():
             val_sessions=args.val_sessions,
             no_test_set=config.get("no_test_set", False),
             separate_val_sessions=config.get("separate_val_sessions", False),
+            exclude_sessions=args.exclude_sessions,
         )
         config["dataset_type"] = "olfactory"
         config["in_channels"] = 32   # OB channels

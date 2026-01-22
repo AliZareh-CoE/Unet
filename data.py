@@ -1525,6 +1525,7 @@ def prepare_data(
     val_sessions: Optional[List[str]] = None,   # Explicit val session names
     no_test_set: bool = False,  # If True, no test set - all held-out sessions for validation
     separate_val_sessions: bool = False,  # If True, return per-session val indices
+    exclude_sessions: Optional[List[str]] = None,  # Sessions to exclude entirely
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline.
 
@@ -1541,6 +1542,7 @@ def prepare_data(
         val_sessions: Explicit list of session names for val (overrides n_val_sessions)
         no_test_set: If True, no test set - all held-out sessions are for validation only
         separate_val_sessions: If True, return per-session validation indices
+        exclude_sessions: Sessions to exclude entirely from all data (for held-out test)
 
     Returns dictionary with:
     - ob, pcx: Normalized signal arrays
@@ -1550,6 +1552,7 @@ def prepare_data(
     - norm_stats: Normalization statistics
     - split_info: (only if split_by_session) metadata about session splits
     - val_idx_per_session: (only if separate_val_sessions) dict of session_name -> indices
+    - excluded_sessions: (only if exclude_sessions) list of excluded session names
     """
     # Load raw signals
     signals = load_signals(data_path)
@@ -1557,6 +1560,32 @@ def prepare_data(
 
     # Load odor labels
     odors, vocab = load_odor_labels(odor_csv_path, num_trials)
+
+    # Load session IDs for filtering
+    session_ids, session_to_idx, idx_to_session = load_session_ids(
+        odor_csv_path, session_column, num_trials
+    )
+
+    # Filter out excluded sessions if specified
+    excluded_session_names = []
+    if exclude_sessions:
+        # Get indices of trials to keep (not in excluded sessions)
+        excluded_session_ids = set()
+        for sess_name in exclude_sessions:
+            if sess_name in session_to_idx:
+                excluded_session_ids.add(session_to_idx[sess_name])
+                excluded_session_names.append(sess_name)
+            else:
+                _print_primary(f"Warning: Session '{sess_name}' not found, skipping")
+
+        if excluded_session_ids:
+            keep_mask = ~np.isin(session_ids, list(excluded_session_ids))
+            signals = signals[keep_mask]
+            odors = odors[keep_mask]
+            session_ids = session_ids[keep_mask]
+            num_trials = signals.shape[0]
+            _print_primary(f"Excluded {len(excluded_session_names)} sessions: {excluded_session_names}")
+            _print_primary(f"Remaining trials: {num_trials}")
 
     # Extract window
     windowed = extract_window(signals)
@@ -1614,6 +1643,10 @@ def prepare_data(
         # Include per-session validation indices if available
         if "val_idx_per_session" in split_info:
             result["val_idx_per_session"] = split_info["val_idx_per_session"]
+
+    # Include excluded sessions info
+    if excluded_session_names:
+        result["excluded_sessions"] = excluded_session_names
 
     # Include session info for per-session evaluation
     if split_by_session:

@@ -5,8 +5,8 @@ Ablation Study Configuration
 Component selection with held-out test sessions.
 
 Setup:
-- 3 sessions held out as TEST (never touched)
-- Remaining 6 sessions: 70% train, 30% val
+- 3 sessions held out as TEST (excluded entirely)
+- Remaining 6 sessions: random 70/30 train/val trial-wise split
 - 3 random seeds for variance estimation
 - 6 variants × 3 seeds = 18 runs total
 """
@@ -85,10 +85,9 @@ class AblationConfig:
     dataset: str = "olfactory"
 
     # Data split
-    n_test_sessions: int = 3  # Held out, never touched
-    val_ratio: float = 0.3  # 30% of remaining for validation
+    n_test_sessions: int = 3  # Excluded entirely from training
 
-    # Seeds for variance estimation
+    # Seeds for variance estimation (each uses random 70/30 trial split)
     seeds: List[int] = field(default_factory=lambda: [42, 123, 456])
 
     # Training

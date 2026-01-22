@@ -46,56 +46,38 @@ def get_all_sessions(dataset: str = "olfactory") -> List[str]:
         raise ValueError(f"Unknown dataset: {dataset}")
 
 
-def create_splits(
+def get_test_sessions(
     sessions: List[str],
     n_test: int = 3,
-    val_ratio: float = 0.3,
-    seed: int = 42,
-) -> Tuple[List[str], List[str], List[str]]:
-    """Split sessions into train/val/test.
+) -> List[str]:
+    """Select sessions to hold out for test (deterministic).
 
     Args:
         sessions: All available sessions
         n_test: Number of sessions to hold out for test
-        val_ratio: Fraction of remaining sessions for validation
-        seed: Random seed for reproducibility
 
     Returns:
-        (train_sessions, val_sessions, test_sessions)
+        List of test session names
     """
-    rng = np.random.default_rng(seed)
-    shuffled = sessions.copy()
-    rng.shuffle(shuffled)
-
-    # Hold out test sessions (always the same regardless of seed)
-    # Use a fixed seed for test selection to ensure consistency
+    # Use a fixed seed for test selection to ensure consistency across all runs
     test_rng = np.random.default_rng(0)
     test_order = sessions.copy()
     test_rng.shuffle(test_order)
-    test_sessions = test_order[:n_test]
-
-    # Remaining sessions for train/val
-    remaining = [s for s in shuffled if s not in test_sessions]
-
-    # Split remaining into train/val
-    n_val = max(1, int(len(remaining) * val_ratio))
-    val_sessions = remaining[:n_val]
-    train_sessions = remaining[n_val:]
-
-    return train_sessions, val_sessions, test_sessions
+    return test_order[:n_test]
 
 
 def run_training(
     config: Dict[str, Any],
     name: str,
     seed: int,
-    train_sessions: List[str],
-    val_sessions: List[str],
+    test_sessions: List[str],
     output_dir: Path,
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run a single training run with specified seed."""
+    """Run a single training run with specified seed.
 
+    Uses random trial-wise 70/30 split on remaining sessions after excluding test.
+    """
     run_dir = output_dir / name / f"seed_{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
     results_file = run_dir / "results.json"
@@ -133,13 +115,12 @@ def run_training(
         "--optimizer", config.get("optimizer", "adamw"),
         "--lr-schedule", config.get("lr_schedule", "step"),
         "--weight-decay", str(config.get("weight_decay", 0.01)),
-        "--split-by-session",
-        "--no-test-set",  # We handle test separately
+        # NO --split-by-session: use random trial-wise splits
+        "--exclude-sessions", *test_sessions,  # Exclude test sessions entirely
         "--output-results-file", str(results_file),
         "--no-plots",
         "--no-early-stop",
         "--force-recreate-splits",
-        "--val-sessions", *val_sessions,
     ])
 
     if config.get("use_adaptive_scaling"):
@@ -152,7 +133,7 @@ def run_training(
         cmd.append("--fsdp")
 
     if ablation_config.verbose:
-        print(f"    Seed {seed}: train={train_sessions}, val={val_sessions}")
+        print(f"    Seed {seed}: excluding test sessions {test_sessions}")
 
     # Set NCCL environment variables for stability with FSDP
     env = os.environ.copy()
@@ -192,12 +173,13 @@ def run_training(
 def run_experiment(
     config: Dict[str, Any],
     name: str,
-    train_sessions: List[str],
-    val_sessions: List[str],
+    test_sessions: List[str],
     ablation_config: AblationConfig,
 ) -> Dict[str, Any]:
-    """Run experiment with multiple seeds."""
+    """Run experiment with multiple seeds.
 
+    Each seed uses random trial-wise split on remaining sessions after excluding test.
+    """
     print(f"\n  {name}")
 
     r2_values = []
@@ -209,8 +191,7 @@ def run_experiment(
             config=config,
             name=name,
             seed=seed,
-            train_sessions=train_sessions,
-            val_sessions=val_sessions,
+            test_sessions=test_sessions,
             output_dir=ablation_config.output_dir,
             ablation_config=ablation_config,
         )
@@ -254,20 +235,15 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
     print(f"Output: {config.output_dir}")
     print(f"Seeds: {config.seeds}")
 
-    # Get all sessions and create splits
+    # Get all sessions and select test sessions to exclude
     all_sessions = get_all_sessions(config.dataset)
-    train_sessions, val_sessions, test_sessions = create_splits(
-        all_sessions,
-        n_test=config.n_test_sessions,
-        val_ratio=config.val_ratio,
-        seed=42,  # Fixed seed for split consistency
-    )
+    test_sessions = get_test_sessions(all_sessions, n_test=config.n_test_sessions)
+    remaining_sessions = [s for s in all_sessions if s not in test_sessions]
 
     print(f"\nAll sessions ({len(all_sessions)}): {all_sessions}")
     print(f"\nData Split:")
-    print(f"  Test (held out):  {test_sessions}")
-    print(f"  Train:            {train_sessions}")
-    print(f"  Val:              {val_sessions}")
+    print(f"  Test (held out, excluded):  {test_sessions}")
+    print(f"  Train+Val (random 70/30):   {remaining_sessions}")
 
     results = {}
 
@@ -276,8 +252,7 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
     baseline_result = run_experiment(
         config=BASELINE_CONFIG.copy(),
         name="baseline",
-        train_sessions=train_sessions,
-        val_sessions=val_sessions,
+        test_sessions=test_sessions,
         ablation_config=config,
     )
     results["baseline"] = baseline_result
@@ -305,8 +280,7 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
             result = run_experiment(
                 config=ablation_cfg,
                 name=f"{group['name']}_{variant['name']}",
-                train_sessions=train_sessions,
-                val_sessions=val_sessions,
+                test_sessions=test_sessions,
                 ablation_config=config,
             )
             results[f"{group['name']}_{variant['name']}"] = result
@@ -331,15 +305,14 @@ def run_ablation(config: Optional[AblationConfig] = None) -> Dict[str, Any]:
         "timestamp": datetime.now().isoformat(),
         "config": {
             "n_test_sessions": config.n_test_sessions,
-            "val_ratio": config.val_ratio,
             "seeds": config.seeds,
             "epochs": config.epochs,
         },
         "splits": {
             "all_sessions": all_sessions,
             "test_sessions": test_sessions,
-            "train_sessions": train_sessions,
-            "val_sessions": val_sessions,
+            "remaining_sessions": remaining_sessions,
+            "note": "Train/val are random 70/30 trial-wise split of remaining sessions",
         },
         "baseline_config": BASELINE_CONFIG,
         "results": results,
@@ -356,8 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run CondUNet ablation study")
     parser.add_argument("--output-dir", type=str, default="results/ablation")
     parser.add_argument("--group", type=str, nargs="+", default=None)
-    parser.add_argument("--n-test-sessions", type=int, default=3, help="Sessions held out for test")
-    parser.add_argument("--val-ratio", type=float, default=0.3, help="Fraction of remaining for validation")
+    parser.add_argument("--n-test-sessions", type=int, default=3, help="Sessions held out entirely")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456], help="Random seeds")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -377,18 +349,13 @@ def main():
 
         # Show sessions and splits
         all_sessions = get_all_sessions("olfactory")
-        train_sessions, val_sessions, test_sessions = create_splits(
-            all_sessions,
-            n_test=args.n_test_sessions,
-            val_ratio=args.val_ratio,
-            seed=42,
-        )
+        test_sessions = get_test_sessions(all_sessions, n_test=args.n_test_sessions)
+        remaining_sessions = [s for s in all_sessions if s not in test_sessions]
 
         print(f"All sessions ({len(all_sessions)}): {all_sessions}")
         print(f"\nData Split:")
-        print(f"  Test (held out):  {test_sessions}")
-        print(f"  Train:            {train_sessions}")
-        print(f"  Val:              {val_sessions}")
+        print(f"  Test (held out, excluded):  {test_sessions}")
+        print(f"  Train+Val (random 70/30):   {remaining_sessions}")
         print(f"\nSeeds: {args.seeds}")
 
         groups = ABLATION_GROUPS
@@ -411,7 +378,6 @@ def main():
     ablation_cfg = AblationConfig(
         output_dir=Path(args.output_dir),
         n_test_sessions=args.n_test_sessions,
-        val_ratio=args.val_ratio,
         seeds=args.seeds,
         epochs=args.epochs,
         batch_size=args.batch_size,
