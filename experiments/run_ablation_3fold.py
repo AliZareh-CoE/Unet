@@ -316,66 +316,226 @@ def get_3fold_session_splits(all_sessions: List[str]) -> List[Dict[str, List[str
 
 
 # =============================================================================
-# Result Classes
+# Result Classes - COMPREHENSIVE
 # =============================================================================
 
 @dataclass
 class FoldResult:
-    """Result from a single fold of ablation experiment."""
+    """Result from a single fold of ablation experiment.
+
+    Captures ALL metrics from train.py output for comprehensive analysis.
+    """
     fold_idx: int
     test_sessions: List[str]
     train_sessions: List[str]
+
+    # Primary metrics
     val_r2: float
     val_loss: float
-    epochs_trained: int
-    total_time: float
+    val_corr: float = 0.0
+    val_mae: float = 0.0
+
+    # Training metadata
+    epochs_trained: int = 0
+    total_time: float = 0.0
+    n_parameters: int = 0
+    best_epoch: int = 0
+
+    # Training curves (full history)
+    train_losses: List[float] = field(default_factory=list)
+    val_losses: List[float] = field(default_factory=list)
+    val_r2s: List[float] = field(default_factory=list)
+    val_corrs: List[float] = field(default_factory=list)
+
+    # Per-session metrics (CRITICAL for session-level analysis)
     per_session_r2: Dict[str, float] = field(default_factory=dict)
+    per_session_corr: Dict[str, float] = field(default_factory=dict)
+    per_session_loss: Dict[str, float] = field(default_factory=dict)
+
+    # Test set metrics (if available)
+    test_avg_r2: Optional[float] = None
+    test_avg_corr: Optional[float] = None
+    per_session_test_results: List[Dict] = field(default_factory=list)
+
+    # Raw results dict (keep everything)
+    raw_results: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "fold_idx": self.fold_idx,
             "test_sessions": self.test_sessions,
             "train_sessions": self.train_sessions,
+            # Primary metrics
             "val_r2": self.val_r2,
             "val_loss": self.val_loss,
+            "val_corr": self.val_corr,
+            "val_mae": self.val_mae,
+            # Training metadata
             "epochs_trained": self.epochs_trained,
             "total_time": self.total_time,
+            "n_parameters": self.n_parameters,
+            "best_epoch": self.best_epoch,
+            # Training curves
+            "train_losses": self.train_losses,
+            "val_losses": self.val_losses,
+            "val_r2s": self.val_r2s,
+            "val_corrs": self.val_corrs,
+            # Per-session metrics
             "per_session_r2": self.per_session_r2,
+            "per_session_corr": self.per_session_corr,
+            "per_session_loss": self.per_session_loss,
+            # Test metrics
+            "test_avg_r2": self.test_avg_r2,
+            "test_avg_corr": self.test_avg_corr,
+            "per_session_test_results": self.per_session_test_results,
         }
 
 
 @dataclass
 class AblationResult:
-    """Aggregated results for one ablation configuration."""
+    """Aggregated results for one ablation configuration.
+
+    Includes comprehensive statistics and per-session analysis.
+    """
     config: AblationConfig
     fold_results: List[FoldResult]
 
-    # Statistics (computed after all folds)
+    # Primary statistics (computed after all folds)
     mean_r2: float = 0.0
     std_r2: float = 0.0
+    sem_r2: float = 0.0
+    median_r2: float = 0.0
+    min_r2: float = 0.0
+    max_r2: float = 0.0
+
+    # Confidence intervals
+    ci_lower_r2: float = 0.0
+    ci_upper_r2: float = 0.0
+
+    # Correlation statistics
+    mean_corr: float = 0.0
+    std_corr: float = 0.0
+
+    # Loss statistics
+    mean_loss: float = 0.0
+    std_loss: float = 0.0
+
+    # Per-session aggregated statistics
     all_session_r2s: Dict[str, float] = field(default_factory=dict)
+    all_session_corrs: Dict[str, float] = field(default_factory=dict)
+    session_r2_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # Training metadata
+    mean_epochs: float = 0.0
+    mean_time: float = 0.0
+    total_time: float = 0.0
+    n_parameters: int = 0
+
+    # Raw fold values for statistical tests
+    fold_r2_values: List[float] = field(default_factory=list)
+    fold_corr_values: List[float] = field(default_factory=list)
+    fold_loss_values: List[float] = field(default_factory=list)
 
     def compute_statistics(self) -> None:
-        """Compute aggregate statistics from fold results."""
+        """Compute comprehensive aggregate statistics from fold results."""
         if not self.fold_results:
             return
 
-        r2_values = [r.val_r2 for r in self.fold_results]
-        self.mean_r2 = float(np.mean(r2_values))
-        self.std_r2 = float(np.std(r2_values))
+        # Extract fold-level values
+        self.fold_r2_values = [r.val_r2 for r in self.fold_results]
+        self.fold_corr_values = [r.val_corr for r in self.fold_results]
+        self.fold_loss_values = [r.val_loss for r in self.fold_results]
+
+        r2_arr = np.array(self.fold_r2_values)
+        corr_arr = np.array(self.fold_corr_values)
+        loss_arr = np.array(self.fold_loss_values)
+
+        # R² statistics
+        self.mean_r2 = float(np.mean(r2_arr))
+        self.std_r2 = float(np.std(r2_arr, ddof=1)) if len(r2_arr) > 1 else 0.0
+        self.sem_r2 = float(self.std_r2 / np.sqrt(len(r2_arr))) if len(r2_arr) > 1 else 0.0
+        self.median_r2 = float(np.median(r2_arr))
+        self.min_r2 = float(np.min(r2_arr))
+        self.max_r2 = float(np.max(r2_arr))
+
+        # Confidence interval for R² (95%)
+        if len(r2_arr) >= 2:
+            from scipy import stats as scipy_stats
+            t_crit = scipy_stats.t.ppf(0.975, len(r2_arr) - 1)
+            margin = t_crit * self.sem_r2
+            self.ci_lower_r2 = self.mean_r2 - margin
+            self.ci_upper_r2 = self.mean_r2 + margin
+
+        # Correlation statistics
+        self.mean_corr = float(np.mean(corr_arr))
+        self.std_corr = float(np.std(corr_arr, ddof=1)) if len(corr_arr) > 1 else 0.0
+
+        # Loss statistics
+        self.mean_loss = float(np.mean(loss_arr))
+        self.std_loss = float(np.std(loss_arr, ddof=1)) if len(loss_arr) > 1 else 0.0
+
+        # Training metadata
+        self.mean_epochs = float(np.mean([r.epochs_trained for r in self.fold_results]))
+        self.mean_time = float(np.mean([r.total_time for r in self.fold_results]))
+        self.total_time = sum(r.total_time for r in self.fold_results)
+        self.n_parameters = self.fold_results[0].n_parameters if self.fold_results else 0
 
         # Aggregate per-session R2s across folds
+        session_r2_lists: Dict[str, List[float]] = {}
+        session_corr_lists: Dict[str, List[float]] = {}
+
         for fold in self.fold_results:
             for session, r2 in fold.per_session_r2.items():
                 self.all_session_r2s[session] = r2
+                if session not in session_r2_lists:
+                    session_r2_lists[session] = []
+                session_r2_lists[session].append(r2)
+
+            for session, corr in fold.per_session_corr.items():
+                self.all_session_corrs[session] = corr
+                if session not in session_corr_lists:
+                    session_corr_lists[session] = []
+                session_corr_lists[session].append(corr)
+
+        # Compute per-session statistics (if session appears in multiple folds, which shouldn't happen in our design)
+        for session, r2_list in session_r2_lists.items():
+            self.session_r2_stats[session] = {
+                "r2": float(np.mean(r2_list)),
+                "n_folds": len(r2_list),
+            }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "config": self.config.to_dict(),
             "fold_results": [f.to_dict() for f in self.fold_results],
+            # Primary R² statistics
             "mean_r2": self.mean_r2,
             "std_r2": self.std_r2,
+            "sem_r2": self.sem_r2,
+            "median_r2": self.median_r2,
+            "min_r2": self.min_r2,
+            "max_r2": self.max_r2,
+            "ci_lower_r2": self.ci_lower_r2,
+            "ci_upper_r2": self.ci_upper_r2,
+            # Correlation statistics
+            "mean_corr": self.mean_corr,
+            "std_corr": self.std_corr,
+            # Loss statistics
+            "mean_loss": self.mean_loss,
+            "std_loss": self.std_loss,
+            # Per-session data
             "all_session_r2s": self.all_session_r2s,
+            "all_session_corrs": self.all_session_corrs,
+            "session_r2_stats": self.session_r2_stats,
+            # Training metadata
+            "mean_epochs": self.mean_epochs,
+            "mean_time": self.mean_time,
+            "total_time": self.total_time,
+            "n_parameters": self.n_parameters,
+            # Raw values for statistical tests
+            "fold_r2_values": self.fold_r2_values,
+            "fold_corr_values": self.fold_corr_values,
+            "fold_loss_values": self.fold_loss_values,
         }
 
 
@@ -552,25 +712,52 @@ def run_single_fold(
 
     elapsed = time.time() - start_time
 
-    # Load results
+    # Load results - CAPTURE EVERYTHING
     if results_file.exists():
         with open(results_file, 'r') as f:
             results = json.load(f)
 
+        # Create comprehensive FoldResult with ALL metrics
         fold_result = FoldResult(
             fold_idx=fold_idx,
             test_sessions=test_sessions,
             train_sessions=train_sessions,
+            # Primary metrics
             val_r2=results.get("best_val_r2", results.get("val_r2", 0.0)),
             val_loss=results.get("best_val_loss", results.get("val_loss", float('inf'))),
+            val_corr=results.get("best_val_corr", 0.0),
+            val_mae=results.get("best_val_mae", 0.0),
+            # Training metadata
             epochs_trained=results.get("epochs_trained", ablation_config.epochs),
             total_time=elapsed,
+            n_parameters=results.get("n_parameters", 0),
+            best_epoch=results.get("best_epoch", 0),
+            # Training curves (full history)
+            train_losses=results.get("train_losses", []),
+            val_losses=results.get("val_losses", []),
+            val_r2s=results.get("val_r2s", []),
+            val_corrs=results.get("val_corrs", []),
+            # Per-session metrics
             per_session_r2=results.get("per_session_r2", {}),
+            per_session_corr=results.get("per_session_corr", {}),
+            per_session_loss=results.get("per_session_loss", {}),
+            # Test metrics (if available)
+            test_avg_r2=results.get("test_avg_r2"),
+            test_avg_corr=results.get("test_avg_corr"),
+            per_session_test_results=results.get("per_session_test_results", []),
+            # Keep raw results for reference
+            raw_results=results,
         )
 
         print(f"\n  Fold {fold_idx} completed:")
         print(f"    Val R2: {fold_result.val_r2:.4f}")
+        print(f"    Val Corr: {fold_result.val_corr:.4f}")
+        print(f"    Val Loss: {fold_result.val_loss:.4f}")
+        print(f"    Best Epoch: {fold_result.best_epoch}")
+        print(f"    Parameters: {fold_result.n_parameters:,}")
         print(f"    Time: {elapsed/60:.1f} minutes")
+        if fold_result.per_session_r2:
+            print(f"    Per-session R2: {fold_result.per_session_r2}")
 
         return fold_result
     else:
@@ -738,17 +925,150 @@ def run_3fold_ablation_study(
     return results
 
 
-def print_summary(results: Dict[str, AblationResult], total_time: float) -> None:
-    """Print summary of ablation study results."""
-    print("\n" + "=" * 70)
-    print("ABLATION STUDY RESULTS SUMMARY")
-    print("=" * 70)
+def compute_statistical_comparisons(
+    results: Dict[str, AblationResult],
+    baseline_name: str = "baseline",
+) -> Dict[str, Dict[str, Any]]:
+    """Compute comprehensive statistical comparisons vs baseline.
 
-    # Find baseline for comparison
-    baseline_r2 = results.get("baseline", AblationResult(
-        config=AblationConfig(name="baseline", description=""),
-        fold_results=[]
-    )).mean_r2
+    Returns dict with effect sizes, p-values, CIs for each ablation.
+    """
+    from scipy import stats as scipy_stats
+
+    if baseline_name not in results:
+        return {}
+
+    baseline = results[baseline_name]
+    baseline_r2s = np.array(baseline.fold_r2_values)
+
+    if len(baseline_r2s) < 2:
+        return {}
+
+    comparisons = {}
+
+    for name, result in results.items():
+        if name == baseline_name:
+            continue
+
+        ablation_r2s = np.array(result.fold_r2_values)
+
+        if len(ablation_r2s) < 2:
+            continue
+
+        # Basic statistics
+        mean_diff = result.mean_r2 - baseline.mean_r2
+        diff = ablation_r2s - baseline_r2s  # For paired tests
+
+        # Cohen's d (paired)
+        if np.std(diff, ddof=1) > 0:
+            cohens_d = np.mean(diff) / np.std(diff, ddof=1)
+        else:
+            cohens_d = 0.0
+
+        # Hedges' g (bias-corrected for small samples)
+        n = len(diff)
+        correction = 1 - (3 / (4 * n - 1)) if n > 1 else 1.0
+        hedges_g = cohens_d * correction
+
+        # Effect size interpretation
+        d_abs = abs(cohens_d)
+        if d_abs < 0.2:
+            effect_interp = "negligible"
+        elif d_abs < 0.5:
+            effect_interp = "small"
+        elif d_abs < 0.8:
+            effect_interp = "medium"
+        else:
+            effect_interp = "large"
+
+        # Paired t-test
+        try:
+            t_stat, t_pvalue = scipy_stats.ttest_rel(ablation_r2s, baseline_r2s)
+        except Exception:
+            t_stat, t_pvalue = 0.0, 1.0
+
+        # Wilcoxon signed-rank test (non-parametric)
+        try:
+            diff_nonzero = diff[diff != 0]
+            if len(diff_nonzero) >= 2:
+                w_stat, w_pvalue = scipy_stats.wilcoxon(diff_nonzero)
+            else:
+                w_stat, w_pvalue = 0.0, 1.0
+        except Exception:
+            w_stat, w_pvalue = 0.0, 1.0
+
+        # Confidence interval for mean difference
+        if len(diff) >= 2:
+            se = scipy_stats.sem(diff)
+            t_crit = scipy_stats.t.ppf(0.975, len(diff) - 1)
+            ci_lower = np.mean(diff) - t_crit * se
+            ci_upper = np.mean(diff) + t_crit * se
+        else:
+            ci_lower, ci_upper = mean_diff, mean_diff
+
+        # Normality test on differences
+        try:
+            _, norm_p = scipy_stats.shapiro(diff)
+            normality_ok = norm_p > 0.05
+        except Exception:
+            norm_p, normality_ok = 1.0, True
+
+        # Significance markers
+        if t_pvalue < 0.001:
+            sig_marker = "***"
+        elif t_pvalue < 0.01:
+            sig_marker = "**"
+        elif t_pvalue < 0.05:
+            sig_marker = "*"
+        else:
+            sig_marker = "ns"
+
+        comparisons[name] = {
+            "mean_diff": float(mean_diff),
+            "ci_lower": float(ci_lower),
+            "ci_upper": float(ci_upper),
+            "cohens_d": float(cohens_d),
+            "hedges_g": float(hedges_g),
+            "effect_interpretation": effect_interp,
+            "t_statistic": float(t_stat),
+            "t_pvalue": float(t_pvalue),
+            "wilcoxon_statistic": float(w_stat),
+            "wilcoxon_pvalue": float(w_pvalue),
+            "normality_pvalue": float(norm_p),
+            "normality_ok": normality_ok,
+            "recommended_test": "t-test" if normality_ok else "Wilcoxon",
+            "recommended_pvalue": float(t_pvalue) if normality_ok else float(w_pvalue),
+            "significance_marker": sig_marker,
+            "significant_005": t_pvalue < 0.05,
+            "significant_001": t_pvalue < 0.01,
+        }
+
+    # Apply multiple comparison correction (Holm-Bonferroni)
+    if comparisons:
+        p_values = [(name, c["t_pvalue"]) for name, c in comparisons.items()]
+        sorted_pvals = sorted(p_values, key=lambda x: x[1])
+        n_comparisons = len(p_values)
+
+        for i, (name, p) in enumerate(sorted_pvals):
+            threshold = 0.05 / (n_comparisons - i)
+            comparisons[name]["holm_significant"] = p < threshold
+            comparisons[name]["holm_threshold"] = threshold
+
+    return comparisons
+
+
+def print_summary(results: Dict[str, AblationResult], total_time: float) -> None:
+    """Print comprehensive summary of ablation study results with statistics."""
+    print("\n" + "=" * 80)
+    print("ABLATION STUDY RESULTS SUMMARY")
+    print("=" * 80)
+
+    # Find baseline
+    baseline_result = results.get("baseline")
+    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0
+
+    # Compute statistical comparisons
+    comparisons = compute_statistical_comparisons(results, "baseline")
 
     # Sort by mean R2
     sorted_results = sorted(
@@ -757,53 +1077,295 @@ def print_summary(results: Dict[str, AblationResult], total_time: float) -> None
         reverse=True
     )
 
-    print(f"\n{'Ablation':<25} {'R2 (mean ± std)':<20} {'Delta':>10}")
-    print("-" * 60)
+    # Print main results table
+    print(f"\n{'Ablation':<22} {'R2 (mean±std)':<18} {'95% CI':<18} {'Delta':>8} {'d':>6} {'p':>8} {'Sig':>4}")
+    print("-" * 90)
 
     for name, result in sorted_results:
-        r2_str = f"{result.mean_r2:.4f} +/- {result.std_r2:.4f}"
-        delta = result.mean_r2 - baseline_r2 if name != "baseline" else 0.0
-        delta_str = f"{delta:+.4f}" if name != "baseline" else "--"
-        sign = "+" if delta > 0 else "" if delta == 0 else ""
+        r2_str = f"{result.mean_r2:.4f}±{result.std_r2:.4f}"
+        ci_str = f"[{result.ci_lower_r2:.4f},{result.ci_upper_r2:.4f}]"
 
-        print(f"{name:<25} {r2_str:<20} {sign}{delta_str:>10}")
+        if name == "baseline":
+            delta_str = "--"
+            d_str = "--"
+            p_str = "--"
+            sig_str = "--"
+        else:
+            delta = result.mean_r2 - baseline_r2
+            delta_str = f"{delta:+.4f}"
 
+            if name in comparisons:
+                comp = comparisons[name]
+                d_str = f"{comp['cohens_d']:.2f}"
+                p_str = f"{comp['recommended_pvalue']:.4f}"
+                sig_str = comp['significance_marker']
+            else:
+                d_str = "--"
+                p_str = "--"
+                sig_str = "--"
+
+        print(f"{name:<22} {r2_str:<18} {ci_str:<18} {delta_str:>8} {d_str:>6} {p_str:>8} {sig_str:>4}")
+
+    print("-" * 90)
+
+    # Print statistical summary
+    if comparisons:
+        print("\nSTATISTICAL ANALYSIS (vs baseline):")
+        print("-" * 60)
+
+        # Count significant results
+        sig_005 = sum(1 for c in comparisons.values() if c['significant_005'])
+        sig_001 = sum(1 for c in comparisons.values() if c['significant_001'])
+        holm_sig = sum(1 for c in comparisons.values() if c.get('holm_significant', False))
+
+        print(f"  Significant at p<0.05: {sig_005}/{len(comparisons)}")
+        print(f"  Significant at p<0.01: {sig_001}/{len(comparisons)}")
+        print(f"  Significant (Holm-corrected): {holm_sig}/{len(comparisons)}")
+
+        # Effect size summary
+        large_effects = [n for n, c in comparisons.items() if c['effect_interpretation'] == 'large']
+        medium_effects = [n for n, c in comparisons.items() if c['effect_interpretation'] == 'medium']
+
+        if large_effects:
+            print(f"  Large effects (|d|≥0.8): {', '.join(large_effects)}")
+        if medium_effects:
+            print(f"  Medium effects (0.5≤|d|<0.8): {', '.join(medium_effects)}")
+
+    # Print per-session summary
+    print("\nPER-SESSION R² SUMMARY:")
     print("-" * 60)
-    print(f"\nTotal time: {total_time/3600:.1f} hours")
-    print("=" * 70)
+    all_sessions = set()
+    for result in results.values():
+        all_sessions.update(result.all_session_r2s.keys())
+
+    if all_sessions:
+        for session in sorted(all_sessions):
+            session_r2s = []
+            for name, result in results.items():
+                if session in result.all_session_r2s:
+                    session_r2s.append((name, result.all_session_r2s[session]))
+            if session_r2s:
+                best = max(session_r2s, key=lambda x: x[1])
+                worst = min(session_r2s, key=lambda x: x[1])
+                print(f"  {session}: best={best[0]} ({best[1]:.4f}), worst={worst[0]} ({worst[1]:.4f})")
+
+    # Print timing
+    print(f"\nTotal time: {total_time/3600:.1f} hours ({total_time/60:.0f} minutes)")
+    print("=" * 80)
 
 
 def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
-    """Save summary of results to JSON."""
-    summary = {
-        "timestamp": datetime.now().isoformat(),
-        "results": {name: result.to_dict() for name, result in results.items()},
-        "summary_table": [],
-    }
+    """Save comprehensive summary with all statistics to JSON files."""
+    output_dir = Path(output_dir)
+
+    # Compute statistical comparisons
+    comparisons = compute_statistical_comparisons(results, "baseline")
 
     # Find baseline
-    baseline_r2 = results.get("baseline", AblationResult(
-        config=AblationConfig(name="baseline", description=""),
-        fold_results=[]
-    )).mean_r2
+    baseline_result = results.get("baseline")
+    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0
 
-    # Build summary table
+    # =========================================================================
+    # 1. MAIN SUMMARY FILE (ablation_summary.json)
+    # =========================================================================
+    summary = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "n_ablations": len(results),
+            "n_folds": 3,
+            "baseline": "baseline" if "baseline" in results else None,
+        },
+        "results": {name: result.to_dict() for name, result in results.items()},
+        "statistical_comparisons": comparisons,
+    }
+
+    # Build summary table (sorted by R²)
+    summary_table = []
     for name, result in sorted(results.items(), key=lambda x: x[1].mean_r2, reverse=True):
-        delta = result.mean_r2 - baseline_r2 if name != "baseline" else 0.0
-        summary["summary_table"].append({
+        entry = {
+            "rank": len(summary_table) + 1,
             "name": name,
+            "description": result.config.description,
+            # R² statistics
             "mean_r2": result.mean_r2,
             "std_r2": result.std_r2,
-            "delta_vs_baseline": delta,
+            "sem_r2": result.sem_r2,
+            "ci_lower_r2": result.ci_lower_r2,
+            "ci_upper_r2": result.ci_upper_r2,
+            "median_r2": result.median_r2,
+            "min_r2": result.min_r2,
+            "max_r2": result.max_r2,
+            # Correlation statistics
+            "mean_corr": result.mean_corr,
+            "std_corr": result.std_corr,
+            # Loss statistics
+            "mean_loss": result.mean_loss,
+            "std_loss": result.std_loss,
+            # Comparison vs baseline
+            "delta_vs_baseline": result.mean_r2 - baseline_r2 if name != "baseline" else 0.0,
+            # Training info
             "n_folds": len(result.fold_results),
-        })
+            "n_parameters": result.n_parameters,
+            "mean_epochs": result.mean_epochs,
+            "total_time_minutes": result.total_time / 60,
+        }
 
-    # Save
+        # Add statistical comparison if available
+        if name in comparisons:
+            comp = comparisons[name]
+            entry["cohens_d"] = comp["cohens_d"]
+            entry["hedges_g"] = comp["hedges_g"]
+            entry["effect_size"] = comp["effect_interpretation"]
+            entry["t_pvalue"] = comp["t_pvalue"]
+            entry["wilcoxon_pvalue"] = comp["wilcoxon_pvalue"]
+            entry["significance"] = comp["significance_marker"]
+            entry["holm_significant"] = comp.get("holm_significant", False)
+
+        summary_table.append(entry)
+
+    summary["summary_table"] = summary_table
+
+    # Save main summary
     summary_file = output_dir / "ablation_summary.json"
     with open(summary_file, 'w') as f:
         json.dump(summary, f, indent=2)
+    print(f"\nMain summary saved to: {summary_file}")
 
-    print(f"\nSummary saved to: {summary_file}")
+    # =========================================================================
+    # 2. STATISTICAL ANALYSIS FILE (statistical_analysis.json)
+    # =========================================================================
+    stats_analysis = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "baseline": "baseline",
+            "alpha": 0.05,
+            "correction_method": "Holm-Bonferroni",
+        },
+        "comparisons": comparisons,
+        "effect_size_thresholds": {
+            "negligible": "|d| < 0.2",
+            "small": "0.2 ≤ |d| < 0.5",
+            "medium": "0.5 ≤ |d| < 0.8",
+            "large": "|d| ≥ 0.8",
+        },
+        "significance_markers": {
+            "***": "p < 0.001",
+            "**": "p < 0.01",
+            "*": "p < 0.05",
+            "ns": "not significant",
+        },
+    }
+
+    stats_file = output_dir / "statistical_analysis.json"
+    with open(stats_file, 'w') as f:
+        json.dump(stats_analysis, f, indent=2)
+    print(f"Statistical analysis saved to: {stats_file}")
+
+    # =========================================================================
+    # 3. PER-SESSION RESULTS FILE (per_session_results.json)
+    # =========================================================================
+    per_session = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+        },
+        "sessions": {},
+    }
+
+    # Collect all sessions
+    all_sessions = set()
+    for result in results.values():
+        all_sessions.update(result.all_session_r2s.keys())
+
+    for session in sorted(all_sessions):
+        session_data = {"ablations": {}}
+        for name, result in results.items():
+            if session in result.all_session_r2s:
+                session_data["ablations"][name] = {
+                    "r2": result.all_session_r2s[session],
+                    "corr": result.all_session_corrs.get(session, 0.0),
+                }
+        if session_data["ablations"]:
+            r2_values = [v["r2"] for v in session_data["ablations"].values()]
+            session_data["mean_r2"] = float(np.mean(r2_values))
+            session_data["std_r2"] = float(np.std(r2_values))
+            session_data["best_ablation"] = max(
+                session_data["ablations"].items(),
+                key=lambda x: x[1]["r2"]
+            )[0]
+            session_data["worst_ablation"] = min(
+                session_data["ablations"].items(),
+                key=lambda x: x[1]["r2"]
+            )[0]
+        per_session["sessions"][session] = session_data
+
+    session_file = output_dir / "per_session_results.json"
+    with open(session_file, 'w') as f:
+        json.dump(per_session, f, indent=2)
+    print(f"Per-session results saved to: {session_file}")
+
+    # =========================================================================
+    # 4. TRAINING CURVES FILE (training_curves.json)
+    # =========================================================================
+    training_curves = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+        },
+        "ablations": {},
+    }
+
+    for name, result in results.items():
+        curves = {
+            "folds": [],
+            "mean_final_loss": result.mean_loss,
+            "mean_final_r2": result.mean_r2,
+        }
+        for fold in result.fold_results:
+            curves["folds"].append({
+                "fold_idx": fold.fold_idx,
+                "train_losses": fold.train_losses,
+                "val_losses": fold.val_losses,
+                "val_r2s": fold.val_r2s,
+                "val_corrs": fold.val_corrs,
+                "best_epoch": fold.best_epoch,
+                "epochs_trained": fold.epochs_trained,
+            })
+        training_curves["ablations"][name] = curves
+
+    curves_file = output_dir / "training_curves.json"
+    with open(curves_file, 'w') as f:
+        json.dump(training_curves, f, indent=2)
+    print(f"Training curves saved to: {curves_file}")
+
+    # =========================================================================
+    # 5. PUBLICATION-READY TABLE (results_table.csv)
+    # =========================================================================
+    try:
+        import csv
+        csv_file = output_dir / "results_table.csv"
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Rank", "Ablation", "R² (mean±std)", "95% CI",
+                "Δ vs baseline", "Cohen's d", "Effect Size",
+                "p-value", "Significance", "Holm Significant"
+            ])
+            for entry in summary_table:
+                r2_str = f"{entry['mean_r2']:.4f}±{entry['std_r2']:.4f}"
+                ci_str = f"[{entry['ci_lower_r2']:.4f}, {entry['ci_upper_r2']:.4f}]"
+                delta_str = f"{entry['delta_vs_baseline']:+.4f}" if entry['name'] != 'baseline' else "--"
+                d_str = f"{entry.get('cohens_d', 0):.3f}" if entry['name'] != 'baseline' else "--"
+                effect_str = entry.get('effect_size', '--') if entry['name'] != 'baseline' else "--"
+                p_str = f"{entry.get('t_pvalue', 1):.4f}" if entry['name'] != 'baseline' else "--"
+                sig_str = entry.get('significance', '--') if entry['name'] != 'baseline' else "--"
+                holm_str = "Yes" if entry.get('holm_significant', False) else "No"
+
+                writer.writerow([
+                    entry['rank'], entry['name'], r2_str, ci_str,
+                    delta_str, d_str, effect_str, p_str, sig_str, holm_str
+                ])
+        print(f"Results table saved to: {csv_file}")
+    except Exception as e:
+        print(f"Warning: Could not save CSV table: {e}")
 
 
 # =============================================================================

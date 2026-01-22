@@ -77,10 +77,14 @@ python experiments/run_ablation_3fold.py --dry-run
 
 ```
 results/ablation_3fold/
-├── ablation_summary.json       # Summary of all results
+├── ablation_summary.json       # Main summary with all results
+├── statistical_analysis.json   # Statistical comparisons vs baseline
+├── per_session_results.json    # Per-session R² for all ablations
+├── training_curves.json        # Full training history curves
+├── results_table.csv           # Publication-ready table
 ├── ablation_run_*.log          # Run logs
 ├── baseline/
-│   ├── baseline_fold0_results.json
+│   ├── baseline_fold0_results.json  # Full metrics per fold
 │   ├── baseline_fold1_results.json
 │   ├── baseline_fold2_results.json
 │   └── ablation_result.json    # Aggregated results
@@ -88,6 +92,24 @@ results/ablation_3fold/
 │   └── ...
 └── ...
 ```
+
+## Saved Metrics (Per Fold)
+
+From each `train.py` run, we capture:
+- **Primary metrics**: val_r2, val_loss, val_corr, val_mae
+- **Training metadata**: epochs_trained, n_parameters, best_epoch, total_time
+- **Training curves**: train_losses, val_losses, val_r2s, val_corrs (full history)
+- **Per-session metrics**: per_session_r2, per_session_corr, per_session_loss
+- **Test metrics** (if available): test_avg_r2, per_session_test_results
+
+## Statistical Analysis
+
+For each ablation vs baseline, we compute:
+- **Effect sizes**: Cohen's d, Hedges' g (bias-corrected)
+- **Statistical tests**: Paired t-test, Wilcoxon signed-rank
+- **Confidence intervals**: 95% CI for mean difference
+- **Multiple comparison correction**: Holm-Bonferroni
+- **Normality tests**: Shapiro-Wilk (recommends parametric vs non-parametric)
 
 ## Results Interpretation
 
