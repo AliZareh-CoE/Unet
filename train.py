@@ -1185,7 +1185,11 @@ def evaluate(
         per_ch_corr_mean = per_ch_corr_stacked.mean(dim=0)  # [C]
 
         results["per_channel_corr"] = per_ch_corr_mean.tolist()  # List of per-channel correlations
-        results["per_channel_corr_std"] = per_ch_corr_stacked.std(dim=0).tolist()
+        # Only compute std if we have more than 1 batch (avoid degrees of freedom warning)
+        if per_ch_corr_stacked.size(0) > 1:
+            results["per_channel_corr_std"] = per_ch_corr_stacked.std(dim=0).tolist()
+        else:
+            results["per_channel_corr_std"] = [0.0] * per_ch_corr_mean.size(0)
         results["per_channel_corr_min"] = float(per_ch_corr_mean.min())
         results["per_channel_corr_max"] = float(per_ch_corr_mean.max())
         results["channel_corr_range"] = float(per_ch_corr_mean.max() - per_ch_corr_mean.min())
