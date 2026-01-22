@@ -98,6 +98,7 @@ class AblationConfig:
     # Execution
     use_fsdp: bool = False
     n_gpus: int = 8
+    gpu: int = 0  # GPU to use for single-GPU mode
     verbose: bool = True
     groups_to_run: Optional[List[str]] = None
 

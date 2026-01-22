@@ -135,12 +135,17 @@ def run_training(
     if ablation_config.verbose:
         print(f"    Seed {seed}: excluding test sessions {test_sessions}")
 
-    # Set NCCL environment variables for stability with FSDP
+    # Set environment variables
     env = os.environ.copy()
-    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
-    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
-    env["NCCL_TIMEOUT"] = "1800"
-    env["NCCL_DEBUG"] = "WARN"
+    if ablation_config.use_fsdp:
+        # NCCL environment variables for stability with FSDP
+        env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
+        env["NCCL_TIMEOUT"] = "1800"
+        env["NCCL_DEBUG"] = "WARN"
+    else:
+        # Single-GPU mode: specify which GPU to use
+        env["CUDA_VISIBLE_DEVICES"] = str(ablation_config.gpu)
 
     try:
         result = subprocess.run(
@@ -334,8 +339,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--fsdp", action="store_true")
-    parser.add_argument("--n-gpus", type=int, default=8)
+    parser.add_argument("--fsdp", action="store_true", help="Use FSDP (may have sync issues)")
+    parser.add_argument("--n-gpus", type=int, default=8, help="Number of GPUs for FSDP")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU to use for single-GPU mode")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -384,6 +390,7 @@ def main():
         learning_rate=args.lr,
         use_fsdp=args.fsdp,
         n_gpus=args.n_gpus,
+        gpu=args.gpu,
         verbose=not args.quiet,
         groups_to_run=args.group,
     )
