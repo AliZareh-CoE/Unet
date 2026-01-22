@@ -27,14 +27,14 @@ BASELINE_CONFIG: Dict[str, Any] = {
     "attention_type": "none",
     "n_heads": 4,
     "skip_type": "add",
-    "activation": "relu",
+    "activation": "gelu",  # gelu is more efficient than relu
     "cond_mode": "cross_attn_gated",
     "conditioning": "spectro_temporal",
     "use_adaptive_scaling": True,
     "use_session_stats": False,
     "use_bidirectional": False,
     "optimizer": "adamw",
-    "lr_schedule": "step",
+    "lr_schedule": "cosine_warmup",  # More efficient than step (no plateau checking)
     "learning_rate": 1e-3,
     "weight_decay": 0.01,
     "batch_size": 64,

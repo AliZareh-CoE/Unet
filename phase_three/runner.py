@@ -96,6 +96,9 @@ def run_training(
     else:
         cmd = ["python", "train.py"]
 
+    # Unique checkpoint prefix to avoid conflicts between runs
+    checkpoint_prefix = f"{name}_seed{seed}"
+
     cmd.extend([
         "--dataset", config.get("dataset", "olfactory"),
         "--epochs", str(ablation_config.epochs),
@@ -107,14 +110,15 @@ def run_training(
         "--n-downsample", str(config.get("n_downsample", 2)),
         "--conv-type", config.get("conv_type", "modern"),
         "--attention-type", config.get("attention_type", "none"),
-        "--activation", config.get("activation", "relu"),
+        "--activation", config.get("activation", "gelu"),
         "--skip-type", config.get("skip_type", "add"),
         "--n-heads", str(config.get("n_heads", 4)),
         "--conditioning", config.get("conditioning", "spectro_temporal"),
         "--cond-mode", config.get("cond_mode", "cross_attn_gated"),
         "--optimizer", config.get("optimizer", "adamw"),
-        "--lr-schedule", config.get("lr_schedule", "step"),
+        "--lr-schedule", config.get("lr_schedule", "cosine_warmup"),
         "--weight-decay", str(config.get("weight_decay", 0.01)),
+        "--checkpoint-prefix", checkpoint_prefix,  # Unique checkpoint per run
         # Exclude test sessions entirely (faster - no test eval)
         "--exclude-sessions", *test_sessions,
         "--output-results-file", str(results_file),
@@ -137,10 +141,12 @@ def run_training(
 
     # Set environment variables
     env = os.environ.copy()
+    # NCCL environment variables (disable monitoring overhead)
+    env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+    env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
+
     if ablation_config.use_fsdp:
-        # NCCL environment variables for stability with FSDP
-        env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
-        env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
+        # Additional FSDP settings
         env["NCCL_TIMEOUT"] = "1800"
         env["NCCL_DEBUG"] = "WARN"
     else:
