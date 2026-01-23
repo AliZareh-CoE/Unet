@@ -61,6 +61,24 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # =============================================================================
+# Custom JSON Encoder for NumPy types
+# =============================================================================
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -174,7 +192,7 @@ def save_sweep_state(state: SweepState, output_dir: Path) -> None:
     state.updated_at = datetime.now().isoformat()
     state_file = output_dir / "sweep_state.json"
     with open(state_file, 'w') as f:
-        json.dump(state.to_dict(), f, indent=2)
+        json.dump(state.to_dict(), f, indent=2, cls=NumpyEncoder)
     print(f"Sweep state saved to: {state_file}")
 
 
@@ -1194,7 +1212,7 @@ def run_ablation_experiment(
     # Save ablation result
     result_file = ablation_dir / "ablation_result.json"
     with open(result_file, 'w') as f:
-        json.dump(ablation_result.to_dict(), f, indent=2)
+        json.dump(ablation_result.to_dict(), f, indent=2, cls=NumpyEncoder)
 
     return ablation_result
 
@@ -1835,7 +1853,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
     # Save main summary
     summary_file = output_dir / "ablation_summary.json"
     with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
     print(f"\nMain summary saved to: {summary_file}")
 
     # =========================================================================
@@ -1865,7 +1883,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     stats_file = output_dir / "statistical_analysis.json"
     with open(stats_file, 'w') as f:
-        json.dump(stats_analysis, f, indent=2)
+        json.dump(stats_analysis, f, indent=2, cls=NumpyEncoder)
     print(f"Statistical analysis saved to: {stats_file}")
 
     # =========================================================================
@@ -1909,7 +1927,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     session_file = output_dir / "per_session_test_results.json"
     with open(session_file, 'w') as f:
-        json.dump(per_session, f, indent=2)
+        json.dump(per_session, f, indent=2, cls=NumpyEncoder)
     print(f"Per-session TEST results saved to: {session_file}")
 
     # =========================================================================
@@ -1942,7 +1960,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     curves_file = output_dir / "training_curves.json"
     with open(curves_file, 'w') as f:
-        json.dump(training_curves, f, indent=2)
+        json.dump(training_curves, f, indent=2, cls=NumpyEncoder)
     print(f"Training curves saved to: {curves_file}")
 
     # =========================================================================
@@ -1983,13 +2001,13 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     recommendations_file = output_dir / "recommendations.json"
     with open(recommendations_file, 'w') as f:
-        json.dump(recommendations, f, indent=2)
+        json.dump(recommendations, f, indent=2, cls=NumpyEncoder)
     print(f"Recommendations saved to: {recommendations_file}")
 
     # Also add recommendations to main summary
     summary["recommendations"] = recommendations
     with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
 
 
 # =============================================================================
