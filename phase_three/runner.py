@@ -1222,6 +1222,12 @@ def run_ablation_experiment(
         if result is not None:
             fold_results.append(result)
 
+            # Save after EACH fold (don't lose progress if interrupted)
+            fold_file = ablation_dir / f"fold{split['fold_idx']}_result.json"
+            with open(fold_file, 'w') as f:
+                json.dump(result.to_dict(), f, indent=2, cls=NumpyEncoder)
+            print(f"  Fold {split['fold_idx']} saved to: {fold_file}")
+
     # Create ablation result
     ablation_result = AblationResult(
         config=ablation_config,
