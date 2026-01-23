@@ -2134,9 +2134,12 @@ def train(
             best_epoch = epoch
             patience_counter = 0
             CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+            # Use checkpoint_prefix if provided (for Phase 3 folds)
+            ckpt_prefix = config.get("checkpoint_prefix")
+            ckpt_name = f"{ckpt_prefix}_best_model.pt" if ckpt_prefix else "best_model.pt"
             save_checkpoint(
                 model, optimizer, epoch,
-                CHECKPOINT_DIR / "best_model.pt",
+                CHECKPOINT_DIR / ckpt_name,
                 is_fsdp=is_fsdp_wrapped,
                 reverse_model=reverse_model,
                 config=config,
@@ -3106,6 +3109,9 @@ def main():
     if args.separate_val_sessions is not None:
         config["separate_val_sessions"] = args.separate_val_sessions
 
+    # Checkpoint prefix for unique checkpoint paths (used by Phase 3 folds)
+    config["checkpoint_prefix"] = getattr(args, 'checkpoint_prefix', None)
+
     # Session embedding configuration
     if args.use_session_embedding:
         # n_sessions will be auto-detected from data if not specified
@@ -3578,7 +3584,9 @@ def main():
         else:
             print("No test set (using held-out validation sessions instead)")
 
-        print(f"Model saved to: {CHECKPOINT_DIR / 'best_model.pt'}")
+        ckpt_prefix = config.get("checkpoint_prefix")
+        ckpt_name = f"{ckpt_prefix}_best_model.pt" if ckpt_prefix else "best_model.pt"
+        print(f"Model saved to: {CHECKPOINT_DIR / ckpt_name}")
 
         # Machine-parseable results for experiment scripts
         if results['test_metrics']:
