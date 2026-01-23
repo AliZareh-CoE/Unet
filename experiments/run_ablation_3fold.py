@@ -783,7 +783,7 @@ def evaluate_on_test_sessions(
         model = CondUNet1D(
             in_channels=config.get("in_channels", 32),
             out_channels=config.get("out_channels", 32),
-            base_channels=config.get("base_channels", 128),
+            base=config.get("base_channels", 128),  # Note: CLI uses base_channels, model uses base
             n_odors=config.get("n_odors", 7),
             n_downsample=config.get("n_downsample", 2),
             conv_type=config.get("conv_type", "modern"),
@@ -791,7 +791,6 @@ def evaluate_on_test_sessions(
             skip_type=config.get("skip_type", "add"),
             activation=config.get("activation", "gelu"),
             cond_mode=config.get("cond_mode", "cross_attn_gated"),
-            conditioning=config.get("conditioning", "spectro_temporal"),
             use_adaptive_scaling=config.get("use_adaptive_scaling", True),
             n_heads=config.get("n_heads", 4),
         )
