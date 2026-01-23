@@ -844,11 +844,19 @@ def evaluate_on_test_sessions(
         y_test = torch.tensor(y[test_idx], dtype=torch.float32)
         odors_test = torch.tensor(odors[test_idx], dtype=torch.long)
 
-        # Evaluate
+        # Evaluate in batches to avoid OOM
+        batch_size = 32
+        y_pred_list = []
         with torch.no_grad():
-            X_test_dev = X_test.to(device)
-            odors_test_dev = odors_test.to(device)
-            y_pred = model(X_test_dev, odors_test_dev).cpu()
+            for i in range(0, len(X_test), batch_size):
+                X_batch = X_test[i:i+batch_size].to(device)
+                odors_batch = odors_test[i:i+batch_size].to(device)
+                y_batch = model(X_batch, odors_batch).cpu()
+                y_pred_list.append(y_batch)
+                # Clear GPU memory
+                del X_batch, odors_batch
+                torch.cuda.empty_cache()
+        y_pred = torch.cat(y_pred_list, dim=0)
 
         # Compute overall metrics
         y_test_flat = y_test.numpy().flatten()
