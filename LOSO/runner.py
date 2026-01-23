@@ -39,7 +39,14 @@ import torch
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from LOSO.config import LOSOConfig, LOSOFoldResult, LOSOResult
+from LOSO.config import (
+    LOSOConfig,
+    LOSOFoldResult,
+    LOSOResult,
+    DatasetConfig,
+    DATASET_CONFIGS,
+    get_dataset_config,
+)
 
 
 # =============================================================================
@@ -92,38 +99,230 @@ def setup_logging(output_dir: Path) -> Tuple[Path, TeeLogger]:
 # Session Discovery
 # =============================================================================
 
-def get_all_sessions(dataset: str) -> List[str]:
-    """Get list of all session names for a dataset.
+def get_all_sessions(
+    dataset: str,
+    config: Optional[LOSOConfig] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Get list of all session/subject names for a dataset with metadata.
+
+    This function discovers all available sessions or subjects for LOSO
+    cross-validation. For session-based datasets (olfactory, pfc_hpc), it
+    returns recording session IDs. For subject-based datasets (dandi_movie),
+    it returns subject IDs.
 
     Args:
         dataset: Dataset name (olfactory, pfc_hpc, dandi_movie)
+        config: Optional LOSOConfig for dataset-specific parameters
 
     Returns:
-        List of session names/identifiers
+        Tuple of:
+            - sessions: List of session/subject identifiers
+            - metadata: Dict with dataset-specific info:
+                - session_type: "session" or "subject"
+                - trials_per_session: Dict mapping session -> trial count (if available)
+                - total_trials: Total number of trials (if available)
+                - description: Human-readable dataset description
+
+    Raises:
+        ValueError: If dataset is not recognized
+        FileNotFoundError: If required data files are not found
     """
+    ds_config = get_dataset_config(dataset)
+
     if dataset == "olfactory":
         from data import load_session_ids, ODOR_CSV_PATH
-        _, session_to_idx, _ = load_session_ids(ODOR_CSV_PATH)
-        return sorted(session_to_idx.keys())
+
+        session_ids, session_to_idx, idx_to_session = load_session_ids(ODOR_CSV_PATH)
+        sessions = sorted(session_to_idx.keys())
+
+        # Count trials per session
+        unique_ids, counts = np.unique(session_ids, return_counts=True)
+        trials_per_session = {
+            idx_to_session[int(sid)]: int(cnt)
+            for sid, cnt in zip(unique_ids, counts)
+        }
+
+        metadata = {
+            "session_type": ds_config.session_type,
+            "trials_per_session": trials_per_session,
+            "total_trials": int(len(session_ids)),
+            "description": ds_config.description,
+            "source_region": ds_config.source_region,
+            "target_region": ds_config.target_region,
+        }
+        return sessions, metadata
 
     elif dataset == "pfc_hpc":
         from data import load_pfc_session_ids, PFC_META_PATH
-        _, session_to_idx, _ = load_pfc_session_ids(PFC_META_PATH)
-        return sorted(session_to_idx.keys())
+
+        session_ids, session_to_idx, idx_to_session = load_pfc_session_ids(PFC_META_PATH)
+        sessions = sorted(session_to_idx.keys())
+
+        # Count trials per session
+        unique_ids, counts = np.unique(session_ids, return_counts=True)
+        trials_per_session = {
+            idx_to_session[int(sid)]: int(cnt)
+            for sid, cnt in zip(unique_ids, counts)
+        }
+
+        metadata = {
+            "session_type": ds_config.session_type,
+            "trials_per_session": trials_per_session,
+            "total_trials": int(len(session_ids)),
+            "description": ds_config.description,
+            "source_region": ds_config.source_region,
+            "target_region": ds_config.target_region,
+        }
+        return sessions, metadata
 
     elif dataset == "dandi_movie":
-        # DANDI dataset - get sessions from data directory
-        from data import _DANDI_DATA_DIR
-        if _DANDI_DATA_DIR.exists():
-            sessions = []
-            for session_dir in sorted(_DANDI_DATA_DIR.iterdir()):
-                if session_dir.is_dir() and session_dir.name.startswith("sub-"):
-                    sessions.append(session_dir.name)
-            return sessions
-        raise FileNotFoundError(f"DANDI data directory not found: {_DANDI_DATA_DIR}")
+        from data import _DANDI_DATA_DIR, list_dandi_nwb_files
+
+        if not _DANDI_DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"DANDI data directory not found: {_DANDI_DATA_DIR}\n"
+                f"Please download DANDI 000623 dataset to this location."
+            )
+
+        # Discover subjects from NWB files
+        nwb_files = list_dandi_nwb_files(_DANDI_DATA_DIR)
+        if not nwb_files:
+            raise FileNotFoundError(
+                f"No NWB files found in DANDI data directory: {_DANDI_DATA_DIR}"
+            )
+
+        # Extract unique subject IDs
+        subjects = []
+        for f in nwb_files:
+            stem = f.stem
+            if "sub-" in stem:
+                subj_id = stem.split("_")[0]  # Get sub-CSXX part
+            else:
+                subj_id = stem
+            if subj_id not in subjects:
+                subjects.append(subj_id)
+
+        subjects = sorted(subjects)
+
+        # Get source/target regions from config if available
+        source_region = ds_config.source_region
+        target_region = ds_config.target_region
+        if config is not None:
+            source_region = config.dandi_source_region
+            target_region = config.dandi_target_region
+
+        metadata = {
+            "session_type": ds_config.session_type,  # "subject"
+            "description": ds_config.description,
+            "source_region": source_region,
+            "target_region": target_region,
+            "n_subjects": len(subjects),
+            "note": "LOSO holds out entire subjects (Leave-One-Subject-Out)",
+        }
+        return subjects, metadata
 
     else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+        available = ", ".join(DATASET_CONFIGS.keys())
+        raise ValueError(
+            f"Unknown dataset: '{dataset}'. Available datasets: {available}"
+        )
+
+
+def validate_sessions(
+    sessions: List[str],
+    dataset: str,
+    config: LOSOConfig,
+) -> None:
+    """Validate that we have enough sessions for LOSO.
+
+    Args:
+        sessions: List of session/subject identifiers
+        dataset: Dataset name
+        config: LOSO configuration
+
+    Raises:
+        ValueError: If validation fails
+    """
+    ds_config = get_dataset_config(dataset)
+    session_label = "subjects" if ds_config.session_type == "subject" else "sessions"
+
+    # Minimum sessions check
+    if len(sessions) < 3:
+        raise ValueError(
+            f"LOSO requires at least 3 {session_label}. "
+            f"Dataset '{dataset}' has only {len(sessions)}."
+        )
+
+    # Dataset-specific validations
+    if dataset == "dandi_movie":
+        # Validate DANDI source/target regions
+        valid_regions = ["amygdala", "hippocampus", "medial_frontal_cortex"]
+
+        if config.dandi_source_region == config.dandi_target_region:
+            raise ValueError(
+                f"Source and target regions must be different. "
+                f"Both are set to '{config.dandi_source_region}'."
+            )
+
+        for region_name, region_val in [
+            ("source", config.dandi_source_region),
+            ("target", config.dandi_target_region),
+        ]:
+            if region_val not in valid_regions:
+                raise ValueError(
+                    f"Invalid DANDI {region_name} region: '{region_val}'. "
+                    f"Valid options: {valid_regions}"
+                )
+
+    print(f"✓ Configuration validated for {dataset}")
+    print(f"  {len(sessions)} {session_label} available for LOSO")
+
+
+def check_data_leakage(
+    fold_idx: int,
+    test_session: str,
+    train_sessions: List[str],
+    dataset: str,
+) -> None:
+    """Verify no data leakage between train and test.
+
+    This is a critical safety check for LOSO cross-validation.
+    Raises RuntimeError if the test session appears in training set.
+
+    Args:
+        fold_idx: Current fold index
+        test_session: Session/subject held out for testing
+        train_sessions: List of sessions/subjects used for training
+        dataset: Dataset name (for error message)
+
+    Raises:
+        RuntimeError: If data leakage is detected
+    """
+    ds_config = get_dataset_config(dataset)
+    session_label = "subject" if ds_config.session_type == "subject" else "session"
+
+    # Check for leakage
+    if test_session in train_sessions:
+        raise RuntimeError(
+            f"CRITICAL DATA LEAKAGE DETECTED in fold {fold_idx}!\n"
+            f"  Test {session_label} '{test_session}' found in training set!\n"
+            f"  Training {session_label}s: {train_sessions}\n"
+            f"  This would invalidate all results. Aborting."
+        )
+
+    # Also check that test session exists
+    if not test_session:
+        raise RuntimeError(
+            f"Empty test {session_label} in fold {fold_idx}. "
+            f"This indicates a bug in session assignment."
+        )
+
+    # Check train sessions are not empty
+    if len(train_sessions) == 0:
+        raise RuntimeError(
+            f"No training {session_label}s in fold {fold_idx}. "
+            f"Cannot train without any training data."
+        )
 
 
 # =============================================================================
@@ -190,6 +389,11 @@ def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List[LOSOFo
             epochs_trained=r_dict.get("epochs_trained", 0),
             total_time=r_dict.get("total_time", 0.0),
             config=r_dict.get("config", {}),
+            # Dataset metadata (may not exist in old checkpoints)
+            dataset=r_dict.get("dataset", ""),
+            session_type=r_dict.get("session_type", ""),
+            n_train_samples=r_dict.get("n_train_samples", 0),
+            n_val_samples=r_dict.get("n_val_samples", 0),
         )
         fold_results.append(result)
 
@@ -224,11 +428,21 @@ def run_single_fold(
     """
     train_sessions = [s for s in all_sessions if s != test_session]
 
+    # CRITICAL: Check for data leakage before proceeding
+    check_data_leakage(fold_idx, test_session, train_sessions, config.dataset)
+
+    # Get dataset config for proper labeling
+    ds_config = config.get_dataset_config()
+    session_label = "Subject" if ds_config.session_type == "subject" else "Session"
+    session_label_lower = session_label.lower()
+
     print(f"\n{'='*70}")
     print(f"LOSO FOLD {fold_idx + 1}/{len(all_sessions)}")
     print(f"{'='*70}")
-    print(f"Test session:  {test_session}")
-    print(f"Train sessions: {train_sessions}")
+    print(f"Dataset: {config.dataset} ({ds_config.source_region} → {ds_config.target_region})")
+    print(f"Held-out {session_label}: {test_session}")
+    print(f"Training {session_label_lower}s ({len(train_sessions)}): {train_sessions}")
+    print(f"✓ No data leakage detected")
     print()
 
     # Build train.py command
@@ -257,14 +471,39 @@ def run_single_fold(
     if not config.generate_plots:
         cmd.append("--no-plots")
 
-    # Dataset selection
-    if config.dataset != "olfactory":
-        cmd.extend(["--dataset", config.dataset])
+    # Dataset selection - map LOSO dataset names to train.py dataset names
+    ds_config = config.get_dataset_config()
+    train_py_dataset = ds_config.train_py_dataset_name
+    if train_py_dataset != "olfactory":
+        cmd.extend(["--dataset", train_py_dataset])
+
+    # Dataset-specific arguments
+    if config.dataset == "dandi_movie":
+        # DANDI-specific: source/target regions and window settings
+        cmd.extend([
+            "--dandi-source-region", config.dandi_source_region,
+            "--dandi-target-region", config.dandi_target_region,
+            "--dandi-window-size", str(config.dandi_window_size),
+            "--dandi-stride-ratio", str(config.dandi_stride_ratio),
+        ])
+        # For DANDI, the --val-sessions will be treated as subject IDs
+
+    elif config.dataset == "pfc_hpc":
+        # PFC-specific: resampling and sliding window options
+        if config.pfc_resample_to_1khz:
+            cmd.append("--resample-pfc")
+        if config.pfc_sliding_window:
+            cmd.extend([
+                "--pfc-sliding-window",
+                "--pfc-window-size", str(config.pfc_window_size),
+                "--pfc-stride-ratio", str(config.pfc_stride_ratio),
+            ])
 
     # Session-based splitting: hold out one session for validation (LOSO)
+    # For DANDI, "sessions" are actually subjects, but the same mechanism applies
     cmd.append("--split-by-session")
     cmd.append("--force-recreate-splits")
-    cmd.extend(["--val-sessions", test_session])  # Held-out session becomes validation
+    cmd.extend(["--val-sessions", test_session])  # Held-out session/subject becomes validation
     cmd.append("--no-test-set")  # No separate test set needed
     cmd.append("--no-early-stop")  # Train full epochs, no tuning
 
@@ -363,6 +602,9 @@ def run_single_fold(
         with open(output_results_file, 'r') as f:
             results = json.load(f)
 
+        # Get dataset info for the result
+        ds_config = config.get_dataset_config()
+
         fold_result = LOSOFoldResult(
             fold_idx=fold_idx,
             test_session=test_session,
@@ -375,10 +617,18 @@ def run_single_fold(
             epochs_trained=results.get("epochs_trained", config.epochs),
             total_time=elapsed,
             config=config.to_dict(),
+            # Dataset metadata
+            dataset=config.dataset,
+            session_type=ds_config.session_type,
+            n_train_samples=results.get("n_train_samples", 0),
+            n_val_samples=results.get("n_val_samples", 0),
         )
 
+        # Use appropriate label (session vs subject)
+        session_label = "Subject" if ds_config.session_type == "subject" else "Session"
+
         print(f"\nFold {fold_idx} completed:")
-        print(f"  Test session: {test_session}")
+        print(f"  Held-out {session_label}: {test_session}")
         print(f"  Val R²: {fold_result.val_r2:.4f}")
         print(f"  Val Loss: {fold_result.val_loss:.4f}")
         print(f"  Time: {elapsed/60:.1f} minutes")
@@ -411,17 +661,31 @@ def run_loso(
     config.output_dir.mkdir(parents=True, exist_ok=True)
     log_path, tee = setup_logging(config.output_dir)
 
+    # Get dataset configuration for display
+    ds_config = config.get_dataset_config()
+    session_label = config.get_session_type_label()
+
     print("=" * 70)
     print("LOSO (Leave-One-Session-Out) Cross-Validation")
     print("=" * 70)
     print(f"Dataset: {config.dataset}")
+    print(f"Description: {ds_config.description}")
+    print(f"Translation: {ds_config.source_region} → {ds_config.target_region}")
+    print(f"CV Type: Leave-One-{session_label}-Out")
     print(f"Output directory: {config.output_dir}")
     print()
 
-    # Get all sessions
-    all_sessions = get_all_sessions(config.dataset)
+    # Get all sessions/subjects with metadata
+    all_sessions, session_metadata = get_all_sessions(config.dataset, config)
     n_folds = len(all_sessions)
-    print(f"Found {n_folds} sessions: {all_sessions}")
+
+    # Validate configuration
+    validate_sessions(all_sessions, config.dataset, config)
+
+    print(f"\nFound {n_folds} {session_label.lower()}s: {all_sessions}")
+    if "trials_per_session" in session_metadata:
+        total = session_metadata.get("total_trials", "?")
+        print(f"Total trials: {total}")
     print()
 
     # Check for checkpoint to resume
@@ -604,6 +868,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument("--generate-plots", action="store_true", help="Generate validation plots")
 
+    # =========================================================================
+    # Dataset-specific arguments
+    # =========================================================================
+
+    # DANDI Movie dataset options (human iEEG)
+    dandi_group = parser.add_argument_group(
+        "DANDI Movie Dataset",
+        "Options for DANDI 000623 human iEEG movie watching dataset"
+    )
+    dandi_group.add_argument(
+        "--dandi-source-region",
+        type=str,
+        default="amygdala",
+        choices=["amygdala", "hippocampus", "medial_frontal_cortex"],
+        help="Source brain region for translation",
+    )
+    dandi_group.add_argument(
+        "--dandi-target-region",
+        type=str,
+        default="hippocampus",
+        choices=["amygdala", "hippocampus", "medial_frontal_cortex"],
+        help="Target brain region for translation",
+    )
+    dandi_group.add_argument(
+        "--dandi-window-size",
+        type=int,
+        default=5000,
+        help="Window size in samples (at 1kHz)",
+    )
+    dandi_group.add_argument(
+        "--dandi-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+
+    # PFC/HPC dataset options
+    pfc_group = parser.add_argument_group(
+        "PFC/HPC Dataset",
+        "Options for PFC to hippocampus (CA1) translation dataset"
+    )
+    pfc_group.add_argument(
+        "--pfc-resample",
+        action="store_true",
+        help="Resample PFC data from 1.25kHz to 1kHz",
+    )
+    pfc_group.add_argument(
+        "--pfc-sliding-window",
+        action="store_true",
+        help="Use sliding window for PFC dataset",
+    )
+    pfc_group.add_argument(
+        "--pfc-window-size",
+        type=int,
+        default=2500,
+        help="Window size in samples for sliding window",
+    )
+    pfc_group.add_argument(
+        "--pfc-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size",
+    )
+
     return parser.parse_args()
 
 
@@ -613,12 +941,15 @@ def main():
 
     # Create config from args
     config = LOSOConfig(
+        # Dataset
         dataset=args.dataset,
         output_dir=Path(args.output_dir),
+        # Training
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
         seed=args.seed,
+        # Model architecture
         arch=args.arch,
         base_channels=args.base_channels,
         n_downsample=args.n_downsample,
@@ -629,26 +960,43 @@ def main():
         skip_type=args.skip_type,
         n_heads=args.n_heads,
         conditioning=args.conditioning,
+        # Optimizer
         optimizer=args.optimizer,
         lr_schedule=args.lr_schedule,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
+        # Session adaptation
         use_session_stats=args.use_session_stats,
         session_use_spectral=args.session_use_spectral,
         use_adaptive_scaling=args.use_adaptive_scaling,
         use_bidirectional=not args.no_bidirectional,
+        # FSDP
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
+        # Execution
         resume=not args.no_resume,
         verbose=not args.quiet,
         generate_plots=args.generate_plots,
+        # DANDI-specific
+        dandi_source_region=args.dandi_source_region,
+        dandi_target_region=args.dandi_target_region,
+        dandi_window_size=args.dandi_window_size,
+        dandi_stride_ratio=args.dandi_stride_ratio,
+        # PFC-specific
+        pfc_resample_to_1khz=args.pfc_resample,
+        pfc_sliding_window=args.pfc_sliding_window,
+        pfc_window_size=args.pfc_window_size,
+        pfc_stride_ratio=args.pfc_stride_ratio,
     )
 
     # Run LOSO
     result = run_loso(config, folds_to_run=args.folds)
 
     # Print final summary
+    ds_config = config.get_dataset_config()
+    session_label = config.get_session_type_label().lower()
     print(f"\nLOSO cross-validation complete!")
+    print(f"Dataset: {config.dataset} ({len(result.all_sessions)} {session_label}s)")
     print(f"Mean R²: {result.mean_r2:.4f} ± {result.std_r2:.4f}")
 
     return 0

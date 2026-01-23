@@ -947,60 +947,111 @@ def load_or_create_pfc_session_splits(
     seed: int = 42,
     force_recreate: bool = False,
     idx_to_session: Optional[Dict[int, str]] = None,
+    # Explicit session holdout for LOSO cross-validation
+    val_sessions: Optional[List[str]] = None,
+    test_sessions: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
     """Create train/val/test splits by holding out entire PFC recording sessions.
 
     Args:
         session_ids: Array of integer session indices for each trial
         trial_types: Array of trial type labels for each trial
-        n_test_sessions: Number of sessions to hold out for testing
-        n_val_sessions: Number of sessions to hold out for validation
+        n_test_sessions: Number of sessions to hold out for testing (ignored if val_sessions provided)
+        n_val_sessions: Number of sessions to hold out for validation (ignored if val_sessions provided)
         seed: Random seed for reproducibility
         force_recreate: If True, recreate splits even if they exist
         idx_to_session: Optional mapping from integer index to original session name
+        val_sessions: Explicit list of session names for validation (for LOSO). Overrides n_val_sessions.
+        test_sessions: Explicit list of session names for testing (for LOSO). Overrides n_test_sessions.
 
     Returns:
         train_idx, val_idx, test_idx: Split indices
         split_info: Dictionary with split metadata
+
+    Note:
+        For LOSO cross-validation, use val_sessions to specify the held-out session.
+        All other sessions will be used for training. Example:
+            load_or_create_pfc_session_splits(session_ids, trial_types, val_sessions=["session_1"])
     """
-    # Session split paths for PFC
-    pfc_session_train = _PFC_DATA_DIR / "session_train_indices.npy"
-    pfc_session_val = _PFC_DATA_DIR / "session_val_indices.npy"
-    pfc_session_test = _PFC_DATA_DIR / "session_test_indices.npy"
-    pfc_session_info = _PFC_DATA_DIR / "session_split_info.json"
-
-    if (not force_recreate and
-        pfc_session_train.exists() and
-        pfc_session_val.exists() and
-        pfc_session_test.exists() and
-        pfc_session_info.exists()):
-
-        train_idx = np.load(pfc_session_train)
-        val_idx = np.load(pfc_session_val)
-        test_idx = np.load(pfc_session_test)
-        split_info = json.loads(pfc_session_info.read_text())
-        _print_primary(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
-              f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
-        return train_idx, val_idx, test_idx, split_info
-
     rng = np.random.default_rng(seed)
     unique_sessions = np.unique(session_ids)
     n_sessions = len(unique_sessions)
 
-    if n_test_sessions + n_val_sessions >= n_sessions:
-        raise ValueError(
-            f"Cannot hold out {n_test_sessions} test + {n_val_sessions} val sessions "
-            f"from only {n_sessions} total sessions."
-        )
+    # Build mapping from session name to integer ID if not provided
+    if idx_to_session is None:
+        idx_to_session = {i: str(i) for i in unique_sessions}
+    session_to_idx = {name: idx for idx, name in idx_to_session.items()}
 
-    # Shuffle sessions
-    shuffled_sessions = unique_sessions.copy()
-    rng.shuffle(shuffled_sessions)
+    # Check for explicit session holdout (LOSO mode)
+    if val_sessions is not None or test_sessions is not None:
+        # Explicit session holdout mode (for LOSO)
+        val_sessions = val_sessions or []
+        test_sessions = test_sessions or []
 
-    # Assign sessions to splits
-    test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
-    val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
-    train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
+        # Validate that specified sessions exist
+        available_sessions = set(idx_to_session.values())
+        for sess in val_sessions + test_sessions:
+            if sess not in available_sessions:
+                raise ValueError(
+                    f"Session '{sess}' not found in dataset. "
+                    f"Available sessions: {sorted(available_sessions)}"
+                )
+
+        # Check for overlap between val and test
+        overlap = set(val_sessions) & set(test_sessions)
+        if overlap:
+            raise ValueError(
+                f"Overlap between val and test sessions: {overlap}. "
+                f"This would cause data leakage!"
+            )
+
+        # Convert session names to integer IDs
+        val_session_ids = set(session_to_idx[s] for s in val_sessions)
+        test_session_ids = set(session_to_idx[s] for s in test_sessions)
+        holdout_ids = val_session_ids | test_session_ids
+        train_session_ids = set(i for i in unique_sessions if i not in holdout_ids)
+
+        _print_primary(f"[LOSO MODE] Explicit PFC session holdout:")
+        _print_primary(f"  Train sessions ({len(train_session_ids)}): {sorted([idx_to_session[i] for i in train_session_ids])}")
+        _print_primary(f"  Val sessions ({len(val_session_ids)}): {val_sessions}")
+        _print_primary(f"  Test sessions ({len(test_session_ids)}): {test_sessions}")
+
+        # Don't load/save cached splits in LOSO mode - always create fresh
+    else:
+        # Random split mode - check for cached splits
+        pfc_session_train = _PFC_DATA_DIR / "session_train_indices.npy"
+        pfc_session_val = _PFC_DATA_DIR / "session_val_indices.npy"
+        pfc_session_test = _PFC_DATA_DIR / "session_test_indices.npy"
+        pfc_session_info = _PFC_DATA_DIR / "session_split_info.json"
+
+        if (not force_recreate and
+            pfc_session_train.exists() and
+            pfc_session_val.exists() and
+            pfc_session_test.exists() and
+            pfc_session_info.exists()):
+
+            train_idx = np.load(pfc_session_train)
+            val_idx = np.load(pfc_session_val)
+            test_idx = np.load(pfc_session_test)
+            split_info = json.loads(pfc_session_info.read_text())
+            _print_primary(f"Loaded existing PFC session splits: {split_info['n_train_sessions']} train, "
+                  f"{split_info['n_val_sessions']} val, {split_info['n_test_sessions']} test sessions")
+            return train_idx, val_idx, test_idx, split_info
+
+        if n_test_sessions + n_val_sessions >= n_sessions:
+            raise ValueError(
+                f"Cannot hold out {n_test_sessions} test + {n_val_sessions} val sessions "
+                f"from only {n_sessions} total sessions."
+            )
+
+        # Shuffle sessions
+        shuffled_sessions = unique_sessions.copy()
+        rng.shuffle(shuffled_sessions)
+
+        # Assign sessions to splits
+        test_session_ids = set(shuffled_sessions[:n_test_sessions].tolist())
+        val_session_ids = set(shuffled_sessions[n_test_sessions:n_test_sessions + n_val_sessions].tolist())
+        train_session_ids = set(shuffled_sessions[n_test_sessions + n_val_sessions:].tolist())
 
     # Create index arrays
     all_indices = np.arange(len(session_ids))
@@ -1735,6 +1786,9 @@ def prepare_pfc_data(
     n_val_sessions: int = 1,
     force_recreate_splits: bool = False,
     resample_to_1khz: bool = False,
+    # Explicit session holdout for LOSO cross-validation
+    val_sessions: Optional[List[str]] = None,
+    test_sessions: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for PFC/Hippocampus dataset.
 
@@ -1747,10 +1801,12 @@ def prepare_pfc_data(
         seed: Random seed for reproducibility
         split_by_session: If True, hold out entire sessions for test/val
         split_by_rat: If True, hold out entire subjects (rats) for test/val
-        n_test_sessions: Number of sessions/rats to hold out for testing
-        n_val_sessions: Number of sessions/rats to hold out for validation
+        n_test_sessions: Number of sessions/rats to hold out for testing (ignored if val_sessions provided)
+        n_val_sessions: Number of sessions/rats to hold out for validation (ignored if val_sessions provided)
         force_recreate_splits: If True, recreate splits even if they exist
         resample_to_1khz: If True, downsample from 1250Hz to 1000Hz
+        val_sessions: Explicit list of session names for validation (for LOSO). Overrides n_val_sessions.
+        test_sessions: Explicit list of session names for testing (for LOSO). Overrides n_test_sessions.
 
     Returns dictionary with:
     - pfc: Normalized PFC signal array [trials, 64, time]
@@ -1815,6 +1871,8 @@ def prepare_pfc_data(
             seed=seed,
             force_recreate=force_recreate_splits,
             idx_to_session=idx_to_session,
+            val_sessions=val_sessions,
+            test_sessions=test_sessions,
         )
     else:
         # Random stratified splits
@@ -3670,6 +3728,9 @@ def prepare_dandi_data(
     zscore: bool = True,
     verbose: bool = True,
     min_channels: int = 12,
+    # Explicit subject holdout for LOSO cross-validation
+    val_subjects: Optional[List[str]] = None,
+    test_subjects: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for DANDI 000623 dataset.
 
@@ -3679,16 +3740,23 @@ def prepare_dandi_data(
         target_region: Target brain region for translation
         window_size: Window size in samples
         stride: Stride between windows
-        train_ratio: Fraction of subjects for training
-        val_ratio: Fraction of subjects for validation
-        test_ratio: Fraction of subjects for testing
+        train_ratio: Fraction of subjects for training (ignored if val_subjects provided)
+        val_ratio: Fraction of subjects for validation (ignored if val_subjects provided)
+        test_ratio: Fraction of subjects for testing (ignored if test_subjects provided)
         seed: Random seed for reproducibility
         zscore: Whether to z-score normalize the data
         verbose: Whether to print progress messages (set False for non-primary processes)
         min_channels: Minimum channels required in both source and target (subjects with fewer are excluded)
+        val_subjects: Explicit list of subjects for validation (for LOSO). Overrides val_ratio.
+        test_subjects: Explicit list of subjects for testing (for LOSO). Overrides test_ratio.
 
     Returns:
         Dictionary containing train/val/test datasets and metadata
+
+    Note:
+        For LOSO cross-validation, use val_subjects to specify the held-out subject.
+        All other subjects will be used for training. Example:
+            prepare_dandi_data(val_subjects=["sub-CS41"], test_subjects=[])
     """
     if verbose:
         _print_primary(f"Preparing DANDI 000623 dataset...")
@@ -3697,7 +3765,7 @@ def prepare_dandi_data(
 
     # Get available subjects
     nwb_files = list_dandi_nwb_files(data_dir)
-    subject_ids = []
+    all_subject_ids = []
 
     for f in nwb_files:
         # Extract subject ID from filename
@@ -3706,27 +3774,63 @@ def prepare_dandi_data(
             subj_id = stem.split("_")[0]  # Get sub-CSXX part
         else:
             subj_id = stem
-        if subj_id not in subject_ids:
-            subject_ids.append(subj_id)
+        if subj_id not in all_subject_ids:
+            all_subject_ids.append(subj_id)
+
+    all_subject_ids = sorted(all_subject_ids)  # Sort for reproducibility
 
     if verbose:
-        _print_primary(f"  Found {len(subject_ids)} subjects")
+        _print_primary(f"  Found {len(all_subject_ids)} subjects: {all_subject_ids}")
 
-    # Split subjects
-    rng = np.random.default_rng(seed)
-    rng.shuffle(subject_ids)
+    # Determine train/val/test split
+    if val_subjects is not None or test_subjects is not None:
+        # Explicit subject holdout mode (for LOSO)
+        val_subjects = val_subjects or []
+        test_subjects = test_subjects or []
 
-    n_train = int(len(subject_ids) * train_ratio)
-    n_val = int(len(subject_ids) * val_ratio)
+        # Validate that specified subjects exist
+        for subj in val_subjects + test_subjects:
+            if subj not in all_subject_ids:
+                raise ValueError(
+                    f"Subject '{subj}' not found in dataset. "
+                    f"Available: {all_subject_ids}"
+                )
 
-    train_subjects = subject_ids[:n_train]
-    val_subjects = subject_ids[n_train:n_train + n_val]
-    test_subjects = subject_ids[n_train + n_val:]
+        # Check for overlap between val and test
+        overlap = set(val_subjects) & set(test_subjects)
+        if overlap:
+            raise ValueError(
+                f"Overlap between val and test subjects: {overlap}. "
+                f"This would cause data leakage!"
+            )
 
-    if verbose:
-        _print_primary(f"  Train subjects ({len(train_subjects)}): {train_subjects}")
-        _print_primary(f"  Val subjects ({len(val_subjects)}): {val_subjects}")
-        _print_primary(f"  Test subjects ({len(test_subjects)}): {test_subjects}")
+        # Training = all subjects not in val or test
+        holdout_subjects = set(val_subjects) | set(test_subjects)
+        train_subjects = [s for s in all_subject_ids if s not in holdout_subjects]
+
+        if verbose:
+            _print_primary(f"  [LOSO MODE] Explicit subject holdout:")
+            _print_primary(f"    Train subjects ({len(train_subjects)}): {train_subjects}")
+            _print_primary(f"    Val subjects ({len(val_subjects)}): {val_subjects}")
+            _print_primary(f"    Test subjects ({len(test_subjects)}): {test_subjects}")
+    else:
+        # Random split mode (default)
+        rng = np.random.default_rng(seed)
+        subject_ids_shuffled = all_subject_ids.copy()
+        rng.shuffle(subject_ids_shuffled)
+
+        n_train = int(len(subject_ids_shuffled) * train_ratio)
+        n_val = int(len(subject_ids_shuffled) * val_ratio)
+
+        train_subjects = subject_ids_shuffled[:n_train]
+        val_subjects = subject_ids_shuffled[n_train:n_train + n_val]
+        test_subjects = subject_ids_shuffled[n_train + n_val:]
+
+        if verbose:
+            _print_primary(f"  [Random Split] seed={seed}")
+            _print_primary(f"    Train subjects ({len(train_subjects)}): {train_subjects}")
+            _print_primary(f"    Val subjects ({len(val_subjects)}): {val_subjects}")
+            _print_primary(f"    Test subjects ({len(test_subjects)}): {test_subjects}")
 
     # Load data for each split
     def load_subjects(subject_list, split_name=""):

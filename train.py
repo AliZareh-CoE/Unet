@@ -3258,12 +3258,29 @@ def main():
 
     elif args.dataset == "pfc":
         # PFC/Hippocampus dataset
+        # Check for explicit session holdout (used by LOSO)
+        loso_val_sessions = None
+        loso_test_sessions = None
+        if args.val_sessions:
+            loso_val_sessions = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_sessions = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
+        if is_primary() and (loso_val_sessions or loso_test_sessions):
+            print(f"[LOSO MODE] PFC session holdout:")
+            if loso_val_sessions:
+                print(f"  Held-out validation sessions: {loso_val_sessions}")
+            if loso_test_sessions:
+                print(f"  Held-out test sessions: {loso_test_sessions}")
+
         data = prepare_pfc_data(
             split_by_session=config["split_by_session"],
             n_test_sessions=config["n_test_sessions"],
             n_val_sessions=config["n_val_sessions"],
             force_recreate_splits=args.force_recreate_splits,
             resample_to_1khz=args.resample_pfc,
+            val_sessions=loso_val_sessions,
+            test_sessions=loso_test_sessions,
         )
         # Set dataset-specific config
         config["dataset_type"] = "pfc"
@@ -3306,14 +3323,29 @@ def main():
         # Use default DANDI data dir from data.py if not specified
         dandi_data_dir = Path(args.dandi_data_dir) if args.dandi_data_dir else _DANDI_DATA_DIR
 
+        # Check for explicit subject holdout (used by LOSO)
+        # In LOSO mode, --val-sessions specifies the subject(s) to hold out
+        loso_val_subjects = None
+        loso_test_subjects = None
+        if args.val_sessions:
+            loso_val_subjects = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
         if is_primary():
             print(f"\nLoading DANDI 000623 dataset...")
             print(f"  Data directory: {dandi_data_dir}")
             print(f"  Source region: {args.dandi_source_region}")
             print(f"  Target region: {args.dandi_target_region}")
             print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            if loso_val_subjects:
+                print(f"  [LOSO MODE] Held-out validation subjects: {loso_val_subjects}")
+            if loso_test_subjects:
+                print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
 
         # Prepare DANDI data - this returns datasets directly
+        # If val_subjects/test_subjects are provided, uses explicit holdout (LOSO mode)
+        # Otherwise uses random train/val/test split
         dandi_data = prepare_dandi_data(
             data_dir=dandi_data_dir,
             source_region=args.dandi_source_region,
@@ -3322,6 +3354,8 @@ def main():
             stride=train_stride,
             seed=config["seed"],
             verbose=is_primary(),  # Only print from rank 0 in distributed training
+            val_subjects=loso_val_subjects,
+            test_subjects=loso_test_subjects,
         )
 
         # Create a minimal data dict for compatibility with training loop

@@ -17,6 +17,13 @@ This avoids ANY data leakage because:
 1. Test session never seen during inner loop selection
 2. Different sessions may select different optimal configs (that's ok!)
 3. Final metric is mean ± std across outer folds
+
+Multi-Dataset Support
+=====================
+Supports three datasets:
+- olfactory: OB→PCx translation (session-based LOSO)
+- pfc_hpc: PFC→CA1 translation (session-based LOSO)
+- dandi_movie: Human iEEG movie watching (subject-based LOSO)
 """
 
 from __future__ import annotations
@@ -24,13 +31,126 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import copy
 
 import numpy as np
 
 
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+
+@dataclass
+class DatasetConfig:
+    """Dataset-specific configuration for LOSO.
+
+    Encapsulates the unique characteristics of each dataset to enable
+    dataset-agnostic LOSO cross-validation.
+    """
+    # Identification
+    name: str
+    description: str
+
+    # Session/subject semantics
+    # "session" = recording session (olfactory, pfc_hpc)
+    # "subject" = individual subject/animal (dandi_movie)
+    session_type: str
+
+    # Data characteristics (may be 0 if variable/detected at runtime)
+    in_channels: int
+    out_channels: int
+    sampling_rate: int
+
+    # Source and target region names (for display)
+    source_region: str
+    target_region: str
+
+    # For sliding window datasets (DANDI, PCx1)
+    uses_sliding_window: bool = False
+    default_window_size: int = 5000
+    default_stride_ratio: float = 0.5
+
+    # train.py dataset name (may differ from LOSO name)
+    train_py_dataset_name: str = ""
+
+    def __post_init__(self):
+        if not self.train_py_dataset_name:
+            self.train_py_dataset_name = self.name
+
+    def copy(self) -> "DatasetConfig":
+        """Create a copy of this config."""
+        return copy.deepcopy(self)
+
+
+# Pre-defined dataset configurations
+DATASET_CONFIGS: Dict[str, DatasetConfig] = {
+    "olfactory": DatasetConfig(
+        name="olfactory",
+        description="Olfactory bulb to piriform cortex translation",
+        session_type="session",
+        in_channels=32,
+        out_channels=32,
+        sampling_rate=1000,
+        source_region="OB",
+        target_region="PCx",
+        uses_sliding_window=False,
+        train_py_dataset_name="olfactory",
+    ),
+    "pfc_hpc": DatasetConfig(
+        name="pfc_hpc",
+        description="Prefrontal cortex to hippocampus (CA1) translation",
+        session_type="session",
+        in_channels=64,
+        out_channels=32,
+        sampling_rate=1250,
+        source_region="PFC",
+        target_region="CA1",
+        uses_sliding_window=False,
+        train_py_dataset_name="pfc",
+    ),
+    "dandi_movie": DatasetConfig(
+        name="dandi_movie",
+        description="Human iEEG movie watching (DANDI 000623)",
+        session_type="subject",  # CRITICAL: uses subjects, not sessions
+        in_channels=0,  # Variable - detected at runtime
+        out_channels=0,  # Variable - detected at runtime
+        sampling_rate=1000,
+        source_region="amygdala",  # Default, can be changed
+        target_region="hippocampus",  # Default, can be changed
+        uses_sliding_window=True,
+        default_window_size=5000,
+        default_stride_ratio=0.5,
+        train_py_dataset_name="dandi",
+    ),
+}
+
+
+def get_dataset_config(dataset: str) -> DatasetConfig:
+    """Get the configuration for a dataset.
+
+    Args:
+        dataset: Dataset name (olfactory, pfc_hpc, dandi_movie)
+
+    Returns:
+        DatasetConfig for the specified dataset
+
+    Raises:
+        ValueError: If dataset is not recognized
+    """
+    if dataset not in DATASET_CONFIGS:
+        available = ", ".join(DATASET_CONFIGS.keys())
+        raise ValueError(
+            f"Unknown dataset: '{dataset}'. Available datasets: {available}"
+        )
+    return DATASET_CONFIGS[dataset].copy()
+
+
 @dataclass
 class LOSOConfig:
-    """Configuration for nested LOSO cross-validation."""
+    """Configuration for nested LOSO cross-validation.
+
+    Supports multiple datasets with dataset-specific parameters.
+    """
 
     # Dataset
     dataset: str = "olfactory"
@@ -81,9 +201,56 @@ class LOSOConfig:
     generate_plots: bool = False
     folds_to_run: Optional[List[int]] = None
 
+    # =========================================================================
+    # Dataset-specific parameters
+    # =========================================================================
+
+    # DANDI Movie dataset options
+    dandi_source_region: str = "amygdala"
+    dandi_target_region: str = "hippocampus"
+    dandi_window_size: int = 5000
+    dandi_stride_ratio: float = 0.5
+
+    # PFC/HPC dataset options
+    pfc_resample_to_1khz: bool = False
+    pfc_sliding_window: bool = False
+    pfc_window_size: int = 2500
+    pfc_stride_ratio: float = 0.5
+
     def __post_init__(self):
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
+        # Validate dataset
+        if self.dataset not in DATASET_CONFIGS:
+            available = ", ".join(DATASET_CONFIGS.keys())
+            raise ValueError(
+                f"Unknown dataset: '{self.dataset}'. Available: {available}"
+            )
+
+    def get_dataset_config(self) -> DatasetConfig:
+        """Get the dataset-specific configuration.
+
+        Returns a DatasetConfig with any overrides from this LOSOConfig applied.
+        """
+        ds_config = get_dataset_config(self.dataset)
+
+        # Apply DANDI-specific overrides
+        if self.dataset == "dandi_movie":
+            ds_config.source_region = self.dandi_source_region
+            ds_config.target_region = self.dandi_target_region
+            ds_config.default_window_size = self.dandi_window_size
+            ds_config.default_stride_ratio = self.dandi_stride_ratio
+
+        return ds_config
+
+    def get_session_type_label(self) -> str:
+        """Get human-readable label for session/subject type.
+
+        Returns:
+            'Session' for session-based datasets, 'Subject' for subject-based
+        """
+        ds_config = self.get_dataset_config()
+        return "Subject" if ds_config.session_type == "subject" else "Session"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization."""
@@ -100,8 +267,8 @@ class LOSOConfig:
 class LOSOFoldResult:
     """Result from a single LOSO fold."""
     fold_idx: int
-    test_session: str
-    train_sessions: List[str]
+    test_session: str  # Session or subject ID that was held out
+    train_sessions: List[str]  # Sessions/subjects used for training
     val_r2: float
     val_loss: float
     train_loss: float = 0.0
@@ -110,6 +277,12 @@ class LOSOFoldResult:
     epochs_trained: int = 0
     total_time: float = 0.0
     config: Dict[str, Any] = field(default_factory=dict)
+
+    # Dataset metadata (for multi-dataset support)
+    dataset: str = ""
+    session_type: str = ""  # "session" or "subject"
+    n_train_samples: int = 0
+    n_val_samples: int = 0
 
     # Legacy aliases
     @property
@@ -146,6 +319,10 @@ class LOSOFoldResult:
             "epochs_trained": self.epochs_trained,
             "total_time": self.total_time,
             "config": self.config,
+            "dataset": self.dataset,
+            "session_type": self.session_type,
+            "n_train_samples": self.n_train_samples,
+            "n_val_samples": self.n_val_samples,
         }
 
 
@@ -191,12 +368,23 @@ class LOSOResult:
         self.std_loss = float(np.std(loss_values))
 
     def print_summary(self) -> None:
-        """Print summary of LOSO results."""
+        """Print dataset-aware summary of LOSO results."""
         print("\n" + "=" * 70)
         print("LOSO CROSS-VALIDATION RESULTS")
         print("=" * 70)
 
-        print(f"\n{'Fold':<6} {'Test Session':<20} {'R²':>10} {'Loss':>10}")
+        # Dataset information
+        ds_config = self.config.get_dataset_config()
+        session_label = "Subject" if ds_config.session_type == "subject" else "Session"
+
+        print(f"\nDataset: {self.config.dataset}")
+        print(f"Description: {ds_config.description}")
+        print(f"Translation: {ds_config.source_region} → {ds_config.target_region}")
+        print(f"CV Type: Leave-One-{session_label}-Out ({len(self.all_sessions)} folds)")
+
+        # Per-fold results table
+        header_label = f"Held-Out {session_label}"
+        print(f"\n{'Fold':<6} {header_label:<20} {'R²':>10} {'Loss':>10}")
         print("-" * 50)
 
         for r in self.fold_results:
@@ -207,6 +395,11 @@ class LOSOResult:
         print(f"{'Std':<6} {'':<20} {self.std_r2:>10.4f} {self.std_loss:>10.4f}")
         print()
         print(f"Final: R² = {self.mean_r2:.4f} ± {self.std_r2:.4f}")
+
+        # Dataset-specific notes
+        if self.config.dataset == "dandi_movie":
+            print(f"\nNote: Leave-One-Subject-Out CV (each fold holds out one human subject)")
+            print(f"      Source: {self.config.dandi_source_region}, Target: {self.config.dandi_target_region}")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert result to dictionary for serialization."""
