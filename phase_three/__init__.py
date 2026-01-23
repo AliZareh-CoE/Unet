@@ -1,6 +1,22 @@
-"""Ablation study for CondUNet architecture."""
+"""
+Phase 3: Ablation Study for CondUNet Architecture
+==================================================
 
-from .config import ABLATION_GROUPS, BASELINE_CONFIG
-from .runner import run_ablation
+Implements 3-fold × 3-seed cross-validation with proper train/val/test separation.
+"""
 
-__all__ = ["ABLATION_GROUPS", "BASELINE_CONFIG", "run_ablation"]
+from .runner import (
+    AblationConfig,
+    get_ablation_configs,
+    run_3fold_ablation_study,
+    run_ablation_experiment,
+    main,
+)
+
+__all__ = [
+    "AblationConfig",
+    "get_ablation_configs",
+    "run_3fold_ablation_study",
+    "run_ablation_experiment",
+    "main",
+]
