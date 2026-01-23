@@ -526,10 +526,8 @@ class FoldResult:
     per_session_corr: Dict[str, float] = field(default_factory=dict)
     per_session_loss: Dict[str, float] = field(default_factory=dict)
 
-    # Test set metrics (if available)
-    test_avg_r2: Optional[float] = None
-    test_avg_corr: Optional[float] = None
-    per_session_test_results: List[Dict] = field(default_factory=list)
+    # Per-session TEST metrics (from held-out sessions)
+    per_session_test_results: Dict[str, float] = field(default_factory=dict)
 
     # Raw results dict (keep everything)
     raw_results: Dict[str, Any] = field(default_factory=dict)
@@ -563,9 +561,7 @@ class FoldResult:
             "per_session_corr": self.per_session_corr,
             "per_session_loss": self.per_session_loss,
             # Per-session TEST metrics (from held-out sessions)
-            "test_avg_r2": self.test_avg_r2,
-            "test_avg_corr": self.test_avg_corr,
-            "per_session_test_results": self.per_session_test_results,
+            "per_session_test_r2": self.per_session_test_results,
         }
 
 
@@ -1147,9 +1143,7 @@ def run_single_fold(
             per_session_r2=results.get("per_session_r2", {}),
             per_session_corr=results.get("per_session_corr", {}),
             per_session_loss=results.get("per_session_loss", {}),
-            # Per-session TEST metrics
-            test_avg_r2=test_metrics.get("test_r2"),
-            test_avg_corr=test_metrics.get("test_corr"),
+            # Per-session TEST metrics (from held-out sessions)
             per_session_test_results=test_metrics.get("per_session_test_r2", {}),
             # Keep raw results for reference
             raw_results=results,
