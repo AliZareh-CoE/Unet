@@ -802,8 +802,14 @@ def evaluate_on_test_sessions(
             n_heads=config.get("n_heads", 4),
         )
 
-        # Load weights
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # Load weights (handle different checkpoint formats)
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        elif "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"])
+        else:
+            # Assume checkpoint is the state dict directly
+            model.load_state_dict(checkpoint)
         model.eval()
 
         # Move to GPU if available
