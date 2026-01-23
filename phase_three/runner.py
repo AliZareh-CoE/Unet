@@ -1152,11 +1152,19 @@ def run_single_fold(
         print(f"\n  Fold {fold_idx} completed:")
         print(f"    Val R2: {fold_result.val_r2:.4f} (model selection)")
         print(f"    TEST R2: {fold_result.test_r2:.4f} (PRIMARY - true generalization)")
-        print(f"    Val Corr: {fold_result.val_corr:.4f}")
+        print(f"    TEST Corr: {fold_result.test_corr:.4f}")
         print(f"    Val Loss: {fold_result.val_loss:.4f}")
         print(f"    Best Epoch: {fold_result.best_epoch}")
         print(f"    Parameters: {fold_result.n_parameters:,}")
         print(f"    Time: {elapsed/60:.1f} minutes")
+
+        # Print per-session TEST R² (the important part!)
+        if fold_result.per_session_test_results:
+            print(f"    Per-session TEST R²:")
+            for sess, r2 in fold_result.per_session_test_results.items():
+                print(f"      {sess}: {r2:.4f}")
+        else:
+            print(f"    WARNING: No per-session test results!")
 
         return fold_result
     else:
