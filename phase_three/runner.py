@@ -816,19 +816,37 @@ def evaluate_on_test_sessions(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
 
-        # Load data for test sessions only
-        data = prepare_data(
+        # CRITICAL FIX FOR DATA LEAKAGE:
+        # During training, test sessions were EXCLUDED entirely (via --exclude-sessions).
+        # Normalization was computed from training data only.
+        # We must use the SAME normalization approach here:
+        # 1. Load data excluding test sessions to get training normalization stats
+        # 2. Load full data and apply training normalization to test sessions
+
+        from data import load_signals, load_odor_labels, extract_window, compute_normalization, normalize, DATA_PATH
+
+        # Step 1: Load data with test sessions excluded to get training normalization
+        train_data = prepare_data(
             split_by_session=False,
             force_recreate_splits=True,
+            exclude_sessions=test_sessions,  # Exclude test sessions, same as training
         )
+        train_norm_stats = train_data["norm_stats"]
 
-        X = data["ob"]
-        y = data["pcx"]
-        odors = data["odors"]
+        # Step 2: Load full data (all sessions) without normalization
+        signals = load_signals(DATA_PATH)
+        num_trials = signals.shape[0]
+        odors, vocab = load_odor_labels(ODOR_CSV_PATH, num_trials)
+        windowed = extract_window(signals)
+
+        # Apply training normalization to ALL data (including test)
+        normalized = normalize(windowed, train_norm_stats)
+        X = normalized[:, 0]  # OB
+        y = normalized[:, 1]  # PCx
 
         # Get session IDs
         session_ids, session_to_idx, idx_to_session = load_session_ids(
-            ODOR_CSV_PATH, num_trials=len(odors)
+            ODOR_CSV_PATH, num_trials=num_trials
         )
 
         # Get indices for test sessions
