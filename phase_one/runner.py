@@ -1506,20 +1506,19 @@ def run_3fold_3seed_evaluation(
     print(f"  Methods: {', '.join(config.baselines)}")
     print()
 
-    # Load full dataset without splitting - we'll do our own splits
-    print("Loading full dataset...")
-    data = prepare_data(
-        split_by_session=False,
-        force_recreate_splits=True,
-    )
+    # CRITICAL: Load raw data WITHOUT normalization - we compute per-fold normalization
+    # to avoid data leakage (each fold's normalization uses only its training sessions)
+    print("Loading raw dataset (no normalization - computed per fold)...")
+    from data import load_signals, load_odor_labels, extract_window, compute_normalization, normalize, DATA_PATH
 
-    X = data["ob"]
-    y = data["pcx"]
-    odors = data["odors"]
+    signals = load_signals(DATA_PATH)
+    num_trials = signals.shape[0]
+    odors, vocab = load_odor_labels(ODOR_CSV_PATH, num_trials)
+    windowed = extract_window(signals)  # Raw unnormalized data
 
     # Get session IDs
     session_ids, session_to_idx, idx_to_session = load_session_ids(
-        ODOR_CSV_PATH, num_trials=len(odors)
+        ODOR_CSV_PATH, num_trials=num_trials
     )
 
     unique_sessions = np.unique(session_ids)
@@ -1558,8 +1557,15 @@ def run_3fold_3seed_evaluation(
             train_idx = all_indices[np.isin(session_ids, list(train_session_ids))]
             test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
 
-            X_train, y_train = X[train_idx], y[train_idx]
-            X_test, y_test = X[test_idx], y[test_idx]
+            # CRITICAL FIX: Compute normalization from TRAINING sessions only (no leakage)
+            # This ensures test sessions don't influence normalization statistics
+            fold_norm_stats = compute_normalization(windowed, train_idx)
+            normalized = normalize(windowed, fold_norm_stats)
+            X_fold = normalized[:, 0]  # OB
+            y_fold = normalized[:, 1]  # PCx
+
+            X_train, y_train = X_fold[train_idx], y_fold[train_idx]
+            X_test, y_test = X_fold[test_idx], y_fold[test_idx]
 
             # Create session-to-indices mapping for per-session metrics
             # (indices relative to X_test)
