@@ -1672,9 +1672,18 @@ def prepare_data(
         _print_primary(f"  Train: {len(train_idx)}, Val: {len(val_idx)} (70/30 trial-wise)")
     else:
         # Random stratified splits (original behavior)
-        train_idx, val_idx, test_idx = load_or_create_stratified_splits(
-            odors, seed, force_recreate=force_recreate_splits
-        )
+        if no_test_set:
+            # 70/30 train/val split, no test set
+            train_idx, val_idx, test_idx = load_or_create_stratified_splits(
+                odors, seed, train_ratio=0.7, val_ratio=0.3,
+                force_recreate=force_recreate_splits
+            )
+            test_idx = np.array([], dtype=int)  # Empty test set
+            _print_primary(f"Stratified split (no test): Train {len(train_idx)}, Val {len(val_idx)} (70/30)")
+        else:
+            train_idx, val_idx, test_idx = load_or_create_stratified_splits(
+                odors, seed, force_recreate=force_recreate_splits
+            )
 
     # Compute normalization from training set ONLY
     norm_stats = compute_normalization(windowed, train_idx)
