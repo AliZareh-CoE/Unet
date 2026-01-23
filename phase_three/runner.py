@@ -26,7 +26,7 @@ This gives us:
 
 Baseline: Original default (n_downsample=2) as the reference point
 
-Ablation configurations (11 total, ordered logically):
+Ablation configurations (10 total, ordered logically):
 1. baseline: Original default (n_downsample=2) with all components
 2. depth_medium: n_downsample=3
 3. depth_deep: n_downsample=4
@@ -34,10 +34,9 @@ Ablation configurations (11 total, ordered logically):
 5. width_wide: base_channels=256
 6. conv_type_standard: standard convolutions
 7. attention_none: no attention
-8. attention_basic: basic attention
-9. skip_type_concat: concatenation skip connections
-10. conditioning_none: no conditioning (cond_mode=none)
-11. adaptive_scaling_off: no adaptive scaling
+8. skip_type_concat: concatenation skip connections
+9. conditioning_none: no conditioning (cond_mode=none)
+10. adaptive_scaling_off: no adaptive scaling
 """
 
 from __future__ import annotations
@@ -391,18 +390,8 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         conditioning="spectro_temporal",
     ))
 
-    configs_list.append(AblationConfig(
-        name="attention_basic",
-        description="Basic attention instead of cross_freq_v2",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="basic",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
     # =========================================================================
-    # 9. SKIP CONNECTION ABLATION
+    # 8. SKIP CONNECTION ABLATION
     # =========================================================================
     configs_list.append(AblationConfig(
         name="skip_type_concat",
@@ -1226,6 +1215,7 @@ def run_3fold_ablation_study(
     ablations_to_run: Optional[List[str]] = None,
     folds_to_run: Optional[List[int]] = None,
     seed: int = 42,
+    epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
     dry_run: bool = False,
@@ -1238,6 +1228,7 @@ def run_3fold_ablation_study(
         ablations_to_run: Optional list of ablation names to run (default: all)
         folds_to_run: Optional list of fold indices to run (default: all 3)
         seed: Random seed
+        epochs: Number of training epochs (default: 80 from config)
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
         dry_run: If True, print commands without running them
@@ -1285,6 +1276,11 @@ def run_3fold_ablation_study(
         configs_to_run = {k: v for k, v in all_configs.items() if k in ablations_to_run}
     else:
         configs_to_run = all_configs
+
+    # Override epochs if specified
+    if epochs is not None:
+        for config in configs_to_run.values():
+            config.epochs = epochs
 
     print(f"Ablations to run: {list(configs_to_run.keys())}")
     print()
@@ -2051,6 +2047,13 @@ def main():
     )
 
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs (default: 80)",
+    )
+
+    parser.add_argument(
         "--fsdp",
         action="store_true",
         help="Use FSDP for multi-GPU training",
@@ -2098,6 +2101,7 @@ def main():
         ablations_to_run=args.ablations,
         folds_to_run=args.folds,
         seed=args.seed,
+        epochs=args.epochs,
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
         dry_run=args.dry_run,
