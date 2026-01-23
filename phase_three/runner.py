@@ -495,12 +495,14 @@ class FoldResult:
     The test_r2 is the PRIMARY metric for comparing ablations.
     """
     fold_idx: int
-    test_sessions: List[str]
-    train_sessions: List[str]
+    seed: int = 42  # Actual seed used
+    seed_idx: int = 0  # Which seed iteration (0, 1, 2)
+    test_sessions: List[str] = field(default_factory=list)
+    train_sessions: List[str] = field(default_factory=list)
 
     # Validation metrics (from 70/30 split on training sessions - for model selection)
-    val_r2: float
-    val_loss: float
+    val_r2: float = 0.0
+    val_loss: float = 0.0
     val_corr: float = 0.0
     val_mae: float = 0.0
 
@@ -535,6 +537,8 @@ class FoldResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "fold_idx": self.fold_idx,
+            "seed": self.seed,
+            "seed_idx": self.seed_idx,
             "test_sessions": self.test_sessions,
             "train_sessions": self.train_sessions,
             # Validation metrics (from 70/30 split - for model selection)
@@ -915,6 +919,7 @@ def run_single_fold(
     fold_split: Dict[str, Any],
     output_dir: Path,
     seed: int = 42,
+    seed_idx: int = 0,  # Which seed iteration this is (0, 1, 2)
     verbose: bool = True,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
@@ -948,8 +953,8 @@ def run_single_fold(
     print(f"  Train sessions: {train_sessions}")
     print()
 
-    # Output file for results
-    results_file = output_dir / f"{ablation_config.name}_fold{fold_idx}_results.json"
+    # Output file for results - unique per fold AND seed
+    results_file = output_dir / f"{ablation_config.name}_fold{fold_idx}_seed{seed_idx}_results.json"
 
     # Build train.py command
     if use_fsdp:
@@ -962,9 +967,9 @@ def run_single_fold(
     else:
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
-    # Checkpoint path - unique per config and fold to avoid overwriting
-    checkpoint_prefix = f"{ablation_config.name}_fold{fold_idx}"
-    checkpoint_path = output_dir / ablation_config.name / f"fold{fold_idx}" / "best_model.pt"
+    # Checkpoint path - unique per config, fold, AND seed to avoid overwriting
+    checkpoint_prefix = f"{ablation_config.name}_fold{fold_idx}_seed{seed_idx}"
+    checkpoint_path = output_dir / ablation_config.name / f"fold{fold_idx}_seed{seed_idx}" / "best_model.pt"
 
     # Base arguments
     cmd.extend([
@@ -973,7 +978,7 @@ def run_single_fold(
         "--epochs", str(ablation_config.epochs),
         "--batch-size", str(ablation_config.batch_size),
         "--lr", str(ablation_config.learning_rate),
-        "--seed", str(seed + fold_idx),
+        "--seed", str(seed),  # Use the actual seed passed in
         "--output-results-file", str(results_file),
         "--checkpoint-prefix", checkpoint_prefix,  # Unique checkpoint per fold
         "--fold", str(fold_idx),
@@ -1118,6 +1123,8 @@ def run_single_fold(
         # Create comprehensive FoldResult with ALL metrics
         fold_result = FoldResult(
             fold_idx=fold_idx,
+            seed=seed,
+            seed_idx=seed_idx,
             test_sessions=test_sessions,
             train_sessions=train_sessions,
             # Validation metrics (from 70/30 split - for model selection)
@@ -1177,6 +1184,7 @@ def run_ablation_experiment(
     fold_splits: List[Dict[str, Any]],
     output_dir: Path,
     seed: int = 42,
+    n_seeds: int = 3,  # Run 3 seeds per fold
     verbose: bool = True,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
@@ -1202,6 +1210,7 @@ def run_ablation_experiment(
     print(f"\n{'#'*70}")
     print(f"# ABLATION: {ablation_config.name}")
     print(f"# {ablation_config.description}")
+    print(f"# Strategy: 3 folds × {n_seeds} seeds = {3 * n_seeds} runs")
     print(f"{'#'*70}")
 
     ablation_dir = output_dir / ablation_config.name
@@ -1216,25 +1225,32 @@ def run_ablation_experiment(
         if folds_to_run is not None and fold_idx not in folds_to_run:
             continue
 
-        result = run_single_fold(
-            ablation_config=ablation_config,
-            fold_split=split,
-            output_dir=ablation_dir,
-            seed=seed,
-            verbose=verbose,
-            use_fsdp=use_fsdp,
-            fsdp_strategy=fsdp_strategy,
-            dry_run=dry_run,
-        )
+        # Run multiple seeds per fold
+        for seed_idx in range(n_seeds):
+            current_seed = seed + fold_idx * n_seeds + seed_idx
 
-        if result is not None:
-            fold_results.append(result)
+            print(f"\n  --- Fold {fold_idx}, Seed {seed_idx + 1}/{n_seeds} (seed={current_seed}) ---")
 
-            # Save after EACH fold (don't lose progress if interrupted)
-            fold_file = ablation_dir / f"fold{split['fold_idx']}_result.json"
-            with open(fold_file, 'w') as f:
-                json.dump(result.to_dict(), f, indent=2, cls=NumpyEncoder)
-            print(f"  Fold {split['fold_idx']} saved to: {fold_file}")
+            result = run_single_fold(
+                ablation_config=ablation_config,
+                fold_split=split,
+                output_dir=ablation_dir,
+                seed=current_seed,
+                seed_idx=seed_idx,  # Track which seed this is
+                verbose=verbose,
+                use_fsdp=use_fsdp,
+                fsdp_strategy=fsdp_strategy,
+                dry_run=dry_run,
+            )
+
+            if result is not None:
+                fold_results.append(result)
+
+                # Save after EACH fold+seed (don't lose progress if interrupted)
+                fold_file = ablation_dir / f"fold{fold_idx}_seed{seed_idx}_result.json"
+                with open(fold_file, 'w') as f:
+                    json.dump(result.to_dict(), f, indent=2, cls=NumpyEncoder)
+                print(f"  Fold {fold_idx} Seed {seed_idx} saved to: {fold_file}")
 
     # Create ablation result
     ablation_result = AblationResult(
@@ -1260,6 +1276,7 @@ def run_3fold_ablation_study(
     ablations_to_run: Optional[List[str]] = None,
     folds_to_run: Optional[List[int]] = None,
     seed: int = 42,
+    n_seeds: int = 3,
     epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
@@ -1273,7 +1290,8 @@ def run_3fold_ablation_study(
         output_dir: Directory to save all results
         ablations_to_run: Optional list of ablation names to run (default: all)
         folds_to_run: Optional list of fold indices to run (default: all 3)
-        seed: Random seed
+        seed: Base random seed
+        n_seeds: Number of seeds per fold (default: 3, giving 3 folds × 3 seeds = 9 runs)
         epochs: Number of training epochs (default: 80 from config)
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
@@ -1294,6 +1312,7 @@ def run_3fold_ablation_study(
     print("=" * 70)
     print(f"Output directory: {output_dir}")
     print(f"Log file: {log_file}")
+    print(f"Seeds per fold: {n_seeds} (3 folds × {n_seeds} seeds = {3 * n_seeds} runs per ablation)")
     print(f"Sweep mode: {'ENABLED' if enable_sweep else 'DISABLED'}")
     print()
 
@@ -1341,6 +1360,7 @@ def run_3fold_ablation_study(
             fold_splits=fold_splits,
             output_dir=output_dir,
             seed=seed,
+            n_seeds=n_seeds,
             verbose=verbose,
             use_fsdp=use_fsdp,
             fsdp_strategy=fsdp_strategy,
@@ -2090,7 +2110,14 @@ def main():
         "--seed",
         type=int,
         default=42,
-        help="Random seed",
+        help="Base random seed",
+    )
+
+    parser.add_argument(
+        "--n-seeds",
+        type=int,
+        default=3,
+        help="Number of seeds per fold (default: 3, giving 3 folds × 3 seeds = 9 runs per ablation)",
     )
 
     parser.add_argument(
@@ -2156,6 +2183,7 @@ def main():
         ablations_to_run=args.ablations,
         folds_to_run=args.folds,
         seed=args.seed,
+        n_seeds=args.n_seeds,
         epochs=args.epochs,
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
