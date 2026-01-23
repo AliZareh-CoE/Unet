@@ -3,15 +3,26 @@
 3-Fold Cross-Validation Ablation Study
 =======================================
 
-Implements a proper 3-fold cross-validation where:
-- 9 sessions are divided into 3 groups of 3
-- Each fold holds out a different group of 3 sessions for testing
-- All 9 sessions get evaluated as test data across the 3 folds
+Implements a proper 3-fold cross-validation with NO DATA LEAKAGE:
+
+For each fold:
+- 3 sessions are HELD OUT for final TEST evaluation (never seen during training)
+- Remaining 6 sessions are split 70/30 trial-wise into TRAIN/VAL
+- Model selection is based on VAL performance (NOT test!)
+- Final evaluation on held-out TEST sessions
+
+Data flow per fold:
+  9 sessions total
+  ├── 3 sessions → TEST (held out, excluded during training)
+  └── 6 sessions → 70/30 trial-wise split
+      ├── ~70% trials → TRAIN
+      └── ~30% trials → VAL (for model selection)
 
 This gives us:
-- More robust performance estimates (mean ± std across folds)
-- Test performance for EVERY session
-- Better understanding of model generalization
+- NO data leakage (model never sees test during training OR selection)
+- Robust performance estimates (mean ± std across 3 folds)
+- Every session gets tested exactly once across all folds
+- Proper separation of model selection (val) vs final evaluation (test)
 
 Baseline: Original default (n_downsample=2) as the reference point
 
@@ -75,7 +86,7 @@ class AblationConfig:
     # Fixed parameters
     base_channels: int = 128
     epochs: int = 80
-    batch_size: int = 32
+    batch_size: int = 64  # Larger batch = fewer iterations per epoch
     learning_rate: float = 1e-3
     optimizer: str = "adamw"
     lr_schedule: str = "cosine_warmup"
@@ -470,17 +481,26 @@ def get_3fold_session_splits(all_sessions: List[str]) -> List[Dict[str, List[str
 class FoldResult:
     """Result from a single fold of ablation experiment.
 
-    Captures ALL metrics from train.py output for comprehensive analysis.
+    IMPORTANT: Proper separation of val vs test metrics:
+    - val_* metrics: From 70/30 trial-wise split on training sessions (model selection)
+    - test_* metrics: From held-out test sessions (true generalization, NO leakage)
+
+    The test_r2 is the PRIMARY metric for comparing ablations.
     """
     fold_idx: int
     test_sessions: List[str]
     train_sessions: List[str]
 
-    # Primary metrics
+    # Validation metrics (from 70/30 split on training sessions - for model selection)
     val_r2: float
     val_loss: float
     val_corr: float = 0.0
     val_mae: float = 0.0
+
+    # TEST metrics (from held-out sessions - PRIMARY metric for ablation comparison)
+    test_r2: float = 0.0
+    test_corr: float = 0.0
+    test_mae: float = 0.0
 
     # Training metadata
     epochs_trained: int = 0
@@ -512,11 +532,15 @@ class FoldResult:
             "fold_idx": self.fold_idx,
             "test_sessions": self.test_sessions,
             "train_sessions": self.train_sessions,
-            # Primary metrics
+            # Validation metrics (from 70/30 split - for model selection)
             "val_r2": self.val_r2,
             "val_loss": self.val_loss,
             "val_corr": self.val_corr,
             "val_mae": self.val_mae,
+            # TEST metrics (from held-out sessions - PRIMARY for ablation comparison)
+            "test_r2": self.test_r2,
+            "test_corr": self.test_corr,
+            "test_mae": self.test_mae,
             # Training metadata
             "epochs_trained": self.epochs_trained,
             "total_time": self.total_time,
@@ -527,11 +551,11 @@ class FoldResult:
             "val_losses": self.val_losses,
             "val_r2s": self.val_r2s,
             "val_corrs": self.val_corrs,
-            # Per-session metrics
+            # Per-session metrics (from validation)
             "per_session_r2": self.per_session_r2,
             "per_session_corr": self.per_session_corr,
             "per_session_loss": self.per_session_loss,
-            # Test metrics
+            # Per-session TEST metrics (from held-out sessions)
             "test_avg_r2": self.test_avg_r2,
             "test_avg_corr": self.test_avg_corr,
             "per_session_test_results": self.per_session_test_results,
@@ -542,28 +566,35 @@ class FoldResult:
 class AblationResult:
     """Aggregated results for one ablation configuration.
 
+    IMPORTANT: Uses TEST metrics (from held-out sessions) as PRIMARY metrics.
+    Val metrics are only for reference (model selection during training).
+
     Includes comprehensive statistics and per-session analysis.
     """
     config: AblationConfig
     fold_results: List[FoldResult]
 
-    # Primary statistics (computed after all folds)
-    mean_r2: float = 0.0
+    # PRIMARY statistics - TEST metrics (from held-out sessions, NO leakage)
+    mean_r2: float = 0.0  # Mean TEST R² across folds
     std_r2: float = 0.0
     sem_r2: float = 0.0
     median_r2: float = 0.0
     min_r2: float = 0.0
     max_r2: float = 0.0
 
-    # Confidence intervals
+    # Confidence intervals (for TEST R²)
     ci_lower_r2: float = 0.0
     ci_upper_r2: float = 0.0
 
-    # Correlation statistics
+    # TEST correlation statistics
     mean_corr: float = 0.0
     std_corr: float = 0.0
 
-    # Loss statistics
+    # Validation statistics (for reference only - model selection)
+    mean_val_r2: float = 0.0
+    std_val_r2: float = 0.0
+
+    # Loss statistics (from validation)
     mean_loss: float = 0.0
     std_loss: float = 0.0
 
@@ -584,40 +615,52 @@ class AblationResult:
     fold_loss_values: List[float] = field(default_factory=list)
 
     def compute_statistics(self) -> None:
-        """Compute comprehensive aggregate statistics from fold results."""
+        """Compute comprehensive aggregate statistics from fold results.
+
+        PRIMARY metrics are from TEST (held-out sessions) - NO data leakage.
+        Val metrics are kept for reference (model selection during training).
+        """
         if not self.fold_results:
             return
 
-        # Extract fold-level values
-        self.fold_r2_values = [r.val_r2 for r in self.fold_results]
-        self.fold_corr_values = [r.val_corr for r in self.fold_results]
+        # Extract fold-level TEST values (PRIMARY - for ablation comparison)
+        self.fold_r2_values = [r.test_r2 for r in self.fold_results]
+        self.fold_corr_values = [r.test_corr for r in self.fold_results]
+
+        # Also track validation metrics (for reference)
+        val_r2_values = [r.val_r2 for r in self.fold_results]
         self.fold_loss_values = [r.val_loss for r in self.fold_results]
 
-        r2_arr = np.array(self.fold_r2_values)
-        corr_arr = np.array(self.fold_corr_values)
+        test_r2_arr = np.array(self.fold_r2_values)
+        test_corr_arr = np.array(self.fold_corr_values)
+        val_r2_arr = np.array(val_r2_values)
         loss_arr = np.array(self.fold_loss_values)
 
-        # R² statistics
-        self.mean_r2 = float(np.mean(r2_arr))
-        self.std_r2 = float(np.std(r2_arr, ddof=1)) if len(r2_arr) > 1 else 0.0
-        self.sem_r2 = float(self.std_r2 / np.sqrt(len(r2_arr))) if len(r2_arr) > 1 else 0.0
-        self.median_r2 = float(np.median(r2_arr))
-        self.min_r2 = float(np.min(r2_arr))
-        self.max_r2 = float(np.max(r2_arr))
+        # PRIMARY R² statistics (from TEST - held-out sessions)
+        self.mean_r2 = float(np.mean(test_r2_arr))
+        self.std_r2 = float(np.std(test_r2_arr, ddof=1)) if len(test_r2_arr) > 1 else 0.0
+        self.sem_r2 = float(self.std_r2 / np.sqrt(len(test_r2_arr))) if len(test_r2_arr) > 1 else 0.0
+        self.median_r2 = float(np.median(test_r2_arr))
+        self.min_r2 = float(np.min(test_r2_arr))
+        self.max_r2 = float(np.max(test_r2_arr))
 
-        # Confidence interval for R² (95%)
-        if len(r2_arr) >= 2:
+        # Confidence interval for TEST R² (95%)
+        if len(test_r2_arr) >= 2:
             from scipy import stats as scipy_stats
-            t_crit = scipy_stats.t.ppf(0.975, len(r2_arr) - 1)
+            t_crit = scipy_stats.t.ppf(0.975, len(test_r2_arr) - 1)
             margin = t_crit * self.sem_r2
             self.ci_lower_r2 = self.mean_r2 - margin
             self.ci_upper_r2 = self.mean_r2 + margin
 
-        # Correlation statistics
-        self.mean_corr = float(np.mean(corr_arr))
-        self.std_corr = float(np.std(corr_arr, ddof=1)) if len(corr_arr) > 1 else 0.0
+        # TEST correlation statistics
+        self.mean_corr = float(np.mean(test_corr_arr))
+        self.std_corr = float(np.std(test_corr_arr, ddof=1)) if len(test_corr_arr) > 1 else 0.0
 
-        # Loss statistics
+        # Validation statistics (for reference - model selection)
+        self.mean_val_r2 = float(np.mean(val_r2_arr))
+        self.std_val_r2 = float(np.std(val_r2_arr, ddof=1)) if len(val_r2_arr) > 1 else 0.0
+
+        # Loss statistics (from validation)
         self.mean_loss = float(np.mean(loss_arr))
         self.std_loss = float(np.std(loss_arr, ddof=1)) if len(loss_arr) > 1 else 0.0
 
@@ -627,28 +670,30 @@ class AblationResult:
         self.total_time = sum(r.total_time for r in self.fold_results)
         self.n_parameters = self.fold_results[0].n_parameters if self.fold_results else 0
 
-        # Aggregate per-session R2s across folds
-        session_r2_lists: Dict[str, List[float]] = {}
-        session_corr_lists: Dict[str, List[float]] = {}
+        # Aggregate per-session TEST R²s across folds (from held-out test sessions)
+        # Each session appears in exactly one fold's test set, so each session has one R² value
+        session_test_r2_dict: Dict[str, float] = {}
 
         for fold in self.fold_results:
-            for session, r2 in fold.per_session_r2.items():
-                self.all_session_r2s[session] = r2
-                if session not in session_r2_lists:
-                    session_r2_lists[session] = []
-                session_r2_lists[session].append(r2)
+            # per_session_test_results contains TEST metrics (held-out sessions)
+            if isinstance(fold.per_session_test_results, dict):
+                for session, r2 in fold.per_session_test_results.items():
+                    session_test_r2_dict[session] = r2
+            elif isinstance(fold.per_session_test_results, list):
+                # Handle list format if it exists
+                for item in fold.per_session_test_results:
+                    if isinstance(item, dict) and "session" in item:
+                        session_test_r2_dict[item["session"]] = item.get("r2", 0.0)
 
-            for session, corr in fold.per_session_corr.items():
-                self.all_session_corrs[session] = corr
-                if session not in session_corr_lists:
-                    session_corr_lists[session] = []
-                session_corr_lists[session].append(corr)
+        # Store per-session TEST R²s
+        self.all_session_r2s = session_test_r2_dict
+        self.all_session_corrs = {}  # Could add test correlations if needed
 
-        # Compute per-session statistics (if session appears in multiple folds, which shouldn't happen in our design)
-        for session, r2_list in session_r2_lists.items():
+        # Per-session stats (each session tested once, so no aggregation needed)
+        for session, r2 in session_test_r2_dict.items():
             self.session_r2_stats[session] = {
-                "r2": float(np.mean(r2_list)),
-                "n_folds": len(r2_list),
+                "test_r2": r2,
+                "n_folds": 1,  # Each session appears in exactly one fold's test set
             }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -697,6 +742,137 @@ def get_all_sessions(dataset: str = "olfactory") -> List[str]:
         return list_pcx1_sessions(PCX1_CONTINUOUS_PATH)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
+
+
+def evaluate_on_test_sessions(
+    checkpoint_path: Path,
+    test_sessions: List[str],
+    dataset: str = "olfactory",
+) -> Dict[str, float]:
+    """Evaluate a trained model on held-out test sessions.
+
+    This is the TRUE generalization metric - model has NEVER seen these sessions.
+
+    Args:
+        checkpoint_path: Path to the best model checkpoint
+        test_sessions: List of session names to evaluate on
+        dataset: Dataset name
+
+    Returns:
+        Dict with test_r2, test_corr, test_mae, and per_session metrics
+    """
+    import torch
+    from sklearn.metrics import r2_score, mean_absolute_error
+
+    if not checkpoint_path.exists():
+        print(f"    Warning: Checkpoint not found at {checkpoint_path}")
+        return {"test_r2": 0.0, "test_corr": 0.0, "test_mae": 0.0, "per_session_test_r2": {}}
+
+    try:
+        # Load checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        # Import model creation
+        from models import CondUNet1D
+        from data import prepare_data, load_session_ids, ODOR_CSV_PATH
+
+        # Get model config from checkpoint
+        config = checkpoint.get("config", {})
+
+        # Create model with same architecture
+        model = CondUNet1D(
+            in_channels=config.get("in_channels", 32),
+            out_channels=config.get("out_channels", 32),
+            base=config.get("base_channels", 128),  # Note: CLI uses base_channels, model uses base
+            n_odors=config.get("n_odors", 7),
+            n_downsample=config.get("n_downsample", 2),
+            conv_type=config.get("conv_type", "modern"),
+            attention_type=config.get("attention_type", "none"),
+            skip_type=config.get("skip_type", "add"),
+            activation=config.get("activation", "gelu"),
+            cond_mode=config.get("cond_mode", "cross_attn_gated"),
+            use_adaptive_scaling=config.get("use_adaptive_scaling", True),
+            n_heads=config.get("n_heads", 4),
+        )
+
+        # Load weights
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        # Move to GPU if available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+
+        # Load data for test sessions only
+        data = prepare_data(
+            split_by_session=False,
+            force_recreate_splits=True,
+        )
+
+        X = data["ob"]
+        y = data["pcx"]
+        odors = data["odors"]
+
+        # Get session IDs
+        session_ids, session_to_idx, idx_to_session = load_session_ids(
+            ODOR_CSV_PATH, num_trials=len(odors)
+        )
+
+        # Get indices for test sessions
+        test_session_ids = set(session_to_idx[s] for s in test_sessions if s in session_to_idx)
+        all_indices = np.arange(len(session_ids))
+        test_idx = all_indices[np.isin(session_ids, list(test_session_ids))]
+
+        if len(test_idx) == 0:
+            print(f"    Warning: No test indices found for sessions {test_sessions}")
+            return {"test_r2": 0.0, "test_corr": 0.0, "test_mae": 0.0, "per_session_test_r2": {}}
+
+        X_test = torch.tensor(X[test_idx], dtype=torch.float32)
+        y_test = torch.tensor(y[test_idx], dtype=torch.float32)
+        odors_test = torch.tensor(odors[test_idx], dtype=torch.long)
+
+        # Evaluate
+        with torch.no_grad():
+            X_test_dev = X_test.to(device)
+            odors_test_dev = odors_test.to(device)
+            y_pred = model(X_test_dev, odors_test_dev).cpu()
+
+        # Compute overall metrics
+        y_test_flat = y_test.numpy().flatten()
+        y_pred_flat = y_pred.numpy().flatten()
+
+        test_r2 = float(r2_score(y_test_flat, y_pred_flat))
+        test_mae = float(mean_absolute_error(y_test_flat, y_pred_flat))
+        test_corr = float(np.corrcoef(y_test_flat, y_pred_flat)[0, 1])
+
+        # Compute per-session metrics
+        per_session_test_r2 = {}
+        test_session_ids_arr = session_ids[test_idx]
+
+        for sess_name in test_sessions:
+            if sess_name not in session_to_idx:
+                continue
+            sess_id = session_to_idx[sess_name]
+            local_mask = test_session_ids_arr == sess_id
+            if not np.any(local_mask):
+                continue
+
+            y_sess = y_test[local_mask].numpy().flatten()
+            y_pred_sess = y_pred[local_mask].numpy().flatten()
+            per_session_test_r2[sess_name] = float(r2_score(y_sess, y_pred_sess))
+
+        return {
+            "test_r2": test_r2,
+            "test_corr": test_corr,
+            "test_mae": test_mae,
+            "per_session_test_r2": per_session_test_r2,
+        }
+
+    except Exception as e:
+        print(f"    Warning: Test evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"test_r2": 0.0, "test_corr": 0.0, "test_mae": 0.0, "per_session_test_r2": {}}
 
 
 def run_single_fold(
@@ -749,6 +925,10 @@ def run_single_fold(
     else:
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
+    # Checkpoint path - unique per config and fold to avoid overwriting
+    checkpoint_prefix = f"{ablation_config.name}_fold{fold_idx}"
+    checkpoint_path = output_dir / ablation_config.name / f"fold{fold_idx}" / "best_model.pt"
+
     # Base arguments
     cmd.extend([
         "--arch", "condunet",
@@ -758,15 +938,19 @@ def run_single_fold(
         "--lr", str(ablation_config.learning_rate),
         "--seed", str(seed + fold_idx),
         "--output-results-file", str(results_file),
+        "--checkpoint-prefix", checkpoint_prefix,  # Unique checkpoint per fold
         "--fold", str(fold_idx),
         "--no-plots",
     ])
 
-    # Session-based splitting
-    cmd.append("--split-by-session")
+    # CORRECT DATA SPLIT (no leakage):
+    # - Test sessions are EXCLUDED entirely (never seen during training)
+    # - Remaining sessions use 70/30 trial-wise split for train/val
+    # - Model selection based on val (NOT test)
     cmd.append("--force-recreate-splits")
-    cmd.extend(["--val-sessions"] + test_sessions)  # Hold out test sessions
-    cmd.append("--no-test-set")
+    cmd.extend(["--exclude-sessions"] + test_sessions)  # Exclude test sessions entirely
+    # Default 70/30 trial-wise split on remaining sessions for train/val
+    cmd.append("--no-test-set")  # No separate test during training (we evaluate separately)
     cmd.append("--no-early-stop")  # Train full epochs
 
     # Model architecture arguments
@@ -864,16 +1048,50 @@ def run_single_fold(
         with open(results_file, 'r') as f:
             results = json.load(f)
 
+        # Evaluate on held-out TEST sessions (TRUE generalization, NO leakage)
+        print(f"\n  Evaluating on held-out test sessions: {test_sessions}")
+
+        # Find the checkpoint - try several possible locations
+        possible_checkpoint_paths = [
+            checkpoint_path,  # Unique path we specified
+            PROJECT_ROOT / "artifacts" / "checkpoints" / f"{checkpoint_prefix}_best_model.pt",
+            PROJECT_ROOT / "artifacts" / "checkpoints" / "best_model.pt",
+        ]
+
+        actual_checkpoint_path = None
+        for cp_path in possible_checkpoint_paths:
+            if cp_path.exists():
+                actual_checkpoint_path = cp_path
+                break
+
+        if actual_checkpoint_path:
+            test_metrics = evaluate_on_test_sessions(
+                checkpoint_path=actual_checkpoint_path,
+                test_sessions=test_sessions,
+                dataset="olfactory",
+            )
+            print(f"    TEST R2: {test_metrics['test_r2']:.4f} (PRIMARY METRIC)")
+            print(f"    TEST Corr: {test_metrics['test_corr']:.4f}")
+            if test_metrics.get('per_session_test_r2'):
+                print(f"    Per-session TEST R2: {test_metrics['per_session_test_r2']}")
+        else:
+            print(f"    WARNING: Could not find checkpoint for test evaluation")
+            test_metrics = {"test_r2": 0.0, "test_corr": 0.0, "test_mae": 0.0, "per_session_test_r2": {}}
+
         # Create comprehensive FoldResult with ALL metrics
         fold_result = FoldResult(
             fold_idx=fold_idx,
             test_sessions=test_sessions,
             train_sessions=train_sessions,
-            # Primary metrics
+            # Validation metrics (from 70/30 split - for model selection)
             val_r2=results.get("best_val_r2", results.get("val_r2", 0.0)),
             val_loss=results.get("best_val_loss", results.get("val_loss", float('inf'))),
             val_corr=results.get("best_val_corr", 0.0),
             val_mae=results.get("best_val_mae", 0.0),
+            # TEST metrics (from held-out sessions - PRIMARY for ablation comparison)
+            test_r2=test_metrics["test_r2"],
+            test_corr=test_metrics["test_corr"],
+            test_mae=test_metrics["test_mae"],
             # Training metadata
             epochs_trained=results.get("epochs_trained", ablation_config.epochs),
             total_time=elapsed,
@@ -884,27 +1102,26 @@ def run_single_fold(
             val_losses=results.get("val_losses", []),
             val_r2s=results.get("val_r2s", []),
             val_corrs=results.get("val_corrs", []),
-            # Per-session metrics
+            # Per-session metrics (from validation)
             per_session_r2=results.get("per_session_r2", {}),
             per_session_corr=results.get("per_session_corr", {}),
             per_session_loss=results.get("per_session_loss", {}),
-            # Test metrics (if available)
-            test_avg_r2=results.get("test_avg_r2"),
-            test_avg_corr=results.get("test_avg_corr"),
-            per_session_test_results=results.get("per_session_test_results", []),
+            # Per-session TEST metrics
+            test_avg_r2=test_metrics.get("test_r2"),
+            test_avg_corr=test_metrics.get("test_corr"),
+            per_session_test_results=test_metrics.get("per_session_test_r2", {}),
             # Keep raw results for reference
             raw_results=results,
         )
 
         print(f"\n  Fold {fold_idx} completed:")
-        print(f"    Val R2: {fold_result.val_r2:.4f}")
+        print(f"    Val R2: {fold_result.val_r2:.4f} (model selection)")
+        print(f"    TEST R2: {fold_result.test_r2:.4f} (PRIMARY - true generalization)")
         print(f"    Val Corr: {fold_result.val_corr:.4f}")
         print(f"    Val Loss: {fold_result.val_loss:.4f}")
         print(f"    Best Epoch: {fold_result.best_epoch}")
         print(f"    Parameters: {fold_result.n_parameters:,}")
         print(f"    Time: {elapsed/60:.1f} minutes")
-        if fold_result.per_session_r2:
-            print(f"    Per-session R2: {fold_result.per_session_r2}")
 
         return fold_result
     else:
@@ -1110,6 +1327,9 @@ def compute_statistical_comparisons(
     baseline_name: str = "baseline",
 ) -> Dict[str, Dict[str, Any]]:
     """Compute comprehensive statistical comparisons vs baseline.
+
+    NOTE: Uses TEST R² (from held-out sessions) - NO data leakage.
+    The fold_r2_values in AblationResult are populated from test_r2, not val_r2.
 
     Returns dict with effect sizes, p-values, CIs for each ablation.
     """
@@ -1392,28 +1612,34 @@ def compute_recommendations(
 
 
 def print_summary(results: Dict[str, AblationResult], total_time: float) -> None:
-    """Print comprehensive summary of ablation study results with statistics."""
+    """Print comprehensive summary of ablation study results with statistics.
+
+    NOTE: All R² values shown are TEST R² from held-out sessions (NO data leakage).
+    """
     print("\n" + "=" * 80)
     print("ABLATION STUDY RESULTS SUMMARY")
     print("=" * 80)
+    print("NOTE: All R² values are from TEST (held-out sessions) - NO data leakage")
+    print("      Model selection was based on validation (70/30 split), NOT test")
+    print()
 
     # Find baseline
     baseline_result = results.get("baseline")
-    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0
+    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0  # This is TEST R²
 
-    # Compute statistical comparisons
+    # Compute statistical comparisons (uses TEST R²)
     comparisons = compute_statistical_comparisons(results, "baseline")
 
-    # Sort by mean R2
+    # Sort by mean TEST R²
     sorted_results = sorted(
         results.items(),
         key=lambda x: x[1].mean_r2,
         reverse=True
     )
 
-    # Print main results table
-    print(f"\n{'Ablation':<22} {'R2 (mean±std)':<18} {'95% CI':<18} {'Delta':>8} {'d':>6} {'p':>8} {'Sig':>4}")
-    print("-" * 90)
+    # Print main results table (TEST R²)
+    print(f"{'Ablation':<22} {'TEST R² (mean±std)':<20} {'95% CI':<18} {'Delta':>8} {'d':>6} {'p':>8} {'Sig':>4}")
+    print("-" * 92)
 
     for name, result in sorted_results:
         r2_str = f"{result.mean_r2:.4f}±{result.std_r2:.4f}"
@@ -1465,8 +1691,8 @@ def print_summary(results: Dict[str, AblationResult], total_time: float) -> None
         if medium_effects:
             print(f"  Medium effects (0.5≤|d|<0.8): {', '.join(medium_effects)}")
 
-    # Print per-session summary
-    print("\nPER-SESSION R² SUMMARY:")
+    # Print per-session TEST summary (each session tested in exactly one fold)
+    print("\nPER-SESSION TEST R² SUMMARY (from held-out sessions):")
     print("-" * 60)
     all_sessions = set()
     for result in results.values():
@@ -1522,15 +1748,19 @@ def print_summary(results: Dict[str, AblationResult], total_time: float) -> None
 
 
 def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
-    """Save comprehensive summary with all statistics to JSON files."""
+    """Save comprehensive summary with all statistics to JSON files.
+
+    NOTE: All R² metrics are from TEST (held-out sessions) - NO data leakage.
+    Val metrics are included for reference but TEST is the primary metric.
+    """
     output_dir = Path(output_dir)
 
-    # Compute statistical comparisons
+    # Compute statistical comparisons (uses TEST R² as primary metric)
     comparisons = compute_statistical_comparisons(results, "baseline")
 
     # Find baseline
     baseline_result = results.get("baseline")
-    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0
+    baseline_r2 = baseline_result.mean_r2 if baseline_result else 0.0  # This is TEST R²
 
     # =========================================================================
     # 1. MAIN SUMMARY FILE (ablation_summary.json)
@@ -1541,35 +1771,45 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
             "n_ablations": len(results),
             "n_folds": 3,
             "baseline": "baseline" if "baseline" in results else None,
+            "primary_metric": "test_r2",  # From held-out sessions, NO leakage
+            "data_split_design": {
+                "test": "3 sessions held out per fold (never seen during training)",
+                "train_val": "Remaining 6 sessions split 70/30 trial-wise",
+                "model_selection": "Based on val (70/30 split), NOT test",
+                "ablation_comparison": "Based on test (held-out sessions)",
+            },
         },
         "results": {name: result.to_dict() for name, result in results.items()},
         "statistical_comparisons": comparisons,
     }
 
-    # Build summary table (sorted by R²)
+    # Build summary table (sorted by TEST R² - primary metric)
     summary_table = []
     for name, result in sorted(results.items(), key=lambda x: x[1].mean_r2, reverse=True):
         entry = {
             "rank": len(summary_table) + 1,
             "name": name,
             "description": result.config.description,
-            # R² statistics
-            "mean_r2": result.mean_r2,
-            "std_r2": result.std_r2,
-            "sem_r2": result.sem_r2,
-            "ci_lower_r2": result.ci_lower_r2,
-            "ci_upper_r2": result.ci_upper_r2,
-            "median_r2": result.median_r2,
-            "min_r2": result.min_r2,
-            "max_r2": result.max_r2,
-            # Correlation statistics
-            "mean_corr": result.mean_corr,
-            "std_corr": result.std_corr,
-            # Loss statistics
-            "mean_loss": result.mean_loss,
-            "std_loss": result.std_loss,
-            # Comparison vs baseline
-            "delta_vs_baseline": result.mean_r2 - baseline_r2 if name != "baseline" else 0.0,
+            # TEST R² statistics (PRIMARY - from held-out sessions, NO leakage)
+            "test_r2_mean": result.mean_r2,
+            "test_r2_std": result.std_r2,
+            "test_r2_sem": result.sem_r2,
+            "test_r2_ci_lower": result.ci_lower_r2,
+            "test_r2_ci_upper": result.ci_upper_r2,
+            "test_r2_median": result.median_r2,
+            "test_r2_min": result.min_r2,
+            "test_r2_max": result.max_r2,
+            # Validation R² (for reference - model selection)
+            "val_r2_mean": result.mean_val_r2,
+            "val_r2_std": result.std_val_r2,
+            # TEST correlation statistics
+            "test_corr_mean": result.mean_corr,
+            "test_corr_std": result.std_corr,
+            # Loss statistics (from validation)
+            "val_loss_mean": result.mean_loss,
+            "val_loss_std": result.std_loss,
+            # Comparison vs baseline (TEST R²)
+            "delta_test_r2_vs_baseline": result.mean_r2 - baseline_r2 if name != "baseline" else 0.0,
             # Training info
             "n_folds": len(result.fold_results),
             "n_parameters": result.n_parameters,
@@ -1629,11 +1869,14 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
     print(f"Statistical analysis saved to: {stats_file}")
 
     # =========================================================================
-    # 3. PER-SESSION RESULTS FILE (per_session_results.json)
+    # 3. PER-SESSION TEST RESULTS FILE (per_session_test_results.json)
+    # These are TRUE TEST metrics from held-out sessions - NO data leakage
     # =========================================================================
     per_session = {
         "metadata": {
             "timestamp": datetime.now().isoformat(),
+            "note": "TEST R² from held-out sessions (NO data leakage)",
+            "data_split": "Each session tested in exactly one fold, model never saw it during training",
         },
         "sessions": {},
     }
@@ -1648,27 +1891,26 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
         for name, result in results.items():
             if session in result.all_session_r2s:
                 session_data["ablations"][name] = {
-                    "r2": result.all_session_r2s[session],
-                    "corr": result.all_session_corrs.get(session, 0.0),
+                    "test_r2": result.all_session_r2s[session],  # TEST R² (held-out)
                 }
         if session_data["ablations"]:
-            r2_values = [v["r2"] for v in session_data["ablations"].values()]
-            session_data["mean_r2"] = float(np.mean(r2_values))
-            session_data["std_r2"] = float(np.std(r2_values))
+            r2_values = [v["test_r2"] for v in session_data["ablations"].values()]
+            session_data["mean_test_r2"] = float(np.mean(r2_values))
+            session_data["std_test_r2"] = float(np.std(r2_values))
             session_data["best_ablation"] = max(
                 session_data["ablations"].items(),
-                key=lambda x: x[1]["r2"]
+                key=lambda x: x[1]["test_r2"]
             )[0]
             session_data["worst_ablation"] = min(
                 session_data["ablations"].items(),
-                key=lambda x: x[1]["r2"]
+                key=lambda x: x[1]["test_r2"]
             )[0]
         per_session["sessions"][session] = session_data
 
-    session_file = output_dir / "per_session_results.json"
+    session_file = output_dir / "per_session_test_results.json"
     with open(session_file, 'w') as f:
         json.dump(per_session, f, indent=2)
-    print(f"Per-session results saved to: {session_file}")
+    print(f"Per-session TEST results saved to: {session_file}")
 
     # =========================================================================
     # 4. TRAINING CURVES FILE (training_curves.json)

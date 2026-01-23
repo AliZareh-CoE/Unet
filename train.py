@@ -1755,11 +1755,13 @@ def train(
 
     # Create conditioning encoder for auto-conditioning modes
     # Only for CondUNet - other architectures don't support conditioning
+    # Skip if cond_mode=none (conditioning bypassed, encoder would be unused)
     cond_source = config.get("conditioning_source", "odor_onehot")
+    cond_mode = config.get("cond_mode", "film")
     cond_encoder = None
     emb_dim = 128  # Must match model's emb_dim
 
-    if cond_source != "odor_onehot" and arch == "condunet":
+    if cond_source != "odor_onehot" and arch == "condunet" and cond_mode != "none":
         if is_primary():
             print(f"Using auto-conditioning: {cond_source}")
 
