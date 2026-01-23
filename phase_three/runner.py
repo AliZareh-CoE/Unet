@@ -26,7 +26,7 @@ This gives us:
 
 Baseline: Original default (n_downsample=2) as the reference point
 
-Ablation configurations (11 total, ordered logically):
+Ablation configurations (10 total, ordered logically):
 1. baseline: Original default (n_downsample=2) with all components
 2. depth_medium: n_downsample=3
 3. depth_deep: n_downsample=4
@@ -34,10 +34,9 @@ Ablation configurations (11 total, ordered logically):
 5. width_wide: base_channels=256
 6. conv_type_standard: standard convolutions
 7. attention_none: no attention
-8. attention_basic: basic attention
-9. skip_type_concat: concatenation skip connections
-10. conditioning_none: no conditioning (cond_mode=none)
-11. adaptive_scaling_off: no adaptive scaling
+8. skip_type_concat: concatenation skip connections
+9. conditioning_none: no conditioning (cond_mode=none)
+10. adaptive_scaling_off: no adaptive scaling
 """
 
 from __future__ import annotations
@@ -58,6 +57,24 @@ import numpy as np
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# =============================================================================
+# Custom JSON Encoder for NumPy types
+# =============================================================================
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 # =============================================================================
@@ -174,7 +191,7 @@ def save_sweep_state(state: SweepState, output_dir: Path) -> None:
     state.updated_at = datetime.now().isoformat()
     state_file = output_dir / "sweep_state.json"
     with open(state_file, 'w') as f:
-        json.dump(state.to_dict(), f, indent=2)
+        json.dump(state.to_dict(), f, indent=2, cls=NumpyEncoder)
     print(f"Sweep state saved to: {state_file}")
 
 
@@ -373,18 +390,8 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         conditioning="spectro_temporal",
     ))
 
-    configs_list.append(AblationConfig(
-        name="attention_basic",
-        description="Basic attention instead of cross_freq_v2",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="basic",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
     # =========================================================================
-    # 9. SKIP CONNECTION ABLATION
+    # 8. SKIP CONNECTION ABLATION
     # =========================================================================
     configs_list.append(AblationConfig(
         name="skip_type_concat",
@@ -795,8 +802,14 @@ def evaluate_on_test_sessions(
             n_heads=config.get("n_heads", 4),
         )
 
-        # Load weights
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # Load weights (handle different checkpoint formats)
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        elif "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"])
+        else:
+            # Assume checkpoint is the state dict directly
+            model.load_state_dict(checkpoint)
         model.eval()
 
         # Move to GPU if available
@@ -831,11 +844,19 @@ def evaluate_on_test_sessions(
         y_test = torch.tensor(y[test_idx], dtype=torch.float32)
         odors_test = torch.tensor(odors[test_idx], dtype=torch.long)
 
-        # Evaluate
+        # Evaluate in batches to avoid OOM
+        batch_size = 32
+        y_pred_list = []
         with torch.no_grad():
-            X_test_dev = X_test.to(device)
-            odors_test_dev = odors_test.to(device)
-            y_pred = model(X_test_dev, odors_test_dev).cpu()
+            for i in range(0, len(X_test), batch_size):
+                X_batch = X_test[i:i+batch_size].to(device)
+                odors_batch = odors_test[i:i+batch_size].to(device)
+                y_batch = model(X_batch, odors_batch).cpu()
+                y_pred_list.append(y_batch)
+                # Clear GPU memory
+                del X_batch, odors_batch
+                torch.cuda.empty_cache()
+        y_pred = torch.cat(y_pred_list, dim=0)
 
         # Compute overall metrics
         y_test_flat = y_test.numpy().flatten()
@@ -882,6 +903,7 @@ def run_single_fold(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     dry_run: bool = False,
 ) -> Optional[FoldResult]:
     """Run training for a single fold.
@@ -893,6 +915,7 @@ def run_single_fold(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        fsdp_strategy: FSDP sharding strategy
         dry_run: If True, print commands without running them
 
     Returns:
@@ -984,7 +1007,7 @@ def run_single_fold(
         cmd.append("--no-bidirectional")
 
     if use_fsdp:
-        cmd.extend(["--fsdp", "--fsdp-strategy", "grad_op"])
+        cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
     # Set environment variables
     env = os.environ.copy()
@@ -1136,6 +1159,7 @@ def run_ablation_experiment(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     folds_to_run: Optional[List[int]] = None,
     dry_run: bool = False,
 ) -> AblationResult:
@@ -1148,6 +1172,7 @@ def run_ablation_experiment(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        fsdp_strategy: FSDP sharding strategy
         folds_to_run: Optional list of specific fold indices to run
         dry_run: If True, print commands without running them
 
@@ -1178,6 +1203,7 @@ def run_ablation_experiment(
             seed=seed,
             verbose=verbose,
             use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
             dry_run=dry_run,
         )
 
@@ -1194,7 +1220,7 @@ def run_ablation_experiment(
     # Save ablation result
     result_file = ablation_dir / "ablation_result.json"
     with open(result_file, 'w') as f:
-        json.dump(ablation_result.to_dict(), f, indent=2)
+        json.dump(ablation_result.to_dict(), f, indent=2, cls=NumpyEncoder)
 
     return ablation_result
 
@@ -1208,8 +1234,10 @@ def run_3fold_ablation_study(
     ablations_to_run: Optional[List[str]] = None,
     folds_to_run: Optional[List[int]] = None,
     seed: int = 42,
+    epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     dry_run: bool = False,
     enable_sweep: bool = True,
 ) -> Dict[str, AblationResult]:
@@ -1220,6 +1248,7 @@ def run_3fold_ablation_study(
         ablations_to_run: Optional list of ablation names to run (default: all)
         folds_to_run: Optional list of fold indices to run (default: all 3)
         seed: Random seed
+        epochs: Number of training epochs (default: 80 from config)
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
         dry_run: If True, print commands without running them
@@ -1268,6 +1297,11 @@ def run_3fold_ablation_study(
     else:
         configs_to_run = all_configs
 
+    # Override epochs if specified
+    if epochs is not None:
+        for config in configs_to_run.values():
+            config.epochs = epochs
+
     print(f"Ablations to run: {list(configs_to_run.keys())}")
     print()
 
@@ -1283,6 +1317,7 @@ def run_3fold_ablation_study(
             seed=seed,
             verbose=verbose,
             use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
             folds_to_run=folds_to_run,
             dry_run=dry_run,
         )
@@ -1835,7 +1870,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
     # Save main summary
     summary_file = output_dir / "ablation_summary.json"
     with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
     print(f"\nMain summary saved to: {summary_file}")
 
     # =========================================================================
@@ -1865,7 +1900,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     stats_file = output_dir / "statistical_analysis.json"
     with open(stats_file, 'w') as f:
-        json.dump(stats_analysis, f, indent=2)
+        json.dump(stats_analysis, f, indent=2, cls=NumpyEncoder)
     print(f"Statistical analysis saved to: {stats_file}")
 
     # =========================================================================
@@ -1909,7 +1944,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     session_file = output_dir / "per_session_test_results.json"
     with open(session_file, 'w') as f:
-        json.dump(per_session, f, indent=2)
+        json.dump(per_session, f, indent=2, cls=NumpyEncoder)
     print(f"Per-session TEST results saved to: {session_file}")
 
     # =========================================================================
@@ -1942,7 +1977,7 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     curves_file = output_dir / "training_curves.json"
     with open(curves_file, 'w') as f:
-        json.dump(training_curves, f, indent=2)
+        json.dump(training_curves, f, indent=2, cls=NumpyEncoder)
     print(f"Training curves saved to: {curves_file}")
 
     # =========================================================================
@@ -1983,13 +2018,13 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
     recommendations_file = output_dir / "recommendations.json"
     with open(recommendations_file, 'w') as f:
-        json.dump(recommendations, f, indent=2)
+        json.dump(recommendations, f, indent=2, cls=NumpyEncoder)
     print(f"Recommendations saved to: {recommendations_file}")
 
     # Also add recommendations to main summary
     summary["recommendations"] = recommendations
     with open(summary_file, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
 
 
 # =============================================================================
@@ -2033,9 +2068,24 @@ def main():
     )
 
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Number of training epochs (default: 80)",
+    )
+
+    parser.add_argument(
         "--fsdp",
         action="store_true",
         help="Use FSDP for multi-GPU training",
+    )
+
+    parser.add_argument(
+        "--fsdp-strategy",
+        type=str,
+        default="grad_op",
+        choices=["full", "grad_op", "no_shard"],
+        help="FSDP sharding strategy (default: grad_op)",
     )
 
     parser.add_argument(
@@ -2080,8 +2130,10 @@ def main():
         ablations_to_run=args.ablations,
         folds_to_run=args.folds,
         seed=args.seed,
+        epochs=args.epochs,
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
+        fsdp_strategy=args.fsdp_strategy,
         dry_run=args.dry_run,
         enable_sweep=not args.no_sweep,
     )
