@@ -895,6 +895,7 @@ def run_single_fold(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     dry_run: bool = False,
 ) -> Optional[FoldResult]:
     """Run training for a single fold.
@@ -906,6 +907,7 @@ def run_single_fold(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        fsdp_strategy: FSDP sharding strategy
         dry_run: If True, print commands without running them
 
     Returns:
@@ -997,7 +999,7 @@ def run_single_fold(
         cmd.append("--no-bidirectional")
 
     if use_fsdp:
-        cmd.extend(["--fsdp", "--fsdp-strategy", "grad_op"])
+        cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
     # Set environment variables
     env = os.environ.copy()
@@ -1149,6 +1151,7 @@ def run_ablation_experiment(
     seed: int = 42,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     folds_to_run: Optional[List[int]] = None,
     dry_run: bool = False,
 ) -> AblationResult:
@@ -1161,6 +1164,7 @@ def run_ablation_experiment(
         seed: Random seed
         verbose: Print training output
         use_fsdp: Use FSDP for multi-GPU training
+        fsdp_strategy: FSDP sharding strategy
         folds_to_run: Optional list of specific fold indices to run
         dry_run: If True, print commands without running them
 
@@ -1191,6 +1195,7 @@ def run_ablation_experiment(
             seed=seed,
             verbose=verbose,
             use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
             dry_run=dry_run,
         )
 
@@ -1224,6 +1229,7 @@ def run_3fold_ablation_study(
     epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
     dry_run: bool = False,
     enable_sweep: bool = True,
 ) -> Dict[str, AblationResult]:
@@ -1303,6 +1309,7 @@ def run_3fold_ablation_study(
             seed=seed,
             verbose=verbose,
             use_fsdp=use_fsdp,
+            fsdp_strategy=fsdp_strategy,
             folds_to_run=folds_to_run,
             dry_run=dry_run,
         )
@@ -2066,6 +2073,14 @@ def main():
     )
 
     parser.add_argument(
+        "--fsdp-strategy",
+        type=str,
+        default="grad_op",
+        choices=["full", "grad_op", "no_shard"],
+        help="FSDP sharding strategy (default: grad_op)",
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Minimal output (don't show training logs)",
@@ -2110,6 +2125,7 @@ def main():
         epochs=args.epochs,
         verbose=not args.quiet,
         use_fsdp=args.fsdp,
+        fsdp_strategy=args.fsdp_strategy,
         dry_run=args.dry_run,
         enable_sweep=not args.no_sweep,
     )
