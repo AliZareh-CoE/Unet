@@ -814,8 +814,12 @@ def evaluate(
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    # Pre-create iterator to trigger prefetch (avoids validation-start delay)
-    loader_iter = iter(loader)
+    # Warmup: fetch first batch to ensure DataLoader workers are ready
+    import time
+    import itertools
+    _warmup_iter = iter(loader)
+    _first_batch = next(_warmup_iter)
+    loader_iter = itertools.chain([_first_batch], _warmup_iter)
 
     # Use no_grad for FSDP compatibility
     with torch.no_grad():
@@ -1264,8 +1268,18 @@ def train_epoch(
     loss_components = defaultdict(lambda: torch.tensor(0.0, device=device))
     optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
 
-    # Create iterator first to trigger prefetch before tqdm (avoids epoch-start delay)
-    loader_iter = iter(loader)
+    # Warmup: fetch first batch to ensure DataLoader workers are ready
+    # This moves the "cold start" delay outside the tqdm progress bar
+    import time
+    _t0 = time.perf_counter()
+    _warmup_iter = iter(loader)
+    _first_batch = next(_warmup_iter)
+    if is_primary() and epoch == 1:
+        print(f"[DataLoader warmup took {time.perf_counter() - _t0:.2f}s]")
+
+    # Chain first batch with rest of iterator
+    import itertools
+    loader_iter = itertools.chain([_first_batch], _warmup_iter)
 
     pbar = tqdm(
         loader_iter,
