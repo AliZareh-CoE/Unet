@@ -817,8 +817,12 @@ def evaluate(
     # Warmup: fetch first batch to ensure DataLoader workers are ready
     import time
     import itertools
+    _t0 = time.perf_counter()
     _warmup_iter = iter(loader)
     _first_batch = next(_warmup_iter)
+    _warmup_time = time.perf_counter() - _t0
+    if _warmup_time > 0.3:  # Only print if delay > 0.3s
+        print(f"[Val loader warmup: {_warmup_time:.2f}s]")
     loader_iter = itertools.chain([_first_batch], _warmup_iter)
 
     # Use no_grad for FSDP compatibility
@@ -1274,8 +1278,9 @@ def train_epoch(
     _t0 = time.perf_counter()
     _warmup_iter = iter(loader)
     _first_batch = next(_warmup_iter)
-    if is_primary() and epoch == 1:
-        print(f"[DataLoader warmup took {time.perf_counter() - _t0:.2f}s]")
+    _warmup_time = time.perf_counter() - _t0
+    if is_primary() and _warmup_time > 0.3:  # Only print if delay > 0.3s
+        print(f"[Train loader warmup: {_warmup_time:.2f}s]")
 
     # Chain first batch with rest of iterator
     import itertools
@@ -2098,7 +2103,9 @@ def train(
     patience_counter = 0
     history = []
 
+    import time as _time_module
     for epoch in range(1, num_epochs + 1):
+        _epoch_start = _time_module.perf_counter()
         if loaders.get("train_sampler") is not None:
             loaders["train_sampler"].set_epoch(epoch)
 
@@ -2109,7 +2116,11 @@ def train(
             noise_augmentor=noise_augmentor,
         )
 
+        _t_barrier = _time_module.perf_counter()
         barrier()
+        _barrier_time = _time_module.perf_counter() - _t_barrier
+        if is_primary() and _barrier_time > 0.3:
+            print(f"[Barrier took: {_barrier_time:.2f}s]")
 
         # Validation (skip some epochs if val_every > 1 for faster training)
         val_every = config.get("val_every", 1)
