@@ -1136,6 +1136,18 @@ def evaluate_on_test_sessions(
         y_test = torch.tensor(y[test_idx], dtype=torch.float32)
         odors_test = torch.tensor(odors[test_idx], dtype=torch.long)
 
+        # CRITICAL FIX: Apply per_channel_normalize to target!
+        # During training, the target pcx is normalized per-channel per-sample.
+        # The model learns to output values matching per_channel_normalize(pcx).
+        # We MUST apply the same normalization to y_test for fair comparison.
+        def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            """Apply per-channel z-score normalization to a batch of signals."""
+            mean = x.mean(dim=-1, keepdim=True)
+            std = x.std(dim=-1, keepdim=True).clamp(min=eps)
+            return (x - mean) / std
+
+        y_test_norm = per_channel_normalize(y_test)
+
         # Evaluate in batches to avoid OOM
         batch_size = 32
         y_pred_list = []
@@ -1150,8 +1162,8 @@ def evaluate_on_test_sessions(
                 torch.cuda.empty_cache()
         y_pred = torch.cat(y_pred_list, dim=0)
 
-        # Compute overall metrics
-        y_test_flat = y_test.numpy().flatten()
+        # Compute overall metrics using normalized target
+        y_test_flat = y_test_norm.numpy().flatten()
         y_pred_flat = y_pred.numpy().flatten()
 
         test_r2 = float(r2_score(y_test_flat, y_pred_flat))
@@ -1170,7 +1182,7 @@ def evaluate_on_test_sessions(
             if not np.any(local_mask):
                 continue
 
-            y_sess = y_test[local_mask].numpy().flatten()
+            y_sess = y_test_norm[local_mask].numpy().flatten()
             y_pred_sess = y_pred[local_mask].numpy().flatten()
             per_session_test_r2[sess_name] = float(r2_score(y_sess, y_pred_sess))
 
