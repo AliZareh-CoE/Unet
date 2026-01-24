@@ -3369,3 +3369,573 @@ def psd_diff_db_torch(
     return psd_diff
 
 
+# =============================================================================
+# Ablation Study Components
+# =============================================================================
+
+
+class EuclideanAligner(nn.Module):
+    """Euclidean Alignment for session normalization.
+
+    Aligns feature distributions between sessions using Euclidean geometry.
+    Re-centers and whitens features to align sessions to a reference distribution.
+
+    Expected improvement: +2-5% R² on cross-session generalization.
+
+    Usage:
+        aligner = EuclideanAligner(n_channels=32)
+        # During training, fit on reference session(s)
+        aligner.fit(reference_data)
+        # During inference, align new session data
+        aligned_data = aligner(new_session_data)
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        reference_mode: str = "identity",  # "identity", "first_session", "mean"
+        momentum: float = 0.1,
+        eps: float = 1e-6,
+        align_time: bool = False,  # Also align temporal statistics
+    ):
+        super().__init__()
+        self.n_channels = n_channels
+        self.reference_mode = reference_mode
+        self.momentum = momentum
+        self.eps = eps
+        self.align_time = align_time
+
+        # Running statistics for reference distribution
+        self.register_buffer("reference_mean", torch.zeros(n_channels))
+        self.register_buffer("reference_std", torch.ones(n_channels))
+        self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+
+        # Learnable affine parameters (optional fine-tuning)
+        self.gamma = nn.Parameter(torch.ones(n_channels))
+        self.beta = nn.Parameter(torch.zeros(n_channels))
+
+    def fit(self, data: torch.Tensor, session_mask: Optional[torch.Tensor] = None) -> None:
+        """Fit reference statistics from data.
+
+        Args:
+            data: Input tensor [B, C, T] or [N, C, T] for full dataset
+            session_mask: Optional boolean mask to select reference session samples
+        """
+        if session_mask is not None:
+            data = data[session_mask]
+
+        if data.ndim == 3:
+            # [B, C, T] -> compute statistics over batch and time
+            mean = data.mean(dim=(0, 2))  # [C]
+            std = data.std(dim=(0, 2)) + self.eps  # [C]
+        else:
+            mean = data.mean(dim=0)
+            std = data.std(dim=0) + self.eps
+
+        # Update with momentum
+        if self.num_batches_tracked == 0:
+            self.reference_mean.copy_(mean)
+            self.reference_std.copy_(std)
+        else:
+            self.reference_mean.mul_(1 - self.momentum).add_(mean * self.momentum)
+            self.reference_std.mul_(1 - self.momentum).add_(std * self.momentum)
+
+        self.num_batches_tracked += 1
+
+    def forward(self, x: torch.Tensor, session_mean: Optional[torch.Tensor] = None,
+                session_std: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Align input to reference distribution.
+
+        Args:
+            x: Input tensor [B, C, T]
+            session_mean: Optional pre-computed session mean [C]
+            session_std: Optional pre-computed session std [C]
+
+        Returns:
+            Aligned tensor [B, C, T]
+        """
+        if session_mean is None or session_std is None:
+            # Compute session statistics from input batch
+            session_mean = x.mean(dim=(0, 2))  # [C]
+            session_std = x.std(dim=(0, 2)) + self.eps  # [C]
+
+        # Expand for broadcasting: [C] -> [1, C, 1]
+        session_mean = session_mean.view(1, -1, 1)
+        session_std = session_std.view(1, -1, 1)
+        ref_mean = self.reference_mean.view(1, -1, 1)
+        ref_std = self.reference_std.view(1, -1, 1)
+        gamma = self.gamma.view(1, -1, 1)
+        beta = self.beta.view(1, -1, 1)
+
+        # Align: normalize by session stats, then scale to reference
+        x_normalized = (x - session_mean) / session_std
+        x_aligned = x_normalized * ref_std + ref_mean
+
+        # Apply learnable affine transform
+        x_aligned = x_aligned * gamma + beta
+
+        return x_aligned
+
+
+class BNAdaptation(nn.Module):
+    """Test-time Batch Normalization Adaptation.
+
+    Adapts batch normalization statistics to new test sessions using a few samples,
+    improving generalization to unseen sessions without retraining.
+
+    Expected improvement: +2-4% R² on cross-session generalization.
+
+    Usage:
+        # After training, before evaluation on new session:
+        bn_adapter = BNAdaptation(model)
+        bn_adapter.adapt(test_loader, n_steps=10)
+        # Then evaluate normally
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        momentum: float = 0.1,
+        reset_running_stats: bool = False,
+    ):
+        super().__init__()
+        self.model = model
+        self.momentum = momentum
+        self.reset_running_stats = reset_running_stats
+
+        # Store original BN states for reset
+        self._original_states = {}
+        self._save_bn_states()
+
+    def _save_bn_states(self) -> None:
+        """Save original BN running statistics."""
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                self._original_states[name] = {
+                    "running_mean": module.running_mean.clone() if module.running_mean is not None else None,
+                    "running_var": module.running_var.clone() if module.running_var is not None else None,
+                    "num_batches_tracked": module.num_batches_tracked.clone() if module.num_batches_tracked is not None else None,
+                }
+
+    def reset(self) -> None:
+        """Reset BN statistics to original training values."""
+        for name, module in self.model.named_modules():
+            if name in self._original_states:
+                state = self._original_states[name]
+                if state["running_mean"] is not None:
+                    module.running_mean.copy_(state["running_mean"])
+                if state["running_var"] is not None:
+                    module.running_var.copy_(state["running_var"])
+                if state["num_batches_tracked"] is not None:
+                    module.num_batches_tracked.copy_(state["num_batches_tracked"])
+
+    @torch.no_grad()
+    def adapt(
+        self,
+        data_loader,
+        n_steps: int = 10,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Adapt BN statistics to new data distribution.
+
+        Args:
+            data_loader: DataLoader for adaptation data
+            n_steps: Number of adaptation steps (batches)
+            device: Device for computation
+        """
+        if device is None:
+            device = next(self.model.parameters()).device
+
+        # Optionally reset running stats
+        if self.reset_running_stats:
+            for module in self.model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                    module.reset_running_stats()
+
+        # Set model to train mode for BN to update running stats
+        # but disable gradient computation
+        was_training = self.model.training
+        self.model.train()
+
+        # Set momentum for adaptation
+        original_momentums = {}
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                original_momentums[name] = module.momentum
+                module.momentum = self.momentum
+
+        # Run forward passes to adapt statistics
+        step = 0
+        for batch in data_loader:
+            if step >= n_steps:
+                break
+
+            # Handle different batch formats
+            if isinstance(batch, (list, tuple)):
+                x = batch[0]
+            elif isinstance(batch, dict):
+                x = batch.get("source", batch.get("x", list(batch.values())[0]))
+            else:
+                x = batch
+
+            x = x.to(device)
+
+            # Forward pass (no gradients needed)
+            _ = self.model(x) if not hasattr(self.model, 'forward_features') else self.model.forward_features(x)
+            step += 1
+
+        # Restore original momentums
+        for name, module in self.model.named_modules():
+            if name in original_momentums:
+                module.momentum = original_momentums[name]
+
+        # Restore training mode
+        self.model.train(was_training)
+
+
+class SessionAugmentor(nn.Module):
+    """Session Augmentation for training data.
+
+    Augments training data by applying session-specific transformations,
+    mixing features across sessions, or synthesizing interpolated session
+    characteristics to improve cross-session generalization.
+
+    Expected improvement: +2-5% R² on cross-session generalization.
+
+    Usage:
+        augmentor = SessionAugmentor(mix_prob=0.3, scale_range=(0.9, 1.1))
+        augmented_x = augmentor(x, session_ids)
+    """
+
+    def __init__(
+        self,
+        mix_prob: float = 0.3,
+        scale_range: Tuple[float, float] = (0.9, 1.1),
+        shift_range: Tuple[float, float] = (-0.1, 0.1),
+        temporal_jitter_ms: float = 0.0,
+        sample_rate: float = 1000.0,
+        channel_shuffle_prob: float = 0.0,
+    ):
+        super().__init__()
+        self.mix_prob = mix_prob
+        self.scale_range = scale_range
+        self.shift_range = shift_range
+        self.temporal_jitter_ms = temporal_jitter_ms
+        self.sample_rate = sample_rate
+        self.channel_shuffle_prob = channel_shuffle_prob
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        session_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply session augmentations.
+
+        Args:
+            x: Input tensor [B, C, T]
+            session_ids: Session IDs for each sample [B]
+
+        Returns:
+            Augmented tensor [B, C, T]
+        """
+        if not self.training:
+            return x
+
+        B, C, T = x.shape
+        device = x.device
+
+        # 1. Session mixing: blend with other samples in batch
+        if self.mix_prob > 0 and torch.rand(1).item() < self.mix_prob:
+            # Random permutation for mixing
+            perm = torch.randperm(B, device=device)
+            mix_weight = torch.rand(B, 1, 1, device=device) * 0.5  # 0-50% mix
+            x = x * (1 - mix_weight) + x[perm] * mix_weight
+
+        # 2. Scale augmentation: session-specific gain
+        if self.scale_range != (1.0, 1.0):
+            scale = torch.empty(B, 1, 1, device=device).uniform_(*self.scale_range)
+            x = x * scale
+
+        # 3. Shift augmentation: session-specific offset
+        if self.shift_range != (0.0, 0.0):
+            shift = torch.empty(B, C, 1, device=device).uniform_(*self.shift_range)
+            # Scale shift by data std to be meaningful
+            data_std = x.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            x = x + shift * data_std
+
+        # 4. Temporal jitter: small timing perturbations
+        if self.temporal_jitter_ms > 0:
+            jitter_samples = int(self.temporal_jitter_ms * self.sample_rate / 1000)
+            if jitter_samples > 0:
+                shift = torch.randint(-jitter_samples, jitter_samples + 1, (B,), device=device)
+                # Apply shift per sample (simplified: same shift for all channels)
+                for i in range(B):
+                    if shift[i] != 0:
+                        x[i] = torch.roll(x[i], shifts=shift[i].item(), dims=-1)
+
+        # 5. Channel shuffle: randomly permute channels (rarely used)
+        if self.channel_shuffle_prob > 0 and torch.rand(1).item() < self.channel_shuffle_prob:
+            perm = torch.randperm(C, device=device)
+            x = x[:, perm, :]
+
+        return x
+
+
+class NoiseAugmentor(nn.Module):
+    """Noise Augmentation for training robustness.
+
+    Adds controlled noise during training to improve model robustness
+    to recording artifacts and session-specific noise patterns.
+
+    Supports multiple noise types relevant to neural signal processing.
+
+    Usage:
+        augmentor = NoiseAugmentor(gaussian_std=0.1, pink_noise=True)
+        noisy_x = augmentor(x)
+    """
+
+    def __init__(
+        self,
+        gaussian_std: float = 0.1,
+        pink_noise: bool = False,
+        pink_noise_std: float = 0.05,
+        channel_dropout: float = 0.0,
+        temporal_dropout: float = 0.0,
+        line_noise_hz: float = 0.0,  # 50/60 Hz line noise
+        sample_rate: float = 1000.0,
+        prob: float = 0.5,  # Probability of applying augmentation
+    ):
+        super().__init__()
+        self.gaussian_std = gaussian_std
+        self.pink_noise = pink_noise
+        self.pink_noise_std = pink_noise_std
+        self.channel_dropout = channel_dropout
+        self.temporal_dropout = temporal_dropout
+        self.line_noise_hz = line_noise_hz
+        self.sample_rate = sample_rate
+        self.prob = prob
+
+    def _generate_pink_noise(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Generate 1/f (pink) noise using FFT method.
+
+        Pink noise has equal power per octave, which is more realistic
+        for neural signal artifacts than white noise.
+        """
+        B, C, T = shape
+
+        # Generate white noise in frequency domain
+        white = torch.randn(B, C, T // 2 + 1, device=device, dtype=torch.complex64)
+
+        # Create 1/f filter
+        freqs = torch.fft.rfftfreq(T, d=1.0 / self.sample_rate, device=device)
+        freqs[0] = 1e-6  # Avoid division by zero at DC
+        pink_filter = 1.0 / torch.sqrt(freqs)
+        pink_filter = pink_filter / pink_filter.max()  # Normalize
+
+        # Apply filter
+        pink_freq = white * pink_filter
+
+        # Convert back to time domain
+        pink = torch.fft.irfft(pink_freq, n=T)
+
+        # Normalize to unit std
+        pink = pink / (pink.std() + 1e-6)
+
+        return pink
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply noise augmentations.
+
+        Args:
+            x: Input tensor [B, C, T]
+
+        Returns:
+            Noisy tensor [B, C, T]
+        """
+        if not self.training or torch.rand(1).item() > self.prob:
+            return x
+
+        B, C, T = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # Get input scale for relative noise
+        data_std = x.std().clamp(min=1e-6)
+
+        # 1. Gaussian noise
+        if self.gaussian_std > 0:
+            noise = torch.randn_like(x) * self.gaussian_std * data_std
+            x = x + noise
+
+        # 2. Pink (1/f) noise
+        if self.pink_noise and self.pink_noise_std > 0:
+            pink = self._generate_pink_noise((B, C, T), device).to(dtype)
+            x = x + pink * self.pink_noise_std * data_std
+
+        # 3. Channel dropout: zero out random channels
+        if self.channel_dropout > 0:
+            mask = torch.rand(B, C, 1, device=device) > self.channel_dropout
+            x = x * mask.to(dtype)
+
+        # 4. Temporal dropout: zero out random time points
+        if self.temporal_dropout > 0:
+            mask = torch.rand(B, 1, T, device=device) > self.temporal_dropout
+            x = x * mask.to(dtype)
+
+        # 5. Line noise (50/60 Hz hum)
+        if self.line_noise_hz > 0:
+            t = torch.linspace(0, T / self.sample_rate, T, device=device, dtype=dtype)
+            line = torch.sin(2 * np.pi * self.line_noise_hz * t)
+            # Random amplitude and phase per sample
+            amp = torch.rand(B, 1, 1, device=device, dtype=dtype) * 0.02 * data_std
+            phase = torch.rand(B, 1, 1, device=device, dtype=dtype) * 2 * np.pi
+            line_noise = amp * torch.sin(2 * np.pi * self.line_noise_hz * t + phase)
+            x = x + line_noise
+
+        return x
+
+
+class MMDLoss(nn.Module):
+    """Maximum Mean Discrepancy (MMD) Loss for session invariance.
+
+    Encourages learned features to be session-invariant by minimizing
+    distribution differences across sessions in the embedding space.
+
+    Uses Gaussian (RBF) kernel with multiple bandwidths for better sensitivity
+    across different scales of distribution differences.
+
+    Expected improvement: +1-3% R² on cross-session generalization.
+
+    Usage:
+        mmd_loss = MMDLoss(bandwidth_multipliers=[0.5, 1.0, 2.0])
+        features_a = encoder(session_a_data)  # From session A
+        features_b = encoder(session_b_data)  # From session B
+        loss = mmd_loss(features_a, features_b)
+    """
+
+    def __init__(
+        self,
+        bandwidth_multipliers: Optional[List[float]] = None,
+        biased: bool = False,
+    ):
+        super().__init__()
+        if bandwidth_multipliers is None:
+            bandwidth_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0]
+        self.bandwidth_multipliers = bandwidth_multipliers
+        self.biased = biased
+
+    def _gaussian_kernel(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        bandwidth: float,
+    ) -> torch.Tensor:
+        """Compute Gaussian (RBF) kernel between x and y."""
+        # x: [N, D], y: [M, D]
+        x_sq = (x ** 2).sum(dim=-1, keepdim=True)  # [N, 1]
+        y_sq = (y ** 2).sum(dim=-1, keepdim=True)  # [M, 1]
+
+        # ||x - y||^2 = ||x||^2 - 2*x.y + ||y||^2
+        dist_sq = x_sq - 2 * torch.mm(x, y.t()) + y_sq.t()  # [N, M]
+
+        return torch.exp(-dist_sq / (2 * bandwidth ** 2))
+
+    def _compute_bandwidth(self, x: torch.Tensor, y: torch.Tensor) -> float:
+        """Compute median heuristic bandwidth."""
+        # Combine samples
+        combined = torch.cat([x, y], dim=0)
+
+        # Compute pairwise distances (subsample if too large)
+        n = combined.shape[0]
+        if n > 1000:
+            idx = torch.randperm(n)[:1000]
+            combined = combined[idx]
+
+        dists = torch.cdist(combined, combined, p=2)
+
+        # Median of non-zero distances
+        median_dist = torch.median(dists[dists > 0])
+
+        return median_dist.item()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute MMD between two distributions.
+
+        Args:
+            x: Samples from distribution P [N, D]
+            y: Samples from distribution Q [M, D]
+
+        Returns:
+            MMD^2 estimate (scalar tensor)
+        """
+        # Flatten if needed: [B, C, T] -> [B, C*T] or [B, D]
+        if x.ndim == 3:
+            x = x.view(x.shape[0], -1)
+        if y.ndim == 3:
+            y = y.view(y.shape[0], -1)
+
+        n = x.shape[0]
+        m = y.shape[0]
+
+        # Compute bandwidth using median heuristic
+        base_bandwidth = self._compute_bandwidth(x.detach(), y.detach())
+
+        # Multi-scale kernel MMD
+        mmd_sq = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+        for mult in self.bandwidth_multipliers:
+            bandwidth = base_bandwidth * mult
+
+            # Kernel matrices
+            Kxx = self._gaussian_kernel(x, x, bandwidth)
+            Kyy = self._gaussian_kernel(y, y, bandwidth)
+            Kxy = self._gaussian_kernel(x, y, bandwidth)
+
+            if self.biased:
+                # Biased estimator (includes diagonal)
+                mmd_sq = mmd_sq + Kxx.mean() + Kyy.mean() - 2 * Kxy.mean()
+            else:
+                # Unbiased estimator (excludes diagonal for Kxx, Kyy)
+                # Sum and subtract diagonal, then divide
+                Kxx_sum = Kxx.sum() - Kxx.trace()
+                Kyy_sum = Kyy.sum() - Kyy.trace()
+
+                mmd_sq = mmd_sq + (
+                    Kxx_sum / (n * (n - 1)) +
+                    Kyy_sum / (m * (m - 1)) -
+                    2 * Kxy.mean()
+                )
+
+        # Average over bandwidths
+        mmd_sq = mmd_sq / len(self.bandwidth_multipliers)
+
+        # Ensure non-negative
+        return torch.clamp(mmd_sq, min=0.0)
+
+
+def adapt_bn_to_session(
+    model: nn.Module,
+    data_loader,
+    n_steps: int = 10,
+    momentum: float = 0.1,
+    reset_stats: bool = False,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Convenience function for test-time BN adaptation.
+
+    Args:
+        model: Model with BatchNorm layers
+        data_loader: DataLoader for adaptation data
+        n_steps: Number of adaptation steps
+        momentum: BN momentum during adaptation
+        reset_stats: Whether to reset running stats before adaptation
+        device: Device for computation
+    """
+    adapter = BNAdaptation(model, momentum=momentum, reset_running_stats=reset_stats)
+    adapter.adapt(data_loader, n_steps=n_steps, device=device)
+
+

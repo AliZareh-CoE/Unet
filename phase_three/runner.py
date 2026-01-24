@@ -109,6 +109,39 @@ class AblationConfig:
     lr_schedule: str = "cosine_warmup"
     activation: str = "gelu"
 
+    # =========================================================================
+    # NEW ABLATION COMPONENTS
+    # =========================================================================
+
+    # Euclidean Alignment (+2-5% expected improvement)
+    use_euclidean_alignment: bool = False
+    euclidean_momentum: float = 0.1
+
+    # Test-time BN Adaptation (+2-4% expected improvement)
+    use_bn_adaptation: bool = False
+    bn_adaptation_steps: int = 10
+    bn_adaptation_momentum: float = 0.1
+    bn_reset_stats: bool = False
+
+    # Session Augmentation (+2-5% expected improvement)
+    use_session_augmentation: bool = False
+    session_aug_mix_prob: float = 0.3
+    session_aug_scale_range: Tuple[float, float] = (0.9, 1.1)
+    session_aug_shift_range: Tuple[float, float] = (-0.1, 0.1)
+
+    # MMD Loss for Session Invariance (+1-3% expected improvement)
+    use_mmd_loss: bool = False
+    mmd_weight: float = 0.1
+
+    # Noise Augmentation (robustness improvement)
+    use_noise_augmentation: bool = False
+    noise_gaussian_std: float = 0.1
+    noise_pink: bool = False
+    noise_pink_std: float = 0.05
+    noise_channel_dropout: float = 0.0
+    noise_temporal_dropout: float = 0.0
+    noise_prob: float = 0.5
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -126,6 +159,26 @@ class AblationConfig:
             "epochs": self.epochs,
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
+            # New ablation components
+            "use_euclidean_alignment": self.use_euclidean_alignment,
+            "euclidean_momentum": self.euclidean_momentum,
+            "use_bn_adaptation": self.use_bn_adaptation,
+            "bn_adaptation_steps": self.bn_adaptation_steps,
+            "bn_adaptation_momentum": self.bn_adaptation_momentum,
+            "bn_reset_stats": self.bn_reset_stats,
+            "use_session_augmentation": self.use_session_augmentation,
+            "session_aug_mix_prob": self.session_aug_mix_prob,
+            "session_aug_scale_range": self.session_aug_scale_range,
+            "session_aug_shift_range": self.session_aug_shift_range,
+            "use_mmd_loss": self.use_mmd_loss,
+            "mmd_weight": self.mmd_weight,
+            "use_noise_augmentation": self.use_noise_augmentation,
+            "noise_gaussian_std": self.noise_gaussian_std,
+            "noise_pink": self.noise_pink,
+            "noise_pink_std": self.noise_pink_std,
+            "noise_channel_dropout": self.noise_channel_dropout,
+            "noise_temporal_dropout": self.noise_temporal_dropout,
+            "noise_prob": self.noise_prob,
         }
 
 
@@ -429,6 +482,109 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=False,
         conditioning="spectro_temporal",
+    ))
+
+    # =========================================================================
+    # NEW ABLATION COMPONENTS (Session/Domain Adaptation)
+    # =========================================================================
+
+    # 12. EUCLIDEAN ALIGNMENT (+2-5% expected improvement)
+    configs_list.append(AblationConfig(
+        name="euclidean_alignment",
+        description="Euclidean alignment for session normalization (+2-5%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+    ))
+
+    # 13. TEST-TIME BN ADAPTATION (+2-4% expected improvement)
+    configs_list.append(AblationConfig(
+        name="bn_adaptation",
+        description="Test-time batch norm adaptation (+2-4%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        use_bn_adaptation=True,
+        bn_adaptation_steps=10,
+        bn_adaptation_momentum=0.1,
+        bn_reset_stats=False,
+    ))
+
+    # 14. SESSION AUGMENTATION (+2-5% expected improvement)
+    configs_list.append(AblationConfig(
+        name="session_augmentation",
+        description="Session augmentation during training (+2-5%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        use_session_augmentation=True,
+        session_aug_mix_prob=0.3,
+        session_aug_scale_range=(0.9, 1.1),
+        session_aug_shift_range=(-0.1, 0.1),
+    ))
+
+    # 15. MMD LOSS FOR SESSION INVARIANCE (+1-3% expected improvement)
+    configs_list.append(AblationConfig(
+        name="mmd_loss",
+        description="MMD loss for session invariance (+1-3%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        use_mmd_loss=True,
+        mmd_weight=0.1,
+    ))
+
+    # 16. NOISE AUGMENTATION (robustness improvement)
+    configs_list.append(AblationConfig(
+        name="noise_augmentation",
+        description="Noise augmentation for training robustness",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        use_noise_augmentation=True,
+        noise_gaussian_std=0.1,
+        noise_pink=True,
+        noise_pink_std=0.05,
+        noise_channel_dropout=0.05,
+        noise_temporal_dropout=0.02,
+        noise_prob=0.5,
+    ))
+
+    # 17. COMBINED: ALL NEW COMPONENTS (maximum improvement)
+    configs_list.append(AblationConfig(
+        name="combined_all_new",
+        description="All new components combined (EA + BN + SA + MMD + Noise)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        # Enable all new components
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+        use_bn_adaptation=True,
+        bn_adaptation_steps=10,
+        use_session_augmentation=True,
+        session_aug_mix_prob=0.2,  # Lower prob when combined
+        use_mmd_loss=True,
+        mmd_weight=0.05,  # Lower weight when combined
+        use_noise_augmentation=True,
+        noise_gaussian_std=0.05,  # Lower noise when combined
+        noise_pink=True,
+        noise_pink_std=0.03,
+        noise_prob=0.3,
     ))
 
     # Convert to ordered dict
@@ -1028,6 +1184,46 @@ def run_single_fold(
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
+    # =========================================================================
+    # NEW ABLATION COMPONENT FLAGS
+    # =========================================================================
+
+    # Euclidean Alignment
+    if ablation_config.use_euclidean_alignment:
+        cmd.append("--use-euclidean-alignment")
+        cmd.extend(["--euclidean-momentum", str(ablation_config.euclidean_momentum)])
+
+    # Test-time BN Adaptation (note: this is used during evaluation, passed for metadata)
+    if ablation_config.use_bn_adaptation:
+        cmd.append("--use-bn-adaptation")
+        cmd.extend(["--bn-adaptation-steps", str(ablation_config.bn_adaptation_steps)])
+        cmd.extend(["--bn-adaptation-momentum", str(ablation_config.bn_adaptation_momentum)])
+        if ablation_config.bn_reset_stats:
+            cmd.append("--bn-reset-stats")
+
+    # Session Augmentation
+    if ablation_config.use_session_augmentation:
+        cmd.append("--use-session-augmentation")
+        cmd.extend(["--session-aug-mix-prob", str(ablation_config.session_aug_mix_prob)])
+        cmd.extend(["--session-aug-scale-min", str(ablation_config.session_aug_scale_range[0])])
+        cmd.extend(["--session-aug-scale-max", str(ablation_config.session_aug_scale_range[1])])
+
+    # MMD Loss
+    if ablation_config.use_mmd_loss:
+        cmd.append("--use-mmd-loss")
+        cmd.extend(["--mmd-weight", str(ablation_config.mmd_weight)])
+
+    # Noise Augmentation
+    if ablation_config.use_noise_augmentation:
+        cmd.append("--use-noise-augmentation")
+        cmd.extend(["--noise-gaussian-std", str(ablation_config.noise_gaussian_std)])
+        if ablation_config.noise_pink:
+            cmd.append("--noise-pink")
+        cmd.extend(["--noise-pink-std", str(ablation_config.noise_pink_std)])
+        cmd.extend(["--noise-channel-dropout", str(ablation_config.noise_channel_dropout)])
+        cmd.extend(["--noise-temporal-dropout", str(ablation_config.noise_temporal_dropout)])
+        cmd.extend(["--noise-prob", str(ablation_config.noise_prob)])
+
     # Set environment variables
     env = os.environ.copy()
     env["TORCH_NCCL_ENABLE_MONITORING"] = "0"
@@ -1184,7 +1380,7 @@ def run_ablation_experiment(
     fold_splits: List[Dict[str, Any]],
     output_dir: Path,
     seed: int = 42,
-    n_seeds: int = 3,  # Run 3 seeds per fold
+    n_seeds: int = 1,  # Single seed per fold (removed 3-seed approach for ablation)
     verbose: bool = True,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
@@ -1276,7 +1472,7 @@ def run_3fold_ablation_study(
     ablations_to_run: Optional[List[str]] = None,
     folds_to_run: Optional[List[int]] = None,
     seed: int = 42,
-    n_seeds: int = 3,
+    n_seeds: int = 1,  # Single seed (removed 3-seed approach for ablation)
     epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
@@ -2116,8 +2312,8 @@ def main():
     parser.add_argument(
         "--n-seeds",
         type=int,
-        default=3,
-        help="Number of seeds per fold (default: 3, giving 3 folds × 3 seeds = 9 runs per ablation)",
+        default=1,
+        help="Number of seeds per fold (default: 1, giving 3 folds × 1 seed = 3 runs per ablation)",
     )
 
     parser.add_argument(
