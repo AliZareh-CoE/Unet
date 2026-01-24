@@ -3848,13 +3848,20 @@ class MMDLoss(nn.Module):
         # Compute pairwise distances (subsample if too large)
         n = combined.shape[0]
         if n > 1000:
-            idx = torch.randperm(n)[:1000]
+            idx = torch.randperm(n, device=combined.device)[:1000]
             combined = combined[idx]
+
+        # CRITICAL: cdist doesn't support BFloat16/Float16 - convert to float32
+        if combined.dtype in (torch.bfloat16, torch.float16):
+            combined = combined.float()
 
         dists = torch.cdist(combined, combined, p=2)
 
         # Median of non-zero distances
-        median_dist = torch.median(dists[dists > 0])
+        nonzero_dists = dists[dists > 0]
+        if nonzero_dists.numel() == 0:
+            return 1.0  # Default bandwidth if all distances are zero
+        median_dist = torch.median(nonzero_dists)
 
         return median_dist.item()
 
@@ -3878,8 +3885,18 @@ class MMDLoss(nn.Module):
         if y.ndim == 3:
             y = y.view(y.shape[0], -1)
 
+        # CRITICAL: Convert to float32 for numerical stability with BFloat16
+        original_dtype = x.dtype
+        if x.dtype in (torch.bfloat16, torch.float16):
+            x = x.float()
+            y = y.float()
+
         n = x.shape[0]
         m = y.shape[0]
+
+        # Handle edge cases
+        if n < 2 or m < 2:
+            return torch.tensor(0.0, device=x.device, dtype=original_dtype)
 
         # Compute bandwidth using median heuristic
         base_bandwidth = self._compute_bandwidth(x.detach(), y.detach())
@@ -3913,8 +3930,9 @@ class MMDLoss(nn.Module):
         # Average over bandwidths
         mmd_sq = mmd_sq / len(self.bandwidth_multipliers)
 
-        # Ensure non-negative
-        return torch.clamp(mmd_sq, min=0.0)
+        # Ensure non-negative and convert back to original dtype
+        result = torch.clamp(mmd_sq, min=0.0)
+        return result.to(original_dtype)
 
 
 def adapt_bn_to_session(
