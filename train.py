@@ -814,9 +814,12 @@ def evaluate(
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
+    # Pre-create iterator to trigger prefetch (avoids validation-start delay)
+    loader_iter = iter(loader)
+
     # Use no_grad for FSDP compatibility
     with torch.no_grad():
-        for batch in loader:
+        for batch in loader_iter:
             # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
             if len(batch) == 4:
                 ob, pcx, odor, session_ids_batch = batch
