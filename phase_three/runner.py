@@ -110,36 +110,36 @@ class AblationConfig:
     activation: str = "gelu"
 
     # =========================================================================
-    # NEW ABLATION COMPONENTS
+    # NEW ABLATION COMPONENTS (ALL ENABLED BY DEFAULT)
     # =========================================================================
 
     # Euclidean Alignment (+2-5% expected improvement)
-    use_euclidean_alignment: bool = False
+    use_euclidean_alignment: bool = True  # ENABLED BY DEFAULT
     euclidean_momentum: float = 0.1
 
     # Test-time BN Adaptation (+2-4% expected improvement)
-    use_bn_adaptation: bool = False
+    use_bn_adaptation: bool = True  # ENABLED BY DEFAULT
     bn_adaptation_steps: int = 10
     bn_adaptation_momentum: float = 0.1
     bn_reset_stats: bool = False
 
     # Session Augmentation (+2-5% expected improvement)
-    use_session_augmentation: bool = False
+    use_session_augmentation: bool = True  # ENABLED BY DEFAULT
     session_aug_mix_prob: float = 0.3
     session_aug_scale_range: Tuple[float, float] = (0.9, 1.1)
     session_aug_shift_range: Tuple[float, float] = (-0.1, 0.1)
 
     # MMD Loss for Session Invariance (+1-3% expected improvement)
-    use_mmd_loss: bool = False
+    use_mmd_loss: bool = True  # ENABLED BY DEFAULT
     mmd_weight: float = 0.1
 
     # Noise Augmentation (robustness improvement)
-    use_noise_augmentation: bool = False
+    use_noise_augmentation: bool = True  # ENABLED BY DEFAULT
     noise_gaussian_std: float = 0.1
-    noise_pink: bool = False
+    noise_pink: bool = True  # ENABLED BY DEFAULT
     noise_pink_std: float = 0.05
-    noise_channel_dropout: float = 0.0
-    noise_temporal_dropout: float = 0.0
+    noise_channel_dropout: float = 0.05  # Small dropout by default
+    noise_temporal_dropout: float = 0.02  # Small dropout by default
     noise_prob: float = 0.5
 
     def to_dict(self) -> Dict[str, Any]:
@@ -356,21 +356,40 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
     configs_list = []
 
     # =========================================================================
-    # 1. BASELINE (original default - n_downsample=2)
+    # 1. BASELINE (with ALL augmentations enabled by default)
     # =========================================================================
     configs_list.append(AblationConfig(
         name="baseline",
-        description="Original default baseline (n_downsample=2) with all components",
+        description="Full baseline with all augmentations enabled by default",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
         use_bidirectional=False,
+        # ALL NEW AUGMENTATIONS ENABLED BY DEFAULT
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+        use_bn_adaptation=True,
+        bn_adaptation_steps=10,
+        bn_adaptation_momentum=0.1,
+        use_session_augmentation=True,
+        session_aug_mix_prob=0.3,
+        session_aug_scale_range=(0.9, 1.1),
+        use_mmd_loss=True,
+        mmd_weight=0.1,
+        use_noise_augmentation=True,
+        noise_gaussian_std=0.1,
+        noise_pink=True,
+        noise_pink_std=0.05,
+        noise_channel_dropout=0.05,
+        noise_temporal_dropout=0.02,
+        noise_prob=0.5,
     ))
 
     # =========================================================================
     # 2-3. DEPTH ABLATIONS (fundamental architecture choice)
+    # All configs include default augmentations for fair comparison
     # =========================================================================
     configs_list.append(AblationConfig(
         name="depth_medium",
@@ -380,6 +399,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     configs_list.append(AblationConfig(
@@ -390,6 +416,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -404,6 +437,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     configs_list.append(AblationConfig(
@@ -415,6 +455,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -428,6 +475,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -441,6 +495,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="none",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -455,6 +516,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         skip_type="concat",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -469,6 +537,13 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",  # Source doesn't matter when cond_mode=none
         cond_mode="none",
+        # Include all default augmentations
+        use_euclidean_alignment=True,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
     # =========================================================================
@@ -482,109 +557,152 @@ def get_ablation_configs() -> Dict[str, AblationConfig]:
         attention_type="cross_freq_v2",
         use_adaptive_scaling=False,
         conditioning="spectro_temporal",
-    ))
-
-    # =========================================================================
-    # NEW ABLATION COMPONENTS (Session/Domain Adaptation)
-    # =========================================================================
-
-    # 12. EUCLIDEAN ALIGNMENT (+2-5% expected improvement)
-    configs_list.append(AblationConfig(
-        name="euclidean_alignment",
-        description="Euclidean alignment for session normalization (+2-5%)",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
+        # Include all default augmentations
         use_euclidean_alignment=True,
-        euclidean_momentum=0.1,
+        use_bn_adaptation=True,
+        use_session_augmentation=True,
+        use_mmd_loss=True,
+        use_noise_augmentation=True,
+        noise_pink=True,
     ))
 
-    # 13. TEST-TIME BN ADAPTATION (+2-4% expected improvement)
+    # =========================================================================
+    # NEW ABLATION TESTS: Disable each augmentation to measure contribution
+    # (Baseline has ALL augmentations enabled - these test removing each one)
+    # =========================================================================
+
+    # 12. ABLATE EUCLIDEAN ALIGNMENT (disable to measure its contribution)
     configs_list.append(AblationConfig(
-        name="bn_adaptation",
-        description="Test-time batch norm adaptation (+2-4%)",
+        name="no_euclidean_alignment",
+        description="Ablate: disable Euclidean alignment (expect -2-5%)",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        # ALL augmentations EXCEPT Euclidean alignment
+        use_euclidean_alignment=False,  # DISABLED for ablation
         use_bn_adaptation=True,
         bn_adaptation_steps=10,
-        bn_adaptation_momentum=0.1,
-        bn_reset_stats=False,
-    ))
-
-    # 14. SESSION AUGMENTATION (+2-5% expected improvement)
-    configs_list.append(AblationConfig(
-        name="session_augmentation",
-        description="Session augmentation during training (+2-5%)",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
         use_session_augmentation=True,
         session_aug_mix_prob=0.3,
-        session_aug_scale_range=(0.9, 1.1),
-        session_aug_shift_range=(-0.1, 0.1),
-    ))
-
-    # 15. MMD LOSS FOR SESSION INVARIANCE (+1-3% expected improvement)
-    configs_list.append(AblationConfig(
-        name="mmd_loss",
-        description="MMD loss for session invariance (+1-3%)",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
         use_mmd_loss=True,
         mmd_weight=0.1,
-    ))
-
-    # 16. NOISE AUGMENTATION (robustness improvement)
-    configs_list.append(AblationConfig(
-        name="noise_augmentation",
-        description="Noise augmentation for training robustness",
-        n_downsample=2,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
         use_noise_augmentation=True,
         noise_gaussian_std=0.1,
         noise_pink=True,
         noise_pink_std=0.05,
-        noise_channel_dropout=0.05,
-        noise_temporal_dropout=0.02,
         noise_prob=0.5,
     ))
 
-    # 17. COMBINED: ALL NEW COMPONENTS (maximum improvement)
+    # 13. ABLATE TEST-TIME BN ADAPTATION (disable to measure its contribution)
     configs_list.append(AblationConfig(
-        name="combined_all_new",
-        description="All new components combined (EA + BN + SA + MMD + Noise)",
+        name="no_bn_adaptation",
+        description="Ablate: disable test-time BN adaptation (expect -2-4%)",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
-        # Enable all new components
+        # ALL augmentations EXCEPT BN adaptation
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+        use_bn_adaptation=False,  # DISABLED for ablation
+        use_session_augmentation=True,
+        session_aug_mix_prob=0.3,
+        use_mmd_loss=True,
+        mmd_weight=0.1,
+        use_noise_augmentation=True,
+        noise_gaussian_std=0.1,
+        noise_pink=True,
+        noise_pink_std=0.05,
+        noise_prob=0.5,
+    ))
+
+    # 14. ABLATE SESSION AUGMENTATION (disable to measure its contribution)
+    configs_list.append(AblationConfig(
+        name="no_session_augmentation",
+        description="Ablate: disable session augmentation (expect -2-5%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        # ALL augmentations EXCEPT session augmentation
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+        use_bn_adaptation=True,
+        bn_adaptation_steps=10,
+        use_session_augmentation=False,  # DISABLED for ablation
+        use_mmd_loss=True,
+        mmd_weight=0.1,
+        use_noise_augmentation=True,
+        noise_gaussian_std=0.1,
+        noise_pink=True,
+        noise_pink_std=0.05,
+        noise_prob=0.5,
+    ))
+
+    # 15. ABLATE MMD LOSS (disable to measure its contribution)
+    configs_list.append(AblationConfig(
+        name="no_mmd_loss",
+        description="Ablate: disable MMD loss for session invariance (expect -1-3%)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        # ALL augmentations EXCEPT MMD loss
         use_euclidean_alignment=True,
         euclidean_momentum=0.1,
         use_bn_adaptation=True,
         bn_adaptation_steps=10,
         use_session_augmentation=True,
-        session_aug_mix_prob=0.2,  # Lower prob when combined
-        use_mmd_loss=True,
-        mmd_weight=0.05,  # Lower weight when combined
+        session_aug_mix_prob=0.3,
+        use_mmd_loss=False,  # DISABLED for ablation
         use_noise_augmentation=True,
-        noise_gaussian_std=0.05,  # Lower noise when combined
+        noise_gaussian_std=0.1,
         noise_pink=True,
-        noise_pink_std=0.03,
-        noise_prob=0.3,
+        noise_pink_std=0.05,
+        noise_prob=0.5,
+    ))
+
+    # 16. ABLATE NOISE AUGMENTATION (disable to measure its contribution)
+    configs_list.append(AblationConfig(
+        name="no_noise_augmentation",
+        description="Ablate: disable noise augmentation (expect reduced robustness)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        # ALL augmentations EXCEPT noise augmentation
+        use_euclidean_alignment=True,
+        euclidean_momentum=0.1,
+        use_bn_adaptation=True,
+        bn_adaptation_steps=10,
+        use_session_augmentation=True,
+        session_aug_mix_prob=0.3,
+        use_mmd_loss=True,
+        mmd_weight=0.1,
+        use_noise_augmentation=False,  # DISABLED for ablation
+    ))
+
+    # 17. ABLATE ALL NEW AUGMENTATIONS (no augmentations - legacy baseline)
+    configs_list.append(AblationConfig(
+        name="no_augmentations",
+        description="Ablate: disable ALL new augmentations (legacy baseline)",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        # ALL new augmentations DISABLED
+        use_euclidean_alignment=False,
+        use_bn_adaptation=False,
+        use_session_augmentation=False,
+        use_mmd_loss=False,
+        use_noise_augmentation=False,
     ))
 
     # Convert to ordered dict
