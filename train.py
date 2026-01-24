@@ -92,6 +92,8 @@ from models import (
     hilbert_torch,
     # Session matching for inference
     SessionMatcher,
+    # Noise augmentation for training robustness
+    NoiseAugmentor,
 )
 from data import (
     prepare_data,
@@ -1239,11 +1241,13 @@ def train_epoch(
     epoch: int = 0,
     num_epochs: int = 0,
     cond_encoder: Optional[nn.Module] = None,
+    noise_augmentor: Optional[NoiseAugmentor] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
+        noise_augmentor: Optional NoiseAugmentor for noise augmentation
     """
     model.train()
     if reverse_model is not None:
@@ -1257,18 +1261,27 @@ def train_epoch(
     loss_components = defaultdict(lambda: torch.tensor(0.0, device=device))
     optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
 
+    # Pre-fetch first batch to reduce perceived delay
+    import itertools
+    _warmup_iter = iter(loader)
+    _first_batch = next(_warmup_iter)
+    loader_iter = itertools.chain([_first_batch], _warmup_iter)
+
+    # Determine compute dtype for FSDP mixed precision compatibility
+    use_bf16 = config.get("fsdp_bf16", False)
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    quiet_mode = config.get("quiet", False)
     pbar = tqdm(
-        loader,
+        loader_iter,
         desc=f"Epoch {epoch}/{num_epochs}",
         leave=True,
         position=0,
         ncols=100,
-        disable=not is_primary(),
+        disable=quiet_mode or not is_primary(),
         file=sys.stdout,
+        total=len(loader),
     )
-    # Determine compute dtype for FSDP mixed precision compatibility
-    use_bf16 = config.get("fsdp_bf16", False)
-    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     for batch_idx, batch in enumerate(pbar):
         # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
@@ -1282,6 +1295,10 @@ def train_epoch(
         pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
         odor = odor.to(device, non_blocking=True)
         session_ids_batch = session_ids_batch.to(device, non_blocking=True)
+
+        # Apply noise augmentation if enabled
+        if noise_augmentor is not None:
+            ob = noise_augmentor(ob)
 
         # Normalize target (input is normalized inside model's forward())
         pcx = per_channel_normalize(pcx)
@@ -2019,6 +2036,26 @@ def train(
         )
         print(f"Recording system initialized: {recording_session.output_dir}")
 
+    # =========================================================================
+    # Initialize Noise Augmentation
+    # =========================================================================
+    noise_augmentor = None
+
+    # Noise Augmentation for training robustness
+    if config.get("use_noise_augmentation", False):
+        noise_augmentor = NoiseAugmentor(
+            gaussian_std=config.get("noise_gaussian_std", 0.1),
+            pink_noise=config.get("noise_pink", False),
+            pink_noise_std=config.get("noise_pink_std", 0.05),
+            channel_dropout=config.get("noise_channel_dropout", 0.0),
+            temporal_dropout=config.get("noise_temporal_dropout", 0.0),
+            sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+            prob=config.get("noise_prob", 0.5),
+        ).to(device)
+        noise_augmentor.train()  # Enable augmentation
+        if is_primary():
+            print("Noise Augmentation ENABLED")
+
     early_stop_patience = config.get("early_stop_patience", 8)
 
     # =============================================================================
@@ -2057,6 +2094,7 @@ def train(
             model, loaders["train"], optimizer, device, config,
             reverse_model, epoch, num_epochs,
             cond_encoder=cond_encoder,
+            noise_augmentor=noise_augmentor,
         )
 
         barrier()
@@ -2800,6 +2838,8 @@ def parse_args():
     parser.add_argument("--dandi-data-dir", type=str, default=None,
                         help="Directory containing DANDI NWB files (default: $UNET_DATA_DIR/movie)")
 
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Quiet mode: minimal output, no progress bars")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: from config)")
@@ -2950,6 +2990,26 @@ def parse_args():
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (FiLM style)")
 
+    # =========================================================================
+    # Noise Augmentation (Training Robustness)
+    # =========================================================================
+
+    # Noise Augmentation (robustness improvement)
+    parser.add_argument("--use-noise-augmentation", action="store_true",
+                        help="Enable noise augmentation for training robustness")
+    parser.add_argument("--noise-gaussian-std", type=float, default=0.1,
+                        help="Standard deviation of Gaussian noise (default: 0.1)")
+    parser.add_argument("--noise-pink", action="store_true",
+                        help="Add pink (1/f) noise in addition to Gaussian")
+    parser.add_argument("--noise-pink-std", type=float, default=0.05,
+                        help="Standard deviation of pink noise (default: 0.05)")
+    parser.add_argument("--noise-channel-dropout", type=float, default=0.0,
+                        help="Channel dropout probability for noise augmentation (default: 0)")
+    parser.add_argument("--noise-temporal-dropout", type=float, default=0.0,
+                        help="Temporal dropout probability for noise augmentation (default: 0)")
+    parser.add_argument("--noise-prob", type=float, default=0.5,
+                        help="Probability of applying noise augmentation (default: 0.5)")
+
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
                         help="Generate validation plots at end of training (default: True)")
@@ -3091,6 +3151,7 @@ def main():
     config["gradient_checkpointing"] = args.gradient_checkpointing
     config["num_workers"] = args.num_workers  # None = auto
     config["prefetch_factor"] = args.prefetch_factor
+    config["quiet"] = args.quiet  # Minimal output mode
 
     # Session-based split config (CLI overrides config if explicitly provided)
     if args.split_by_session:
@@ -3128,6 +3189,17 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
+
+    # =========================================================================
+    # Noise Augmentation
+    # =========================================================================
+    config["use_noise_augmentation"] = args.use_noise_augmentation
+    config["noise_gaussian_std"] = args.noise_gaussian_std
+    config["noise_pink"] = args.noise_pink
+    config["noise_pink_std"] = args.noise_pink_std
+    config["noise_channel_dropout"] = args.noise_channel_dropout
+    config["noise_temporal_dropout"] = args.noise_temporal_dropout
+    config["noise_prob"] = args.noise_prob
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -3258,12 +3330,29 @@ def main():
 
     elif args.dataset == "pfc":
         # PFC/Hippocampus dataset
+        # Check for explicit session holdout (used by LOSO)
+        loso_val_sessions = None
+        loso_test_sessions = None
+        if args.val_sessions:
+            loso_val_sessions = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_sessions = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
+        if is_primary() and (loso_val_sessions or loso_test_sessions):
+            print(f"[LOSO MODE] PFC session holdout:")
+            if loso_val_sessions:
+                print(f"  Held-out validation sessions: {loso_val_sessions}")
+            if loso_test_sessions:
+                print(f"  Held-out test sessions: {loso_test_sessions}")
+
         data = prepare_pfc_data(
             split_by_session=config["split_by_session"],
             n_test_sessions=config["n_test_sessions"],
             n_val_sessions=config["n_val_sessions"],
             force_recreate_splits=args.force_recreate_splits,
             resample_to_1khz=args.resample_pfc,
+            val_sessions=loso_val_sessions,
+            test_sessions=loso_test_sessions,
         )
         # Set dataset-specific config
         config["dataset_type"] = "pfc"
@@ -3306,14 +3395,29 @@ def main():
         # Use default DANDI data dir from data.py if not specified
         dandi_data_dir = Path(args.dandi_data_dir) if args.dandi_data_dir else _DANDI_DATA_DIR
 
+        # Check for explicit subject holdout (used by LOSO)
+        # In LOSO mode, --val-sessions specifies the subject(s) to hold out
+        loso_val_subjects = None
+        loso_test_subjects = None
+        if args.val_sessions:
+            loso_val_subjects = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
         if is_primary():
             print(f"\nLoading DANDI 000623 dataset...")
             print(f"  Data directory: {dandi_data_dir}")
             print(f"  Source region: {args.dandi_source_region}")
             print(f"  Target region: {args.dandi_target_region}")
             print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            if loso_val_subjects:
+                print(f"  [LOSO MODE] Held-out validation subjects: {loso_val_subjects}")
+            if loso_test_subjects:
+                print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
 
         # Prepare DANDI data - this returns datasets directly
+        # If val_subjects/test_subjects are provided, uses explicit holdout (LOSO mode)
+        # Otherwise uses random train/val/test split
         dandi_data = prepare_dandi_data(
             data_dir=dandi_data_dir,
             source_region=args.dandi_source_region,
@@ -3322,6 +3426,8 @@ def main():
             stride=train_stride,
             seed=config["seed"],
             verbose=is_primary(),  # Only print from rank 0 in distributed training
+            val_subjects=loso_val_subjects,
+            test_subjects=loso_test_subjects,
         )
 
         # Create a minimal data dict for compatibility with training loop

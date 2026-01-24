@@ -1,42 +1,50 @@
 #!/usr/bin/env python3
 """
-3-Fold Cross-Validation Ablation Study
-=======================================
+CASCADING Ablation Study with 3-Fold Cross-Validation
+======================================================
 
-Implements a proper 3-fold cross-validation with NO DATA LEAKAGE:
+Implements a SCIENTIFICALLY RIGOROUS cascading ablation study where each phase
+builds on the best configuration from the previous phase.
 
-For each fold:
-- 3 sessions are HELD OUT for final TEST evaluation (never seen during training)
-- Remaining 6 sessions are split 70/30 trial-wise into TRAIN/VAL
-- Model selection is based on VAL performance (NOT test!)
-- Final evaluation on held-out TEST sessions
+CASCADING PHASES:
+=================
 
-Data flow per fold:
-  9 sessions total
-  ├── 3 sessions → TEST (held out, excluded during training)
-  └── 6 sessions → 70/30 trial-wise split
-      ├── ~70% trials → TRAIN
-      └── ~30% trials → VAL (for model selection)
+Phase 1: ARCHITECTURE SEARCH (find optimal depth × width)
+    - Test depth: n_downsample = 2, 3, 4
+    - Test width: base_channels = 64, 128, 256
+    - Total: 9 combinations (3×3 grid search)
+    - Winner becomes baseline for Phase 2
 
-This gives us:
-- NO data leakage (model never sees test during training OR selection)
-- Robust performance estimates (mean ± std across 3 folds)
-- Every session gets tested exactly once across all folds
-- Proper separation of model selection (val) vs final evaluation (test)
+Phase 2: COMPONENT ABLATIONS (using best architecture from Phase 1)
+    - conv_type: modern vs standard
+    - attention_type: cross_freq_v2 vs none
+    - skip_type: add vs concat
+    - Winner becomes baseline for Phase 3
 
-Baseline: Original default (n_downsample=2) as the reference point
+Phase 3: CONDITIONING & SCALING (using best from Phase 2)
+    - with vs without conditioning
+    - with vs without adaptive_scaling
+    - Winner becomes baseline for Phase 4
 
-Ablation configurations (10 total, ordered logically):
-1. baseline: Original default (n_downsample=2) with all components
-2. depth_medium: n_downsample=3
-3. depth_deep: n_downsample=4
-4. width_narrow: base_channels=64
-5. width_wide: base_channels=256
-6. conv_type_standard: standard convolutions
-7. attention_none: no attention
-8. skip_type_concat: concatenation skip connections
-9. conditioning_none: no conditioning (cond_mode=none)
-10. adaptive_scaling_off: no adaptive scaling
+Phase 4: NOISE AUGMENTATION (using best from Phase 3)
+    - Test contribution of noise augmentation
+    - Final optimized configuration
+
+WHY CASCADING?
+==============
+If n_downsample=4 gives +5% over n_downsample=2, testing attention on
+n_downsample=2 would give WRONG conclusions. We must test components
+on the OPTIMAL architecture, not a suboptimal one.
+
+CROSS-VALIDATION:
+=================
+For each config in each phase:
+- 3 sessions HELD OUT for TEST (never seen during training)
+- Remaining 6 sessions split 70/30 trial-wise into TRAIN/VAL
+- Model selection based on VAL (NOT test!)
+- Final metric: TEST R² (true generalization)
+
+NO DATA LEAKAGE: Model never sees test during training OR selection.
 """
 
 from __future__ import annotations
@@ -109,6 +117,17 @@ class AblationConfig:
     lr_schedule: str = "cosine_warmup"
     activation: str = "gelu"
 
+    # =========================================================================
+    # Noise Augmentation (Training Robustness)
+    # =========================================================================
+    use_noise_augmentation: bool = True  # ENABLED BY DEFAULT
+    noise_gaussian_std: float = 0.1
+    noise_pink: bool = True  # ENABLED BY DEFAULT
+    noise_pink_std: float = 0.05
+    noise_channel_dropout: float = 0.05  # Small dropout by default
+    noise_temporal_dropout: float = 0.02  # Small dropout by default
+    noise_prob: float = 0.5
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -126,6 +145,14 @@ class AblationConfig:
             "epochs": self.epochs,
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
+            # Noise augmentation
+            "use_noise_augmentation": self.use_noise_augmentation,
+            "noise_gaussian_std": self.noise_gaussian_std,
+            "noise_pink": self.noise_pink,
+            "noise_pink_std": self.noise_pink_std,
+            "noise_channel_dropout": self.noise_channel_dropout,
+            "noise_temporal_dropout": self.noise_temporal_dropout,
+            "noise_prob": self.noise_prob,
         }
 
 
@@ -134,8 +161,119 @@ class AblationConfig:
 # =============================================================================
 
 @dataclass
+class CascadingState:
+    """State for cascading ablation study.
+
+    Tracks which phase we're in and the best config from each completed phase.
+    """
+    current_phase: int = 1
+    phase_results: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    best_configs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def get_best_config_for_phase(self, phase: int) -> Optional[Dict[str, Any]]:
+        """Get the best config to use as baseline for the given phase."""
+        if phase <= 1:
+            return None  # Phase 1 has no previous best
+        return self.best_configs.get(phase - 1)
+
+    def set_phase_result(self, phase: int, results: Dict[str, Any], best_config: Dict[str, Any]):
+        """Record results and best config for a phase."""
+        self.phase_results[phase] = results
+        self.best_configs[phase] = best_config
+        self.updated_at = datetime.now().isoformat()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current_phase": self.current_phase,
+            "phase_results": self.phase_results,
+            "best_configs": self.best_configs,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CascadingState":
+        state = cls(
+            current_phase=data.get("current_phase", 1),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+        )
+        # Convert string keys back to int for phase_results and best_configs
+        state.phase_results = {int(k): v for k, v in data.get("phase_results", {}).items()}
+        state.best_configs = {int(k): v for k, v in data.get("best_configs", {}).items()}
+        return state
+
+
+def load_cascading_state(output_dir: Path) -> CascadingState:
+    """Load cascading state from disk, or create new if doesn't exist."""
+    state_file = output_dir / "cascading_state.json"
+    if state_file.exists():
+        with open(state_file, 'r') as f:
+            data = json.load(f)
+        state = CascadingState.from_dict(data)
+        print(f"\n{'='*60}")
+        print("LOADED CASCADING STATE")
+        print(f"{'='*60}")
+        print(f"  Current phase: {state.current_phase}")
+        print(f"  Completed phases: {list(state.best_configs.keys())}")
+        for phase, config in state.best_configs.items():
+            print(f"  Phase {phase} best: {config.get('name', 'unknown')}")
+        print(f"{'='*60}\n")
+        return state
+    else:
+        state = CascadingState(created_at=datetime.now().isoformat())
+        print(f"\nNo existing cascading state found. Starting from Phase 1.")
+        return state
+
+
+def save_cascading_state(state: CascadingState, output_dir: Path) -> None:
+    """Save cascading state to disk."""
+    state.updated_at = datetime.now().isoformat()
+    state_file = output_dir / "cascading_state.json"
+    with open(state_file, 'w') as f:
+        json.dump(state.to_dict(), f, indent=2, cls=NumpyEncoder)
+    print(f"Cascading state saved to: {state_file}")
+
+
+def select_best_config(results: Dict[str, Any], configs: Dict[str, AblationConfig]) -> Tuple[str, Dict[str, Any]]:
+    """Select the best configuration based on test R² results.
+
+    Args:
+        results: Dictionary of config_name -> AblationResult (with mean_r2, etc.)
+        configs: Dictionary of config_name -> AblationConfig
+
+    Returns:
+        Tuple of (best_config_name, best_config_dict)
+    """
+    best_name = None
+    best_r2 = -float('inf')
+
+    for name, result in results.items():
+        # Handle both AblationResult objects and dicts
+        if hasattr(result, 'mean_r2'):
+            r2 = result.mean_r2
+        elif isinstance(result, dict):
+            r2 = result.get('mean_r2', result.get('test_r2', 0))
+        else:
+            continue
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_name = name
+
+    if best_name is None:
+        raise ValueError("No valid results found to select best config")
+
+    # Convert AblationConfig to dict
+    best_config = configs[best_name]
+    return best_name, best_config.to_dict()
+
+
+@dataclass
 class SweepState:
-    """Persistent state for sweep decisions.
+    """Persistent state for sweep decisions (legacy, kept for compatibility).
 
     Tracks which configurations have been eliminated or promoted.
     Saved to disk and loaded on subsequent runs.
@@ -285,155 +423,399 @@ def filter_ablations_by_sweep_state(
 
 
 # =============================================================================
-# Define Ablation Configurations (ORDERED)
+# CASCADING ABLATION PHASES
 # =============================================================================
 
-def get_ablation_configs() -> Dict[str, AblationConfig]:
-    """Define all ablation configurations to test.
+# Default augmentation settings (applied to all configs for fair comparison)
+DEFAULT_AUGMENTATIONS = {
+    "use_noise_augmentation": True,
+    "noise_gaussian_std": 0.1,
+    "noise_pink": True,
+    "noise_pink_std": 0.05,
+    "noise_channel_dropout": 0.05,
+    "noise_temporal_dropout": 0.02,
+    "noise_prob": 0.5,
+}
 
-    Baseline: Original default (n_downsample=2) with modern convs, cross_freq_v2
-              attention, adaptive scaling, spectro_temporal conditioning.
 
-    ORDER MATTERS: Configs are ordered logically from fundamental architecture
-    choices (depth, width) to component-level choices (conv, attention, etc.)
+def get_phase1_configs(base_config: Optional[Dict[str, Any]] = None) -> Dict[str, AblationConfig]:
+    """Phase 1: Architecture Search - find optimal depth × width combination.
 
-    Total: 11 ablations (baseline + 10 variants)
+    Tests 9 configurations (3 depths × 3 widths):
+    - Depth: n_downsample = 2, 3, 4
+    - Width: base_channels = 64, 128, 256
+
+    Winner becomes baseline for Phase 2.
     """
-    # Use list to preserve insertion order, then convert to dict
     configs_list = []
 
-    # =========================================================================
-    # 1. BASELINE (original default - n_downsample=2)
-    # =========================================================================
+    depths = [2, 3, 4]
+    widths = [64, 128, 256]
+
+    for depth in depths:
+        for width in widths:
+            name = f"arch_d{depth}_w{width}"
+            configs_list.append(AblationConfig(
+                name=name,
+                description=f"Architecture: depth={depth}, width={width}",
+                n_downsample=depth,
+                base_channels=width,
+                conv_type="modern",
+                attention_type="cross_freq_v2",
+                skip_type="add",
+                use_adaptive_scaling=True,
+                conditioning="spectro_temporal",
+                **DEFAULT_AUGMENTATIONS,
+            ))
+
+    return {c.name: c for c in configs_list}
+
+
+def get_phase2_configs(best_arch: Dict[str, Any]) -> Dict[str, AblationConfig]:
+    """Phase 2: Component Ablations - test conv, attention, skip types.
+
+    Uses best architecture from Phase 1.
+    Tests each component independently.
+
+    Args:
+        best_arch: Best architecture config from Phase 1 (n_downsample, base_channels)
+    """
+    configs_list = []
+    depth = best_arch.get("n_downsample", 2)
+    width = best_arch.get("base_channels", 128)
+
+    # Baseline with best architecture
     configs_list.append(AblationConfig(
-        name="baseline",
-        description="Original default baseline (n_downsample=2) with all components",
-        n_downsample=2,
+        name="phase2_baseline",
+        description=f"Phase 2 baseline (d={depth}, w={width})",
+        n_downsample=depth,
+        base_channels=width,
         conv_type="modern",
         attention_type="cross_freq_v2",
+        skip_type="add",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
-        use_bidirectional=False,
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    # =========================================================================
-    # 2-3. DEPTH ABLATIONS (fundamental architecture choice)
-    # =========================================================================
+    # Test: Standard convolutions (instead of modern)
     configs_list.append(AblationConfig(
-        name="depth_medium",
-        description="Medium depth (n_downsample=3) vs baseline",
-        n_downsample=3,
-        conv_type="modern",
+        name="conv_standard",
+        description="Standard convolutions (vs modern depthwise separable)",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type="standard",  # CHANGED
         attention_type="cross_freq_v2",
+        skip_type="add",
         use_adaptive_scaling=True,
         conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    configs_list.append(AblationConfig(
-        name="depth_deep",
-        description="Deep network (n_downsample=4) vs baseline",
-        n_downsample=4,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
-    # =========================================================================
-    # 4-5. WIDTH ABLATIONS (fundamental architecture choice)
-    # =========================================================================
-    configs_list.append(AblationConfig(
-        name="width_narrow",
-        description="Narrow network (base_channels=64) vs default 128",
-        n_downsample=2,
-        base_channels=64,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
-    configs_list.append(AblationConfig(
-        name="width_wide",
-        description="Wide network (base_channels=256) vs default 128",
-        n_downsample=2,
-        base_channels=256,
-        conv_type="modern",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
-    # =========================================================================
-    # 6. CONVOLUTION TYPE ABLATION
-    # =========================================================================
-    configs_list.append(AblationConfig(
-        name="conv_type_standard",
-        description="Standard convolutions instead of modern (dilated depthwise separable)",
-        n_downsample=2,
-        conv_type="standard",
-        attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
-    ))
-
-    # =========================================================================
-    # 7-8. ATTENTION ABLATIONS
-    # =========================================================================
+    # Test: No attention
     configs_list.append(AblationConfig(
         name="attention_none",
         description="No attention mechanism",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type="modern",
+        attention_type="none",  # CHANGED
+        skip_type="add",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    # Test: Concatenation skip connections
+    configs_list.append(AblationConfig(
+        name="skip_concat",
+        description="Concatenation skip connections (vs addition)",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        skip_type="concat",  # CHANGED
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    return {c.name: c for c in configs_list}
+
+
+def get_phase3_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]:
+    """Phase 3: Conditioning & Scaling - test conditioning and adaptive scaling.
+
+    Uses best configuration from Phase 2.
+
+    Args:
+        best_config: Best config from Phase 2
+    """
+    configs_list = []
+    depth = best_config.get("n_downsample", 2)
+    width = best_config.get("base_channels", 128)
+    conv_type = best_config.get("conv_type", "modern")
+    attention_type = best_config.get("attention_type", "cross_freq_v2")
+    skip_type = best_config.get("skip_type", "add")
+
+    # Baseline with best config from Phase 2
+    configs_list.append(AblationConfig(
+        name="phase3_baseline",
+        description=f"Phase 3 baseline",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    # Test: No conditioning
+    configs_list.append(AblationConfig(
+        name="conditioning_none",
+        description="No conditioning (cond_mode=none)",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        cond_mode="none",  # CHANGED
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    # Test: No adaptive scaling
+    configs_list.append(AblationConfig(
+        name="adaptive_scaling_off",
+        description="No adaptive output scaling",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=False,  # CHANGED
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    return {c.name: c for c in configs_list}
+
+
+def get_phase4_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]:
+    """Phase 4: Noise Augmentation Ablation - test contribution of noise augmentation.
+
+    Uses best configuration from Phase 3.
+    Tests removing noise augmentation to measure its contribution.
+
+    Args:
+        best_config: Best config from Phase 3
+    """
+    configs_list = []
+    depth = best_config.get("n_downsample", 2)
+    width = best_config.get("base_channels", 128)
+    conv_type = best_config.get("conv_type", "modern")
+    attention_type = best_config.get("attention_type", "cross_freq_v2")
+    skip_type = best_config.get("skip_type", "add")
+    use_adaptive_scaling = best_config.get("use_adaptive_scaling", True)
+    cond_mode = best_config.get("cond_mode", "cross_attn_gated")
+
+    # Full baseline with noise augmentation
+    configs_list.append(AblationConfig(
+        name="full_baseline",
+        description="Full optimized config with noise augmentation",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=use_adaptive_scaling,
+        cond_mode=cond_mode,
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    # Test: NO Noise Augmentation
+    no_noise = DEFAULT_AUGMENTATIONS.copy()
+    no_noise["use_noise_augmentation"] = False
+    configs_list.append(AblationConfig(
+        name="no_noise_augmentation",
+        description="Ablate: disable noise augmentation",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=use_adaptive_scaling,
+        cond_mode=cond_mode,
+        conditioning="spectro_temporal",
+        **no_noise,
+    ))
+
+    # Test: NO augmentations at all (legacy baseline comparison)
+    configs_list.append(AblationConfig(
+        name="no_augmentations",
+        description="Ablate: disable ALL augmentations (legacy baseline)",
+        n_downsample=depth,
+        base_channels=width,
+        conv_type=conv_type,
+        attention_type=attention_type,
+        skip_type=skip_type,
+        use_adaptive_scaling=use_adaptive_scaling,
+        cond_mode=cond_mode,
+        conditioning="spectro_temporal",
+        use_noise_augmentation=False,
+    ))
+
+    return {c.name: c for c in configs_list}
+
+
+def get_ablation_configs(phase: int = 0, best_config: Optional[Dict[str, Any]] = None) -> Dict[str, AblationConfig]:
+    """Get ablation configurations for a specific phase.
+
+    Args:
+        phase: Which phase to get configs for (1-4), or 0 for legacy (all configs)
+        best_config: Best configuration from previous phase (required for phases 2-4)
+
+    Returns:
+        Dictionary of ablation configurations for the specified phase
+    """
+    if phase == 0:
+        # Legacy mode: return all configs for backwards compatibility
+        return _get_legacy_all_configs()
+    elif phase == 1:
+        return get_phase1_configs()
+    elif phase == 2:
+        if best_config is None:
+            raise ValueError("Phase 2 requires best_config from Phase 1")
+        return get_phase2_configs(best_config)
+    elif phase == 3:
+        if best_config is None:
+            raise ValueError("Phase 3 requires best_config from Phase 2")
+        return get_phase3_configs(best_config)
+    elif phase == 4:
+        if best_config is None:
+            raise ValueError("Phase 4 requires best_config from Phase 3")
+        return get_phase4_configs(best_config)
+    else:
+        raise ValueError(f"Invalid phase: {phase}. Must be 0-4.")
+
+
+def _get_legacy_all_configs() -> Dict[str, AblationConfig]:
+    """Legacy function: return all configs for backwards compatibility."""
+    configs_list = []
+
+    # Baseline
+    configs_list.append(AblationConfig(
+        name="baseline",
+        description="Full baseline with all augmentations",
+        n_downsample=2,
+        base_channels=128,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        skip_type="add",
+        use_adaptive_scaling=True,
+        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    # Architecture variants
+    for depth in [3, 4]:
+        configs_list.append(AblationConfig(
+            name=f"depth_{depth}",
+            description=f"Depth: n_downsample={depth}",
+            n_downsample=depth,
+            base_channels=128,
+            conv_type="modern",
+            attention_type="cross_freq_v2",
+            **DEFAULT_AUGMENTATIONS,
+        ))
+
+    for width in [64, 256]:
+        configs_list.append(AblationConfig(
+            name=f"width_{width}",
+            description=f"Width: base_channels={width}",
+            n_downsample=2,
+            base_channels=width,
+            conv_type="modern",
+            attention_type="cross_freq_v2",
+            **DEFAULT_AUGMENTATIONS,
+        ))
+
+    # Component ablations
+    configs_list.append(AblationConfig(
+        name="conv_standard",
+        description="Standard convolutions",
+        n_downsample=2,
+        conv_type="standard",
+        attention_type="cross_freq_v2",
+        **DEFAULT_AUGMENTATIONS,
+    ))
+
+    configs_list.append(AblationConfig(
+        name="attention_none",
+        description="No attention",
         n_downsample=2,
         conv_type="modern",
         attention_type="none",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    # =========================================================================
-    # 8. SKIP CONNECTION ABLATION
-    # =========================================================================
     configs_list.append(AblationConfig(
-        name="skip_type_concat",
-        description="Concatenation skip connections instead of addition",
+        name="skip_concat",
+        description="Concatenation skip connections",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         skip_type="concat",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    # =========================================================================
-    # 10. CONDITIONING ABLATION
-    # =========================================================================
     configs_list.append(AblationConfig(
         name="conditioning_none",
-        description="No conditioning (cond_mode=none bypasses conditioning entirely)",
+        description="No conditioning",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
-        use_adaptive_scaling=True,
-        conditioning="spectro_temporal",  # Source doesn't matter when cond_mode=none
         cond_mode="none",
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    # =========================================================================
-    # 11. ADAPTIVE SCALING ABLATION
-    # =========================================================================
     configs_list.append(AblationConfig(
         name="adaptive_scaling_off",
-        description="Disable adaptive output scaling",
+        description="No adaptive scaling",
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
         use_adaptive_scaling=False,
-        conditioning="spectro_temporal",
+        **DEFAULT_AUGMENTATIONS,
     ))
 
-    # Convert to ordered dict
-    configs = {c.name: c for c in configs_list}
-    return configs
+    # Noise augmentation ablation
+    no_noise = DEFAULT_AUGMENTATIONS.copy()
+    no_noise["use_noise_augmentation"] = False
+    configs_list.append(AblationConfig(
+        name="no_noise_augmentation",
+        description="Disable noise augmentation",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        **no_noise,
+    ))
+
+    # No augmentations at all
+    configs_list.append(AblationConfig(
+        name="no_augmentations",
+        description="Disable ALL augmentations",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        use_noise_augmentation=False,
+    ))
+
+    return {c.name: c for c in configs_list}
 
 
 # =============================================================================
@@ -862,6 +1244,18 @@ def evaluate_on_test_sessions(
         y_test = torch.tensor(y[test_idx], dtype=torch.float32)
         odors_test = torch.tensor(odors[test_idx], dtype=torch.long)
 
+        # CRITICAL FIX: Apply per_channel_normalize to target!
+        # During training, the target pcx is normalized per-channel per-sample.
+        # The model learns to output values matching per_channel_normalize(pcx).
+        # We MUST apply the same normalization to y_test for fair comparison.
+        def per_channel_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            """Apply per-channel z-score normalization to a batch of signals."""
+            mean = x.mean(dim=-1, keepdim=True)
+            std = x.std(dim=-1, keepdim=True).clamp(min=eps)
+            return (x - mean) / std
+
+        y_test_norm = per_channel_normalize(y_test)
+
         # Evaluate in batches to avoid OOM
         batch_size = 32
         y_pred_list = []
@@ -876,8 +1270,8 @@ def evaluate_on_test_sessions(
                 torch.cuda.empty_cache()
         y_pred = torch.cat(y_pred_list, dim=0)
 
-        # Compute overall metrics
-        y_test_flat = y_test.numpy().flatten()
+        # Compute overall metrics using normalized target
+        y_test_flat = y_test_norm.numpy().flatten()
         y_pred_flat = y_pred.numpy().flatten()
 
         test_r2 = float(r2_score(y_test_flat, y_pred_flat))
@@ -896,7 +1290,7 @@ def evaluate_on_test_sessions(
             if not np.any(local_mask):
                 continue
 
-            y_sess = y_test[local_mask].numpy().flatten()
+            y_sess = y_test_norm[local_mask].numpy().flatten()
             y_pred_sess = y_pred[local_mask].numpy().flatten()
             per_session_test_r2[sess_name] = float(r2_score(y_sess, y_pred_sess))
 
@@ -983,6 +1377,7 @@ def run_single_fold(
         "--checkpoint-prefix", checkpoint_prefix,  # Unique checkpoint per fold
         "--fold", str(fold_idx),
         "--no-plots",
+        "--quiet",  # Minimal output, no progress bars
     ])
 
     # CORRECT DATA SPLIT (no leakage):
@@ -1027,6 +1422,21 @@ def run_single_fold(
 
     if use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
+
+    # =========================================================================
+    # NOISE AUGMENTATION FLAGS
+    # =========================================================================
+
+    # Noise Augmentation
+    if ablation_config.use_noise_augmentation:
+        cmd.append("--use-noise-augmentation")
+        cmd.extend(["--noise-gaussian-std", str(ablation_config.noise_gaussian_std)])
+        if ablation_config.noise_pink:
+            cmd.append("--noise-pink")
+        cmd.extend(["--noise-pink-std", str(ablation_config.noise_pink_std)])
+        cmd.extend(["--noise-channel-dropout", str(ablation_config.noise_channel_dropout)])
+        cmd.extend(["--noise-temporal-dropout", str(ablation_config.noise_temporal_dropout)])
+        cmd.extend(["--noise-prob", str(ablation_config.noise_prob)])
 
     # Set environment variables
     env = os.environ.copy()
@@ -1184,7 +1594,7 @@ def run_ablation_experiment(
     fold_splits: List[Dict[str, Any]],
     output_dir: Path,
     seed: int = 42,
-    n_seeds: int = 3,  # Run 3 seeds per fold
+    n_seeds: int = 1,  # Single seed per fold (removed 3-seed approach for ablation)
     verbose: bool = True,
     use_fsdp: bool = False,
     fsdp_strategy: str = "grad_op",
@@ -1276,7 +1686,7 @@ def run_3fold_ablation_study(
     ablations_to_run: Optional[List[str]] = None,
     folds_to_run: Optional[List[int]] = None,
     seed: int = 42,
-    n_seeds: int = 3,
+    n_seeds: int = 1,  # Single seed (removed 3-seed approach for ablation)
     epochs: Optional[int] = None,
     verbose: bool = True,
     use_fsdp: bool = False,
@@ -1401,6 +1811,190 @@ def run_3fold_ablation_study(
         print("=" * 60)
 
     return results
+
+
+# =============================================================================
+# CASCADING ABLATION STUDY
+# =============================================================================
+
+def run_cascading_ablation_study(
+    output_dir: Path,
+    start_phase: int = 1,
+    end_phase: int = 4,
+    folds_to_run: Optional[List[int]] = None,
+    seed: int = 42,
+    n_seeds: int = 1,
+    epochs: Optional[int] = None,
+    verbose: bool = True,
+    use_fsdp: bool = False,
+    fsdp_strategy: str = "grad_op",
+    dry_run: bool = False,
+) -> Dict[int, Dict[str, Any]]:
+    """Run cascading ablation study where each phase builds on the best from previous.
+
+    PHASES:
+    1. Architecture Search (9 configs: 3 depths × 3 widths)
+    2. Component Ablations (4 configs using best arch)
+    3. Conditioning & Scaling (3 configs using best from phase 2)
+    4. Domain Adaptation (7 configs using best from phase 3)
+
+    Args:
+        output_dir: Directory to save all results
+        start_phase: Phase to start from (1-4)
+        end_phase: Phase to end at (1-4)
+        folds_to_run: Optional list of fold indices to run (default: all 3)
+        seed: Base random seed
+        n_seeds: Number of seeds per fold
+        epochs: Number of training epochs
+        verbose: Print training output
+        use_fsdp: Use FSDP for multi-GPU training
+        dry_run: Print commands without running them
+
+    Returns:
+        Dict mapping phase number to phase results
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("CASCADING ABLATION STUDY")
+    print("=" * 70)
+    print(f"Output directory: {output_dir}")
+    print(f"Phases to run: {start_phase} -> {end_phase}")
+    print(f"3 folds × {n_seeds} seeds = {3 * n_seeds} runs per config")
+    print("=" * 70)
+    print()
+
+    # Load or create cascading state
+    state = load_cascading_state(output_dir)
+
+    # Get all sessions and create fold splits
+    all_sessions = get_all_sessions("olfactory")
+    fold_splits = get_3fold_session_splits(all_sessions)
+
+    print(f"Found {len(all_sessions)} sessions: {all_sessions}")
+    print(f"\n3-Fold Session Splits:")
+    for split in fold_splits:
+        print(f"  Fold {split['fold_idx']}: test={split['test_sessions']}")
+    print()
+
+    all_phase_results = {}
+
+    for phase in range(start_phase, end_phase + 1):
+        print("\n" + "=" * 70)
+        print(f"PHASE {phase}")
+        print("=" * 70)
+
+        # Get best config from previous phase (None for phase 1)
+        best_config = state.get_best_config_for_phase(phase)
+
+        if phase > 1 and best_config is None:
+            # Try to load from previous phase results if state doesn't have it
+            if phase - 1 in state.phase_results:
+                print(f"Warning: No best_config for phase {phase}, using previous phase results")
+            else:
+                raise ValueError(
+                    f"Cannot run phase {phase} without completing phase {phase - 1}. "
+                    f"Run with --start-phase {phase - 1} first."
+                )
+
+        # Get configs for this phase
+        configs = get_ablation_configs(phase=phase, best_config=best_config)
+
+        print(f"Phase {phase} configurations ({len(configs)} total):")
+        for name, config in configs.items():
+            print(f"  - {name}: {config.description}")
+        print()
+
+        # Override epochs if specified
+        if epochs is not None:
+            for config in configs.values():
+                config.epochs = epochs
+
+        # Run all configs in this phase
+        phase_results = {}
+        phase_start_time = time.time()
+
+        for config_name, config in configs.items():
+            print(f"\n--- Running: {config_name} ---")
+            result = run_ablation_experiment(
+                ablation_config=config,
+                fold_splits=fold_splits,
+                output_dir=output_dir / f"phase{phase}",
+                seed=seed,
+                n_seeds=n_seeds,
+                verbose=verbose,
+                use_fsdp=use_fsdp,
+                fsdp_strategy=fsdp_strategy,
+                folds_to_run=folds_to_run,
+                dry_run=dry_run,
+            )
+            phase_results[config_name] = result
+
+        phase_time = time.time() - phase_start_time
+
+        # Print phase summary
+        print(f"\n{'='*60}")
+        print(f"PHASE {phase} COMPLETE (took {phase_time/60:.1f} min)")
+        print(f"{'='*60}")
+
+        if not dry_run:
+            # Select best config for this phase
+            best_name, best_config_dict = select_best_config(phase_results, configs)
+
+            print(f"\nPhase {phase} Results (sorted by Test R²):")
+            sorted_results = sorted(
+                phase_results.items(),
+                key=lambda x: x[1].mean_r2 if hasattr(x[1], 'mean_r2') else 0,
+                reverse=True
+            )
+            for name, result in sorted_results:
+                r2 = result.mean_r2 if hasattr(result, 'mean_r2') else 0
+                std = result.std_r2 if hasattr(result, 'std_r2') else 0
+                marker = " <-- BEST" if name == best_name else ""
+                print(f"  {name:<30} R² = {r2:.4f} ± {std:.4f}{marker}")
+
+            print(f"\n*** Phase {phase} WINNER: {best_name} ***")
+            print(f"    Config: n_downsample={best_config_dict.get('n_downsample')}, "
+                  f"base_channels={best_config_dict.get('base_channels')}")
+
+            # Save phase results and best config
+            state.set_phase_result(
+                phase,
+                {name: result.to_dict() if hasattr(result, 'to_dict') else result
+                 for name, result in phase_results.items()},
+                best_config_dict
+            )
+            state.current_phase = phase + 1
+            save_cascading_state(state, output_dir)
+
+            # Save phase-specific results
+            phase_output = output_dir / f"phase{phase}"
+            phase_output.mkdir(parents=True, exist_ok=True)
+            save_summary(phase_results, phase_output)
+
+        all_phase_results[phase] = phase_results
+
+    # Final summary
+    print("\n" + "=" * 70)
+    print("CASCADING ABLATION STUDY COMPLETE")
+    print("=" * 70)
+
+    if not dry_run:
+        print("\nBest configs at each phase:")
+        for phase, best in state.best_configs.items():
+            print(f"  Phase {phase}: {best.get('name', 'unknown')}")
+            print(f"           depth={best.get('n_downsample')}, width={best.get('base_channels')}")
+            print(f"           conv={best.get('conv_type')}, attention={best.get('attention_type')}")
+
+        # Print final optimized config
+        final_config = state.best_configs.get(end_phase, {})
+        print(f"\n*** FINAL OPTIMIZED CONFIGURATION ***")
+        for key, value in final_config.items():
+            if key not in ['name', 'description']:
+                print(f"  {key}: {value}")
+
+    return all_phase_results
 
 
 def compute_statistical_comparisons(
@@ -2079,15 +2673,45 @@ def save_summary(results: Dict[str, AblationResult], output_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="3-Fold Cross-Validation Ablation Study",
+        description="Cascading Ablation Study with 3-Fold Cross-Validation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="results/ablation_3fold",
+        default="results/ablation_cascading",
         help="Output directory for results",
+    )
+
+    # Cascading mode arguments
+    parser.add_argument(
+        "--cascading",
+        action="store_true",
+        default=True,
+        help="Run cascading ablation study (default: True)",
+    )
+
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Run legacy (non-cascading) ablation study",
+    )
+
+    parser.add_argument(
+        "--start-phase",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4],
+        help="Phase to start from (1=Architecture, 2=Components, 3=Conditioning, 4=Augmentation)",
+    )
+
+    parser.add_argument(
+        "--end-phase",
+        type=int,
+        default=4,
+        choices=[1, 2, 3, 4],
+        help="Phase to end at",
     )
 
     parser.add_argument(
@@ -2095,7 +2719,7 @@ def main():
         type=str,
         nargs="+",
         default=None,
-        help="Specific ablations to run (default: all)",
+        help="Specific ablations to run (legacy mode only)",
     )
 
     parser.add_argument(
@@ -2116,8 +2740,8 @@ def main():
     parser.add_argument(
         "--n-seeds",
         type=int,
-        default=3,
-        help="Number of seeds per fold (default: 3, giving 3 folds × 3 seeds = 9 runs per ablation)",
+        default=1,
+        help="Number of seeds per fold (default: 1, giving 3 folds × 1 seed = 3 runs per ablation)",
     )
 
     parser.add_argument(
@@ -2154,6 +2778,12 @@ def main():
     )
 
     parser.add_argument(
+        "--list-phases",
+        action="store_true",
+        help="List all phases and their configurations",
+    )
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands that would be run without actually running them",
@@ -2162,35 +2792,90 @@ def main():
     parser.add_argument(
         "--no-sweep",
         action="store_true",
-        help="Disable sweep mode (don't apply permanent eliminate/upgrade decisions)",
+        help="Disable sweep mode (legacy mode only)",
     )
 
     args = parser.parse_args()
 
-    # List ablations and exit
+    # List phases and exit
+    if args.list_phases:
+        print("\n" + "=" * 70)
+        print("CASCADING ABLATION PHASES")
+        print("=" * 70)
+
+        print("\nPhase 1: ARCHITECTURE SEARCH (9 configs)")
+        print("  Find optimal depth × width combination")
+        configs = get_phase1_configs()
+        for name in configs:
+            print(f"    - {name}")
+
+        print("\nPhase 2: COMPONENT ABLATIONS (4 configs)")
+        print("  Test conv_type, attention, skip connections")
+        print("  Uses best architecture from Phase 1")
+        dummy_arch = {"n_downsample": 2, "base_channels": 128}
+        configs = get_phase2_configs(dummy_arch)
+        for name, c in configs.items():
+            print(f"    - {name}: {c.description}")
+
+        print("\nPhase 3: CONDITIONING & SCALING (3 configs)")
+        print("  Test conditioning and adaptive scaling")
+        print("  Uses best config from Phase 2")
+        configs = get_phase3_configs(dummy_arch)
+        for name, c in configs.items():
+            print(f"    - {name}: {c.description}")
+
+        print("\nPhase 4: DOMAIN ADAPTATION (7 configs)")
+        print("  Test each augmentation component's contribution")
+        print("  Uses best config from Phase 3")
+        configs = get_phase4_configs(dummy_arch)
+        for name, c in configs.items():
+            print(f"    - {name}: {c.description}")
+
+        print("\nTotal: 23 configurations across 4 phases")
+        print("=" * 70)
+        return 0
+
+    # List ablations (legacy) and exit
     if args.list_ablations:
-        configs = get_ablation_configs()
-        print("\nAvailable ablation configurations:")
+        configs = get_ablation_configs(phase=0)  # Legacy mode
+        print("\nAvailable ablation configurations (legacy mode):")
         print("-" * 60)
         for name, config in configs.items():
             print(f"  {name:<25} - {config.description}")
         print()
         return 0
 
-    # Run ablation study
-    run_3fold_ablation_study(
-        output_dir=Path(args.output_dir),
-        ablations_to_run=args.ablations,
-        folds_to_run=args.folds,
-        seed=args.seed,
-        n_seeds=args.n_seeds,
-        epochs=args.epochs,
-        verbose=not args.quiet,
-        use_fsdp=args.fsdp,
-        fsdp_strategy=args.fsdp_strategy,
-        dry_run=args.dry_run,
-        enable_sweep=not args.no_sweep,
-    )
+    # Run cascading or legacy study
+    if args.legacy:
+        print("Running LEGACY (non-cascading) ablation study...")
+        run_3fold_ablation_study(
+            output_dir=Path(args.output_dir),
+            ablations_to_run=args.ablations,
+            folds_to_run=args.folds,
+            seed=args.seed,
+            n_seeds=args.n_seeds,
+            epochs=args.epochs,
+            verbose=not args.quiet,
+            use_fsdp=args.fsdp,
+            fsdp_strategy=args.fsdp_strategy,
+            dry_run=args.dry_run,
+            enable_sweep=not args.no_sweep,
+        )
+    else:
+        print("Running CASCADING ablation study...")
+        run_cascading_ablation_study(
+            output_dir=Path(args.output_dir),
+            start_phase=args.start_phase,
+            end_phase=args.end_phase,
+            folds_to_run=args.folds,
+            seed=args.seed,
+            n_seeds=args.n_seeds,
+            epochs=args.epochs,
+            verbose=not args.quiet,
+            use_fsdp=args.fsdp,
+            fsdp_strategy=args.fsdp_strategy,
+            dry_run=args.dry_run,
+        )
 
     return 0
 

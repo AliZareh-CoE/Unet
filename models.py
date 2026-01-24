@@ -3369,3 +3369,124 @@ def psd_diff_db_torch(
     return psd_diff
 
 
+# =============================================================================
+# Noise Augmentation for Training Robustness
+# =============================================================================
+
+
+class NoiseAugmentor(nn.Module):
+    """Noise Augmentation for training robustness.
+
+    Adds controlled noise during training to improve model robustness
+    to recording artifacts and session-specific noise patterns.
+
+    Supports multiple noise types relevant to neural signal processing.
+
+    Usage:
+        augmentor = NoiseAugmentor(gaussian_std=0.1, pink_noise=True)
+        noisy_x = augmentor(x)
+    """
+
+    def __init__(
+        self,
+        gaussian_std: float = 0.1,
+        pink_noise: bool = False,
+        pink_noise_std: float = 0.05,
+        channel_dropout: float = 0.0,
+        temporal_dropout: float = 0.0,
+        line_noise_hz: float = 0.0,  # 50/60 Hz line noise
+        sample_rate: float = 1000.0,
+        prob: float = 0.5,  # Probability of applying augmentation
+    ):
+        super().__init__()
+        self.gaussian_std = gaussian_std
+        self.pink_noise = pink_noise
+        self.pink_noise_std = pink_noise_std
+        self.channel_dropout = channel_dropout
+        self.temporal_dropout = temporal_dropout
+        self.line_noise_hz = line_noise_hz
+        self.sample_rate = sample_rate
+        self.prob = prob
+
+    def _generate_pink_noise(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Generate 1/f (pink) noise using FFT method.
+
+        Pink noise has equal power per octave, which is more realistic
+        for neural signal artifacts than white noise.
+        """
+        B, C, T = shape
+
+        # Generate white noise in frequency domain
+        white = torch.randn(B, C, T // 2 + 1, device=device, dtype=torch.complex64)
+
+        # Create 1/f filter
+        freqs = torch.fft.rfftfreq(T, d=1.0 / self.sample_rate, device=device)
+        freqs[0] = 1e-6  # Avoid division by zero at DC
+        pink_filter = 1.0 / torch.sqrt(freqs)
+        pink_filter = pink_filter / pink_filter.max()  # Normalize
+
+        # Apply filter
+        pink_freq = white * pink_filter
+
+        # Convert back to time domain
+        pink = torch.fft.irfft(pink_freq, n=T)
+
+        # Normalize to unit std
+        pink = pink / (pink.std() + 1e-6)
+
+        return pink
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply noise augmentations.
+
+        Args:
+            x: Input tensor [B, C, T]
+
+        Returns:
+            Noisy tensor [B, C, T]
+        """
+        if not self.training or torch.rand(1).item() > self.prob:
+            return x
+
+        B, C, T = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # Get input scale for relative noise
+        data_std = x.std().clamp(min=1e-6)
+
+        # 1. Gaussian noise
+        if self.gaussian_std > 0:
+            noise = torch.randn_like(x) * self.gaussian_std * data_std
+            x = x + noise
+
+        # 2. Pink (1/f) noise
+        if self.pink_noise and self.pink_noise_std > 0:
+            pink = self._generate_pink_noise((B, C, T), device).to(dtype)
+            x = x + pink * self.pink_noise_std * data_std
+
+        # 3. Channel dropout: zero out random channels
+        if self.channel_dropout > 0:
+            mask = torch.rand(B, C, 1, device=device) > self.channel_dropout
+            x = x * mask.to(dtype)
+
+        # 4. Temporal dropout: zero out random time points
+        if self.temporal_dropout > 0:
+            mask = torch.rand(B, 1, T, device=device) > self.temporal_dropout
+            x = x * mask.to(dtype)
+
+        # 5. Line noise (50/60 Hz hum)
+        if self.line_noise_hz > 0:
+            t = torch.linspace(0, T / self.sample_rate, T, device=device, dtype=dtype)
+            line = torch.sin(2 * np.pi * self.line_noise_hz * t)
+            # Random amplitude and phase per sample
+            amp = torch.rand(B, 1, 1, device=device, dtype=dtype) * 0.02 * data_std
+            phase = torch.rand(B, 1, 1, device=device, dtype=dtype) * 2 * np.pi
+            line_noise = amp * torch.sin(2 * np.pi * self.line_noise_hz * t + phase)
+            x = x + line_noise
+
+        return x
+
+
+
+
