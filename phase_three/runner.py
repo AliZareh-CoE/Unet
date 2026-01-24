@@ -26,13 +26,8 @@ Phase 3: CONDITIONING & SCALING (using best from Phase 2)
     - with vs without adaptive_scaling
     - Winner becomes baseline for Phase 4
 
-Phase 4: DOMAIN ADAPTATION (using best from Phase 3)
-    - Test contribution of each augmentation component:
-      - Euclidean alignment
-      - Test-time BN adaptation
-      - Session augmentation
-      - MMD loss
-      - Noise augmentation
+Phase 4: NOISE AUGMENTATION (using best from Phase 3)
+    - Test contribution of noise augmentation
     - Final optimized configuration
 
 WHY CASCADING?
@@ -123,30 +118,8 @@ class AblationConfig:
     activation: str = "gelu"
 
     # =========================================================================
-    # NEW ABLATION COMPONENTS (ALL ENABLED BY DEFAULT)
+    # Noise Augmentation (Training Robustness)
     # =========================================================================
-
-    # Euclidean Alignment (+2-5% expected improvement)
-    use_euclidean_alignment: bool = True  # ENABLED BY DEFAULT
-    euclidean_momentum: float = 0.1
-
-    # Test-time BN Adaptation (+2-4% expected improvement)
-    use_bn_adaptation: bool = True  # ENABLED BY DEFAULT
-    bn_adaptation_steps: int = 10
-    bn_adaptation_momentum: float = 0.1
-    bn_reset_stats: bool = False
-
-    # Session Augmentation (+2-5% expected improvement)
-    use_session_augmentation: bool = True  # ENABLED BY DEFAULT
-    session_aug_mix_prob: float = 0.3
-    session_aug_scale_range: Tuple[float, float] = (0.9, 1.1)
-    session_aug_shift_range: Tuple[float, float] = (-0.1, 0.1)
-
-    # MMD Loss for Session Invariance (+1-3% expected improvement)
-    use_mmd_loss: bool = True  # ENABLED BY DEFAULT
-    mmd_weight: float = 0.1
-
-    # Noise Augmentation (robustness improvement)
     use_noise_augmentation: bool = True  # ENABLED BY DEFAULT
     noise_gaussian_std: float = 0.1
     noise_pink: bool = True  # ENABLED BY DEFAULT
@@ -172,19 +145,7 @@ class AblationConfig:
             "epochs": self.epochs,
             "batch_size": self.batch_size,
             "learning_rate": self.learning_rate,
-            # New ablation components
-            "use_euclidean_alignment": self.use_euclidean_alignment,
-            "euclidean_momentum": self.euclidean_momentum,
-            "use_bn_adaptation": self.use_bn_adaptation,
-            "bn_adaptation_steps": self.bn_adaptation_steps,
-            "bn_adaptation_momentum": self.bn_adaptation_momentum,
-            "bn_reset_stats": self.bn_reset_stats,
-            "use_session_augmentation": self.use_session_augmentation,
-            "session_aug_mix_prob": self.session_aug_mix_prob,
-            "session_aug_scale_range": self.session_aug_scale_range,
-            "session_aug_shift_range": self.session_aug_shift_range,
-            "use_mmd_loss": self.use_mmd_loss,
-            "mmd_weight": self.mmd_weight,
+            # Noise augmentation
             "use_noise_augmentation": self.use_noise_augmentation,
             "noise_gaussian_std": self.noise_gaussian_std,
             "noise_pink": self.noise_pink,
@@ -467,16 +428,6 @@ def filter_ablations_by_sweep_state(
 
 # Default augmentation settings (applied to all configs for fair comparison)
 DEFAULT_AUGMENTATIONS = {
-    "use_euclidean_alignment": True,
-    "euclidean_momentum": 0.1,
-    "use_bn_adaptation": True,
-    "bn_adaptation_steps": 10,
-    "bn_adaptation_momentum": 0.1,
-    "use_session_augmentation": True,
-    "session_aug_mix_prob": 0.3,
-    "session_aug_scale_range": (0.9, 1.1),
-    "use_mmd_loss": True,
-    "mmd_weight": 0.1,
     "use_noise_augmentation": True,
     "noise_gaussian_std": 0.1,
     "noise_pink": True,
@@ -654,10 +605,10 @@ def get_phase3_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]
 
 
 def get_phase4_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]:
-    """Phase 4: Domain Adaptation - test contribution of each augmentation.
+    """Phase 4: Noise Augmentation Ablation - test contribution of noise augmentation.
 
     Uses best configuration from Phase 3.
-    Tests removing each augmentation component to measure its contribution.
+    Tests removing noise augmentation to measure its contribution.
 
     Args:
         best_config: Best config from Phase 3
@@ -671,10 +622,10 @@ def get_phase4_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]
     use_adaptive_scaling = best_config.get("use_adaptive_scaling", True)
     cond_mode = best_config.get("cond_mode", "cross_attn_gated")
 
-    # Full baseline with ALL augmentations
+    # Full baseline with noise augmentation
     configs_list.append(AblationConfig(
         name="full_baseline",
-        description="Full optimized config with all augmentations",
+        description="Full optimized config with noise augmentation",
         n_downsample=depth,
         base_channels=width,
         conv_type=conv_type,
@@ -684,74 +635,6 @@ def get_phase4_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]
         cond_mode=cond_mode,
         conditioning="spectro_temporal",
         **DEFAULT_AUGMENTATIONS,
-    ))
-
-    # Test: NO Euclidean Alignment
-    no_euclidean = DEFAULT_AUGMENTATIONS.copy()
-    no_euclidean["use_euclidean_alignment"] = False
-    configs_list.append(AblationConfig(
-        name="no_euclidean_alignment",
-        description="Ablate: disable Euclidean alignment (expect -2-5%)",
-        n_downsample=depth,
-        base_channels=width,
-        conv_type=conv_type,
-        attention_type=attention_type,
-        skip_type=skip_type,
-        use_adaptive_scaling=use_adaptive_scaling,
-        cond_mode=cond_mode,
-        conditioning="spectro_temporal",
-        **no_euclidean,
-    ))
-
-    # Test: NO BN Adaptation
-    no_bn = DEFAULT_AUGMENTATIONS.copy()
-    no_bn["use_bn_adaptation"] = False
-    configs_list.append(AblationConfig(
-        name="no_bn_adaptation",
-        description="Ablate: disable test-time BN adaptation (expect -2-4%)",
-        n_downsample=depth,
-        base_channels=width,
-        conv_type=conv_type,
-        attention_type=attention_type,
-        skip_type=skip_type,
-        use_adaptive_scaling=use_adaptive_scaling,
-        cond_mode=cond_mode,
-        conditioning="spectro_temporal",
-        **no_bn,
-    ))
-
-    # Test: NO Session Augmentation
-    no_session = DEFAULT_AUGMENTATIONS.copy()
-    no_session["use_session_augmentation"] = False
-    configs_list.append(AblationConfig(
-        name="no_session_augmentation",
-        description="Ablate: disable session augmentation (expect -2-5%)",
-        n_downsample=depth,
-        base_channels=width,
-        conv_type=conv_type,
-        attention_type=attention_type,
-        skip_type=skip_type,
-        use_adaptive_scaling=use_adaptive_scaling,
-        cond_mode=cond_mode,
-        conditioning="spectro_temporal",
-        **no_session,
-    ))
-
-    # Test: NO MMD Loss
-    no_mmd = DEFAULT_AUGMENTATIONS.copy()
-    no_mmd["use_mmd_loss"] = False
-    configs_list.append(AblationConfig(
-        name="no_mmd_loss",
-        description="Ablate: disable MMD loss (expect -1-3%)",
-        n_downsample=depth,
-        base_channels=width,
-        conv_type=conv_type,
-        attention_type=attention_type,
-        skip_type=skip_type,
-        use_adaptive_scaling=use_adaptive_scaling,
-        cond_mode=cond_mode,
-        conditioning="spectro_temporal",
-        **no_mmd,
     ))
 
     # Test: NO Noise Augmentation
@@ -783,10 +666,6 @@ def get_phase4_configs(best_config: Dict[str, Any]) -> Dict[str, AblationConfig]
         use_adaptive_scaling=use_adaptive_scaling,
         cond_mode=cond_mode,
         conditioning="spectro_temporal",
-        use_euclidean_alignment=False,
-        use_bn_adaptation=False,
-        use_session_augmentation=False,
-        use_mmd_loss=False,
         use_noise_augmentation=False,
     ))
 
@@ -914,18 +793,17 @@ def _get_legacy_all_configs() -> Dict[str, AblationConfig]:
         **DEFAULT_AUGMENTATIONS,
     ))
 
-    # Domain adaptation ablations
-    for aug_name in ["euclidean_alignment", "bn_adaptation", "session_augmentation", "mmd_loss", "noise_augmentation"]:
-        no_aug = DEFAULT_AUGMENTATIONS.copy()
-        no_aug[f"use_{aug_name}"] = False
-        configs_list.append(AblationConfig(
-            name=f"no_{aug_name}",
-            description=f"Disable {aug_name}",
-            n_downsample=2,
-            conv_type="modern",
-            attention_type="cross_freq_v2",
-            **no_aug,
-        ))
+    # Noise augmentation ablation
+    no_noise = DEFAULT_AUGMENTATIONS.copy()
+    no_noise["use_noise_augmentation"] = False
+    configs_list.append(AblationConfig(
+        name="no_noise_augmentation",
+        description="Disable noise augmentation",
+        n_downsample=2,
+        conv_type="modern",
+        attention_type="cross_freq_v2",
+        **no_noise,
+    ))
 
     # No augmentations at all
     configs_list.append(AblationConfig(
@@ -934,10 +812,6 @@ def _get_legacy_all_configs() -> Dict[str, AblationConfig]:
         n_downsample=2,
         conv_type="modern",
         attention_type="cross_freq_v2",
-        use_euclidean_alignment=False,
-        use_bn_adaptation=False,
-        use_session_augmentation=False,
-        use_mmd_loss=False,
         use_noise_augmentation=False,
     ))
 
@@ -1549,33 +1423,8 @@ def run_single_fold(
         cmd.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
 
     # =========================================================================
-    # NEW ABLATION COMPONENT FLAGS
+    # NOISE AUGMENTATION FLAGS
     # =========================================================================
-
-    # Euclidean Alignment
-    if ablation_config.use_euclidean_alignment:
-        cmd.append("--use-euclidean-alignment")
-        cmd.extend(["--euclidean-momentum", str(ablation_config.euclidean_momentum)])
-
-    # Test-time BN Adaptation (note: this is used during evaluation, passed for metadata)
-    if ablation_config.use_bn_adaptation:
-        cmd.append("--use-bn-adaptation")
-        cmd.extend(["--bn-adaptation-steps", str(ablation_config.bn_adaptation_steps)])
-        cmd.extend(["--bn-adaptation-momentum", str(ablation_config.bn_adaptation_momentum)])
-        if ablation_config.bn_reset_stats:
-            cmd.append("--bn-reset-stats")
-
-    # Session Augmentation
-    if ablation_config.use_session_augmentation:
-        cmd.append("--use-session-augmentation")
-        cmd.extend(["--session-aug-mix-prob", str(ablation_config.session_aug_mix_prob)])
-        cmd.extend(["--session-aug-scale-min", str(ablation_config.session_aug_scale_range[0])])
-        cmd.extend(["--session-aug-scale-max", str(ablation_config.session_aug_scale_range[1])])
-
-    # MMD Loss
-    if ablation_config.use_mmd_loss:
-        cmd.append("--use-mmd-loss")
-        cmd.extend(["--mmd-weight", str(ablation_config.mmd_weight)])
 
     # Noise Augmentation
     if ablation_config.use_noise_augmentation:

@@ -92,13 +92,8 @@ from models import (
     hilbert_torch,
     # Session matching for inference
     SessionMatcher,
-    # NEW: Ablation components for domain adaptation
-    EuclideanAligner,
-    BNAdaptation,
-    SessionAugmentor,
+    # Noise augmentation for training robustness
     NoiseAugmentor,
-    MMDLoss,
-    adapt_bn_to_session,
 )
 from data import (
     prepare_data,
@@ -761,7 +756,6 @@ def evaluate(
     cond_encoder: Optional[nn.Module] = None,
     envelope_matcher_fwd: Optional[nn.Module] = None,
     envelope_matcher_rev: Optional[nn.Module] = None,
-    euclidean_aligner: Optional[nn.Module] = None,  # For consistent input normalization
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -772,38 +766,11 @@ def evaluate(
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
-    # Apply test-time BN adaptation if enabled
-    # This adapts BatchNorm running statistics to the test distribution
-    # NOTE: This uses test data intentionally - it's test-time adaptation, not data leakage
-    if config and config.get("use_bn_adaptation", False):
-        n_steps = config.get("bn_adaptation_steps", 10)
-        momentum = config.get("bn_adaptation_momentum", 0.1)
-        reset_stats = config.get("bn_reset_stats", False)
-        adapt_bn_to_session(
-            model,
-            loader,
-            n_steps=n_steps,
-            momentum=momentum,
-            reset_stats=reset_stats,
-            device=device,
-        )
-        if reverse_model is not None:
-            adapt_bn_to_session(
-                reverse_model,
-                loader,
-                n_steps=n_steps,
-                momentum=momentum,
-                reset_stats=reset_stats,
-                device=device,
-            )
-
     model.eval()
     if reverse_model is not None:
         reverse_model.eval()
     if cond_encoder is not None:
         cond_encoder.eval()
-    if euclidean_aligner is not None:
-        euclidean_aligner.eval()  # Don't update running stats during evaluation
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -860,10 +827,6 @@ def evaluate(
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
             session_ids_batch = session_ids_batch.to(device, non_blocking=True)
-
-            # Apply Euclidean Alignment if enabled (for consistent normalization with training)
-            if euclidean_aligner is not None:
-                ob = euclidean_aligner(ob)
 
             # Normalize target (input is normalized in model's forward())
             pcx = per_channel_normalize(pcx)
@@ -1278,20 +1241,13 @@ def train_epoch(
     epoch: int = 0,
     num_epochs: int = 0,
     cond_encoder: Optional[nn.Module] = None,
-    # NEW: Ablation components
-    session_augmentor: Optional[SessionAugmentor] = None,
     noise_augmentor: Optional[NoiseAugmentor] = None,
-    euclidean_aligner: Optional[EuclideanAligner] = None,
-    mmd_loss_fn: Optional[MMDLoss] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
-        session_augmentor: Optional SessionAugmentor for session augmentation
         noise_augmentor: Optional NoiseAugmentor for noise augmentation
-        euclidean_aligner: Optional EuclideanAligner for session normalization
-        mmd_loss_fn: Optional MMDLoss for session invariance loss
     """
     model.train()
     if reverse_model is not None:
@@ -1331,19 +1287,7 @@ def train_epoch(
         odor = odor.to(device, non_blocking=True)
         session_ids_batch = session_ids_batch.to(device, non_blocking=True)
 
-        # =====================================================================
-        # NEW: Apply ablation augmentations
-        # =====================================================================
-
-        # 1. Euclidean Alignment (normalize session statistics)
-        if euclidean_aligner is not None:
-            ob = euclidean_aligner(ob)
-
-        # 2. Session Augmentation (mixing, scaling, jitter)
-        if session_augmentor is not None:
-            ob = session_augmentor(ob, session_ids=session_ids_batch)
-
-        # 3. Noise Augmentation (Gaussian, pink, dropout)
+        # Apply noise augmentation if enabled
         if noise_augmentor is not None:
             ob = noise_augmentor(ob)
 
@@ -1415,34 +1359,6 @@ def train_epoch(
         if cond_loss != 0.0:
             loss = loss + cond_loss
             loss_components["cond_loss"] = loss_components["cond_loss"] + cond_loss.detach() if isinstance(cond_loss, torch.Tensor) else loss_components["cond_loss"] + cond_loss
-
-        # =====================================================================
-        # NEW: MMD Loss for session invariance
-        # =====================================================================
-        if mmd_loss_fn is not None:
-            # Compute MMD loss between different sessions in the batch
-            # Use the intermediate features (pred_raw as proxy for bottleneck features)
-            mmd_weight = config.get("mmd_weight", 0.1)
-            unique_sessions = torch.unique(session_ids_batch)
-
-            if len(unique_sessions) >= 2:
-                # RANDOMLY sample two sessions (not always first two)
-                # This provides more robust training signal across all session pairs
-                perm = torch.randperm(len(unique_sessions), device=device)
-                sess_a = unique_sessions[perm[0]].item()
-                sess_b = unique_sessions[perm[1]].item()
-
-                mask_a = session_ids_batch == sess_a
-                mask_b = session_ids_batch == sess_b
-
-                if mask_a.sum() > 0 and mask_b.sum() > 0:
-                    # Use predictions as feature representation
-                    features_a = pred_raw_c[mask_a]
-                    features_b = pred_raw_c[mask_b]
-
-                    mmd_loss_val = mmd_weight * mmd_loss_fn(features_a, features_b)
-                    loss = loss + mmd_loss_val
-                    loss_components["mmd_loss"] = loss_components["mmd_loss"] + mmd_loss_val.detach()
 
         # Bidirectional training with cycle consistency
         if reverse_model is not None:
@@ -2112,36 +2028,9 @@ def train(
         print(f"Recording system initialized: {recording_session.output_dir}")
 
     # =========================================================================
-    # Initialize NEW Ablation Components
+    # Initialize Noise Augmentation
     # =========================================================================
-    euclidean_aligner = None
-    session_augmentor = None
     noise_augmentor = None
-    mmd_loss_fn = None
-
-    # Euclidean Alignment for session normalization
-    if config.get("use_euclidean_alignment", False):
-        euclidean_aligner = EuclideanAligner(
-            n_channels=config.get("in_channels", 32),
-            momentum=config.get("euclidean_momentum", 0.1),
-        ).to(device)
-        if is_primary():
-            print("Euclidean Alignment ENABLED")
-
-    # Session Augmentation for training data augmentation
-    if config.get("use_session_augmentation", False):
-        session_augmentor = SessionAugmentor(
-            mix_prob=config.get("session_aug_mix_prob", 0.3),
-            scale_range=(
-                config.get("session_aug_scale_min", 0.9),
-                config.get("session_aug_scale_max", 1.1),
-            ),
-            shift_range=config.get("session_aug_shift_range", (-0.1, 0.1)),
-            sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-        ).to(device)
-        session_augmentor.train()  # Enable augmentation
-        if is_primary():
-            print("Session Augmentation ENABLED")
 
     # Noise Augmentation for training robustness
     if config.get("use_noise_augmentation", False):
@@ -2157,15 +2046,6 @@ def train(
         noise_augmentor.train()  # Enable augmentation
         if is_primary():
             print("Noise Augmentation ENABLED")
-
-    # MMD Loss for session invariance
-    if config.get("use_mmd_loss", False):
-        mmd_loss_fn = MMDLoss(
-            bandwidth_multipliers=[0.25, 0.5, 1.0, 2.0, 4.0],
-            biased=False,
-        ).to(device)
-        if is_primary():
-            print(f"MMD Loss ENABLED (weight={config.get('mmd_weight', 0.1)})")
 
     early_stop_patience = config.get("early_stop_patience", 8)
 
@@ -2205,11 +2085,7 @@ def train(
             model, loaders["train"], optimizer, device, config,
             reverse_model, epoch, num_epochs,
             cond_encoder=cond_encoder,
-            # NEW: Ablation components
-            session_augmentor=session_augmentor,
             noise_augmentor=noise_augmentor,
-            euclidean_aligner=euclidean_aligner,
-            mmd_loss_fn=mmd_loss_fn,
         )
 
         barrier()
@@ -2249,7 +2125,6 @@ def train(
                 fast_mode=True,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
-                euclidean_aligner=euclidean_aligner,
             )
             last_val_metrics = val_metrics  # Cache for non-validation epochs
 
@@ -2263,7 +2138,6 @@ def train(
                         fast_mode=True,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                         cond_encoder=cond_encoder,
-                        euclidean_aligner=euclidean_aligner,
                     )
                     per_session_metrics[sess_name] = sess_metrics
         else:
@@ -2502,7 +2376,6 @@ def train(
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                euclidean_aligner=euclidean_aligner,
             )
 
             barrier()
@@ -2513,7 +2386,6 @@ def train(
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
-                euclidean_aligner=euclidean_aligner,
             )
 
             barrier()
@@ -2575,7 +2447,6 @@ def train(
             cond_encoder=cond_encoder,
             envelope_matcher_fwd=envelope_matcher_fwd,
             envelope_matcher_rev=envelope_matcher_rev,
-            euclidean_aligner=euclidean_aligner,
         )
     else:
         test_metrics = {}
@@ -2692,7 +2563,6 @@ def train(
                     fast_mode=True,  # Fast mode for per-session eval
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
-                    euclidean_aligner=euclidean_aligner,
                 )
 
                 per_session_results.append({
@@ -3110,40 +2980,8 @@ def parse_args():
                         help="Use session-adaptive output scaling (FiLM style)")
 
     # =========================================================================
-    # NEW ABLATION COMPONENTS (Domain Adaptation / Session Generalization)
+    # Noise Augmentation (Training Robustness)
     # =========================================================================
-
-    # Euclidean Alignment (+2-5% expected improvement)
-    parser.add_argument("--use-euclidean-alignment", action="store_true",
-                        help="Enable Euclidean alignment for session normalization (+2-5%%)")
-    parser.add_argument("--euclidean-momentum", type=float, default=0.1,
-                        help="Momentum for Euclidean alignment statistics (default: 0.1)")
-
-    # Test-time BN Adaptation (+2-4% expected improvement)
-    parser.add_argument("--use-bn-adaptation", action="store_true",
-                        help="Enable test-time batch norm adaptation (+2-4%%)")
-    parser.add_argument("--bn-adaptation-steps", type=int, default=10,
-                        help="Number of BN adaptation steps at test time (default: 10)")
-    parser.add_argument("--bn-adaptation-momentum", type=float, default=0.1,
-                        help="Momentum for BN adaptation (default: 0.1)")
-    parser.add_argument("--bn-reset-stats", action="store_true",
-                        help="Reset BN running stats before adaptation")
-
-    # Session Augmentation (+2-5% expected improvement)
-    parser.add_argument("--use-session-augmentation", action="store_true",
-                        help="Enable session augmentation during training (+2-5%%)")
-    parser.add_argument("--session-aug-mix-prob", type=float, default=0.3,
-                        help="Probability of session mixing augmentation (default: 0.3)")
-    parser.add_argument("--session-aug-scale-min", type=float, default=0.9,
-                        help="Minimum scale for session augmentation (default: 0.9)")
-    parser.add_argument("--session-aug-scale-max", type=float, default=1.1,
-                        help="Maximum scale for session augmentation (default: 1.1)")
-
-    # MMD Loss for Session Invariance (+1-3% expected improvement)
-    parser.add_argument("--use-mmd-loss", action="store_true",
-                        help="Enable MMD loss for session invariance (+1-3%%)")
-    parser.add_argument("--mmd-weight", type=float, default=0.1,
-                        help="Weight for MMD loss term (default: 0.1)")
 
     # Noise Augmentation (robustness improvement)
     parser.add_argument("--use-noise-augmentation", action="store_true",
@@ -3341,31 +3179,8 @@ def main():
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
 
     # =========================================================================
-    # NEW ABLATION COMPONENTS (Domain Adaptation)
-    # =========================================================================
-
-    # Euclidean Alignment
-    config["use_euclidean_alignment"] = args.use_euclidean_alignment
-    config["euclidean_momentum"] = args.euclidean_momentum
-
-    # Test-time BN Adaptation
-    config["use_bn_adaptation"] = args.use_bn_adaptation
-    config["bn_adaptation_steps"] = args.bn_adaptation_steps
-    config["bn_adaptation_momentum"] = args.bn_adaptation_momentum
-    config["bn_reset_stats"] = args.bn_reset_stats
-
-    # Session Augmentation
-    config["use_session_augmentation"] = args.use_session_augmentation
-    config["session_aug_mix_prob"] = args.session_aug_mix_prob
-    config["session_aug_scale_min"] = args.session_aug_scale_min
-    config["session_aug_scale_max"] = args.session_aug_scale_max
-    config["session_aug_shift_range"] = (-0.1, 0.1)  # Default shift range
-
-    # MMD Loss
-    config["use_mmd_loss"] = args.use_mmd_loss
-    config["mmd_weight"] = args.mmd_weight
-
     # Noise Augmentation
+    # =========================================================================
     config["use_noise_augmentation"] = args.use_noise_augmentation
     config["noise_gaussian_std"] = args.noise_gaussian_std
     config["noise_pink"] = args.noise_pink
