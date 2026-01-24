@@ -761,6 +761,7 @@ def evaluate(
     cond_encoder: Optional[nn.Module] = None,
     envelope_matcher_fwd: Optional[nn.Module] = None,
     envelope_matcher_rev: Optional[nn.Module] = None,
+    euclidean_aligner: Optional[nn.Module] = None,  # For consistent input normalization
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -771,11 +772,38 @@ def evaluate(
                    Use fast_mode=False only for final evaluation.
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
     """
+    # Apply test-time BN adaptation if enabled
+    # This adapts BatchNorm running statistics to the test distribution
+    # NOTE: This uses test data intentionally - it's test-time adaptation, not data leakage
+    if config and config.get("use_bn_adaptation", False):
+        n_steps = config.get("bn_adaptation_steps", 10)
+        momentum = config.get("bn_adaptation_momentum", 0.1)
+        reset_stats = config.get("bn_reset_stats", False)
+        adapt_bn_to_session(
+            model,
+            loader,
+            n_steps=n_steps,
+            momentum=momentum,
+            reset_stats=reset_stats,
+            device=device,
+        )
+        if reverse_model is not None:
+            adapt_bn_to_session(
+                reverse_model,
+                loader,
+                n_steps=n_steps,
+                momentum=momentum,
+                reset_stats=reset_stats,
+                device=device,
+            )
+
     model.eval()
     if reverse_model is not None:
         reverse_model.eval()
     if cond_encoder is not None:
         cond_encoder.eval()
+    if euclidean_aligner is not None:
+        euclidean_aligner.eval()  # Don't update running stats during evaluation
 
     # Forward direction (OB→PCx)
     mse_list, mae_list, corr_list = [], [], []
@@ -832,6 +860,10 @@ def evaluate(
             pcx = pcx.to(device, dtype=compute_dtype, non_blocking=True)
             odor = odor.to(device, non_blocking=True)
             session_ids_batch = session_ids_batch.to(device, non_blocking=True)
+
+            # Apply Euclidean Alignment if enabled (for consistent normalization with training)
+            if euclidean_aligner is not None:
+                ob = euclidean_aligner(ob)
 
             # Normalize target (input is normalized in model's forward())
             pcx = per_channel_normalize(pcx)
@@ -1394,9 +1426,11 @@ def train_epoch(
             unique_sessions = torch.unique(session_ids_batch)
 
             if len(unique_sessions) >= 2:
-                # Get features from two random sessions
-                sess_a = unique_sessions[0].item()
-                sess_b = unique_sessions[1].item()
+                # RANDOMLY sample two sessions (not always first two)
+                # This provides more robust training signal across all session pairs
+                perm = torch.randperm(len(unique_sessions), device=device)
+                sess_a = unique_sessions[perm[0]].item()
+                sess_b = unique_sessions[perm[1]].item()
 
                 mask_a = session_ids_batch == sess_a
                 mask_b = session_ids_batch == sess_b
@@ -2215,6 +2249,7 @@ def train(
                 fast_mode=True,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
+                euclidean_aligner=euclidean_aligner,
             )
             last_val_metrics = val_metrics  # Cache for non-validation epochs
 
@@ -2228,6 +2263,7 @@ def train(
                         fast_mode=True,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                         cond_encoder=cond_encoder,
+                        euclidean_aligner=euclidean_aligner,
                     )
                     per_session_metrics[sess_name] = sess_metrics
         else:
@@ -2466,6 +2502,7 @@ def train(
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                euclidean_aligner=euclidean_aligner,
             )
 
             barrier()
@@ -2476,6 +2513,7 @@ def train(
                 compute_phase=True, reverse_model=reverse_model, config=config,
                 fast_mode=False,  # Full metrics for stage evaluation
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                euclidean_aligner=euclidean_aligner,
             )
 
             barrier()
@@ -2537,6 +2575,7 @@ def train(
             cond_encoder=cond_encoder,
             envelope_matcher_fwd=envelope_matcher_fwd,
             envelope_matcher_rev=envelope_matcher_rev,
+            euclidean_aligner=euclidean_aligner,
         )
     else:
         test_metrics = {}
@@ -2653,6 +2692,7 @@ def train(
                     fast_mode=True,  # Fast mode for per-session eval
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
+                    euclidean_aligner=euclidean_aligner,
                 )
 
                 per_session_results.append({

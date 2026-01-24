@@ -3446,6 +3446,9 @@ class EuclideanAligner(nn.Module):
                 session_std: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Align input to reference distribution.
 
+        During training: updates running reference statistics (like BatchNorm)
+        During inference: uses accumulated reference statistics
+
         Args:
             x: Input tensor [B, C, T]
             session_mean: Optional pre-computed session mean [C]
@@ -3458,6 +3461,17 @@ class EuclideanAligner(nn.Module):
             # Compute session statistics from input batch
             session_mean = x.mean(dim=(0, 2))  # [C]
             session_std = x.std(dim=(0, 2)) + self.eps  # [C]
+
+        # During training, update running reference statistics (like BatchNorm)
+        if self.training:
+            with torch.no_grad():
+                if self.num_batches_tracked == 0:
+                    self.reference_mean.copy_(session_mean)
+                    self.reference_std.copy_(session_std)
+                else:
+                    self.reference_mean.mul_(1 - self.momentum).add_(session_mean * self.momentum)
+                    self.reference_std.mul_(1 - self.momentum).add_(session_std * self.momentum)
+                self.num_batches_tracked += 1
 
         # Expand for broadcasting: [C] -> [1, C, 1]
         session_mean = session_mean.view(1, -1, 1)
@@ -3633,7 +3647,7 @@ class SessionAugmentor(nn.Module):
 
         Args:
             x: Input tensor [B, C, T]
-            session_ids: Session IDs for each sample [B]
+            session_ids: Session IDs for each sample [B] - used for cross-session mixing
 
         Returns:
             Augmented tensor [B, C, T]
@@ -3644,10 +3658,25 @@ class SessionAugmentor(nn.Module):
         B, C, T = x.shape
         device = x.device
 
-        # 1. Session mixing: blend with other samples in batch
+        # 1. Session mixing: blend with samples from DIFFERENT sessions
+        # This encourages learning session-invariant features
         if self.mix_prob > 0 and torch.rand(1).item() < self.mix_prob:
-            # Random permutation for mixing
-            perm = torch.randperm(B, device=device)
+            if session_ids is not None and len(torch.unique(session_ids)) > 1:
+                # Prefer mixing with samples from different sessions
+                perm = torch.zeros(B, dtype=torch.long, device=device)
+                for i in range(B):
+                    # Find samples from different sessions
+                    different_session_mask = session_ids != session_ids[i]
+                    if different_session_mask.sum() > 0:
+                        # Randomly select from different sessions
+                        candidates = torch.where(different_session_mask)[0]
+                        perm[i] = candidates[torch.randint(len(candidates), (1,), device=device)]
+                    else:
+                        # Fallback to random if no different sessions
+                        perm[i] = torch.randint(B, (1,), device=device)
+            else:
+                # Fallback to random permutation if no session info
+                perm = torch.randperm(B, device=device)
             mix_weight = torch.rand(B, 1, 1, device=device) * 0.5  # 0-50% mix
             x = x * (1 - mix_weight) + x[perm] * mix_weight
 
