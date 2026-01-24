@@ -1377,6 +1377,7 @@ def run_single_fold(
         "--checkpoint-prefix", checkpoint_prefix,  # Unique checkpoint per fold
         "--fold", str(fold_idx),
         "--no-plots",
+        "--quiet",  # Minimal output, no progress bars
     ])
 
     # CORRECT DATA SPLIT (no leakage):

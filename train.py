@@ -1271,13 +1271,14 @@ def train_epoch(
     use_bf16 = config.get("fsdp_bf16", False)
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
+    quiet_mode = config.get("quiet", False)
     pbar = tqdm(
         loader_iter,
         desc=f"Epoch {epoch}/{num_epochs}",
         leave=True,
         position=0,
         ncols=100,
-        disable=not is_primary(),
+        disable=quiet_mode or not is_primary(),
         file=sys.stdout,
         total=len(loader),
     )
@@ -2837,6 +2838,8 @@ def parse_args():
     parser.add_argument("--dandi-data-dir", type=str, default=None,
                         help="Directory containing DANDI NWB files (default: $UNET_DATA_DIR/movie)")
 
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Quiet mode: minimal output, no progress bars")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: from config)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (default: from config)")
@@ -3148,6 +3151,7 @@ def main():
     config["gradient_checkpointing"] = args.gradient_checkpointing
     config["num_workers"] = args.num_workers  # None = auto
     config["prefetch_factor"] = args.prefetch_factor
+    config["quiet"] = args.quiet  # Minimal output mode
 
     # Session-based split config (CLI overrides config if explicitly provided)
     if args.split_by_session:
