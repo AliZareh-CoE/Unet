@@ -814,20 +814,9 @@ def evaluate(
     use_bf16 = config.get("fsdp_bf16", False) if config else False
     compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-    # Warmup: fetch first batch to ensure DataLoader workers are ready
-    import time
-    import itertools
-    _t0 = time.perf_counter()
-    _warmup_iter = iter(loader)
-    _first_batch = next(_warmup_iter)
-    _warmup_time = time.perf_counter() - _t0
-    if _warmup_time > 0.3:  # Only print if delay > 0.3s
-        print(f"[Val loader warmup: {_warmup_time:.2f}s]")
-    loader_iter = itertools.chain([_first_batch], _warmup_iter)
-
     # Use no_grad for FSDP compatibility
     with torch.no_grad():
-        for batch in loader_iter:
+        for batch in loader:
             # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
             if len(batch) == 4:
                 ob, pcx, odor, session_ids_batch = batch
@@ -1272,19 +1261,15 @@ def train_epoch(
     loss_components = defaultdict(lambda: torch.tensor(0.0, device=device))
     optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
 
-    # Warmup: fetch first batch to ensure DataLoader workers are ready
-    # This moves the "cold start" delay outside the tqdm progress bar
-    import time
-    _t0 = time.perf_counter()
+    # Pre-fetch first batch to reduce perceived delay
+    import itertools
     _warmup_iter = iter(loader)
     _first_batch = next(_warmup_iter)
-    _warmup_time = time.perf_counter() - _t0
-    if is_primary() and _warmup_time > 0.3:  # Only print if delay > 0.3s
-        print(f"[Train loader warmup: {_warmup_time:.2f}s]")
-
-    # Chain first batch with rest of iterator
-    import itertools
     loader_iter = itertools.chain([_first_batch], _warmup_iter)
+
+    # Determine compute dtype for FSDP mixed precision compatibility
+    use_bf16 = config.get("fsdp_bf16", False)
+    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     pbar = tqdm(
         loader_iter,
@@ -1296,9 +1281,6 @@ def train_epoch(
         file=sys.stdout,
         total=len(loader),
     )
-    # Determine compute dtype for FSDP mixed precision compatibility
-    use_bf16 = config.get("fsdp_bf16", False)
-    compute_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     for batch_idx, batch in enumerate(pbar):
         # Handle both 3-tuple (legacy) and 4-tuple (with session_ids) formats
@@ -2103,9 +2085,7 @@ def train(
     patience_counter = 0
     history = []
 
-    import time as _time_module
     for epoch in range(1, num_epochs + 1):
-        _epoch_start = _time_module.perf_counter()
         if loaders.get("train_sampler") is not None:
             loaders["train_sampler"].set_epoch(epoch)
 
@@ -2116,11 +2096,7 @@ def train(
             noise_augmentor=noise_augmentor,
         )
 
-        _t_barrier = _time_module.perf_counter()
         barrier()
-        _barrier_time = _time_module.perf_counter() - _t_barrier
-        if is_primary() and _barrier_time > 0.3:
-            print(f"[Barrier took: {_barrier_time:.2f}s]")
 
         # Validation (skip some epochs if val_every > 1 for faster training)
         val_every = config.get("val_every", 1)
