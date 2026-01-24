@@ -382,9 +382,11 @@ def reconstruct_from_checkpoint(checkpoint: Dict[str, Any]) -> Tuple[List[LOSOFo
             test_session=r_dict["test_session"],
             train_sessions=r_dict["train_sessions"],
             val_r2=r_dict["val_r2"],
+            val_corr=r_dict.get("val_corr", 0.0),
             val_loss=r_dict["val_loss"],
             train_loss=r_dict.get("train_loss", 0.0),
             per_session_r2=r_dict.get("per_session_r2", {}),
+            per_session_corr=r_dict.get("per_session_corr", {}),
             per_session_loss=r_dict.get("per_session_loss", {}),
             epochs_trained=r_dict.get("epochs_trained", 0),
             total_time=r_dict.get("total_time", 0.0),
@@ -605,14 +607,20 @@ def run_single_fold(
         # Get dataset info for the result
         ds_config = config.get_dataset_config()
 
+        # Extract correlation values
+        val_corr = results.get("best_val_corr", results.get("val_corr", 0.0))
+        per_session_corr = results.get("per_session_corr", {})
+
         fold_result = LOSOFoldResult(
             fold_idx=fold_idx,
             test_session=test_session,
             train_sessions=train_sessions,
             val_r2=results.get("best_val_r2", results.get("val_r2", 0.0)),
+            val_corr=val_corr,
             val_loss=results.get("best_val_loss", results.get("val_loss", float('inf'))),
             train_loss=results.get("final_train_loss", 0.0),
             per_session_r2=results.get("per_session_r2", {}),
+            per_session_corr=per_session_corr,
             per_session_loss=results.get("per_session_loss", {}),
             epochs_trained=results.get("epochs_trained", config.epochs),
             total_time=elapsed,
@@ -630,8 +638,17 @@ def run_single_fold(
         print(f"\nFold {fold_idx} completed:")
         print(f"  Held-out {session_label}: {test_session}")
         print(f"  Val R²: {fold_result.val_r2:.4f}")
+        if val_corr != 0.0:
+            print(f"  Val Corr: {fold_result.val_corr:.4f}")
         print(f"  Val Loss: {fold_result.val_loss:.4f}")
         print(f"  Time: {elapsed/60:.1f} minutes")
+
+        # Print per-session correlations if available
+        if per_session_corr:
+            print(f"  Per-session correlations:")
+            for sess, corr in sorted(per_session_corr.items()):
+                r2 = fold_result.per_session_r2.get(sess, 0.0)
+                print(f"    {sess}: Corr={corr:.4f}, R²={r2:.4f}")
 
         return fold_result
     else:
