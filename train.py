@@ -1261,14 +1261,18 @@ def train_epoch(
     loss_components = defaultdict(lambda: torch.tensor(0.0, device=device))
     optimizer.zero_grad(set_to_none=True)  # More memory efficient than zero_grad()
 
+    # Create iterator first to trigger prefetch before tqdm (avoids epoch-start delay)
+    loader_iter = iter(loader)
+
     pbar = tqdm(
-        loader,
+        loader_iter,
         desc=f"Epoch {epoch}/{num_epochs}",
         leave=True,
         position=0,
         ncols=100,
         disable=not is_primary(),
         file=sys.stdout,
+        total=len(loader),
     )
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False)

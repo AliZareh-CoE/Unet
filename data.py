@@ -2029,7 +2029,7 @@ def create_dataloaders(
         pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2042,7 +2042,7 @@ def create_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,  # Don't drop for val - we want all samples evaluated
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2055,7 +2055,7 @@ def create_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,  # Don't drop for test - we want all samples evaluated
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2162,7 +2162,7 @@ def create_single_session_dataloader(
         pin_memory=pin_memory,
         drop_last=False,
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2262,7 +2262,7 @@ def create_pfc_dataloaders(
         pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2275,7 +2275,7 @@ def create_pfc_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,  # Don't drop for val - we want all samples evaluated
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
@@ -2288,7 +2288,7 @@ def create_pfc_dataloaders(
         pin_memory=pin_memory,
         drop_last=False,  # Don't drop for test - we want all samples evaluated
         persistent_workers=persistent,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
         generator=g,
     )
