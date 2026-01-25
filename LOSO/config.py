@@ -162,23 +162,32 @@ class LOSOConfig:
     learning_rate: float = 1e-3
     seed: int = 42
 
-    # Model defaults (may be overridden by inner CV winner)
+    # Model defaults (optimized from cascading ablation study)
     arch: str = "condunet"
-    base_channels: int = 128
+    base_channels: int = 256  # Optimized: 256 (was 128)
     n_downsample: int = 2
-    attention_type: str = "none"
+    attention_type: str = "none"  # Optimized: no attention
     cond_mode: str = "cross_attn_gated"
     conv_type: str = "modern"
-    activation: str = "relu"
+    activation: str = "gelu"  # Optimized: gelu
     skip_type: str = "add"
     n_heads: int = 4
     conditioning: str = "spectro_temporal"
 
     # Optimizer (fixed)
     optimizer: str = "adamw"
-    lr_schedule: str = "step"
-    weight_decay: float = 0.01
+    lr_schedule: str = "cosine_warmup"  # Optimized: cosine with warmup
+    weight_decay: float = 0.0  # Optimized: no weight decay
     dropout: float = 0.0
+
+    # Noise augmentation (optimized defaults for LOSO)
+    use_noise_augmentation: bool = True  # Enable by default for LOSO
+    noise_gaussian_std: float = 0.1
+    noise_pink: bool = True
+    noise_pink_std: float = 0.05
+    noise_channel_dropout: float = 0.05
+    noise_temporal_dropout: float = 0.02
+    noise_prob: float = 0.5
 
     # Session adaptation
     use_session_stats: bool = False

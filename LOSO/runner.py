@@ -551,6 +551,19 @@ def run_single_fold(
     if config.use_adaptive_scaling:
         cmd.append("--use-adaptive-scaling")
 
+    # Noise augmentation (optimized for LOSO)
+    if config.use_noise_augmentation:
+        cmd.append("--use-noise-augmentation")
+        cmd.extend(["--noise-gaussian-std", str(config.noise_gaussian_std)])
+        if config.noise_pink:
+            cmd.append("--noise-pink")
+            cmd.extend(["--noise-pink-std", str(config.noise_pink_std)])
+        if config.noise_channel_dropout > 0:
+            cmd.extend(["--noise-channel-dropout", str(config.noise_channel_dropout)])
+        if config.noise_temporal_dropout > 0:
+            cmd.extend(["--noise-temporal-dropout", str(config.noise_temporal_dropout)])
+        cmd.extend(["--noise-prob", str(config.noise_prob)])
+
     # FSDP
     if config.use_fsdp:
         cmd.extend(["--fsdp", "--fsdp-strategy", config.fsdp_strategy])

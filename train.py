@@ -3055,36 +3055,52 @@ def main():
         from LOSO.runner import run_loso
         from LOSO.config import LOSOConfig
 
+        # Optimized LOSO defaults from cascading ablation study
+        # CLI arguments override these defaults when explicitly provided
         config = LOSOConfig(
             dataset=args.dataset,
             output_dir=Path(args.loso_output_dir),
-            epochs=args.epochs or 60,
-            batch_size=args.batch_size or 32,
+            # Training (optimized defaults)
+            epochs=args.epochs or 80,  # Optimized: 80 epochs
+            batch_size=args.batch_size or 64,  # Optimized: batch 64
             learning_rate=args.lr or 1e-3,
             seed=args.seed or 42,
+            # Architecture (optimized from ablation study)
             arch=args.arch,
-            base_channels=args.base_channels or 128,
+            base_channels=args.base_channels or 256,  # Optimized: 256 (was 128)
             n_downsample=args.n_downsample or 2,
-            attention_type=args.attention_type or "cross_freq_v2",
+            attention_type=args.attention_type or "none",  # Optimized: no attention
             cond_mode=args.cond_mode or "cross_attn_gated",
             conv_type=args.conv_type or "modern",
             activation=args.activation or "gelu",
             skip_type=args.skip_type or "add",
             n_heads=args.n_heads or 4,
             conditioning=args.conditioning or "spectro_temporal",
+            # Optimizer
             optimizer=args.optimizer or "adamw",
             lr_schedule=args.lr_schedule or "cosine_warmup",
             weight_decay=args.weight_decay or 0.0,
             dropout=args.dropout or 0.0,
+            # Session adaptation
             use_session_stats=args.use_session_stats,
             session_use_spectral=args.session_use_spectral,
             use_adaptive_scaling=args.use_adaptive_scaling,
             use_bidirectional=not args.no_bidirectional,
+            # FSDP
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
+            # Execution
             resume=not args.loso_no_resume,
             verbose=args.loso_verbose,
             generate_plots=args.generate_plots if args.generate_plots is not None else False,
+            # Noise augmentation (enabled by default for LOSO)
+            use_noise_augmentation=args.use_noise_augmentation if args.use_noise_augmentation else True,
+            noise_gaussian_std=args.noise_gaussian_std,
+            noise_pink=args.noise_pink if args.noise_pink else True,
+            noise_pink_std=args.noise_pink_std,
+            noise_channel_dropout=args.noise_channel_dropout if args.noise_channel_dropout > 0 else 0.05,
+            noise_temporal_dropout=args.noise_temporal_dropout if args.noise_temporal_dropout > 0 else 0.02,
+            noise_prob=args.noise_prob,
         )
 
         print("=" * 60)
