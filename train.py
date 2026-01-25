@@ -3302,7 +3302,6 @@ def main():
         # When running multi-GPU, reduce workers per process to avoid shared memory exhaustion
         num_workers = config["num_workers"]
         if num_workers is None:
-            import os
             world_size = get_world_size()
             cpu_count = os.cpu_count() or 8
             # With 8 GPUs, use 2 workers per GPU; with 1 GPU, use up to 8
