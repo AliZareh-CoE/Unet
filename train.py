@@ -3099,11 +3099,11 @@ def main():
             lr_schedule=args.lr_schedule or "cosine_warmup",
             weight_decay=args.weight_decay or 0.0,
             dropout=args.dropout or 0.0,
-            # Session adaptation
+            # Session adaptation (optimized LOSO defaults)
             use_session_stats=args.use_session_stats,
             session_use_spectral=args.session_use_spectral,
-            use_adaptive_scaling=args.use_adaptive_scaling,
-            use_bidirectional=not args.no_bidirectional,
+            use_adaptive_scaling=True,  # Optimized: always True for LOSO
+            use_bidirectional=False,  # Optimized: always False for LOSO
             # FSDP
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
