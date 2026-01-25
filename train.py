@@ -3706,10 +3706,19 @@ def main():
         # Show split type
         if "split_info" in data:
             split_info = data["split_info"]
-            print(f"Split type: SESSION HOLDOUT")
-            print(f"Test sessions: {split_info['test_sessions']} ({split_info['n_test_trials']} trials)")
-            print(f"Val sessions: {split_info['val_sessions']} ({split_info['n_val_trials']} trials)")
-            print(f"Train sessions: {split_info['train_sessions']} ({split_info['n_train_trials']} trials)")
+            mode = split_info.get("mode", "session_holdout")
+            if mode == "hybrid_test_sessions":
+                # Hybrid mode: session-wise test holdout, trial-wise train/val
+                print(f"Split type: HYBRID (session test holdout + trial-wise train/val)")
+                print(f"Test sessions: {split_info['test_sessions']} ({split_info['n_test_trials']} trials)")
+                print(f"Train/Val sessions: {split_info['train_val_sessions']}")
+                print(f"  Train: {split_info['n_train_trials']} trials, Val: {split_info['n_val_trials']} trials (70/30 random)")
+            else:
+                # Standard session-based split
+                print(f"Split type: SESSION HOLDOUT")
+                print(f"Test sessions: {split_info.get('test_sessions', [])} ({split_info.get('n_test_trials', 0)} trials)")
+                print(f"Val sessions: {split_info.get('val_sessions', [])} ({split_info.get('n_val_trials', 0)} trials)")
+                print(f"Train sessions: {split_info.get('train_sessions', [])} ({split_info.get('n_train_trials', 0)} trials)")
         else:
             print(f"Split type: Random stratified")
 
