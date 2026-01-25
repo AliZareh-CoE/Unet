@@ -3052,6 +3052,20 @@ def main():
 
     # Handle LOSO cross-validation mode
     if args.loso:
+        # LOSO mode manages its own distributed training - it spawns torchrun
+        # subprocesses for each fold. If invoked via torchrun (e.g., user ran
+        # "torchrun train.py --loso"), only let rank 0 proceed; others exit.
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if world_size > 1:
+            if rank == 0:
+                print(f"NOTE: LOSO mode detected with torchrun (world_size={world_size}).")
+                print("      LOSO manages its own distributed training per fold.")
+                print("      Only rank 0 will run LOSO; other ranks will exit.")
+            else:
+                # Non-rank-0 processes exit silently
+                return 0
+
         from LOSO.runner import run_loso
         from LOSO.config import LOSOConfig
 
