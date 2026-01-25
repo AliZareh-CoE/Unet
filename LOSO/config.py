@@ -203,6 +203,12 @@ class LOSOConfig:
     inner_cv_folds: int = 3  # k-fold CV for inner loop
     run_inner_cv: bool = False  # Set True to run nested CV with ablation
 
+    # Train/validation split from non-test sessions
+    # CRITICAL: Prevents data leakage by NOT using test session for model selection
+    # val_ratio=0.3 means 30% of non-test sessions go to validation (for best epoch)
+    # Remaining 70% are used for training
+    val_ratio: float = 0.3
+
     # Execution
     resume: bool = True
     verbose: bool = True

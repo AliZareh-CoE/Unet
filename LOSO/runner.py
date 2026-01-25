@@ -428,10 +428,21 @@ def run_single_fold(
     Returns:
         LOSOFoldResult or None on failure
     """
-    train_sessions = [s for s in all_sessions if s != test_session]
+    non_test_sessions = [s for s in all_sessions if s != test_session]
+
+    # CRITICAL: Split non-test sessions into train and validation
+    # This prevents data leakage by NOT using the test session for model selection
+    # Validation sessions are used for best epoch selection / early stopping
+    n_val = max(1, int(len(non_test_sessions) * config.val_ratio))
+    # Use deterministic split based on fold_idx for reproducibility
+    rng = np.random.RandomState(config.seed + fold_idx)
+    shuffled_sessions = non_test_sessions.copy()
+    rng.shuffle(shuffled_sessions)
+    val_sessions = shuffled_sessions[:n_val]
+    train_sessions = shuffled_sessions[n_val:]
 
     # CRITICAL: Check for data leakage before proceeding
-    check_data_leakage(fold_idx, test_session, train_sessions, config.dataset)
+    check_data_leakage(fold_idx, test_session, train_sessions + val_sessions, config.dataset)
 
     # Get dataset config for proper labeling
     ds_config = config.get_dataset_config()
@@ -442,7 +453,8 @@ def run_single_fold(
     print(f"LOSO FOLD {fold_idx + 1}/{len(all_sessions)}")
     print(f"{'='*70}")
     print(f"Dataset: {config.dataset} ({ds_config.source_region} → {ds_config.target_region})")
-    print(f"Held-out {session_label}: {test_session}")
+    print(f"Test {session_label} (held-out): {test_session}")
+    print(f"Validation {session_label_lower}s ({len(val_sessions)}): {val_sessions}")
     print(f"Training {session_label_lower}s ({len(train_sessions)}): {train_sessions}")
     print(f"✓ No data leakage detected")
     print()
@@ -505,13 +517,15 @@ def run_single_fold(
                 "--pfc-stride-ratio", str(config.pfc_stride_ratio),
             ])
 
-    # Session-based splitting: hold out one session for validation (LOSO)
-    # For DANDI, "sessions" are actually subjects, but the same mechanism applies
+    # Session-based splitting with proper train/val/test separation
+    # CRITICAL: This prevents data leakage in LOSO cross-validation
+    # - test_session: Held out completely (LOSO), only for final evaluation
+    # - val_sessions: Used for model selection (best epoch, early stopping)
+    # - train_sessions: Used for training (remaining sessions)
     cmd.append("--split-by-session")
     cmd.append("--force-recreate-splits")
-    cmd.extend(["--val-sessions", test_session])  # Held-out session/subject becomes validation
-    cmd.append("--no-test-set")  # No separate test set needed
-    cmd.append("--no-early-stop")  # Train full epochs, no tuning
+    cmd.extend(["--test-sessions", test_session])  # LOSO held-out session for final eval
+    cmd.extend(["--val-sessions"] + val_sessions)  # For model selection (no leakage)
 
     # Model architecture arguments
     if config.base_channels:
@@ -624,21 +638,35 @@ def run_single_fold(
         # Get dataset info for the result
         ds_config = config.get_dataset_config()
 
-        # Extract correlation values
-        val_corr = results.get("best_val_corr", results.get("val_corr", 0.0))
-        per_session_corr = results.get("per_session_corr", {})
+        # CRITICAL: Use TEST metrics for LOSO evaluation (not validation metrics)
+        # Validation metrics were used for model selection (best epoch)
+        # Test metrics are from the held-out LOSO session - the unbiased evaluation
+        test_r2 = results.get("test_avg_r2", results.get("best_val_r2", 0.0))
+        test_corr = results.get("test_avg_corr", results.get("best_val_corr", 0.0))
+
+        # Per-session test results (for the held-out test session)
+        per_session_test = results.get("per_session_test_results", [])
+        per_session_r2 = {}
+        per_session_corr = {}
+        per_session_loss = {}
+        for session_result in per_session_test:
+            session_name = session_result.get("session", "")
+            if session_name:
+                per_session_r2[session_name] = session_result.get("r2", 0.0)
+                per_session_corr[session_name] = session_result.get("corr", 0.0)
+                per_session_loss[session_name] = session_result.get("delta", 0.0)
 
         fold_result = LOSOFoldResult(
             fold_idx=fold_idx,
             test_session=test_session,
             train_sessions=train_sessions,
-            val_r2=results.get("best_val_r2", results.get("val_r2", 0.0)),
-            val_corr=val_corr,
-            val_loss=results.get("best_val_loss", results.get("val_loss", float('inf'))),
+            val_r2=test_r2,  # LOSO metric: test R² from held-out session
+            val_corr=test_corr,  # LOSO metric: test correlation from held-out session
+            val_loss=results.get("test_avg_delta", results.get("best_val_loss", float('inf'))),
             train_loss=results.get("final_train_loss", 0.0),
-            per_session_r2=results.get("per_session_r2", {}),
+            per_session_r2=per_session_r2,
             per_session_corr=per_session_corr,
-            per_session_loss=results.get("per_session_loss", {}),
+            per_session_loss=per_session_loss,
             epochs_trained=results.get("epochs_trained", config.epochs),
             total_time=elapsed,
             config=config.to_dict(),
@@ -653,17 +681,17 @@ def run_single_fold(
         session_label = "Subject" if ds_config.session_type == "subject" else "Session"
 
         print(f"\nFold {fold_idx} completed:")
-        print(f"  Held-out {session_label}: {test_session}")
-        print(f"  Val R²: {fold_result.val_r2:.4f}")
-        if val_corr != 0.0:
-            print(f"  Val Corr: {fold_result.val_corr:.4f}")
-        print(f"  Val Loss: {fold_result.val_loss:.4f}")
+        print(f"  Held-out {session_label} (TEST): {test_session}")
+        print(f"  Test R²: {fold_result.val_r2:.4f}")
+        if test_corr != 0.0:
+            print(f"  Test Corr: {fold_result.val_corr:.4f}")
+        print(f"  Test Loss: {fold_result.val_loss:.4f}")
         print(f"  Time: {elapsed/60:.1f} minutes")
 
-        # Print per-session correlations if available
-        if per_session_corr:
-            print(f"  Per-session correlations:")
-            for sess, corr in sorted(per_session_corr.items()):
+        # Print per-session test results if available
+        if fold_result.per_session_corr:
+            print(f"  Per-session test results:")
+            for sess, corr in sorted(fold_result.per_session_corr.items()):
                 r2 = fold_result.per_session_r2.get(sess, 0.0)
                 print(f"    {sess}: Corr={corr:.4f}, R²={r2:.4f}")
 
