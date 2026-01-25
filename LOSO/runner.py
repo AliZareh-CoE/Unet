@@ -450,9 +450,13 @@ def run_single_fold(
     # Build train.py command
     if config.use_fsdp:
         nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        # Use unique port per fold to avoid "address already in use" errors
+        # when running sequential folds with FSDP
+        master_port = 29500 + fold_idx
         cmd = [
             "torchrun",
             f"--nproc_per_node={nproc}",
+            f"--master_port={master_port}",
             str(PROJECT_ROOT / "train.py"),
         ]
     else:
@@ -775,6 +779,11 @@ def run_loso(
             )
 
             print(f"\nCheckpoint saved after fold {fold_idx}")
+
+            # Small delay between folds when using FSDP to ensure
+            # distributed processes fully terminate and release ports
+            if config.use_fsdp and fold_idx < folds_remaining[-1]:
+                time.sleep(2)
 
     # Create final result
     loso_result = LOSOResult(
