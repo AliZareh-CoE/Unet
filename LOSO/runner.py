@@ -428,21 +428,10 @@ def run_single_fold(
     Returns:
         LOSOFoldResult or None on failure
     """
-    non_test_sessions = [s for s in all_sessions if s != test_session]
-
-    # CRITICAL: Split non-test sessions into train and validation
-    # This prevents data leakage by NOT using the test session for model selection
-    # Validation sessions are used for best epoch selection / early stopping
-    n_val = max(1, int(len(non_test_sessions) * config.val_ratio))
-    # Use deterministic split based on fold_idx for reproducibility
-    rng = np.random.RandomState(config.seed + fold_idx)
-    shuffled_sessions = non_test_sessions.copy()
-    rng.shuffle(shuffled_sessions)
-    val_sessions = shuffled_sessions[:n_val]
-    train_sessions = shuffled_sessions[n_val:]
+    train_sessions = [s for s in all_sessions if s != test_session]
 
     # CRITICAL: Check for data leakage before proceeding
-    check_data_leakage(fold_idx, test_session, train_sessions + val_sessions, config.dataset)
+    check_data_leakage(fold_idx, test_session, train_sessions, config.dataset)
 
     # Get dataset config for proper labeling
     ds_config = config.get_dataset_config()
@@ -453,9 +442,9 @@ def run_single_fold(
     print(f"LOSO FOLD {fold_idx + 1}/{len(all_sessions)}")
     print(f"{'='*70}")
     print(f"Dataset: {config.dataset} ({ds_config.source_region} → {ds_config.target_region})")
-    print(f"Test {session_label} (held-out): {test_session}")
-    print(f"Validation {session_label_lower}s ({len(val_sessions)}): {val_sessions}")
-    print(f"Training {session_label_lower}s ({len(train_sessions)}): {train_sessions}")
+    print(f"Test {session_label} (held-out LOSO): {test_session}")
+    print(f"Train/Val {session_label_lower}s ({len(train_sessions)}): {train_sessions}")
+    print(f"  -> Train/Val split: 70/30 random at trial level (NOT session-wise)")
     print(f"✓ No data leakage detected")
     print()
 
@@ -517,15 +506,14 @@ def run_single_fold(
                 "--pfc-stride-ratio", str(config.pfc_stride_ratio),
             ])
 
-    # Session-based splitting with proper train/val/test separation
+    # LOSO test session holdout with random train/val split
     # CRITICAL: This prevents data leakage in LOSO cross-validation
-    # - test_session: Held out completely (LOSO), only for final evaluation
-    # - val_sessions: Used for model selection (best epoch, early stopping)
-    # - train_sessions: Used for training (remaining sessions)
-    cmd.append("--split-by-session")
+    # - test_session: Held out completely by SESSION (LOSO), only for final evaluation
+    # - train/val: 70/30 random split at TRIAL level from remaining sessions
+    # NOTE: We do NOT use --split-by-session here - train/val is random, not session-wise
     cmd.append("--force-recreate-splits")
     cmd.extend(["--test-sessions", test_session])  # LOSO held-out session for final eval
-    cmd.extend(["--val-sessions"] + val_sessions)  # For model selection (no leakage)
+    # No --val-sessions: train.py will do 70/30 random trial split from remaining data
 
     # Model architecture arguments
     if config.base_channels:
