@@ -3054,17 +3054,21 @@ def main():
     if args.loso:
         # LOSO mode manages its own distributed training - it spawns torchrun
         # subprocesses for each fold. If invoked via torchrun (e.g., user ran
-        # "torchrun train.py --loso"), only let rank 0 proceed; others exit.
+        # "torchrun train.py --loso"), only rank 0 should proceed.
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         if world_size > 1:
-            if rank == 0:
-                print(f"NOTE: LOSO mode detected with torchrun (world_size={world_size}).")
-                print("      LOSO manages its own distributed training per fold.")
-                print("      Only rank 0 will run LOSO; other ranks will exit.")
-            else:
-                # Non-rank-0 processes exit silently
-                return 0
+            if rank != 0:
+                # Non-rank-0 processes exit immediately to avoid conflicts
+                sys.exit(0)
+            # Rank 0 continues but warns user
+            print("=" * 70)
+            print(f"WARNING: LOSO mode invoked via torchrun (world_size={world_size})")
+            print("         LOSO manages its own distributed training per fold.")
+            print("         Recommended: run 'python train.py --loso --fsdp' instead")
+            print("         Proceeding with rank 0 only...")
+            print("=" * 70)
+            print()
 
         from LOSO.runner import run_loso
         from LOSO.config import LOSOConfig
