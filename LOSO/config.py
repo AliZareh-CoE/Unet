@@ -161,6 +161,7 @@ class LOSOConfig:
     batch_size: int = 64
     learning_rate: float = 1e-3
     seed: int = 42
+    n_seeds: int = 3  # Number of random seeds per fold for robust results
 
     # Model defaults (optimized from cascading ablation study)
     arch: str = "condunet"

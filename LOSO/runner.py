@@ -415,6 +415,7 @@ def run_single_fold(
     all_sessions: List[str],
     config: LOSOConfig,
     output_results_file: Path,
+    seed_idx: int = 0,
 ) -> Optional[LOSOFoldResult]:
     """Run a single LOSO fold by calling train.py.
 
@@ -424,6 +425,7 @@ def run_single_fold(
         all_sessions: List of all session names
         config: LOSO configuration
         output_results_file: Path to save train.py results
+        seed_idx: Seed index within this fold (for multi-seed runs)
 
     Returns:
         LOSOFoldResult or None on failure
@@ -464,12 +466,14 @@ def run_single_fold(
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
     # Base arguments
+    # Seed formula ensures unique seeds across all folds and seed runs
+    run_seed = config.seed + fold_idx * config.n_seeds + seed_idx
     cmd.extend([
         "--arch", config.arch,
         "--epochs", str(config.epochs),
         "--batch-size", str(config.batch_size),
         "--lr", str(config.learning_rate),
-        "--seed", str(config.seed + fold_idx),  # Different seed per fold
+        "--seed", str(run_seed),
         "--output-results-file", str(output_results_file),
         "--fold", str(fold_idx),
     ])
@@ -690,6 +694,69 @@ def run_single_fold(
         return None
 
 
+def _aggregate_seed_results(
+    seed_results: List[LOSOFoldResult],
+    fold_idx: int,
+    test_session: str,
+    config: LOSOConfig,
+) -> LOSOFoldResult:
+    """Aggregate results from multiple seeds into a single fold result.
+
+    Takes the mean of metrics across seeds. The aggregated result represents
+    the expected performance for this fold with training variance accounted for.
+
+    Args:
+        seed_results: List of results from each seed run
+        fold_idx: Fold index
+        test_session: Test session name
+        config: LOSO configuration
+
+    Returns:
+        Aggregated LOSOFoldResult with mean metrics across seeds
+    """
+    # Compute mean metrics across seeds
+    r2_values = [r.val_r2 for r in seed_results if r.val_r2 is not None]
+    corr_values = [r.val_corr for r in seed_results if r.val_corr is not None]
+    loss_values = [r.val_loss for r in seed_results if r.val_loss is not None and r.val_loss != float('inf')]
+
+    mean_r2 = float(np.mean(r2_values)) if r2_values else 0.0
+    mean_corr = float(np.mean(corr_values)) if corr_values else 0.0
+    mean_loss = float(np.mean(loss_values)) if loss_values else float('inf')
+
+    # Compute std for reporting
+    std_r2 = float(np.std(r2_values)) if len(r2_values) > 1 else 0.0
+    std_corr = float(np.std(corr_values)) if len(corr_values) > 1 else 0.0
+
+    print(f"\n  Fold {fold_idx} aggregated ({len(seed_results)} seeds):")
+    print(f"    Test R²: {mean_r2:.4f} ± {std_r2:.4f}")
+    if mean_corr != 0.0:
+        print(f"    Test Corr: {mean_corr:.4f} ± {std_corr:.4f}")
+
+    # Use the first result as template for other fields
+    template = seed_results[0]
+    ds_config = config.get_dataset_config()
+
+    return LOSOFoldResult(
+        fold_idx=fold_idx,
+        test_session=test_session,
+        train_sessions=template.train_sessions,
+        val_r2=mean_r2,
+        val_corr=mean_corr,
+        val_loss=mean_loss,
+        train_loss=float(np.mean([r.train_loss for r in seed_results])),
+        per_session_r2=template.per_session_r2,  # Just use first seed's per-session
+        per_session_corr=template.per_session_corr,
+        per_session_loss=template.per_session_loss,
+        epochs_trained=int(np.mean([r.epochs_trained for r in seed_results])),
+        total_time=sum(r.total_time for r in seed_results),
+        config=config.to_dict(),
+        dataset=config.dataset,
+        session_type=ds_config.session_type,
+        n_train_samples=template.n_train_samples,
+        n_val_samples=template.n_val_samples,
+    )
+
+
 # =============================================================================
 # Main LOSO Runner
 # =============================================================================
@@ -766,24 +833,40 @@ def run_loso(
         print(f"  {key}: {value}")
     print()
 
-    # Run each fold
+    # Run each fold with multiple seeds
     results_dir = config.output_dir / "fold_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     for fold_idx in folds_remaining:
         test_session = all_sessions[fold_idx]
-        output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_results.json"
 
-        result = run_single_fold(
-            fold_idx=fold_idx,
-            test_session=test_session,
-            all_sessions=all_sessions,
-            config=config,
-            output_results_file=output_results_file,
-        )
+        # Run multiple seeds for this fold
+        seed_results = []
+        for seed_idx in range(config.n_seeds):
+            output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_seed{seed_idx}_results.json"
 
-        if result is not None:
-            fold_results.append(result)
+            print(f"\n--- Fold {fold_idx}, Seed {seed_idx + 1}/{config.n_seeds} ---")
+
+            result = run_single_fold(
+                fold_idx=fold_idx,
+                test_session=test_session,
+                all_sessions=all_sessions,
+                config=config,
+                output_results_file=output_results_file,
+                seed_idx=seed_idx,
+            )
+
+            if result is not None:
+                seed_results.append(result)
+
+            # Small delay between runs when using FSDP
+            if config.use_fsdp and seed_idx < config.n_seeds - 1:
+                time.sleep(2)
+
+        # Aggregate results across seeds for this fold
+        if seed_results:
+            aggregated_result = _aggregate_seed_results(seed_results, fold_idx, test_session, config)
+            fold_results.append(aggregated_result)
             completed_folds.append(fold_idx)
 
             # Save checkpoint after each fold
@@ -795,10 +878,9 @@ def run_loso(
                 all_sessions,
             )
 
-            print(f"\nCheckpoint saved after fold {fold_idx}")
+            print(f"\nCheckpoint saved after fold {fold_idx} ({len(seed_results)}/{config.n_seeds} seeds completed)")
 
-            # Small delay between folds when using FSDP to ensure
-            # distributed processes fully terminate and release ports
+            # Small delay between folds when using FSDP
             if config.use_fsdp and fold_idx < folds_remaining[-1]:
                 time.sleep(2)
 
