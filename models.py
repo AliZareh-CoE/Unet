@@ -2342,8 +2342,11 @@ class CondUNet1D(nn.Module):
                 n_input_channels=in_channels,
             )
 
-        # Store in_channels for adaptive scaling
+        # Store architecture parameters for interrogation summary
         self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.base = base
+        self.use_attention = use_attention
 
         # Gradient checkpointing: trade compute for memory
         self.gradient_checkpointing = False
@@ -2727,6 +2730,566 @@ class CondUNet1D(nn.Module):
             if hasattr(module, 'coupling_weights'):
                 return module
         return None
+
+    # =========================================================================
+    # Model Interrogation Support Methods
+    # =========================================================================
+
+    def _get_first_conv_weight(self, module) -> Optional[torch.Tensor]:
+        """Helper to get the first Conv weight from a module (handles Sequential)."""
+        if module is None:
+            return None
+        # Direct weight
+        if hasattr(module, 'weight') and module.weight is not None:
+            return module.weight
+        # Check common attribute names
+        for attr in ['conv', 'conv1', 'conv_in']:
+            if hasattr(module, attr):
+                submod = getattr(module, attr)
+                weight = self._get_first_conv_weight(submod)
+                if weight is not None:
+                    return weight
+        # If Sequential or ModuleList, get first conv
+        if isinstance(module, (nn.Sequential, nn.ModuleList)):
+            for child in module:
+                weight = self._get_first_conv_weight(child)
+                if weight is not None:
+                    return weight
+        # Search all children
+        for child in module.children():
+            if hasattr(child, 'weight') and child.weight is not None:
+                if isinstance(child, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+                    return child.weight
+        return None
+
+    def get_gradient_norms(self) -> Dict[str, float]:
+        """Get gradient norms per layer after backward pass.
+
+        Call this after loss.backward() but before optimizer.step().
+
+        Returns:
+            Dict mapping layer name to gradient L2 norm
+        """
+        grad_norms = {}
+
+        # Input conv
+        weight = self._get_first_conv_weight(self.inc)
+        if weight is not None and weight.grad is not None:
+            grad_norms['inc'] = weight.grad.norm().item()
+
+        # Encoders
+        for i, encoder in enumerate(self.encoders):
+            weight = self._get_first_conv_weight(encoder)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'encoder_{i}'] = weight.grad.norm().item()
+
+        # Bottleneck (mid)
+        for j, layer in enumerate(self.mid):
+            weight = self._get_first_conv_weight(layer)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'mid_{j}'] = weight.grad.norm().item()
+
+        # Decoders
+        for i, decoder in enumerate(self.decoders):
+            weight = self._get_first_conv_weight(decoder)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'decoder_{i}'] = weight.grad.norm().item()
+
+        # Output conv
+        weight = self._get_first_conv_weight(self.outc)
+        if weight is not None and weight.grad is not None:
+            grad_norms['outc'] = weight.grad.norm().item()
+
+        return grad_norms
+
+    def get_weight_norms(self) -> Dict[str, float]:
+        """Get weight norms per layer.
+
+        Returns:
+            Dict mapping layer name to weight L2 norm
+        """
+        weight_norms = {}
+
+        # Input conv
+        weight = self._get_first_conv_weight(self.inc)
+        if weight is not None:
+            weight_norms['inc'] = weight.norm().item()
+
+        # Encoders
+        for i, encoder in enumerate(self.encoders):
+            weight = self._get_first_conv_weight(encoder)
+            if weight is not None:
+                weight_norms[f'encoder_{i}'] = weight.norm().item()
+
+        # Bottleneck
+        for j, layer in enumerate(self.mid):
+            weight = self._get_first_conv_weight(layer)
+            if weight is not None:
+                weight_norms[f'mid_{j}'] = weight.norm().item()
+
+        # Decoders
+        for i, decoder in enumerate(self.decoders):
+            weight = self._get_first_conv_weight(decoder)
+            if weight is not None:
+                weight_norms[f'decoder_{i}'] = weight.norm().item()
+
+        # Output conv
+        weight = self._get_first_conv_weight(self.outc)
+        if weight is not None:
+            weight_norms['outc'] = weight.norm().item()
+
+        return weight_norms
+
+    def get_layer_parameter_counts(self) -> Dict[str, int]:
+        """Get parameter counts per layer.
+
+        Returns:
+            Dict mapping layer name to parameter count
+        """
+        param_counts = {}
+
+        param_counts['inc'] = sum(p.numel() for p in self.inc.parameters())
+
+        for i, encoder in enumerate(self.encoders):
+            param_counts[f'encoder_{i}'] = sum(p.numel() for p in encoder.parameters())
+
+        param_counts['mid'] = sum(p.numel() for p in self.mid.parameters())
+
+        for i, decoder in enumerate(self.decoders):
+            param_counts[f'decoder_{i}'] = sum(p.numel() for p in decoder.parameters())
+
+        param_counts['outc'] = sum(p.numel() for p in self.outc.parameters())
+
+        # Conditioning if present
+        if self.embed is not None:
+            param_counts['embed'] = sum(p.numel() for p in self.embed.parameters())
+        if hasattr(self, 'session_embed') and self.session_embed is not None:
+            param_counts['session_embed'] = self.session_embed.numel()
+        if hasattr(self, 'session_stats_encoder') and self.session_stats_encoder is not None:
+            param_counts['session_stats_encoder'] = sum(
+                p.numel() for p in self.session_stats_encoder.parameters()
+            )
+
+        return param_counts
+
+    def get_architecture_summary(self) -> Dict[str, Any]:
+        """Get comprehensive architecture summary for interrogation.
+
+        Returns:
+            Dict with architecture details
+        """
+        return {
+            'n_downsample': getattr(self, 'n_downsample', None),
+            'in_channels': getattr(self, 'in_channels', None),
+            'out_channels': getattr(self, 'out_channels', None),
+            'base_channels': getattr(self, 'base', None),
+            'cond_mode': getattr(self, 'cond_mode', None),
+            'skip_type': getattr(self, 'skip_type', None),
+            'use_attention': getattr(self, 'use_attention', None),
+            'attention_type': getattr(self, 'attention_type', None),
+            'use_residual': getattr(self, 'use_residual', None),
+            'total_params': sum(p.numel() for p in self.parameters()),
+            'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad),
+            'layer_param_counts': self.get_layer_parameter_counts(),
+            'layer_names': self.get_layer_names(),
+        }
+
+    @torch.no_grad()
+    def extract_all_activations(
+        self,
+        x: torch.Tensor,
+        odor_ids: Optional[torch.Tensor] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Extract activations from all layers for a single forward pass.
+
+        Args:
+            x: Input tensor [B, C, T]
+            odor_ids: Optional odor condition indices
+            cond_emb: Optional conditioning embedding
+            session_ids: Optional session indices
+
+        Returns:
+            Dict mapping layer name to activation tensor
+        """
+        activations = {}
+        hooks = []
+
+        def make_hook(name):
+            def hook(module, input, output):
+                activations[name] = output.detach().clone()
+            return hook
+
+        # Register hooks
+        hooks.append(self.inc.register_forward_hook(make_hook('inc')))
+        for i, encoder in enumerate(self.encoders):
+            hooks.append(encoder.register_forward_hook(make_hook(f'encoder_{i}')))
+        hooks.append(self.mid.register_forward_hook(make_hook('bottleneck')))
+        for i, decoder in enumerate(self.decoders):
+            hooks.append(decoder.register_forward_hook(make_hook(f'decoder_{i}')))
+        hooks.append(self.outc.register_forward_hook(make_hook('outc')))
+
+        # Forward pass
+        _ = self.forward(x, odor_ids=odor_ids, cond_emb=cond_emb, session_ids=session_ids)
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        return activations
+
+    @torch.no_grad()
+    def get_bottleneck_features(
+        self,
+        x: torch.Tensor,
+        odor_ids: Optional[torch.Tensor] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+        session_ids: Optional[torch.Tensor] = None,
+        pool: bool = True,
+    ) -> torch.Tensor:
+        """Extract bottleneck features for latent space analysis.
+
+        Args:
+            x: Input tensor [B, C, T]
+            odor_ids: Optional odor condition indices
+            cond_emb: Optional conditioning embedding
+            session_ids: Optional session indices
+            pool: If True, apply global average pooling [B, C], else keep temporal [B, C, T']
+
+        Returns:
+            Bottleneck features tensor
+        """
+        output, bottleneck = self.forward(
+            x,
+            odor_ids=odor_ids,
+            cond_emb=cond_emb,
+            session_ids=session_ids,
+            return_bottleneck=pool,
+            return_bottleneck_temporal=not pool,
+        )
+        return bottleneck
+
+
+# =============================================================================
+# Training Metrics Recorder for Model Interrogation
+# =============================================================================
+
+class TrainingMetricsRecorder:
+    """Records training dynamics for model interrogation framework.
+
+    Tracks:
+    - Loss components per epoch
+    - Gradient norms per layer per epoch
+    - Weight norms per layer per epoch
+    - Learning rate schedule
+    - Validation metrics per epoch
+
+    Example:
+        recorder = TrainingMetricsRecorder()
+
+        for epoch in range(num_epochs):
+            # Training
+            for batch in train_loader:
+                loss.backward()
+                recorder.record_gradients(model, epoch)
+                optimizer.step()
+
+            # End of epoch
+            recorder.record_epoch_end(epoch, train_metrics, val_metrics, lr)
+            recorder.record_weights(model, epoch)
+
+        # Save for interrogation
+        recorder.save('training_dynamics.pt')
+    """
+
+    def __init__(self):
+        self.history = {
+            # Per-epoch metrics
+            'epochs': [],
+            'train_loss': [],
+            'val_loss': [],
+            'train_r2': [],
+            'val_r2': [],
+            'train_corr': [],
+            'val_corr': [],
+            'learning_rates': [],
+
+            # Loss components (per epoch)
+            'loss_components': {},
+
+            # Gradient norms per layer (layer_name -> list of norms per epoch)
+            'gradient_norms': {},
+
+            # Weight norms per layer (layer_name -> list of norms per epoch)
+            'weight_norms': {},
+
+            # Per-batch gradient norms (for detailed analysis)
+            'batch_gradient_norms': [],
+
+            # Validation per session (session_name -> {metric: [values]})
+            'per_session_metrics': {},
+
+            # Model architecture info (set once)
+            'architecture': None,
+
+            # Configuration
+            'config': None,
+        }
+
+        self._current_epoch_gradients = []
+        self._gradient_sample_rate = 10  # Sample every N batches
+
+    def set_architecture(self, model: nn.Module):
+        """Record model architecture info."""
+        if hasattr(model, 'get_architecture_summary'):
+            self.history['architecture'] = model.get_architecture_summary()
+        else:
+            self.history['architecture'] = {
+                'total_params': sum(p.numel() for p in model.parameters()),
+                'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad),
+            }
+
+    def set_config(self, config: Dict[str, Any]):
+        """Record training configuration."""
+        # Make a copy and convert non-serializable items
+        safe_config = {}
+        for k, v in config.items():
+            if isinstance(v, (int, float, str, bool, list, dict, type(None))):
+                safe_config[k] = v
+            else:
+                safe_config[k] = str(v)
+        self.history['config'] = safe_config
+
+    def record_gradients(
+        self,
+        model: nn.Module,
+        batch_idx: int,
+        epoch: int,
+    ):
+        """Record gradient norms during training.
+
+        Call after loss.backward() but before optimizer.step().
+        """
+        if batch_idx % self._gradient_sample_rate != 0:
+            return
+
+        if hasattr(model, 'get_gradient_norms'):
+            grad_norms = model.get_gradient_norms()
+        else:
+            grad_norms = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    # Simplify name
+                    simple_name = name.split('.')[-2] if '.' in name else name
+                    grad_norms[simple_name] = param.grad.norm().item()
+
+        self._current_epoch_gradients.append(grad_norms)
+
+    def record_weights(self, model: nn.Module, epoch: int):
+        """Record weight norms at end of epoch."""
+        if hasattr(model, 'get_weight_norms'):
+            weight_norms = model.get_weight_norms()
+        else:
+            weight_norms = {}
+            for name, param in model.named_parameters():
+                simple_name = name.split('.')[-2] if '.' in name else name
+                weight_norms[simple_name] = param.norm().item()
+
+        for layer_name, norm in weight_norms.items():
+            if layer_name not in self.history['weight_norms']:
+                self.history['weight_norms'][layer_name] = []
+            self.history['weight_norms'][layer_name].append(norm)
+
+    def record_epoch_end(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        learning_rate: float,
+        loss_components: Optional[Dict[str, float]] = None,
+    ):
+        """Record metrics at end of epoch."""
+        self.history['epochs'].append(epoch)
+        self.history['learning_rates'].append(learning_rate)
+
+        # Core metrics
+        self.history['train_loss'].append(train_metrics.get('loss', 0))
+        self.history['val_loss'].append(val_metrics.get('loss', 0))
+        self.history['train_r2'].append(train_metrics.get('r2', 0))
+        self.history['val_r2'].append(val_metrics.get('r2', 0))
+        self.history['train_corr'].append(train_metrics.get('corr', 0))
+        self.history['val_corr'].append(val_metrics.get('corr', 0))
+
+        # Loss components
+        if loss_components:
+            for name, value in loss_components.items():
+                if name not in self.history['loss_components']:
+                    self.history['loss_components'][name] = []
+                self.history['loss_components'][name].append(value)
+
+        # Aggregate gradient norms from current epoch
+        if self._current_epoch_gradients:
+            # Average gradient norms over batches
+            for layer_name in self._current_epoch_gradients[0].keys():
+                norms = [g.get(layer_name, 0) for g in self._current_epoch_gradients]
+                avg_norm = sum(norms) / len(norms) if norms else 0
+
+                if layer_name not in self.history['gradient_norms']:
+                    self.history['gradient_norms'][layer_name] = []
+                self.history['gradient_norms'][layer_name].append(avg_norm)
+
+        self._current_epoch_gradients = []
+
+    def record_session_metrics(
+        self,
+        session_name: str,
+        epoch: int,
+        metrics: Dict[str, float],
+    ):
+        """Record per-session validation metrics."""
+        if session_name not in self.history['per_session_metrics']:
+            self.history['per_session_metrics'][session_name] = {}
+
+        for metric_name, value in metrics.items():
+            if metric_name not in self.history['per_session_metrics'][session_name]:
+                self.history['per_session_metrics'][session_name][metric_name] = []
+            self.history['per_session_metrics'][session_name][metric_name].append(value)
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary statistics for quick inspection."""
+        return {
+            'n_epochs': len(self.history['epochs']),
+            'final_train_loss': self.history['train_loss'][-1] if self.history['train_loss'] else None,
+            'final_val_loss': self.history['val_loss'][-1] if self.history['val_loss'] else None,
+            'best_val_loss': min(self.history['val_loss']) if self.history['val_loss'] else None,
+            'best_val_r2': max(self.history['val_r2']) if self.history['val_r2'] else None,
+            'n_layers_tracked': len(self.history['gradient_norms']),
+            'n_sessions_tracked': len(self.history['per_session_metrics']),
+        }
+
+    def get_nature_methods_summary(self) -> Dict[str, Any]:
+        """Get summary with bootstrap CIs for Nature Methods reporting.
+
+        Returns:
+            Dict with statistics formatted for publication.
+        """
+        import numpy as np
+
+        def bootstrap_ci(data, n_bootstrap=1000, ci=0.95):
+            """Compute bootstrap confidence interval."""
+            if len(data) < 2:
+                return {'mean': data[0] if data else 0, 'ci_lower': 0, 'ci_upper': 0, 'std': 0}
+            data = np.array(data)
+            boot_means = np.zeros(n_bootstrap)
+            for i in range(n_bootstrap):
+                boot_sample = np.random.choice(data, size=len(data), replace=True)
+                boot_means[i] = np.mean(boot_sample)
+            alpha = 1 - ci
+            return {
+                'mean': float(np.mean(data)),
+                'std': float(np.std(data)),
+                'ci_lower': float(np.percentile(boot_means, 100 * alpha / 2)),
+                'ci_upper': float(np.percentile(boot_means, 100 * (1 - alpha / 2))),
+                'n': len(data),
+            }
+
+        summary = {
+            'n_epochs': len(self.history['epochs']),
+            'training_stability': {},
+            'final_performance': {},
+            'per_session_performance': {},
+        }
+
+        # Final validation performance with CI
+        if self.history['val_r2']:
+            final_r2 = self.history['val_r2'][-1] if isinstance(self.history['val_r2'][-1], (int, float)) else self.history['val_r2']
+            summary['final_performance']['val_r2'] = bootstrap_ci([final_r2] if isinstance(final_r2, (int, float)) else final_r2)
+
+        if self.history['val_loss']:
+            final_loss = self.history['val_loss'][-1] if isinstance(self.history['val_loss'][-1], (int, float)) else self.history['val_loss']
+            summary['final_performance']['val_loss'] = bootstrap_ci([final_loss] if isinstance(final_loss, (int, float)) else final_loss)
+
+        # Per-session performance with CIs
+        if self.history['per_session_metrics']:
+            for session_name, metrics in self.history['per_session_metrics'].items():
+                if 'r2' in metrics and metrics['r2']:
+                    summary['per_session_performance'][session_name] = bootstrap_ci(metrics['r2'])
+
+        # Training stability (variance of loss over last 10 epochs)
+        if len(self.history['val_loss']) >= 10:
+            recent_loss = self.history['val_loss'][-10:]
+            summary['training_stability']['loss_variance'] = float(np.var(recent_loss))
+            summary['training_stability']['is_stable'] = summary['training_stability']['loss_variance'] < 0.01
+
+        return summary
+
+    def generate_methods_text(self) -> str:
+        """Generate text for Nature Methods methods section.
+
+        Returns:
+            Formatted string for publication.
+        """
+        summary = self.get_nature_methods_summary()
+        n_epochs = summary['n_epochs']
+
+        text = f"Models were trained for {n_epochs} epochs"
+
+        if 'val_r2' in summary['final_performance']:
+            perf = summary['final_performance']['val_r2']
+            text += f", achieving a validation R² of {perf['mean']:.4f} ± {perf['std']:.4f} "
+            text += f"(95% CI: [{perf['ci_lower']:.4f}, {perf['ci_upper']:.4f}])"
+
+        if summary['training_stability'].get('is_stable'):
+            text += ". Training showed stable convergence."
+        else:
+            text += "."
+
+        return text
+
+    def save(self, path: Union[str, Path]):
+        """Save training dynamics to file."""
+        path = Path(path)
+        torch.save(self.history, path)
+        print(f"Training dynamics saved to {path}")
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> 'TrainingMetricsRecorder':
+        """Load training dynamics from file."""
+        recorder = cls()
+        recorder.history = torch.load(path)
+        return recorder
+
+    def to_interrogation_format(self) -> Dict[str, Any]:
+        """Convert to format expected by ModelInterrogator.
+
+        Returns:
+            List of dicts suitable for TrainingDynamicsAnalyzer
+        """
+        # Convert to list of per-epoch dicts for learning curve analysis
+        training_logs = []
+        for i, epoch in enumerate(self.history['epochs']):
+            log_entry = {
+                'epoch': epoch,
+                'train_loss': self.history['train_loss'][i] if i < len(self.history['train_loss']) else None,
+                'val_loss': self.history['val_loss'][i] if i < len(self.history['val_loss']) else None,
+                'train_r2': self.history['train_r2'][i] if i < len(self.history['train_r2']) else None,
+                'val_r2': self.history['val_r2'][i] if i < len(self.history['val_r2']) else None,
+            }
+            training_logs.append(log_entry)
+
+        return {
+            'training_logs': [{'train_loss': self.history['train_loss'],
+                              'val_loss': self.history['val_loss'],
+                              'train_r2': self.history['train_r2'],
+                              'val_r2': self.history['val_r2']}],
+            'gradient_history': self.history['gradient_norms'],
+            'weight_history': self.history['weight_norms'],
+            'loss_components': self.history['loss_components'],
+            'per_session_metrics': self.history['per_session_metrics'],
+            'architecture': self.history['architecture'],
+            'config': self.history['config'],
+        }
 
 
 # =============================================================================

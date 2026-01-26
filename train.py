@@ -94,6 +94,8 @@ from models import (
     SessionMatcher,
     # Noise augmentation for training robustness
     NoiseAugmentor,
+    # Training metrics recorder for model interrogation
+    TrainingMetricsRecorder,
 )
 from data import (
     prepare_data,
@@ -557,8 +559,9 @@ def save_checkpoint(
     reverse_model: Optional[nn.Module] = None,
     config: Optional[Dict[str, Any]] = None,
     data: Optional[Dict[str, Any]] = None,  # Add data dict for split info
+    metrics_recorder: Optional[TrainingMetricsRecorder] = None,  # Training dynamics
 ) -> None:
-    """Save checkpoint with FSDP support (includes all models)."""
+    """Save checkpoint with FSDP support (includes all models and training dynamics)."""
     if is_fsdp and isinstance(model, FSDP):
         # FSDP models need special handling - use context manager for each FSDP model
         # Ensure model is in train mode to avoid inference mode restrictions
@@ -622,6 +625,10 @@ def save_checkpoint(
                 "sample_rate": session_matcher.sample_rate,
             }
 
+        # Save training dynamics for model interrogation
+        if metrics_recorder is not None:
+            checkpoint["training_dynamics"] = metrics_recorder.to_interrogation_format()
+
         if is_primary():
             torch.save(checkpoint, path)
     else:
@@ -668,6 +675,10 @@ def save_checkpoint(
                     "use_power_spectrum": session_matcher.use_power_spectrum,
                     "sample_rate": session_matcher.sample_rate,
                 }
+
+            # Save training dynamics for model interrogation
+            if metrics_recorder is not None:
+                checkpoint["training_dynamics"] = metrics_recorder.to_interrogation_format()
 
             torch.save(checkpoint, path)
 
@@ -1242,11 +1253,13 @@ def train_epoch(
     num_epochs: int = 0,
     cond_encoder: Optional[nn.Module] = None,
     noise_augmentor: Optional[NoiseAugmentor] = None,
+    metrics_recorder: Optional[TrainingMetricsRecorder] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
     Args:
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
+        metrics_recorder: Optional recorder for tracking training dynamics
         noise_augmentor: Optional NoiseAugmentor for noise augmentation
     """
     model.train()
@@ -1411,6 +1424,12 @@ def train_epoch(
             raise ValueError(f"NaN/Inf loss detected at epoch {epoch}, batch {batch_idx}. Training aborted.")
 
         loss.backward()
+
+        # Record gradient norms for interrogation before clipping
+        if metrics_recorder is not None:
+            unwrapped_model = model.module if hasattr(model, 'module') else model
+            metrics_recorder.record_gradients(unwrapped_model, batch_idx, epoch)
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         if reverse_model is not None:
             torch.nn.utils.clip_grad_norm_(reverse_model.parameters(), GRAD_CLIP)
@@ -2086,6 +2105,18 @@ def train(
     patience_counter = 0
     history = []
 
+    # Initialize training metrics recorder for model interrogation
+    metrics_recorder = TrainingMetricsRecorder()
+
+    # Record model architecture info
+    unwrapped_model = model.module if hasattr(model, 'module') else model
+    metrics_recorder.set_architecture(unwrapped_model)
+    metrics_recorder.set_config(config)
+
+    if is_primary():
+        print("\n[Interrogation] Training metrics recorder initialized")
+        print(f"  Tracking: gradients, weights, loss components, per-session metrics")
+
     for epoch in range(1, num_epochs + 1):
         if loaders.get("train_sampler") is not None:
             loaders["train_sampler"].set_epoch(epoch)
@@ -2095,6 +2126,7 @@ def train(
             reverse_model, epoch, num_epochs,
             cond_encoder=cond_encoder,
             noise_augmentor=noise_augmentor,
+            metrics_recorder=metrics_recorder,
         )
 
         barrier()
@@ -2182,6 +2214,7 @@ def train(
                 reverse_model=reverse_model,
                 config=config,
                 data=data,  # Save split info for validation
+                metrics_recorder=metrics_recorder,  # Training dynamics for interrogation
             )
         else:
             patience_counter += 1
@@ -2221,6 +2254,32 @@ def train(
                 for k, v in sess_m.items():
                     history_entry[f"val_{sess_name}_{k}"] = v
             history.append(history_entry)
+
+            # =========================================================================
+            # Model Interrogation: Record training dynamics
+            # =========================================================================
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+
+            # Extract loss components from train_metrics
+            loss_components = {k: v for k, v in train_metrics.items() if k != 'loss'}
+
+            # Record epoch metrics for interrogation
+            metrics_recorder.record_epoch_end(
+                epoch=epoch,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                learning_rate=current_lr,
+                loss_components=loss_components if loss_components else None,
+            )
+
+            # Record weight norms
+            unwrapped = model.module if hasattr(model, 'module') else model
+            metrics_recorder.record_weights(unwrapped, epoch)
+
+            # Record per-session metrics
+            for sess_name, sess_m in per_session_metrics.items():
+                metrics_recorder.record_session_metrics(sess_name, epoch, sess_m)
 
             # =========================================================================
             # Recording: Log epoch metrics and run periodic analyses
@@ -2762,6 +2821,29 @@ def train(
         else:
             print(f"\n[SESSION EMBED] WARNING: use_session_embedding=True but model has no session_embed!\n")
 
+    # Save training dynamics to separate file for easy access
+    if is_primary():
+        dynamics_path = CHECKPOINT_DIR / "training_dynamics.pt"
+        metrics_recorder.save(dynamics_path)
+        print(f"\n[Interrogation] Training dynamics saved to {dynamics_path}")
+        print(f"  Summary: {metrics_recorder.get_summary()}")
+
+        # Generate and save Nature Methods summary
+        try:
+            nature_summary = metrics_recorder.get_nature_methods_summary()
+            nature_path = CHECKPOINT_DIR / "nature_methods_summary.json"
+            import json
+            with open(nature_path, 'w') as f:
+                json.dump(nature_summary, f, indent=2)
+            print(f"  Nature Methods summary saved to {nature_path}")
+
+            # Print methods text for paper
+            methods_text = metrics_recorder.generate_methods_text()
+            print(f"\n[Nature Methods] Methods section text:")
+            print(f"  {methods_text}")
+        except Exception as e:
+            print(f"  Warning: Could not generate Nature Methods summary: {e}")
+
     return {
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
@@ -2770,6 +2852,7 @@ def train(
         "model": model,
         "reverse_model": reverse_model,
         "n_parameters": config.get("model_n_params", 0),  # Pre-FSDP param count
+        "training_dynamics": metrics_recorder.to_interrogation_format(),  # For interrogation
     }
 
 
