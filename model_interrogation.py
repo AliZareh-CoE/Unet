@@ -955,7 +955,7 @@ class AnalysisResults:
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
             elif isinstance(obj, torch.Tensor):
-                return obj.cpu().numpy().tolist()
+                return obj.detach().cpu().numpy().tolist()
             elif isinstance(obj, dict):
                 return {k: convert(v) for k, v in obj.items()}
             elif isinstance(obj, list):
@@ -1440,9 +1440,9 @@ class InputAttributionAnalyzer:
 
             outputs = self.model(inputs)
             loss = F.mse_loss(outputs, targets, reduction='none').mean(dim=(1, 2))
-            baseline_losses.extend(loss.cpu().numpy())
-            all_inputs.append(inputs.cpu())
-            all_targets.append(targets.cpu())
+            baseline_losses.extend(loss.detach().cpu().numpy())
+            all_inputs.append(inputs.detach().cpu())
+            all_targets.append(targets.detach().cpu())
 
         all_inputs = torch.cat(all_inputs, dim=0)[:n_samples]
         all_targets = torch.cat(all_targets, dim=0)[:n_samples]
@@ -1464,7 +1464,7 @@ class InputAttributionAnalyzer:
 
                 outputs = self.model(batch_in)
                 loss = F.mse_loss(outputs, batch_tgt, reduction='none').mean(dim=(1, 2))
-                occluded_losses.extend(loss.cpu().numpy())
+                occluded_losses.extend(loss.detach().cpu().numpy())
 
             channel_losses[ch] = np.mean(occluded_losses)
             channel_importance[ch] = channel_losses[ch] - baseline_loss
@@ -1572,7 +1572,7 @@ class InputAttributionAnalyzer:
             saliency = (inputs * inputs.grad).abs()
 
             # Average over batch and channels
-            temporal_saliency = saliency.mean(dim=(0, 1)).cpu().numpy()  # [T]
+            temporal_saliency = saliency.mean(dim=(0, 1)).detach().cpu().numpy()  # [T]
 
             if saliency_sum is None:
                 saliency_sum = temporal_saliency
@@ -1639,7 +1639,7 @@ class InputAttributionAnalyzer:
 
             # Measure impact at each output timepoint
             impact = (perturbed_outputs - baseline_outputs).abs().mean(dim=(0, 1))
-            impact_matrix[i] = impact.cpu().numpy()
+            impact_matrix[i] = impact.detach().cpu().numpy()
 
         # Compute effective receptive field
         # For each output timepoint, find which input timepoints affect it
@@ -2386,7 +2386,7 @@ class LatentSpaceAnalyzer:
                 if activation.dim() == 3:  # [B, C, T]
                     activation = activation.mean(dim=-1)  # [B, C]
 
-                representations.append(activation.cpu().numpy())
+                representations.append(activation.detach().cpu().numpy())
                 metadata['batch_idx'].extend([batch_idx] * len(inputs))
                 metadata['sample_idx'].extend(
                     list(range(batch_idx * len(inputs),
@@ -2607,7 +2607,7 @@ class LatentSpaceAnalyzer:
                     # Global average pool
                     if act.dim() == 3:
                         act = act.mean(dim=-1)
-                    layer_representations[name].append(act.cpu().numpy())
+                    layer_representations[name].append(act.detach().cpu().numpy())
 
         self._remove_hooks()
 
@@ -2789,7 +2789,7 @@ class ConditioningAnalyzer:
                 # Flatten if needed
                 if act.dim() > 2:
                     act = act.view(act.shape[0], -1)
-                embeddings[name].append(act.cpu().numpy())
+                embeddings[name].append(act.detach().cpu().numpy())
 
         self._remove_hooks()
 
@@ -2937,7 +2937,7 @@ class ConditioningAnalyzer:
                     gating_values[name] = []
 
                 # For gating, we want to see the distribution
-                gating_values[name].append(act.cpu().numpy().flatten())
+                gating_values[name].append(act.detach().cpu().numpy().flatten())
 
         self._remove_hooks()
 
@@ -3468,9 +3468,9 @@ class GeneralizationAnalyzer:
 
             # Per-sample metrics
             for i in range(len(inputs)):
-                inp = inputs[i].cpu().numpy()
-                out = outputs[i].cpu().numpy()
-                tgt = targets[i].cpu().numpy()
+                inp = inputs[i].detach().cpu().numpy()
+                out = outputs[i].detach().cpu().numpy()
+                tgt = targets[i].detach().cpu().numpy()
 
                 # Input signal quality metrics
                 input_var = float(np.var(inp))
@@ -3514,8 +3514,8 @@ class GeneralizationAnalyzer:
         return float(1 - ss_res / (ss_tot + 1e-10))
 
     def _compute_correlation(self, pred: torch.Tensor, target: torch.Tensor) -> float:
-        pred = pred.flatten().cpu().numpy()
-        target = target.flatten().cpu().numpy()
+        pred = pred.flatten().detach().cpu().numpy()
+        target = target.flatten().detach().cpu().numpy()
         return float(np.corrcoef(pred, target)[0, 1])
 
     def plot_per_session(
@@ -3616,12 +3616,12 @@ class ErrorAnalyzer:
             targets = batch[1].to(self.device)
             outputs = self.model(inputs)
 
-            errors = (outputs - targets).cpu().numpy()
+            errors = (outputs - targets).detach().cpu().numpy()
             all_errors.append(errors.flatten())
 
             for i in range(len(inputs)):
-                mse = float(np.mean((outputs[i].cpu().numpy() - targets[i].cpu().numpy()) ** 2))
-                mae = float(np.mean(np.abs(outputs[i].cpu().numpy() - targets[i].cpu().numpy())))
+                mse = float(np.mean((outputs[i].detach().cpu().numpy() - targets[i].detach().cpu().numpy()) ** 2))
+                mae = float(np.mean(np.abs(outputs[i].detach().cpu().numpy() - targets[i].detach().cpu().numpy())))
                 per_sample_mse.append(mse)
                 per_sample_mae.append(mae)
 
@@ -3692,9 +3692,9 @@ class ErrorAnalyzer:
             outputs = self.model(inputs)
 
             for i in range(len(inputs)):
-                inp = inputs[i].cpu().numpy()
-                tgt = targets[i].cpu().numpy()
-                out = outputs[i].cpu().numpy()
+                inp = inputs[i].detach().cpu().numpy()
+                tgt = targets[i].detach().cpu().numpy()
+                out = outputs[i].detach().cpu().numpy()
 
                 characteristics['input_amplitude'].append(float(np.mean(np.abs(inp))))
                 characteristics['input_variance'].append(float(np.var(inp)))
@@ -3749,9 +3749,9 @@ class ErrorAnalyzer:
                 mse = float(F.mse_loss(outputs[i], targets[i]).item())
                 all_samples.append({
                     'batch_idx': batch_idx, 'sample_idx': i, 'mse': mse,
-                    'input': inputs[i].cpu().numpy(),
-                    'target': targets[i].cpu().numpy(),
-                    'prediction': outputs[i].cpu().numpy(),
+                    'input': inputs[i].detach().cpu().numpy(),
+                    'target': targets[i].detach().cpu().numpy(),
+                    'prediction': outputs[i].detach().cpu().numpy(),
                 })
 
         all_samples.sort(key=lambda x: x['mse'], reverse=True)
@@ -3792,7 +3792,7 @@ class ErrorAnalyzer:
             inputs = batch[0].to(self.device)
             targets = batch[1].to(self.device)
             outputs = self.model(inputs)
-            residuals = (targets - outputs).cpu().numpy()
+            residuals = (targets - outputs).detach().cpu().numpy()
             all_residuals.append(residuals)
 
         all_residuals = np.concatenate(all_residuals, axis=0)
@@ -4133,7 +4133,7 @@ class BaselineComparisonAnalyzer:
                 outputs = self.model(inputs, cond)
             else:
                 outputs = self.model(inputs)
-            dl_preds.append(outputs.cpu().numpy())
+            dl_preds.append(outputs.detach().cpu().numpy())
 
         dl_pred = np.concatenate(dl_preds, axis=0)
         dl_r2s = compute_per_sample_r2(dl_pred, test_Y)
@@ -4415,9 +4415,9 @@ class ModelInterrogator:
             inp = batch[0].to(self.config.device)
             tgt = batch[1].to(self.config.device)
             out = self.model(inp)
-            inputs.append(inp.cpu().numpy())
-            preds.append(out.cpu().numpy())
-            targets.append(tgt.cpu().numpy())
+            inputs.append(inp.detach().cpu().numpy())
+            preds.append(out.detach().cpu().numpy())
+            targets.append(tgt.detach().cpu().numpy())
         return np.concatenate(preds), np.concatenate(targets), np.concatenate(inputs)
 
     def generate_summary_report(self) -> str:
