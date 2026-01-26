@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union, Callable
 from dataclasses import dataclass, field
 from collections import defaultdict
+from datetime import datetime
 import argparse
 
 import numpy as np
@@ -41,34 +42,85 @@ import seaborn as sns
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# Publication-quality plot settings
-plt.rcParams.update({
-    'font.size': 10,
+# =============================================================================
+# Publication Figure Standards (Nature/Science compliant)
+# =============================================================================
+
+# Figure dimensions (Nature family)
+FIGURE_DIMS = {
+    'single_col': 88 / 25.4,    # 88 mm -> inches
+    'one_half_col': 120 / 25.4,  # 120 mm -> inches
+    'double_col': 180 / 25.4,    # 180 mm -> inches
+    'max_height': 247 / 25.4,    # 247 mm -> inches
+}
+
+# Colorblind-safe palette (from documentation)
+COLORBLIND_PALETTE = {
+    'blue': '#0077BB',
+    'orange': '#EE7733',
+    'cyan': '#33BBEE',
+    'magenta': '#EE3377',
+    'red': '#CC3311',
+    'green': '#009988',
+    'yellow': '#CCBB44',
+    'grey': '#BBBBBB',
+}
+
+# Color schemes for publication (colorblind-safe)
+COLORS = {
+    'primary': COLORBLIND_PALETTE['blue'],
+    'secondary': COLORBLIND_PALETTE['red'],
+    'tertiary': COLORBLIND_PALETTE['green'],
+    'quaternary': COLORBLIND_PALETTE['magenta'],
+    'train': COLORBLIND_PALETTE['blue'],
+    'val': COLORBLIND_PALETTE['orange'],
+    'test': COLORBLIND_PALETTE['green'],
+    'pred': COLORBLIND_PALETTE['blue'],
+    'target': COLORBLIND_PALETTE['red'],
+    'baseline': COLORBLIND_PALETTE['grey'],
+}
+
+# Publication-quality matplotlib settings
+PUBLICATION_RC = {
+    # Fonts (sans-serif preferred)
     'font.family': 'sans-serif',
-    'axes.labelsize': 11,
-    'axes.titlesize': 12,
-    'xtick.labelsize': 9,
-    'ytick.labelsize': 9,
-    'legend.fontsize': 9,
-    'figure.dpi': 150,
-    'savefig.dpi': 300,
-    'savefig.bbox': 'tight',
+    'font.sans-serif': ['Helvetica', 'Arial', 'DejaVu Sans'],
+    'font.size': 7,
+    'axes.labelsize': 7,
+    'axes.titlesize': 8,
+    'xtick.labelsize': 6,
+    'ytick.labelsize': 6,
+    'legend.fontsize': 6,
+
+    # Lines
+    'lines.linewidth': 0.8,
+    'axes.linewidth': 0.5,
+    'xtick.major.width': 0.5,
+    'ytick.major.width': 0.5,
+    'xtick.major.size': 2.5,
+    'ytick.major.size': 2.5,
+
+    # Spines (remove top and right)
     'axes.spines.top': False,
     'axes.spines.right': False,
-})
 
-# Color schemes for publication
-COLORS = {
-    'primary': '#2563eb',      # Blue
-    'secondary': '#dc2626',    # Red
-    'tertiary': '#16a34a',     # Green
-    'quaternary': '#9333ea',   # Purple
-    'train': '#2563eb',
-    'val': '#dc2626',
-    'test': '#16a34a',
-    'pred': '#2563eb',
-    'target': '#dc2626',
+    # Figure
+    'figure.dpi': 150,
+    'savefig.dpi': 300,
+    'savefig.format': 'pdf',
+    'savefig.bbox': 'tight',
+    'savefig.pad_inches': 0.05,
+
+    # Legend
+    'legend.frameon': False,
+    'legend.borderpad': 0.2,
+
+    # Grid (off by default)
+    'axes.grid': False,
 }
+
+# Apply publication settings
+plt.rcParams.update(PUBLICATION_RC)
 
 # Frequency bands for neural signals
 FREQ_BANDS = {
@@ -79,6 +131,155 @@ FREQ_BANDS = {
     'low_gamma': (30, 50),
     'high_gamma': (50, 100),
 }
+
+# Neural frequency band descriptions
+FREQ_BAND_DESCRIPTIONS = {
+    'delta': 'Deep sleep, slow oscillations',
+    'theta': 'Memory, navigation',
+    'alpha': 'Attention, inhibition',
+    'beta': 'Motor, cognitive engagement',
+    'low_gamma': 'Local processing, binding',
+    'high_gamma': 'High-frequency activity',
+}
+
+
+# =============================================================================
+# Publication Helper Functions
+# =============================================================================
+
+def create_figure(
+    n_panels: int = 1,
+    layout: str = 'horizontal',
+    width: str = 'single_col',
+    height_ratio: float = 0.8,
+) -> Tuple[plt.Figure, Any]:
+    """Create a publication-ready figure with proper dimensions.
+
+    Args:
+        n_panels: Number of panels
+        layout: 'horizontal', 'vertical', or 'grid'
+        width: 'single_col', 'one_half_col', or 'double_col'
+        height_ratio: Height as ratio of width
+
+    Returns:
+        Figure and axes
+    """
+    fig_width = FIGURE_DIMS.get(width, FIGURE_DIMS['single_col'])
+
+    if layout == 'horizontal':
+        fig_height = min(fig_width * height_ratio, FIGURE_DIMS['max_height'])
+        fig, axes = plt.subplots(1, n_panels, figsize=(fig_width, fig_height))
+    elif layout == 'vertical':
+        fig_height = min(fig_width * height_ratio * n_panels, FIGURE_DIMS['max_height'])
+        fig, axes = plt.subplots(n_panels, 1, figsize=(fig_width, fig_height))
+    else:  # grid
+        n_cols = int(np.ceil(np.sqrt(n_panels)))
+        n_rows = int(np.ceil(n_panels / n_cols))
+        fig_height = min(fig_width * height_ratio * n_rows / n_cols, FIGURE_DIMS['max_height'])
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height))
+
+    return fig, axes
+
+
+def add_panel_labels(
+    axes: Union[plt.Axes, List[plt.Axes]],
+    labels: Optional[List[str]] = None,
+    fontsize: int = 10,
+    fontweight: str = 'bold',
+    offset: Tuple[float, float] = (-0.1, 1.05),
+):
+    """Add panel labels (a, b, c, ...) to figure axes.
+
+    Args:
+        axes: Single axis or list of axes
+        labels: Custom labels or None for auto (a, b, c, ...)
+        fontsize: Label font size
+        fontweight: Font weight
+        offset: (x, y) offset in axes coordinates
+    """
+    if not isinstance(axes, (list, np.ndarray)):
+        axes = [axes]
+
+    axes = np.array(axes).flatten()
+
+    if labels is None:
+        labels = [chr(ord('a') + i) for i in range(len(axes))]
+
+    for ax, label in zip(axes, labels):
+        ax.text(
+            offset[0], offset[1], label,
+            transform=ax.transAxes,
+            fontsize=fontsize,
+            fontweight=fontweight,
+            va='top', ha='right'
+        )
+
+
+def add_significance_markers(
+    ax: plt.Axes,
+    x1: float, x2: float, y: float,
+    p_value: float,
+    height: float = 0.02,
+):
+    """Add significance bracket and stars to plot.
+
+    Args:
+        ax: Matplotlib axes
+        x1, x2: X positions for bracket
+        y: Y position for bracket
+        p_value: P-value for determining stars
+        height: Height of bracket
+    """
+    # Determine significance marker
+    if p_value < 0.001:
+        marker = '***'
+    elif p_value < 0.01:
+        marker = '**'
+    elif p_value < 0.05:
+        marker = '*'
+    else:
+        marker = 'n.s.'
+
+    # Draw bracket
+    ax.plot([x1, x1, x2, x2], [y, y + height, y + height, y], 'k-', lw=0.8)
+    ax.text((x1 + x2) / 2, y + height, marker, ha='center', va='bottom', fontsize=7)
+
+
+def compute_effect_size(group1: np.ndarray, group2: np.ndarray) -> Dict[str, float]:
+    """Compute effect size metrics for two groups.
+
+    Returns:
+        Dict with Cohen's d, improvement %, and 95% CI
+    """
+    mean1, mean2 = np.mean(group1), np.mean(group2)
+    std1, std2 = np.std(group1, ddof=1), np.std(group2, ddof=1)
+    n1, n2 = len(group1), len(group2)
+
+    # Pooled standard deviation
+    pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
+
+    # Cohen's d
+    cohens_d = (mean2 - mean1) / (pooled_std + 1e-10)
+
+    # Improvement percentage
+    improvement_pct = (mean2 - mean1) / (np.abs(mean1) + 1e-10) * 100
+
+    # 95% CI for difference (using t-distribution)
+    diff = mean2 - mean1
+    se = np.sqrt(std1**2 / n1 + std2**2 / n2)
+    from scipy.stats import t
+    df = n1 + n2 - 2
+    t_crit = t.ppf(0.975, df)
+    ci_low = diff - t_crit * se
+    ci_high = diff + t_crit * se
+
+    return {
+        'cohens_d': cohens_d,
+        'improvement_pct': improvement_pct,
+        'ci_95_low': ci_low,
+        'ci_95_high': ci_high,
+        'mean_diff': diff,
+    }
 
 
 @dataclass
@@ -3396,21 +3597,278 @@ class ModelInterrogator:
         return np.concatenate(preds), np.concatenate(targets), np.concatenate(inputs)
 
     def generate_summary_report(self) -> str:
-        """Generate text summary."""
-        lines = ["=" * 60, "MODEL INTERROGATION SUMMARY", "=" * 60, ""]
+        """Generate comprehensive publication-ready summary report.
+
+        Follows Nature/Science reporting standards with:
+        - Training dynamics summary
+        - Spectral fidelity analysis
+        - Error analysis with distributions
+        - Generalization assessment
+        - Baseline comparisons with effect sizes
+        """
+        lines = []
+        lines.append("=" * 70)
+        lines.append("MODEL INTERROGATION SUMMARY REPORT")
+        lines.append("=" * 70)
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # TRAINING DYNAMICS
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("1. TRAINING DYNAMICS")
+        lines.append("-" * 70)
+
+        if self.results.training_dynamics:
+            td = self.results.training_dynamics
+            if 'learning_curves' in td:
+                lc = td['learning_curves']
+                conv_epochs = lc.get('convergence_epoch', [])
+                best_losses = lc.get('best_val_loss', [])
+                overfitting = lc.get('overfitting_gap', [])
+
+                lines.append(f"  Epochs to convergence: {np.mean(conv_epochs):.1f} ± {np.std(conv_epochs):.1f}")
+                lines.append(f"  Best validation loss: {np.mean(best_losses):.4f} ± {np.std(best_losses):.4f}")
+                lines.append(f"  Overfitting gap: {np.mean(overfitting):.4f} ± {np.std(overfitting):.4f}")
+                lines.append(f"  Training stability: {'STABLE' if np.std(best_losses) < 0.1 else 'VARIABLE'}")
+        else:
+            lines.append("  [Training dynamics not recorded]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # SPECTRAL ANALYSIS
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("2. SPECTRAL FIDELITY")
+        lines.append("-" * 70)
+
+        if self.results.spectral_analysis:
+            sa = self.results.spectral_analysis
+
+            if 'bandwise' in sa:
+                bw = sa['bandwise']
+                lines.append(f"  Mean band-wise R²: {bw.get('mean_r2', 0):.4f}")
+                lines.append(f"  Best preserved band: {bw.get('best_band', 'N/A')}")
+                lines.append(f"  Worst preserved band: {bw.get('worst_band', 'N/A')}")
+                lines.append("")
+                lines.append("  Band-wise Performance:")
+                if 'band_results' in bw:
+                    for band, metrics in bw['band_results'].items():
+                        r2 = metrics.get('r2', 0)
+                        desc = FREQ_BAND_DESCRIPTIONS.get(band, '')
+                        lines.append(f"    {band:12s}: R² = {r2:.4f}  ({desc})")
+
+            if 'psd' in sa:
+                psd = sa['psd']
+                lines.append(f"\n  Mean PSD error: {psd.get('mean_spectral_error_db', 0):.2f} dB")
+
+            if 'plv' in sa:
+                plv = sa['plv']
+                lines.append(f"  Mean Phase Locking Value: {plv.get('mean_plv', 0):.4f}")
+        else:
+            lines.append("  [Spectral analysis not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # INPUT ATTRIBUTION
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("3. INPUT ATTRIBUTION")
+        lines.append("-" * 70)
+
+        if self.results.input_attribution:
+            ia = self.results.input_attribution
+
+            if 'channel_occlusion' in ia:
+                co = ia['channel_occlusion']
+                ranked = co.get('ranked_channels', [])[:5]
+                lines.append(f"  Top 5 important channels (occlusion): {ranked}")
+
+            if 'temporal_saliency' in ia:
+                ts = ia['temporal_saliency']
+                peak = ts.get('peak_timepoint', 0)
+                lines.append(f"  Peak temporal saliency: {peak / self.config.sampling_rate:.3f} s")
+
+            if 'input_ablation' in ia:
+                ab = ia['input_ablation']
+                critical = ab.get('critical_segment', 'N/A')
+                lines.append(f"  Critical input segment: {critical}")
+        else:
+            lines.append("  [Input attribution not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # LATENT SPACE
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("4. LATENT SPACE ANALYSIS")
+        lines.append("-" * 70)
+
+        if self.results.latent_space:
+            ls = self.results.latent_space
+
+            if 'bottleneck' in ls:
+                bn = ls['bottleneck']
+                lines.append(f"  Bottleneck dimension: {bn.get('feature_dim', 'N/A')}")
+                lines.append(f"  Samples extracted: {bn.get('n_samples', 0)}")
+
+            if 'dimensionality' in ls:
+                dim = ls['dimensionality']
+                lines.append(f"  Intrinsic dimensionality: {dim.get('intrinsic_dimensionality', 0):.1f}")
+                lines.append(f"  Components for 90% variance: {dim.get('n_components_for_threshold', 'N/A')}")
+        else:
+            lines.append("  [Latent space analysis not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # LOSS LANDSCAPE
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("5. LOSS LANDSCAPE")
+        lines.append("-" * 70)
+
+        if self.results.loss_landscape:
+            ll = self.results.loss_landscape
+
+            if 'sharpness' in ll:
+                sh = ll['sharpness']
+                is_flat = sh.get('is_flat', False)
+                sharpness = sh.get('sharpness', 0)
+                lines.append(f"  Sharpness metric: {sharpness:.4f}")
+                lines.append(f"  Minimum type: {'FLAT (good generalization)' if is_flat else 'SHARP (risk of overfitting)'}")
+
+            if 'surface' in ll:
+                surf = ll['surface']
+                lines.append(f"  Loss at center: {surf.get('center_loss', 0):.4f}")
+                lines.append(f"  Loss range: [{surf.get('min_loss', 0):.4f}, {surf.get('max_loss', 0):.4f}]")
+        else:
+            lines.append("  [Loss landscape not computed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # ERROR ANALYSIS
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("6. ERROR ANALYSIS")
+        lines.append("-" * 70)
+
+        if self.results.error_analysis:
+            ea = self.results.error_analysis
+
+            if 'distribution' in ea:
+                ed = ea['distribution']
+                lines.append(f"  Error mean: {ed.get('error_mean', 0):.6f}")
+                lines.append(f"  Error std: {ed.get('error_std', 0):.6f}")
+                lines.append(f"  Error skew: {ed.get('error_skew', 0):.3f}")
+                lines.append(f"  Error kurtosis: {ed.get('error_kurtosis', 0):.3f}")
+                lines.append(f"  Distribution: {'NORMAL' if ed.get('is_normal', False) else 'NON-NORMAL'}")
+                lines.append(f"  Heavy tails: {'YES' if ed.get('has_heavy_tails', False) else 'NO'}")
+
+            if 'residuals' in ea:
+                res = ea['residuals']
+                lines.append(f"  Residual structure: {'PRESENT (model missing patterns)' if res.get('has_structure', False) else 'NONE (random noise)'}")
+
+            if 'worst_cases' in ea:
+                wc = ea['worst_cases']
+                lines.append(f"  Worst case MSE: {wc.get('worst_mses', [0])[0]:.4f}")
+                if wc.get('commonalities'):
+                    lines.append(f"  Failure patterns: {', '.join(wc['commonalities'])}")
+        else:
+            lines.append("  [Error analysis not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # GENERALIZATION
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("7. GENERALIZATION")
+        lines.append("-" * 70)
+
+        if self.results.generalization:
+            gen = self.results.generalization
+
+            if 'temporal' in gen:
+                temp = gen['temporal']
+                drift = temp.get('drift', 0)
+                lines.append(f"  Temporal drift: {drift:.4f} ({'SIGNIFICANT' if temp.get('has_drift', False) else 'NONE'})")
+
+            if 'signal_quality' in gen:
+                sq = gen['signal_quality']
+                corr = sq.get('variance_r2_correlation', 0)
+                lines.append(f"  Performance vs input variance correlation: {corr:.3f}")
+                lines.append(f"  Fails on noisy inputs: {'YES' if sq.get('fails_on_noisy', False) else 'NO'}")
+        else:
+            lines.append("  [Generalization analysis not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # BASELINE COMPARISON
+        # ---------------------------------------------------------------------
+        lines.append("-" * 70)
+        lines.append("8. BASELINE COMPARISON")
+        lines.append("-" * 70)
+
+        if self.results.baselines:
+            bl = self.results.baselines
+
+            if 'linear' in bl:
+                lin = bl['linear']
+                lines.append("  Method Comparison:")
+                if 'baseline_results' in lin:
+                    for method, metrics in lin['baseline_results'].items():
+                        r2 = metrics.get('r2', 0)
+                        mse = metrics.get('mse', 0)
+                        lines.append(f"    {method:15s}: R² = {r2:.4f}, MSE = {mse:.6f}")
+
+                if 'improvements' in lin:
+                    lines.append("\n  Improvements over baselines:")
+                    for method, imp in lin['improvements'].items():
+                        r2_imp = imp.get('r2_improvement', 0)
+                        lines.append(f"    vs {method}: ΔR² = {r2_imp:+.4f}")
+
+                lines.append(f"\n  Deep learning necessary: {'YES' if lin.get('deep_learning_needed', False) else 'NO (linear sufficient)'}")
+        else:
+            lines.append("  [Baseline comparison not performed]")
+        lines.append("")
+
+        # ---------------------------------------------------------------------
+        # SUMMARY & RECOMMENDATIONS
+        # ---------------------------------------------------------------------
+        lines.append("=" * 70)
+        lines.append("SUMMARY & RECOMMENDATIONS")
+        lines.append("=" * 70)
+
+        recommendations = []
+
+        # Check for issues and add recommendations
+        if self.results.error_analysis and 'residuals' in self.results.error_analysis:
+            if self.results.error_analysis['residuals'].get('has_structure', False):
+                recommendations.append("• Residuals show structure - model may benefit from architectural changes")
+
+        if self.results.loss_landscape and 'sharpness' in self.results.loss_landscape:
+            if not self.results.loss_landscape['sharpness'].get('is_flat', True):
+                recommendations.append("• Sharp minimum detected - consider regularization or SAM optimizer")
 
         if self.results.spectral_analysis and 'bandwise' in self.results.spectral_analysis:
             bw = self.results.spectral_analysis['bandwise']
-            lines.append(f"SPECTRAL: Mean band R2 = {bw.get('mean_r2', 0):.4f}")
-            lines.append(f"  Best band: {bw.get('best_band')}, Worst: {bw.get('worst_band')}")
-
-        if self.results.error_analysis and 'distribution' in self.results.error_analysis:
-            ed = self.results.error_analysis['distribution']
-            lines.append(f"ERRORS: Mean={ed.get('error_mean', 0):.6f}, Std={ed.get('error_std', 0):.6f}")
+            if bw.get('worst_band') == 'high_gamma':
+                recommendations.append("• High-gamma band underperforming - consider increasing model capacity")
 
         if self.results.baselines and 'linear' in self.results.baselines:
-            bl = self.results.baselines['linear']
-            lines.append(f"BASELINES: DL needed = {bl.get('deep_learning_needed')}")
+            if not self.results.baselines['linear'].get('deep_learning_needed', True):
+                recommendations.append("• Linear baseline performs similarly - deep learning may be unnecessary")
+
+        if recommendations:
+            for rec in recommendations:
+                lines.append(rec)
+        else:
+            lines.append("• No significant issues detected")
+
+        lines.append("")
+        lines.append("=" * 70)
+        lines.append("END OF REPORT")
+        lines.append("=" * 70)
 
         return "\n".join(lines)
 
