@@ -3052,39 +3052,73 @@ def main():
 
     # Handle LOSO cross-validation mode
     if args.loso:
+        # LOSO mode manages its own distributed training - it spawns torchrun
+        # subprocesses for each fold. If invoked via torchrun (e.g., user ran
+        # "torchrun train.py --loso"), only rank 0 should proceed.
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if world_size > 1:
+            if rank != 0:
+                # Non-rank-0 processes exit immediately to avoid conflicts
+                sys.exit(0)
+            # Rank 0 continues but warns user
+            print("=" * 70)
+            print(f"WARNING: LOSO mode invoked via torchrun (world_size={world_size})")
+            print("         LOSO manages its own distributed training per fold.")
+            print("         Recommended: run 'python train.py --loso --fsdp' instead")
+            print("         Proceeding with rank 0 only...")
+            print("=" * 70)
+            print()
+
         from LOSO.runner import run_loso
         from LOSO.config import LOSOConfig
 
+        # Optimized LOSO defaults from cascading ablation study
+        # CLI arguments override these defaults when explicitly provided
         config = LOSOConfig(
             dataset=args.dataset,
             output_dir=Path(args.loso_output_dir),
-            epochs=args.epochs or 60,
-            batch_size=args.batch_size or 32,
+            # Training (optimized defaults)
+            epochs=args.epochs or 80,  # Optimized: 80 epochs
+            batch_size=args.batch_size or 64,  # Optimized: batch 64
             learning_rate=args.lr or 1e-3,
             seed=args.seed or 42,
+            # Architecture (optimized from ablation study)
             arch=args.arch,
-            base_channels=args.base_channels or 128,
+            base_channels=args.base_channels or 256,  # Optimized: 256 (was 128)
             n_downsample=args.n_downsample or 2,
-            attention_type=args.attention_type or "cross_freq_v2",
+            attention_type=args.attention_type or "none",  # Optimized: no attention
             cond_mode=args.cond_mode or "cross_attn_gated",
             conv_type=args.conv_type or "modern",
             activation=args.activation or "gelu",
             skip_type=args.skip_type or "add",
             n_heads=args.n_heads or 4,
             conditioning=args.conditioning or "spectro_temporal",
+            # Optimizer
             optimizer=args.optimizer or "adamw",
             lr_schedule=args.lr_schedule or "cosine_warmup",
             weight_decay=args.weight_decay or 0.0,
             dropout=args.dropout or 0.0,
+            # Session adaptation (optimized LOSO defaults)
             use_session_stats=args.use_session_stats,
             session_use_spectral=args.session_use_spectral,
-            use_adaptive_scaling=args.use_adaptive_scaling,
-            use_bidirectional=not args.no_bidirectional,
+            use_adaptive_scaling=True,  # Optimized: always True for LOSO
+            use_bidirectional=False,  # Optimized: always False for LOSO
+            # FSDP
             use_fsdp=args.fsdp,
             fsdp_strategy=args.fsdp_strategy,
+            # Execution
             resume=not args.loso_no_resume,
             verbose=args.loso_verbose,
             generate_plots=args.generate_plots if args.generate_plots is not None else False,
+            # Noise augmentation (enabled by default for LOSO)
+            use_noise_augmentation=args.use_noise_augmentation if args.use_noise_augmentation else True,
+            noise_gaussian_std=args.noise_gaussian_std,
+            noise_pink=args.noise_pink if args.noise_pink else True,
+            noise_pink_std=args.noise_pink_std,
+            noise_channel_dropout=args.noise_channel_dropout if args.noise_channel_dropout > 0 else 0.05,
+            noise_temporal_dropout=args.noise_temporal_dropout if args.noise_temporal_dropout > 0 else 0.02,
+            noise_prob=args.noise_prob,
         )
 
         print("=" * 60)
@@ -3268,7 +3302,6 @@ def main():
         # When running multi-GPU, reduce workers per process to avoid shared memory exhaustion
         num_workers = config["num_workers"]
         if num_workers is None:
-            import os
             world_size = get_world_size()
             cpu_count = os.cpu_count() or 8
             # With 8 GPUs, use 2 workers per GPU; with 1 GPU, use up to 8
@@ -3673,10 +3706,19 @@ def main():
         # Show split type
         if "split_info" in data:
             split_info = data["split_info"]
-            print(f"Split type: SESSION HOLDOUT")
-            print(f"Test sessions: {split_info['test_sessions']} ({split_info['n_test_trials']} trials)")
-            print(f"Val sessions: {split_info['val_sessions']} ({split_info['n_val_trials']} trials)")
-            print(f"Train sessions: {split_info['train_sessions']} ({split_info['n_train_trials']} trials)")
+            mode = split_info.get("mode", "session_holdout")
+            if mode == "hybrid_test_sessions":
+                # Hybrid mode: session-wise test holdout, trial-wise train/val
+                print(f"Split type: HYBRID (session test holdout + trial-wise train/val)")
+                print(f"Test sessions: {split_info['test_sessions']} ({split_info['n_test_trials']} trials)")
+                print(f"Train/Val sessions: {split_info['train_val_sessions']}")
+                print(f"  Train: {split_info['n_train_trials']} trials, Val: {split_info['n_val_trials']} trials (70/30 random)")
+            else:
+                # Standard session-based split
+                print(f"Split type: SESSION HOLDOUT")
+                print(f"Test sessions: {split_info.get('test_sessions', [])} ({split_info.get('n_test_trials', 0)} trials)")
+                print(f"Val sessions: {split_info.get('val_sessions', [])} ({split_info.get('n_val_trials', 0)} trials)")
+                print(f"Train sessions: {split_info.get('train_sessions', [])} ({split_info.get('n_train_trials', 0)} trials)")
         else:
             print(f"Split type: Random stratified")
 
@@ -3757,6 +3799,12 @@ def main():
                         if session:
                             per_session_loss[session] = value
 
+            # Get actual test metrics (not the multi-session average)
+            test_metrics = results.get("test_metrics", {})
+            actual_test_r2 = test_metrics.get("r2") if test_metrics else results.get("test_avg_r2")
+            actual_test_corr = test_metrics.get("corr") if test_metrics else results.get("test_avg_corr")
+            actual_test_loss = test_metrics.get("loss") if test_metrics else results.get("test_avg_delta")
+
             output_results = {
                 "architecture": args.arch,
                 "fold": args.fold if args.fold is not None else 0,
@@ -3774,9 +3822,10 @@ def main():
                 "per_session_loss": per_session_loss,
                 # Per-session TEST results (if available)
                 "per_session_test_results": results.get("per_session_test_results", []),
-                "test_avg_r2": results.get("test_avg_r2"),
-                "test_avg_corr": results.get("test_avg_corr"),
-                "test_avg_delta": results.get("test_avg_delta"),
+                # CRITICAL: Use actual test metrics from test_metrics dict
+                "test_avg_r2": actual_test_r2,
+                "test_avg_corr": actual_test_corr,
+                "test_avg_delta": actual_test_loss,
                 "total_time": results.get("total_time", 0.0),
                 "epochs_trained": len(history),
                 "n_parameters": n_params,
