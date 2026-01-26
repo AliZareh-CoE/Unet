@@ -3799,6 +3799,12 @@ def main():
                         if session:
                             per_session_loss[session] = value
 
+            # Get actual test metrics (not the multi-session average)
+            test_metrics = results.get("test_metrics", {})
+            actual_test_r2 = test_metrics.get("r2") if test_metrics else results.get("test_avg_r2")
+            actual_test_corr = test_metrics.get("corr") if test_metrics else results.get("test_avg_corr")
+            actual_test_loss = test_metrics.get("loss") if test_metrics else results.get("test_avg_delta")
+
             output_results = {
                 "architecture": args.arch,
                 "fold": args.fold if args.fold is not None else 0,
@@ -3816,9 +3822,10 @@ def main():
                 "per_session_loss": per_session_loss,
                 # Per-session TEST results (if available)
                 "per_session_test_results": results.get("per_session_test_results", []),
-                "test_avg_r2": results.get("test_avg_r2"),
-                "test_avg_corr": results.get("test_avg_corr"),
-                "test_avg_delta": results.get("test_avg_delta"),
+                # CRITICAL: Use actual test metrics from test_metrics dict
+                "test_avg_r2": actual_test_r2,
+                "test_avg_corr": actual_test_corr,
+                "test_avg_delta": actual_test_loss,
                 "total_time": results.get("total_time", 0.0),
                 "epochs_trained": len(history),
                 "n_parameters": n_params,
