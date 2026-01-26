@@ -2735,6 +2735,33 @@ class CondUNet1D(nn.Module):
     # Model Interrogation Support Methods
     # =========================================================================
 
+    def _get_first_conv_weight(self, module) -> Optional[torch.Tensor]:
+        """Helper to get the first Conv weight from a module (handles Sequential)."""
+        if module is None:
+            return None
+        # Direct weight
+        if hasattr(module, 'weight') and module.weight is not None:
+            return module.weight
+        # Check common attribute names
+        for attr in ['conv', 'conv1', 'conv_in']:
+            if hasattr(module, attr):
+                submod = getattr(module, attr)
+                weight = self._get_first_conv_weight(submod)
+                if weight is not None:
+                    return weight
+        # If Sequential or ModuleList, get first conv
+        if isinstance(module, (nn.Sequential, nn.ModuleList)):
+            for child in module:
+                weight = self._get_first_conv_weight(child)
+                if weight is not None:
+                    return weight
+        # Search all children
+        for child in module.children():
+            if hasattr(child, 'weight') and child.weight is not None:
+                if isinstance(child, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+                    return child.weight
+        return None
+
     def get_gradient_norms(self) -> Dict[str, float]:
         """Get gradient norms per layer after backward pass.
 
@@ -2746,33 +2773,32 @@ class CondUNet1D(nn.Module):
         grad_norms = {}
 
         # Input conv
-        if hasattr(self.inc, 'conv') and self.inc.conv.weight.grad is not None:
-            grad_norms['inc'] = self.inc.conv.weight.grad.norm().item()
-        elif hasattr(self.inc, 'conv1') and self.inc.conv1.weight.grad is not None:
-            grad_norms['inc'] = self.inc.conv1.weight.grad.norm().item()
+        weight = self._get_first_conv_weight(self.inc)
+        if weight is not None and weight.grad is not None:
+            grad_norms['inc'] = weight.grad.norm().item()
 
         # Encoders
         for i, encoder in enumerate(self.encoders):
-            if hasattr(encoder, 'conv') and encoder.conv.weight.grad is not None:
-                grad_norms[f'encoder_{i}'] = encoder.conv.weight.grad.norm().item()
-            elif hasattr(encoder, 'conv1') and encoder.conv1.weight.grad is not None:
-                grad_norms[f'encoder_{i}'] = encoder.conv1.weight.grad.norm().item()
+            weight = self._get_first_conv_weight(encoder)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'encoder_{i}'] = weight.grad.norm().item()
 
         # Bottleneck (mid)
         for j, layer in enumerate(self.mid):
-            if hasattr(layer, 'weight') and layer.weight.grad is not None:
-                grad_norms[f'mid_{j}'] = layer.weight.grad.norm().item()
+            weight = self._get_first_conv_weight(layer)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'mid_{j}'] = weight.grad.norm().item()
 
         # Decoders
         for i, decoder in enumerate(self.decoders):
-            if hasattr(decoder, 'conv') and decoder.conv.weight.grad is not None:
-                grad_norms[f'decoder_{i}'] = decoder.conv.weight.grad.norm().item()
-            elif hasattr(decoder, 'conv1') and decoder.conv1.weight.grad is not None:
-                grad_norms[f'decoder_{i}'] = decoder.conv1.weight.grad.norm().item()
+            weight = self._get_first_conv_weight(decoder)
+            if weight is not None and weight.grad is not None:
+                grad_norms[f'decoder_{i}'] = weight.grad.norm().item()
 
         # Output conv
-        if self.outc.weight.grad is not None:
-            grad_norms['outc'] = self.outc.weight.grad.norm().item()
+        weight = self._get_first_conv_weight(self.outc)
+        if weight is not None and weight.grad is not None:
+            grad_norms['outc'] = weight.grad.norm().item()
 
         return grad_norms
 
@@ -2785,32 +2811,32 @@ class CondUNet1D(nn.Module):
         weight_norms = {}
 
         # Input conv
-        if hasattr(self.inc, 'conv'):
-            weight_norms['inc'] = self.inc.conv.weight.norm().item()
-        elif hasattr(self.inc, 'conv1'):
-            weight_norms['inc'] = self.inc.conv1.weight.norm().item()
+        weight = self._get_first_conv_weight(self.inc)
+        if weight is not None:
+            weight_norms['inc'] = weight.norm().item()
 
         # Encoders
         for i, encoder in enumerate(self.encoders):
-            if hasattr(encoder, 'conv'):
-                weight_norms[f'encoder_{i}'] = encoder.conv.weight.norm().item()
-            elif hasattr(encoder, 'conv1'):
-                weight_norms[f'encoder_{i}'] = encoder.conv1.weight.norm().item()
+            weight = self._get_first_conv_weight(encoder)
+            if weight is not None:
+                weight_norms[f'encoder_{i}'] = weight.norm().item()
 
         # Bottleneck
         for j, layer in enumerate(self.mid):
-            if hasattr(layer, 'weight'):
-                weight_norms[f'mid_{j}'] = layer.weight.norm().item()
+            weight = self._get_first_conv_weight(layer)
+            if weight is not None:
+                weight_norms[f'mid_{j}'] = weight.norm().item()
 
         # Decoders
         for i, decoder in enumerate(self.decoders):
-            if hasattr(decoder, 'conv'):
-                weight_norms[f'decoder_{i}'] = decoder.conv.weight.norm().item()
-            elif hasattr(decoder, 'conv1'):
-                weight_norms[f'decoder_{i}'] = decoder.conv1.weight.norm().item()
+            weight = self._get_first_conv_weight(decoder)
+            if weight is not None:
+                weight_norms[f'decoder_{i}'] = weight.norm().item()
 
         # Output conv
-        weight_norms['outc'] = self.outc.weight.norm().item()
+        weight = self._get_first_conv_weight(self.outc)
+        if weight is not None:
+            weight_norms['outc'] = weight.norm().item()
 
         return weight_norms
 
