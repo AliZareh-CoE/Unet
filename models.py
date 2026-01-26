@@ -3139,6 +3139,85 @@ class TrainingMetricsRecorder:
             'n_sessions_tracked': len(self.history['per_session_metrics']),
         }
 
+    def get_nature_methods_summary(self) -> Dict[str, Any]:
+        """Get summary with bootstrap CIs for Nature Methods reporting.
+
+        Returns:
+            Dict with statistics formatted for publication.
+        """
+        import numpy as np
+
+        def bootstrap_ci(data, n_bootstrap=1000, ci=0.95):
+            """Compute bootstrap confidence interval."""
+            if len(data) < 2:
+                return {'mean': data[0] if data else 0, 'ci_lower': 0, 'ci_upper': 0, 'std': 0}
+            data = np.array(data)
+            boot_means = np.zeros(n_bootstrap)
+            for i in range(n_bootstrap):
+                boot_sample = np.random.choice(data, size=len(data), replace=True)
+                boot_means[i] = np.mean(boot_sample)
+            alpha = 1 - ci
+            return {
+                'mean': float(np.mean(data)),
+                'std': float(np.std(data)),
+                'ci_lower': float(np.percentile(boot_means, 100 * alpha / 2)),
+                'ci_upper': float(np.percentile(boot_means, 100 * (1 - alpha / 2))),
+                'n': len(data),
+            }
+
+        summary = {
+            'n_epochs': len(self.history['epochs']),
+            'training_stability': {},
+            'final_performance': {},
+            'per_session_performance': {},
+        }
+
+        # Final validation performance with CI
+        if self.history['val_r2']:
+            final_r2 = self.history['val_r2'][-1] if isinstance(self.history['val_r2'][-1], (int, float)) else self.history['val_r2']
+            summary['final_performance']['val_r2'] = bootstrap_ci([final_r2] if isinstance(final_r2, (int, float)) else final_r2)
+
+        if self.history['val_loss']:
+            final_loss = self.history['val_loss'][-1] if isinstance(self.history['val_loss'][-1], (int, float)) else self.history['val_loss']
+            summary['final_performance']['val_loss'] = bootstrap_ci([final_loss] if isinstance(final_loss, (int, float)) else final_loss)
+
+        # Per-session performance with CIs
+        if self.history['per_session_metrics']:
+            for session_name, metrics in self.history['per_session_metrics'].items():
+                if 'r2' in metrics and metrics['r2']:
+                    summary['per_session_performance'][session_name] = bootstrap_ci(metrics['r2'])
+
+        # Training stability (variance of loss over last 10 epochs)
+        if len(self.history['val_loss']) >= 10:
+            recent_loss = self.history['val_loss'][-10:]
+            summary['training_stability']['loss_variance'] = float(np.var(recent_loss))
+            summary['training_stability']['is_stable'] = summary['training_stability']['loss_variance'] < 0.01
+
+        return summary
+
+    def generate_methods_text(self) -> str:
+        """Generate text for Nature Methods methods section.
+
+        Returns:
+            Formatted string for publication.
+        """
+        summary = self.get_nature_methods_summary()
+        n_epochs = summary['n_epochs']
+
+        text = f"Models were trained for {n_epochs} epochs"
+
+        if 'val_r2' in summary['final_performance']:
+            perf = summary['final_performance']['val_r2']
+            text += f", achieving a validation R² of {perf['mean']:.4f} ± {perf['std']:.4f} "
+            text += f"(95% CI: [{perf['ci_lower']:.4f}, {perf['ci_upper']:.4f}])"
+
+        if summary['training_stability'].get('is_stable'):
+            text += ". Training showed stable convergence."
+        else:
+            text += "."
+
+        return text
+
     def save(self, path: Union[str, Path]):
         """Save training dynamics to file."""
         path = Path(path)

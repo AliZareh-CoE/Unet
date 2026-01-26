@@ -2828,6 +2828,22 @@ def train(
         print(f"\n[Interrogation] Training dynamics saved to {dynamics_path}")
         print(f"  Summary: {metrics_recorder.get_summary()}")
 
+        # Generate and save Nature Methods summary
+        try:
+            nature_summary = metrics_recorder.get_nature_methods_summary()
+            nature_path = CHECKPOINT_DIR / "nature_methods_summary.json"
+            import json
+            with open(nature_path, 'w') as f:
+                json.dump(nature_summary, f, indent=2)
+            print(f"  Nature Methods summary saved to {nature_path}")
+
+            # Print methods text for paper
+            methods_text = metrics_recorder.generate_methods_text()
+            print(f"\n[Nature Methods] Methods section text:")
+            print(f"  {methods_text}")
+        except Exception as e:
+            print(f"  Warning: Could not generate Nature Methods summary: {e}")
+
     return {
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,

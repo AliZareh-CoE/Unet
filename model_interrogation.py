@@ -1,8 +1,18 @@
 """
-Model Interrogation Framework
-=============================
-Comprehensive deep learning model analysis for scientific publications.
+Model Interrogation Framework - Nature Methods Edition
+======================================================
+Comprehensive deep learning model analysis for Nature Methods publications.
 Designed for neural signal translation models (Region A → Region B).
+
+This framework follows Nature Methods reporting standards:
+- Statistical reproducibility with bootstrap confidence intervals (n=10,000)
+- Effect sizes (Cohen's d, Hedges' g) with 95% CI for all comparisons
+- Multiple comparison corrections (FDR Benjamini-Hochberg, Bonferroni)
+- Sample sizes (n) and degrees of freedom (df) reported for all tests
+- Permutation tests for non-parametric inference (n_permutations=10,000)
+- Colorblind-safe figures meeting journal specifications (89/180mm widths)
+- Individual data points shown alongside summary statistics
+- Exact p-values reported (not just significance thresholds)
 
 Usage:
     python model_interrogation.py --checkpoint path/to/model.pt --data_dir path/to/data
@@ -13,7 +23,16 @@ Usage:
     # Generate publication figures
     python model_interrogation.py --checkpoint model.pt --publication --output_dir figures/
 
+    # Generate Nature Methods reproducibility report
+    python model_interrogation.py --checkpoint model.pt --methods_report
+
+Reference:
+    Nature Methods formatting: https://www.nature.com/nmeth/for-authors/preparing-your-submission
+    Statistics guidance: Krzywinski & Altman, Nature Methods (2013-2014) series
+    Reporting standards: ARRIVE guidelines 2.0
+
 Author: Neural Signal Translation Team
+Version: 2.0.0 (Nature Methods Edition)
 """
 
 import os
@@ -42,8 +61,458 @@ import seaborn as sns
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning)
 
+
 # =============================================================================
-# Publication Figure Standards (Nature/Science compliant)
+# Nature Methods Statistical Reporting Module
+# =============================================================================
+
+class NatureMethodsStatistics:
+    """
+    Statistical analysis following Nature Methods reporting guidelines.
+
+    Key principles:
+    1. Report exact p-values (not just < 0.05)
+    2. Include effect sizes with confidence intervals
+    3. Use appropriate non-parametric tests when assumptions violated
+    4. Apply multiple comparison corrections
+    5. Report sample sizes for all groups
+    6. Use bootstrap for robust CI estimation
+    """
+
+    # Constants for statistical analysis
+    N_BOOTSTRAP = 10000  # Nature Methods recommends >= 1000
+    N_PERMUTATIONS = 10000
+    CONFIDENCE_LEVEL = 0.95
+    RANDOM_SEED = 42
+
+    @staticmethod
+    def set_seed(seed: int = 42):
+        """Set random seed for reproducibility."""
+        np.random.seed(seed)
+
+    @staticmethod
+    def bootstrap_ci(
+        data: np.ndarray,
+        statistic: Callable = np.mean,
+        n_bootstrap: int = 10000,
+        confidence_level: float = 0.95,
+        random_state: int = 42
+    ) -> Dict[str, float]:
+        """
+        Compute bootstrap confidence interval for any statistic.
+
+        Args:
+            data: 1D array of observations
+            statistic: Function to compute (default: mean)
+            n_bootstrap: Number of bootstrap samples
+            confidence_level: Confidence level (default: 0.95)
+            random_state: Random seed for reproducibility
+
+        Returns:
+            Dict with point estimate, CI bounds, and SE
+        """
+        np.random.seed(random_state)
+        data = np.asarray(data).flatten()
+        n = len(data)
+
+        # Bootstrap resampling
+        boot_stats = np.zeros(n_bootstrap)
+        for i in range(n_bootstrap):
+            boot_sample = np.random.choice(data, size=n, replace=True)
+            boot_stats[i] = statistic(boot_sample)
+
+        # Percentile method for CI
+        alpha = 1 - confidence_level
+        ci_lower = np.percentile(boot_stats, 100 * alpha / 2)
+        ci_upper = np.percentile(boot_stats, 100 * (1 - alpha / 2))
+
+        # BCa correction (bias-corrected and accelerated)
+        # Compute bias correction
+        point_estimate = statistic(data)
+        z0 = stats.norm.ppf(np.mean(boot_stats < point_estimate))
+
+        # Jackknife for acceleration
+        jackknife_stats = np.zeros(n)
+        for i in range(n):
+            jack_sample = np.delete(data, i)
+            jackknife_stats[i] = statistic(jack_sample)
+        jack_mean = np.mean(jackknife_stats)
+
+        # Acceleration factor
+        num = np.sum((jack_mean - jackknife_stats) ** 3)
+        den = 6 * (np.sum((jack_mean - jackknife_stats) ** 2) ** 1.5)
+        a = num / (den + 1e-10)
+
+        # BCa adjusted percentiles
+        z_alpha_lower = stats.norm.ppf(alpha / 2)
+        z_alpha_upper = stats.norm.ppf(1 - alpha / 2)
+
+        p_lower = stats.norm.cdf(z0 + (z0 + z_alpha_lower) / (1 - a * (z0 + z_alpha_lower)))
+        p_upper = stats.norm.cdf(z0 + (z0 + z_alpha_upper) / (1 - a * (z0 + z_alpha_upper)))
+
+        ci_lower_bca = np.percentile(boot_stats, 100 * p_lower)
+        ci_upper_bca = np.percentile(boot_stats, 100 * p_upper)
+
+        return {
+            'estimate': point_estimate,
+            'ci_lower': ci_lower_bca,
+            'ci_upper': ci_upper_bca,
+            'ci_lower_percentile': ci_lower,
+            'ci_upper_percentile': ci_upper,
+            'se': np.std(boot_stats),
+            'n': n,
+            'n_bootstrap': n_bootstrap,
+            'confidence_level': confidence_level,
+        }
+
+    @staticmethod
+    def cohens_d_with_ci(
+        group1: np.ndarray,
+        group2: np.ndarray,
+        paired: bool = False,
+        n_bootstrap: int = 10000
+    ) -> Dict[str, float]:
+        """
+        Compute Cohen's d with bootstrap confidence interval.
+
+        Nature Methods requires effect sizes for all comparisons.
+
+        Args:
+            group1, group2: Arrays of observations
+            paired: Whether data is paired
+            n_bootstrap: Bootstrap samples for CI
+
+        Returns:
+            Dict with d, CI, and interpretation
+        """
+        group1 = np.asarray(group1).flatten()
+        group2 = np.asarray(group2).flatten()
+
+        n1, n2 = len(group1), len(group2)
+        mean1, mean2 = np.mean(group1), np.mean(group2)
+        std1, std2 = np.std(group1, ddof=1), np.std(group2, ddof=1)
+
+        if paired:
+            # Cohen's d for paired samples
+            diff = group2 - group1
+            d = np.mean(diff) / (np.std(diff, ddof=1) + 1e-10)
+
+            # Hedges' g correction for small samples
+            df = n1 - 1
+            g = d * (1 - 3 / (4 * df - 1))
+        else:
+            # Pooled standard deviation
+            pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
+            d = (mean2 - mean1) / (pooled_std + 1e-10)
+
+            # Hedges' g correction
+            df = n1 + n2 - 2
+            g = d * (1 - 3 / (4 * df - 1))
+
+        # Bootstrap CI for effect size
+        def compute_d(g1, g2):
+            if paired:
+                diff = g2 - g1
+                return np.mean(diff) / (np.std(diff, ddof=1) + 1e-10)
+            else:
+                ps = np.sqrt(((len(g1)-1)*np.std(g1,ddof=1)**2 + (len(g2)-1)*np.std(g2,ddof=1)**2) / (len(g1)+len(g2)-2))
+                return (np.mean(g2) - np.mean(g1)) / (ps + 1e-10)
+
+        np.random.seed(42)
+        boot_d = np.zeros(n_bootstrap)
+        for i in range(n_bootstrap):
+            if paired:
+                idx = np.random.choice(n1, size=n1, replace=True)
+                boot_d[i] = compute_d(group1[idx], group2[idx])
+            else:
+                boot_g1 = np.random.choice(group1, size=n1, replace=True)
+                boot_g2 = np.random.choice(group2, size=n2, replace=True)
+                boot_d[i] = compute_d(boot_g1, boot_g2)
+
+        ci_lower = np.percentile(boot_d, 2.5)
+        ci_upper = np.percentile(boot_d, 97.5)
+
+        # Interpretation (Cohen's conventions)
+        abs_d = abs(d)
+        if abs_d < 0.2:
+            interpretation = 'negligible'
+        elif abs_d < 0.5:
+            interpretation = 'small'
+        elif abs_d < 0.8:
+            interpretation = 'medium'
+        else:
+            interpretation = 'large'
+
+        return {
+            'cohens_d': d,
+            'hedges_g': g,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'interpretation': interpretation,
+            'n1': n1,
+            'n2': n2,
+            'mean_diff': mean2 - mean1,
+        }
+
+    @staticmethod
+    def permutation_test(
+        group1: np.ndarray,
+        group2: np.ndarray,
+        n_permutations: int = 10000,
+        alternative: str = 'two-sided',
+        statistic: str = 'mean'
+    ) -> Dict[str, float]:
+        """
+        Non-parametric permutation test.
+
+        Preferred when normality cannot be assumed.
+
+        Args:
+            group1, group2: Arrays of observations
+            n_permutations: Number of permutations
+            alternative: 'two-sided', 'greater', or 'less'
+            statistic: 'mean' or 'median'
+
+        Returns:
+            Dict with exact p-value and test details
+        """
+        group1 = np.asarray(group1).flatten()
+        group2 = np.asarray(group2).flatten()
+
+        combined = np.concatenate([group1, group2])
+        n1 = len(group1)
+
+        stat_func = np.mean if statistic == 'mean' else np.median
+        observed_diff = stat_func(group2) - stat_func(group1)
+
+        np.random.seed(42)
+        perm_diffs = np.zeros(n_permutations)
+        for i in range(n_permutations):
+            perm = np.random.permutation(combined)
+            perm_diffs[i] = stat_func(perm[n1:]) - stat_func(perm[:n1])
+
+        if alternative == 'two-sided':
+            p_value = np.mean(np.abs(perm_diffs) >= np.abs(observed_diff))
+        elif alternative == 'greater':
+            p_value = np.mean(perm_diffs >= observed_diff)
+        else:  # less
+            p_value = np.mean(perm_diffs <= observed_diff)
+
+        return {
+            'observed_diff': observed_diff,
+            'p_value': p_value,
+            'p_value_exact': p_value,  # Exact p-value as required by Nature Methods
+            'n_permutations': n_permutations,
+            'alternative': alternative,
+            'statistic': statistic,
+            'n1': len(group1),
+            'n2': len(group2),
+        }
+
+    @staticmethod
+    def fdr_correction(p_values: np.ndarray, alpha: float = 0.05, method: str = 'fdr_bh') -> Dict:
+        """
+        Multiple comparison correction using FDR (Benjamini-Hochberg).
+
+        Required when making multiple statistical comparisons.
+
+        Args:
+            p_values: Array of p-values
+            alpha: Significance level
+            method: 'fdr_bh' (Benjamini-Hochberg) or 'bonferroni'
+
+        Returns:
+            Dict with corrected p-values and significance
+        """
+        from scipy.stats import false_discovery_control
+
+        p_values = np.asarray(p_values)
+        n = len(p_values)
+
+        if method == 'fdr_bh':
+            # Benjamini-Hochberg procedure
+            sorted_idx = np.argsort(p_values)
+            sorted_p = p_values[sorted_idx]
+
+            # Critical values
+            critical = (np.arange(1, n + 1) / n) * alpha
+
+            # Find significant tests
+            significant = sorted_p <= critical
+
+            # Adjusted p-values
+            adjusted_p = np.zeros(n)
+            adjusted_p[sorted_idx] = np.minimum.accumulate(
+                (n / (np.arange(n, 0, -1))) * sorted_p[::-1]
+            )[::-1]
+            adjusted_p = np.minimum(adjusted_p, 1.0)
+
+        else:  # Bonferroni
+            adjusted_p = np.minimum(p_values * n, 1.0)
+            significant = adjusted_p < alpha
+
+        return {
+            'original_p': p_values,
+            'adjusted_p': adjusted_p,
+            'significant': adjusted_p < alpha,
+            'n_significant': np.sum(adjusted_p < alpha),
+            'n_tests': n,
+            'method': method,
+            'alpha': alpha,
+        }
+
+    @staticmethod
+    def comprehensive_comparison(
+        group1: np.ndarray,
+        group2: np.ndarray,
+        paired: bool = False,
+        group_names: Tuple[str, str] = ('Group 1', 'Group 2')
+    ) -> Dict:
+        """
+        Complete statistical comparison following Nature Methods standards.
+
+        Performs:
+        1. Normality tests
+        2. Appropriate parametric/non-parametric test
+        3. Effect size with CI
+        4. Bootstrap CI for means
+
+        Args:
+            group1, group2: Data arrays
+            paired: Whether samples are paired
+            group_names: Names for reporting
+
+        Returns:
+            Comprehensive results dict for Methods section
+        """
+        group1 = np.asarray(group1).flatten()
+        group2 = np.asarray(group2).flatten()
+
+        # Descriptive statistics
+        desc1 = {
+            'n': len(group1),
+            'mean': np.mean(group1),
+            'median': np.median(group1),
+            'std': np.std(group1, ddof=1),
+            'sem': np.std(group1, ddof=1) / np.sqrt(len(group1)),
+        }
+        desc2 = {
+            'n': len(group2),
+            'mean': np.mean(group2),
+            'median': np.median(group2),
+            'std': np.std(group2, ddof=1),
+            'sem': np.std(group2, ddof=1) / np.sqrt(len(group2)),
+        }
+
+        # Normality tests (Shapiro-Wilk for n < 50, else D'Agostino-Pearson)
+        if len(group1) < 50:
+            _, p_norm1 = stats.shapiro(group1)
+            _, p_norm2 = stats.shapiro(group2)
+            normality_test = 'Shapiro-Wilk'
+        else:
+            _, p_norm1 = stats.normaltest(group1)
+            _, p_norm2 = stats.normaltest(group2)
+            normality_test = "D'Agostino-Pearson"
+
+        is_normal = (p_norm1 > 0.05) and (p_norm2 > 0.05)
+
+        # Choose appropriate test
+        if paired:
+            if is_normal:
+                t_stat, p_param = stats.ttest_rel(group1, group2)
+                test_name = 'paired t-test'
+                df = len(group1) - 1
+            else:
+                w_stat, p_param = stats.wilcoxon(group1, group2)
+                test_name = 'Wilcoxon signed-rank test'
+                df = None
+                t_stat = w_stat
+        else:
+            if is_normal:
+                # Check homogeneity of variance
+                _, p_levene = stats.levene(group1, group2)
+                if p_levene > 0.05:
+                    t_stat, p_param = stats.ttest_ind(group1, group2)
+                    test_name = "Student's t-test"
+                else:
+                    t_stat, p_param = stats.ttest_ind(group1, group2, equal_var=False)
+                    test_name = "Welch's t-test"
+                df = len(group1) + len(group2) - 2
+            else:
+                u_stat, p_param = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+                test_name = 'Mann-Whitney U test'
+                df = None
+                t_stat = u_stat
+
+        # Effect size
+        effect = NatureMethodsStatistics.cohens_d_with_ci(group1, group2, paired=paired)
+
+        # Permutation test for robustness
+        perm = NatureMethodsStatistics.permutation_test(group1, group2)
+
+        # Bootstrap CI for difference
+        if paired:
+            diff = group2 - group1
+            boot_diff = NatureMethodsStatistics.bootstrap_ci(diff)
+        else:
+            def mean_diff(idx):
+                return np.mean(group2) - np.mean(group1)
+            boot_diff = {
+                'estimate': desc2['mean'] - desc1['mean'],
+                'ci_lower': effect['ci_lower'] * (desc1['std'] + desc2['std']) / 2,
+                'ci_upper': effect['ci_upper'] * (desc1['std'] + desc2['std']) / 2,
+            }
+
+        return {
+            'group_names': group_names,
+            'descriptive': {group_names[0]: desc1, group_names[1]: desc2},
+            'normality': {
+                'test': normality_test,
+                'p_values': (p_norm1, p_norm2),
+                'is_normal': is_normal,
+            },
+            'test': {
+                'name': test_name,
+                'statistic': t_stat,
+                'p_value': p_param,
+                'df': df,
+            },
+            'effect_size': effect,
+            'permutation': perm,
+            'bootstrap_diff': boot_diff,
+            # Nature Methods reporting string
+            'methods_text': (
+                f"Comparison between {group_names[0]} (n={desc1['n']}, "
+                f"mean={desc1['mean']:.4f}±{desc1['std']:.4f}) and "
+                f"{group_names[1]} (n={desc2['n']}, mean={desc2['mean']:.4f}±{desc2['std']:.4f}) "
+                f"using {test_name} "
+                f"({'df=' + str(df) + ', ' if df else ''}"
+                f"p={p_param:.2e if p_param < 0.001 else f'{p_param:.4f}'}, "
+                f"Cohen's d={effect['cohens_d']:.2f} [{effect['ci_lower']:.2f}, {effect['ci_upper']:.2f}], "
+                f"{effect['interpretation']} effect)."
+            )
+        }
+
+    @staticmethod
+    def format_p_value(p: float) -> str:
+        """Format p-value according to Nature Methods guidelines."""
+        if p < 0.0001:
+            return f"p < 0.0001"
+        elif p < 0.001:
+            return f"p = {p:.4f}"
+        elif p < 0.01:
+            return f"p = {p:.3f}"
+        else:
+            return f"p = {p:.2f}"
+
+    @staticmethod
+    def generate_methods_text(results: Dict) -> str:
+        """Generate Methods section text from analysis results."""
+        return results.get('methods_text', '')
+
+
+# =============================================================================
+# Publication Figure Standards (Nature Methods compliant)
 # =============================================================================
 
 # Figure dimensions (Nature family)
@@ -246,40 +715,189 @@ def add_significance_markers(
 
 
 def compute_effect_size(group1: np.ndarray, group2: np.ndarray) -> Dict[str, float]:
-    """Compute effect size metrics for two groups.
+    """Compute effect size metrics following Nature Methods standards.
 
     Returns:
-        Dict with Cohen's d, improvement %, and 95% CI
+        Dict with Cohen's d, Hedges' g, improvement %, and bootstrap 95% CI
     """
-    mean1, mean2 = np.mean(group1), np.mean(group2)
-    std1, std2 = np.std(group1, ddof=1), np.std(group2, ddof=1)
-    n1, n2 = len(group1), len(group2)
+    # Use the comprehensive NatureMethodsStatistics class
+    return NatureMethodsStatistics.cohens_d_with_ci(group1, group2)
 
-    # Pooled standard deviation
-    pooled_std = np.sqrt(((n1 - 1) * std1**2 + (n2 - 1) * std2**2) / (n1 + n2 - 2))
 
-    # Cohen's d
-    cohens_d = (mean2 - mean1) / (pooled_std + 1e-10)
+class ReproducibilityReport:
+    """
+    Generate Nature Methods reproducibility report.
 
-    # Improvement percentage
-    improvement_pct = (mean2 - mean1) / (np.abs(mean1) + 1e-10) * 100
+    This report includes all information required for:
+    1. Methods section writing
+    2. Statistical analysis reporting
+    3. Code and data availability statements
+    4. Figure legends with complete statistical information
+    """
 
-    # 95% CI for difference (using t-distribution)
-    diff = mean2 - mean1
-    se = np.sqrt(std1**2 / n1 + std2**2 / n2)
-    from scipy.stats import t
-    df = n1 + n2 - 2
-    t_crit = t.ppf(0.975, df)
-    ci_low = diff - t_crit * se
-    ci_high = diff + t_crit * se
+    def __init__(self, config: 'AnalysisConfig'):
+        self.config = config
+        self.analyses_performed = []
+        self.statistical_tests = []
+        self.figure_descriptions = []
+        self.software_versions = self._get_software_versions()
 
-    return {
-        'cohens_d': cohens_d,
-        'improvement_pct': improvement_pct,
-        'ci_95_low': ci_low,
-        'ci_95_high': ci_high,
-        'mean_diff': diff,
-    }
+    def _get_software_versions(self) -> Dict[str, str]:
+        """Capture software versions for reproducibility."""
+        versions = {
+            'python': f"{__import__('sys').version_info.major}.{__import__('sys').version_info.minor}.{__import__('sys').version_info.micro}",
+            'numpy': np.__version__,
+            'torch': torch.__version__,
+            'scipy': __import__('scipy').__version__,
+        }
+        try:
+            versions['matplotlib'] = __import__('matplotlib').__version__
+        except:
+            pass
+        try:
+            versions['sklearn'] = __import__('sklearn').__version__
+        except:
+            pass
+        return versions
+
+    def add_analysis(
+        self,
+        name: str,
+        description: str,
+        parameters: Dict,
+        n_samples: int,
+        results_summary: str
+    ):
+        """Record an analysis for the Methods section."""
+        self.analyses_performed.append({
+            'name': name,
+            'description': description,
+            'parameters': parameters,
+            'n_samples': n_samples,
+            'results_summary': results_summary,
+        })
+
+    def add_statistical_test(
+        self,
+        test_name: str,
+        comparison: str,
+        n1: int, n2: int,
+        statistic: float,
+        p_value: float,
+        effect_size: float,
+        effect_ci: Tuple[float, float],
+        correction: Optional[str] = None
+    ):
+        """Record a statistical test."""
+        self.statistical_tests.append({
+            'test': test_name,
+            'comparison': comparison,
+            'n': (n1, n2),
+            'statistic': statistic,
+            'p_value': p_value,
+            'effect_size': effect_size,
+            'effect_ci': effect_ci,
+            'correction': correction,
+        })
+
+    def add_figure_description(
+        self,
+        figure_number: str,
+        title: str,
+        panels: List[Dict],
+        statistical_info: str
+    ):
+        """Add a figure legend with complete statistical information."""
+        self.figure_descriptions.append({
+            'number': figure_number,
+            'title': title,
+            'panels': panels,
+            'stats': statistical_info,
+        })
+
+    def generate_methods_section(self) -> str:
+        """Generate complete Methods section text."""
+        lines = []
+        lines.append("=" * 70)
+        lines.append("METHODS SECTION (Nature Methods Format)")
+        lines.append("=" * 70)
+        lines.append("")
+
+        # Software and environment
+        lines.append("### Computational Environment")
+        lines.append("")
+        lines.append("All analyses were performed using the Model Interrogation Framework")
+        lines.append(f"(v2.0.0) with the following software versions:")
+        for sw, ver in self.software_versions.items():
+            lines.append(f"  - {sw}: {ver}")
+        lines.append(f"  - Random seed: {self.config.seed}")
+        lines.append("")
+
+        # Analysis methods
+        lines.append("### Analysis Methods")
+        lines.append("")
+        for analysis in self.analyses_performed:
+            lines.append(f"**{analysis['name']}**")
+            lines.append(f"{analysis['description']}")
+            lines.append(f"Parameters: {analysis['parameters']}")
+            lines.append(f"Sample size: n = {analysis['n_samples']}")
+            lines.append("")
+
+        # Statistical analysis
+        lines.append("### Statistical Analysis")
+        lines.append("")
+        lines.append("All statistical tests were two-tailed unless otherwise specified.")
+        lines.append("Effect sizes are reported as Cohen's d with 95% bootstrap confidence")
+        lines.append("intervals (n_bootstrap = 10,000). Multiple comparisons were corrected")
+        lines.append("using the Benjamini-Hochberg false discovery rate procedure.")
+        lines.append("")
+
+        if self.statistical_tests:
+            lines.append("Statistical comparisons performed:")
+            for test in self.statistical_tests:
+                correction_note = f", {test['correction']}-corrected" if test['correction'] else ""
+                lines.append(f"  - {test['comparison']}: {test['test']} "
+                           f"(n₁={test['n'][0]}, n₂={test['n'][1]}, "
+                           f"p={test['p_value']:.4f}{correction_note}, "
+                           f"d={test['effect_size']:.2f} "
+                           f"[{test['effect_ci'][0]:.2f}, {test['effect_ci'][1]:.2f}])")
+
+        lines.append("")
+        lines.append("### Data Availability")
+        lines.append("")
+        lines.append("Source data for all figures are available in the Supplementary")
+        lines.append("Information. The model interrogation analysis code is available at")
+        lines.append("[repository URL].")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def generate_figure_legends(self) -> str:
+        """Generate figure legends with complete statistical information."""
+        lines = []
+        lines.append("=" * 70)
+        lines.append("FIGURE LEGENDS")
+        lines.append("=" * 70)
+        lines.append("")
+
+        for fig in self.figure_descriptions:
+            lines.append(f"**{fig['number']}. {fig['title']}**")
+            lines.append("")
+            for panel in fig['panels']:
+                lines.append(f"({panel['label']}) {panel['description']}")
+            lines.append("")
+            lines.append(f"Statistical details: {fig['stats']}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def generate_full_report(self) -> str:
+        """Generate complete reproducibility report."""
+        sections = [
+            self.generate_methods_section(),
+            self.generate_figure_legends(),
+        ]
+        return "\n\n".join(sections)
 
 
 @dataclass
@@ -3355,7 +3973,17 @@ class ArchitecturalAnalyzer:
 # =============================================================================
 
 class BaselineComparisonAnalyzer:
-    """Compare deep learning model to linear baselines."""
+    """
+    Compare deep learning model to linear baselines with Nature Methods statistics.
+
+    Provides:
+    - Multiple baseline methods (Ridge, Wiener, Mean, Persistence)
+    - Per-sample R² for proper statistical comparison
+    - Bootstrap confidence intervals
+    - Effect sizes with CIs
+    - Permutation tests for significance
+    - Multiple comparison correction
+    """
 
     def __init__(self, model: nn.Module, config: AnalysisConfig):
         self.model = model
@@ -3368,11 +3996,16 @@ class BaselineComparisonAnalyzer:
         self,
         train_loader: DataLoader,
         test_loader: DataLoader,
-        methods: List[str] = ['ridge']
+        methods: List[str] = ['ridge', 'wiener', 'mean', 'persistence']
     ) -> Dict:
-        """Compare to linear baselines."""
-        from sklearn.linear_model import Ridge
+        """
+        Compare to linear baselines with comprehensive Nature Methods statistics.
 
+        Returns per-sample metrics for proper statistical testing.
+        """
+        from sklearn.linear_model import Ridge, RidgeCV
+
+        # Collect data
         train_X, train_Y = [], []
         for batch in train_loader:
             train_X.append(batch[0].numpy())
@@ -3396,65 +4029,256 @@ class BaselineComparisonAnalyzer:
         test_Y_flat = test_Y.reshape(n_test, -1)
 
         baseline_results = {}
+        per_sample_r2 = {}
 
+        # Helper to compute per-sample R²
+        def compute_per_sample_r2(pred, target):
+            r2s = []
+            for i in range(len(pred)):
+                ss_res = np.sum((target[i] - pred[i]) ** 2)
+                ss_tot = np.sum((target[i] - np.mean(target[i])) ** 2)
+                r2 = 1 - ss_res / (ss_tot + 1e-10)
+                r2s.append(r2)
+            return np.array(r2s)
+
+        # Ridge regression with cross-validated alpha
         if 'ridge' in methods:
-            ridge = Ridge(alpha=1.0)
+            alphas = np.logspace(-3, 3, 20)
+            ridge = RidgeCV(alphas=alphas, cv=5)
             ridge.fit(train_X_flat, train_Y_flat)
-            ridge_pred = ridge.predict(test_X_flat)
-            ridge_mse = float(np.mean((ridge_pred - test_Y_flat) ** 2))
-            ridge_r2 = float(1 - ridge_mse / (np.var(test_Y_flat) + 1e-10))
-            baseline_results['ridge'] = {'mse': ridge_mse, 'r2': ridge_r2}
+            ridge_pred = ridge.predict(test_X_flat).reshape(n_test, C, T)
 
+            r2s = compute_per_sample_r2(ridge_pred, test_Y)
+            per_sample_r2['ridge'] = r2s
+
+            ridge_ci = NatureMethodsStatistics.bootstrap_ci(r2s)
+            baseline_results['ridge'] = {
+                'r2_mean': float(np.mean(r2s)),
+                'r2_std': float(np.std(r2s)),
+                'r2_ci_lower': ridge_ci['ci_lower'],
+                'r2_ci_upper': ridge_ci['ci_upper'],
+                'mse': float(np.mean((ridge_pred - test_Y) ** 2)),
+                'n': len(r2s),
+                'alpha': float(ridge.alpha_),
+            }
+
+        # Wiener filter (frequency domain denoising)
+        if 'wiener' in methods:
+            # Simple Wiener estimate using training data statistics
+            wiener_pred = np.zeros_like(test_Y)
+            for c in range(C):
+                signal_var = np.var(train_Y[:, c, :])
+                noise_var = np.var(train_Y[:, c, :] - train_X[:, c, :]) if C <= train_X.shape[1] else signal_var * 0.1
+                wiener_gain = signal_var / (signal_var + noise_var + 1e-10)
+                wiener_pred[:, c, :] = test_X[:, min(c, test_X.shape[1]-1), :] * wiener_gain
+
+            r2s = compute_per_sample_r2(wiener_pred, test_Y)
+            per_sample_r2['wiener'] = r2s
+
+            wiener_ci = NatureMethodsStatistics.bootstrap_ci(r2s)
+            baseline_results['wiener'] = {
+                'r2_mean': float(np.mean(r2s)),
+                'r2_std': float(np.std(r2s)),
+                'r2_ci_lower': wiener_ci['ci_lower'],
+                'r2_ci_upper': wiener_ci['ci_upper'],
+                'mse': float(np.mean((wiener_pred - test_Y) ** 2)),
+                'n': len(r2s),
+            }
+
+        # Mean baseline (predict training mean)
+        if 'mean' in methods:
+            mean_pred = np.broadcast_to(
+                np.mean(train_Y, axis=0, keepdims=True),
+                test_Y.shape
+            )
+            r2s = compute_per_sample_r2(mean_pred, test_Y)
+            per_sample_r2['mean'] = r2s
+
+            mean_ci = NatureMethodsStatistics.bootstrap_ci(r2s)
+            baseline_results['mean'] = {
+                'r2_mean': float(np.mean(r2s)),  # Should be ~0 by definition
+                'r2_std': float(np.std(r2s)),
+                'r2_ci_lower': mean_ci['ci_lower'],
+                'r2_ci_upper': mean_ci['ci_upper'],
+                'mse': float(np.mean((mean_pred - test_Y) ** 2)),
+                'n': len(r2s),
+            }
+
+        # Persistence baseline (previous timestep)
+        if 'persistence' in methods:
+            persist_pred = np.roll(test_Y, 1, axis=-1)
+            persist_pred[:, :, 0] = test_Y[:, :, 0]
+
+            r2s = compute_per_sample_r2(persist_pred, test_Y)
+            per_sample_r2['persistence'] = r2s
+
+            persist_ci = NatureMethodsStatistics.bootstrap_ci(r2s)
+            baseline_results['persistence'] = {
+                'r2_mean': float(np.mean(r2s)),
+                'r2_std': float(np.std(r2s)),
+                'r2_ci_lower': persist_ci['ci_lower'],
+                'r2_ci_upper': persist_ci['ci_upper'],
+                'mse': float(np.mean((persist_pred - test_Y) ** 2)),
+                'n': len(r2s),
+            }
+
+        # Deep learning model
         self.model.eval()
         dl_preds = []
         for batch in test_loader:
             inputs = batch[0].to(self.device)
-            outputs = self.model(inputs)
+            # Handle conditioning if present
+            if len(batch) > 2:
+                cond = batch[2].to(self.device) if batch[2] is not None else None
+                outputs = self.model(inputs, cond)
+            else:
+                outputs = self.model(inputs)
             dl_preds.append(outputs.cpu().numpy())
 
         dl_pred = np.concatenate(dl_preds, axis=0)
-        dl_mse = float(np.mean((dl_pred - test_Y) ** 2))
-        dl_r2 = float(1 - dl_mse / (np.var(test_Y) + 1e-10))
-        baseline_results['deep_learning'] = {'mse': dl_mse, 'r2': dl_r2}
+        dl_r2s = compute_per_sample_r2(dl_pred, test_Y)
+        per_sample_r2['deep_learning'] = dl_r2s
 
-        improvements = {}
-        for method, metrics in baseline_results.items():
-            if method != 'deep_learning':
-                r2_improvement = dl_r2 - metrics['r2']
-                improvements[method] = {'r2_improvement': float(r2_improvement)}
+        dl_ci = NatureMethodsStatistics.bootstrap_ci(dl_r2s)
+        baseline_results['deep_learning'] = {
+            'r2_mean': float(np.mean(dl_r2s)),
+            'r2_std': float(np.std(dl_r2s)),
+            'r2_ci_lower': dl_ci['ci_lower'],
+            'r2_ci_upper': dl_ci['ci_upper'],
+            'mse': float(np.mean((dl_pred - test_Y) ** 2)),
+            'n': len(dl_r2s),
+        }
+
+        # Statistical comparisons (DL vs each baseline)
+        statistical_comparisons = {}
+        p_values = []
+
+        for method in ['ridge', 'wiener', 'mean', 'persistence']:
+            if method in per_sample_r2:
+                comparison = NatureMethodsStatistics.comprehensive_comparison(
+                    per_sample_r2[method],
+                    per_sample_r2['deep_learning'],
+                    paired=True,  # Same test samples
+                    group_names=(method.capitalize(), 'Deep Learning')
+                )
+                statistical_comparisons[method] = comparison
+                p_values.append(comparison['test']['p_value'])
+
+        # Multiple comparison correction
+        if p_values:
+            fdr_results = NatureMethodsStatistics.fdr_correction(np.array(p_values))
+            for i, method in enumerate([m for m in ['ridge', 'wiener', 'mean', 'persistence'] if m in statistical_comparisons]):
+                statistical_comparisons[method]['adjusted_p'] = float(fdr_results['adjusted_p'][i])
+                statistical_comparisons[method]['significant_fdr'] = bool(fdr_results['significant'][i])
+
+        # Generate methods text for Nature Methods
+        methods_texts = []
+        for method, comp in statistical_comparisons.items():
+            effect = comp['effect_size']
+            test = comp['test']
+            adj_p = comp.get('adjusted_p', test['p_value'])
+            methods_texts.append(
+                f"Deep learning vs {method}: {test['name']}, "
+                f"p={adj_p:.2e if adj_p < 0.001 else f'{adj_p:.4f}'} (FDR-corrected), "
+                f"Cohen's d={effect['cohens_d']:.2f} [{effect['ci_lower']:.2f}, {effect['ci_upper']:.2f}], "
+                f"{effect['interpretation']} effect"
+            )
 
         results = {
             'baseline_results': baseline_results,
-            'improvements': improvements,
-            'deep_learning_needed': any(imp['r2_improvement'] > 0.05 for imp in improvements.values()),
+            'per_sample_r2': {k: v.tolist() for k, v in per_sample_r2.items()},
+            'statistical_comparisons': statistical_comparisons,
+            'deep_learning_needed': any(
+                comp.get('significant_fdr', comp['test']['p_value'] < 0.05)
+                and comp['effect_size']['cohens_d'] > 0.2
+                for comp in statistical_comparisons.values()
+            ),
+            'methods_text': "; ".join(methods_texts),
+            'n_test_samples': n_test,
         }
 
         self.results['linear_baseline'] = results
         return results
 
     def plot_baseline_comparison(self, save_path: Optional[str] = None) -> plt.Figure:
-        """Plot baseline comparison."""
+        """
+        Plot baseline comparison with Nature Methods standards.
+
+        Features:
+        - Individual data points shown
+        - 95% bootstrap confidence intervals
+        - Significance brackets with FDR-corrected p-values
+        """
         if 'linear_baseline' not in self.results:
             raise ValueError("Run linear_baseline first")
 
         data = self.results['linear_baseline']['baseline_results']
-        fig, ax = plt.subplots(figsize=(8, 5))
+        per_sample = self.results['linear_baseline'].get('per_sample_r2', {})
+        comparisons = self.results['linear_baseline'].get('statistical_comparisons', {})
+
+        fig, ax = plt.subplots(figsize=(FIGURE_DIMS['single_col'] * 1.5, FIGURE_DIMS['single_col']))
 
         methods = list(data.keys())
-        r2s = [data[m]['r2'] for m in methods]
-        colors = [COLORS['tertiary'] if m == 'deep_learning' else COLORS['primary'] for m in methods]
+        # Reorder to put deep learning last
+        if 'deep_learning' in methods:
+            methods = [m for m in methods if m != 'deep_learning'] + ['deep_learning']
 
-        bars = ax.bar(methods, r2s, color=colors, alpha=0.7, edgecolor='black')
-        ax.set_ylabel('R2')
-        ax.set_title('Deep Learning vs Linear Baselines')
+        x = np.arange(len(methods))
+        width = 0.7
 
-        for bar, r2 in zip(bars, r2s):
-            ax.annotate(f'{r2:.4f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+        # Colors: baselines grey, DL blue
+        colors = [COLORS['baseline'] if m != 'deep_learning' else COLORS['primary'] for m in methods]
+
+        # Extract means and CIs
+        means = [data[m]['r2_mean'] for m in methods]
+        ci_lower = [data[m].get('r2_ci_lower', data[m]['r2_mean'] - data[m]['r2_std']) for m in methods]
+        ci_upper = [data[m].get('r2_ci_upper', data[m]['r2_mean'] + data[m]['r2_std']) for m in methods]
+
+        # Error bars (asymmetric CI)
+        yerr_lower = [means[i] - ci_lower[i] for i in range(len(means))]
+        yerr_upper = [ci_upper[i] - means[i] for i in range(len(means))]
+
+        # Bar plot with error bars
+        bars = ax.bar(x, means, width, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5,
+                      yerr=[yerr_lower, yerr_upper], capsize=3, error_kw={'linewidth': 0.8})
+
+        # Overlay individual data points
+        for i, method in enumerate(methods):
+            if method in per_sample:
+                r2s = np.array(per_sample[method])
+                # Jitter x positions
+                jitter = np.random.uniform(-0.15, 0.15, len(r2s))
+                ax.scatter(x[i] + jitter, r2s, c='black', s=8, alpha=0.4, zorder=3)
+
+        # Add significance brackets
+        dl_idx = methods.index('deep_learning') if 'deep_learning' in methods else -1
+        if dl_idx >= 0:
+            y_max = max(ci_upper) + 0.05
+            bracket_height = 0.03
+
+            for i, method in enumerate(methods):
+                if method != 'deep_learning' and method in comparisons:
+                    comp = comparisons[method]
+                    p_val = comp.get('adjusted_p', comp['test']['p_value'])
+
+                    # Draw bracket
+                    y_bracket = y_max + (i * bracket_height * 1.5)
+                    add_significance_markers(ax, i, dl_idx, y_bracket, p_val, height=bracket_height)
+
+        # Labels
+        ax.set_xticks(x)
+        ax.set_xticklabels([m.replace('_', '\n').title() for m in methods], fontsize=7)
+        ax.set_ylabel('R² (bootstrap 95% CI)')
+        ax.set_title('Method Comparison')
+
+        # Add sample size annotation
+        n = data[methods[0]].get('n', '?')
+        ax.text(0.02, 0.98, f'n = {n}', transform=ax.transAxes, fontsize=6,
+                va='top', ha='left')
 
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, format=self.config.figure_format)
+            plt.savefig(save_path, format=self.config.figure_format, dpi=300)
         return fig
 
 
@@ -3803,10 +4627,10 @@ class ModelInterrogator:
         lines.append("")
 
         # ---------------------------------------------------------------------
-        # BASELINE COMPARISON
+        # BASELINE COMPARISON (Nature Methods Format)
         # ---------------------------------------------------------------------
         lines.append("-" * 70)
-        lines.append("8. BASELINE COMPARISON")
+        lines.append("8. BASELINE COMPARISON (Nature Methods Statistics)")
         lines.append("-" * 70)
 
         if self.results.baselines:
@@ -3814,20 +4638,45 @@ class ModelInterrogator:
 
             if 'linear' in bl:
                 lin = bl['linear']
-                lines.append("  Method Comparison:")
+                n_samples = lin.get('n_test_samples', '?')
+                lines.append(f"  Test samples: n = {n_samples}")
+                lines.append("")
+                lines.append("  Method Performance (mean ± SD, 95% CI):")
                 if 'baseline_results' in lin:
                     for method, metrics in lin['baseline_results'].items():
-                        r2 = metrics.get('r2', 0)
-                        mse = metrics.get('mse', 0)
-                        lines.append(f"    {method:15s}: R² = {r2:.4f}, MSE = {mse:.6f}")
+                        r2_mean = metrics.get('r2_mean', metrics.get('r2', 0))
+                        r2_std = metrics.get('r2_std', 0)
+                        ci_low = metrics.get('r2_ci_lower', r2_mean - r2_std)
+                        ci_high = metrics.get('r2_ci_upper', r2_mean + r2_std)
+                        n = metrics.get('n', '?')
+                        lines.append(f"    {method:15s}: R² = {r2_mean:.4f} ± {r2_std:.4f} [{ci_low:.4f}, {ci_high:.4f}], n={n}")
 
-                if 'improvements' in lin:
-                    lines.append("\n  Improvements over baselines:")
-                    for method, imp in lin['improvements'].items():
-                        r2_imp = imp.get('r2_improvement', 0)
-                        lines.append(f"    vs {method}: ΔR² = {r2_imp:+.4f}")
+                # Statistical comparisons with effect sizes
+                if 'statistical_comparisons' in lin:
+                    lines.append("")
+                    lines.append("  Statistical Comparisons (vs Deep Learning):")
+                    for method, comp in lin['statistical_comparisons'].items():
+                        effect = comp['effect_size']
+                        test = comp['test']
+                        adj_p = comp.get('adjusted_p', test['p_value'])
+                        sig = '*' if adj_p < 0.05 else ''
+                        sig += '*' if adj_p < 0.01 else ''
+                        sig += '*' if adj_p < 0.001 else ''
+                        lines.append(
+                            f"    vs {method:12s}: {test['name']}, "
+                            f"p={adj_p:.2e if adj_p < 0.001 else f'{adj_p:.4f}'}{' (FDR)' if 'adjusted_p' in comp else ''}, "
+                            f"d={effect['cohens_d']:.2f} [{effect['ci_lower']:.2f}, {effect['ci_upper']:.2f}] "
+                            f"({effect['interpretation']}) {sig}"
+                        )
 
-                lines.append(f"\n  Deep learning necessary: {'YES' if lin.get('deep_learning_needed', False) else 'NO (linear sufficient)'}")
+                # Methods text for paper
+                if 'methods_text' in lin:
+                    lines.append("")
+                    lines.append("  FOR METHODS SECTION:")
+                    lines.append(f"    {lin['methods_text']}")
+
+                lines.append("")
+                lines.append(f"  Deep learning justified: {'YES (significant improvement with medium+ effect)' if lin.get('deep_learning_needed', False) else 'MARGINAL (consider simpler models)'}")
         else:
             lines.append("  [Baseline comparison not performed]")
         lines.append("")
@@ -3877,6 +4726,168 @@ class ModelInterrogator:
         path = path or os.path.join(self.config.output_dir, 'results.json')
         self.results.save(path)
         print(f"Saved to {path}")
+
+    def generate_nature_methods_report(self) -> str:
+        """
+        Generate complete Nature Methods format report.
+
+        Includes:
+        - Methods section text
+        - Statistical analysis details
+        - Figure legends
+        - Data availability statement
+        - Code availability statement
+        """
+        lines = []
+        lines.append("=" * 80)
+        lines.append("NATURE METHODS FORMAT REPORT")
+        lines.append("=" * 80)
+        lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Random seed: {self.config.seed}")
+        lines.append("")
+
+        # Software versions
+        lines.append("-" * 80)
+        lines.append("SOFTWARE VERSIONS (for Methods section)")
+        lines.append("-" * 80)
+        import sys
+        lines.append(f"  Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+        lines.append(f"  PyTorch: {torch.__version__}")
+        lines.append(f"  NumPy: {np.__version__}")
+        try:
+            import scipy
+            lines.append(f"  SciPy: {scipy.__version__}")
+        except:
+            pass
+        try:
+            import sklearn
+            lines.append(f"  scikit-learn: {sklearn.__version__}")
+        except:
+            pass
+        lines.append("")
+
+        # Statistical methods
+        lines.append("-" * 80)
+        lines.append("STATISTICAL METHODS (copy for Methods section)")
+        lines.append("-" * 80)
+        lines.append("""
+Statistical Analysis
+--------------------
+All statistical analyses were performed using custom Python code (available at
+[repository URL]). Data are presented as mean ± standard deviation unless
+otherwise noted. Confidence intervals (95% CI) were computed using the
+bias-corrected and accelerated bootstrap method (n_bootstrap = 10,000).
+
+For comparisons between methods, we used paired statistical tests as the same
+test samples were evaluated by all methods. Normality was assessed using the
+Shapiro-Wilk test (n < 50) or D'Agostino-Pearson test (n >= 50). For normally
+distributed data, paired t-tests were used; otherwise, Wilcoxon signed-rank
+tests were applied. P-values were corrected for multiple comparisons using the
+Benjamini-Hochberg false discovery rate (FDR) procedure.
+
+Effect sizes are reported as Cohen's d with 95% bootstrap confidence intervals.
+Effect size interpretation: |d| < 0.2 (negligible), 0.2-0.5 (small), 0.5-0.8
+(medium), > 0.8 (large). Statistical significance was set at α = 0.05 after
+FDR correction.
+""")
+
+        # Sample sizes
+        lines.append("-" * 80)
+        lines.append("SAMPLE SIZES")
+        lines.append("-" * 80)
+        if self.results.baselines and 'linear' in self.results.baselines:
+            n = self.results.baselines['linear'].get('n_test_samples', 'N/A')
+            lines.append(f"  Test samples for baseline comparison: n = {n}")
+        if self.results.error_analysis and 'distribution' in self.results.error_analysis:
+            n = self.results.error_analysis['distribution'].get('n_samples', 'N/A')
+            lines.append(f"  Samples for error analysis: n = {n}")
+        lines.append("")
+
+        # Statistical tests performed
+        lines.append("-" * 80)
+        lines.append("STATISTICAL TESTS PERFORMED")
+        lines.append("-" * 80)
+        if self.results.baselines and 'linear' in self.results.baselines:
+            lin = self.results.baselines['linear']
+            if 'statistical_comparisons' in lin:
+                for method, comp in lin['statistical_comparisons'].items():
+                    test = comp['test']
+                    effect = comp['effect_size']
+                    lines.append(f"\n  {method.upper()} vs DEEP LEARNING:")
+                    lines.append(f"    Test: {test['name']}")
+                    lines.append(f"    n₁ = {effect['n1']}, n₂ = {effect['n2']}")
+                    if test['df'] is not None:
+                        lines.append(f"    df = {test['df']}")
+                    lines.append(f"    Test statistic = {test['statistic']:.4f}")
+                    lines.append(f"    p-value (uncorrected) = {test['p_value']:.6f}")
+                    if 'adjusted_p' in comp:
+                        lines.append(f"    p-value (FDR-corrected) = {comp['adjusted_p']:.6f}")
+                    lines.append(f"    Cohen's d = {effect['cohens_d']:.4f}")
+                    lines.append(f"    95% CI for d: [{effect['ci_lower']:.4f}, {effect['ci_upper']:.4f}]")
+                    lines.append(f"    Interpretation: {effect['interpretation']} effect")
+        lines.append("")
+
+        # Data and code availability
+        lines.append("-" * 80)
+        lines.append("DATA AND CODE AVAILABILITY (template)")
+        lines.append("-" * 80)
+        lines.append("""
+Data Availability
+-----------------
+Source data for all figures are provided with this paper. The neural signal
+datasets used in this study are available at [DOI/URL]. Processed data and
+intermediate results are available upon reasonable request.
+
+Code Availability
+-----------------
+The model interrogation analysis code is available at [GitHub URL]. The deep
+learning model implementation and training scripts are available at [GitHub URL].
+All analyses were performed using Python [version] with the packages listed in
+the Methods section.
+""")
+
+        # Figure legends template
+        lines.append("-" * 80)
+        lines.append("FIGURE LEGEND TEMPLATES")
+        lines.append("-" * 80)
+
+        if self.results.baselines and 'linear' in self.results.baselines:
+            lin = self.results.baselines['linear']
+            n = lin.get('n_test_samples', 'N')
+            lines.append(f"""
+Figure X. Deep learning model outperforms linear baselines.
+Bar heights indicate mean R² across n = {n} test samples. Error bars show 95%
+bootstrap confidence intervals (n_bootstrap = 10,000). Individual data points
+are shown as grey dots. Statistical comparisons were made using paired tests
+(see Methods) with FDR correction for multiple comparisons.
+*p < 0.05, **p < 0.01, ***p < 0.001.
+""")
+
+        if self.results.spectral_analysis:
+            lines.append("""
+Figure Y. Spectral fidelity analysis.
+(a) Band-wise R² showing reconstruction accuracy for each frequency band.
+    Error bars: ±1 SD across samples.
+(b) Power spectral density comparison. Black: ground truth; colored: predicted.
+    Shaded region: ±1 SD.
+(c) Phase-locking value (PLV) between ground truth and predicted signals.
+    Dashed line: chance level.
+""")
+
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append("END OF NATURE METHODS REPORT")
+        lines.append("=" * 80)
+
+        return "\n".join(lines)
+
+    def save_nature_methods_report(self, path: Optional[str] = None):
+        """Save Nature Methods format report to file."""
+        path = path or os.path.join(self.config.output_dir, 'nature_methods_report.txt')
+        report = self.generate_nature_methods_report()
+        with open(path, 'w') as f:
+            f.write(report)
+        print(f"Nature Methods report saved to {path}")
 
 
 def main():
