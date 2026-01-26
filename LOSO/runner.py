@@ -630,12 +630,25 @@ def run_single_fold(
         # Get dataset info for the result
         ds_config = config.get_dataset_config()
 
-        # CRITICAL: Use TEST metrics for LOSO evaluation (not validation metrics)
+        # CRITICAL: Use TEST metrics for LOSO evaluation (NOT validation metrics!)
         # Validation metrics were used for model selection (best epoch)
         # Test metrics are from the held-out LOSO session - the unbiased evaluation
-        test_r2 = results.get("test_avg_r2") or results.get("best_val_r2") or 0.0
-        test_corr = results.get("test_avg_corr") or results.get("best_val_corr") or 0.0
-        test_loss = results.get("test_avg_delta") or results.get("best_val_loss") or float('inf')
+        #
+        # WARNING: Do NOT fall back to validation metrics - that would be data leakage!
+        # Use explicit None checks (not `or`) because 0.0 is a valid metric value
+        test_r2 = results.get("test_avg_r2")
+        test_corr = results.get("test_avg_corr")
+        test_loss = results.get("test_avg_delta")
+
+        # Validate that we got actual test metrics
+        if test_r2 is None:
+            print(f"  WARNING: test_avg_r2 is None in results! Check train.py output.")
+            print(f"  Available keys: {list(results.keys())}")
+            test_r2 = 0.0
+        if test_corr is None:
+            test_corr = 0.0
+        if test_loss is None:
+            test_loss = float('inf')
 
         # Per-session test results (for the held-out test session)
         per_session_test = results.get("per_session_test_results", [])
