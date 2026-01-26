@@ -82,6 +82,7 @@ from models import (
     normalized_rmse_torch,
     psd_error_db_torch,
     psd_diff_db_torch,
+    psd_diagnostics_torch,
     MAX_FREQ_HZ,
     # Conditioning encoders
     SpectroTemporalEncoder,
@@ -787,6 +788,7 @@ def evaluate(
     mse_list, mae_list, corr_list = [], [], []
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
+    psd_diagnostics_collected = None  # Collect detailed PSD diagnostics on first batch
 
     # Accumulators for pooled R² and correlation
     pooled_n = 0
@@ -919,6 +921,10 @@ def evaluate(
             if not fast_mode:
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
                 psd_diff_list.append(psd_diff_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
+
+                # Collect detailed PSD diagnostics on first batch (for debugging)
+                if psd_diagnostics_collected is None:
+                    psd_diagnostics_collected = psd_diagnostics_torch(pred_f32, pcx_f32, fs=sampling_rate)
 
             # Baseline metrics: Compare raw source vs target
             # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
@@ -1086,6 +1092,8 @@ def evaluate(
         results["psd_err_db"] = float(np.mean(psd_err_list))
     if psd_diff_list:
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
+    if psd_diagnostics_collected is not None:
+        results["psd_diagnostics"] = psd_diagnostics_collected
 
     # Reverse results (PCx→OB) - also use TRUE POOLED metrics
     if mse_list_rev:
@@ -2563,6 +2571,17 @@ def train(
         print(f"  R²: {fwd_r2:.4f} (Δ={delta_r2:+.4f})")
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
+
+        # Print detailed PSD diagnostics if available
+        if "psd_diagnostics" in test_metrics:
+            diag = test_metrics["psd_diagnostics"]
+            print(f"\n  PSD Diagnostics (first batch):")
+            print(f"    Signal STD ratio (pred/target): {diag['std_ratio']:.4f}")
+            print(f"    Total power ratio: {diag['total_power_ratio_db']:+.2f} dB")
+            print(f"    Spectral shape correlation: {diag['spectral_correlation']:.4f}")
+            print(f"    Per-band power ratios (dB):")
+            for band, ratio in diag['band_power_ratios_db'].items():
+                print(f"      {band}: {ratio:+.2f}")
 
         if "corr_rev" in test_metrics:
             print("\nReverse Direction (PCx → OB):")

@@ -3777,17 +3777,61 @@ def pli_torch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return pli
 
 
+def _compute_welch_psd_torch(
+    signal: torch.Tensor,
+    fs: float,
+    nperseg: int,
+    window: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Compute properly normalized Welch PSD for a batch of signals.
+
+    Args:
+        signal: Input signal [N, T]
+        fs: Sampling frequency
+        nperseg: Segment length
+        window: Pre-computed Hann window [nperseg]
+        scale: Normalization scale factor (2 / (fs * S2) for density)
+
+    Returns:
+        PSD [N, n_freq] - properly normalized power spectral density
+    """
+    hop = nperseg // 2
+
+    # Extract segments: [N, T] -> [N, n_segments, nperseg]
+    segments = signal.unfold(dimension=-1, size=nperseg, step=hop)
+
+    # Apply window
+    windowed = segments * window  # [N, n_seg, nperseg]
+
+    # FFT
+    fft_result = torch.fft.rfft(windowed, dim=-1)  # [N, n_seg, n_freq]
+
+    # Power: |FFT|^2, averaged over segments
+    psd = torch.mean(torch.abs(fft_result) ** 2, dim=1)  # [N, n_freq]
+
+    # Apply proper Welch normalization
+    # scale = 2 / (fs * S2) where S2 = sum(window^2)
+    # Factor of 2 for one-sided spectrum
+    psd = psd * scale
+
+    return psd
+
+
 def psd_error_db_torch(
     pred: torch.Tensor,
     target: torch.Tensor,
     fs: float = SAMPLING_RATE_HZ,
     nperseg: int = 512,
     freq_range: tuple = (0.0, MAX_FREQ_HZ),
+    normalize_psd: bool = False,
 ) -> torch.Tensor:
     """Compute PSD error in dB (GPU-accelerated, fully vectorized).
 
     Computes mean absolute error between PSDs in decibels.
     Lower is better (0 = perfect match).
+
+    Uses proper Welch normalization for correct PSD values.
 
     Args:
         pred: Predicted signal [B, C, T]
@@ -3795,6 +3839,8 @@ def psd_error_db_torch(
         fs: Sampling frequency in Hz
         nperseg: Segment length for Welch PSD
         freq_range: (min_freq, max_freq) to consider
+        normalize_psd: If True, normalize PSDs by total power before comparison.
+                       This focuses on spectral SHAPE rather than absolute power.
 
     Returns:
         PSD error in dB (scalar tensor). Lower is better.
@@ -3815,27 +3861,14 @@ def psd_error_db_torch(
         pred = pred.float()
         target = target.float()
 
-    n_samples = pred.shape[-1]
-    hop = nperseg // 2
-
-    # Vectorized Welch PSD using unfold (no Python loops)
-    # Extract all segments at once: [N, T] -> [N, n_segments, nperseg]
-    pred_segments = pred.unfold(dimension=-1, size=nperseg, step=hop)
-    target_segments = target.unfold(dimension=-1, size=nperseg, step=hop)
-    n_segments = pred_segments.shape[1]
-
-    # Apply Hann window [nperseg] -> broadcasted
+    # Create window and compute normalization scale
     window = torch.hann_window(nperseg, device=pred.device, dtype=pred.dtype)
-    pred_windowed = pred_segments * window  # [N, n_seg, nperseg]
-    target_windowed = target_segments * window
+    S2 = (window ** 2).sum()  # Window power
+    scale = 2.0 / (fs * S2)  # Welch normalization for one-sided PSD
 
-    # Batched FFT over all segments at once
-    pred_fft = torch.fft.rfft(pred_windowed, dim=-1)  # [N, n_seg, n_freq]
-    target_fft = torch.fft.rfft(target_windowed, dim=-1)
-
-    # PSD: mean over samples and segments
-    pred_psd = torch.mean(torch.abs(pred_fft) ** 2, dim=(0, 1))  # [n_freq]
-    target_psd = torch.mean(torch.abs(target_fft) ** 2, dim=(0, 1))
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target, fs, nperseg, window, scale)
 
     # Frequency bins
     freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
@@ -3843,15 +3876,22 @@ def psd_error_db_torch(
     # Filter to freq_range
     freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
 
-    pred_psd_filtered = pred_psd[freq_mask]
-    target_psd_filtered = target_psd[freq_mask]
+    pred_psd_filtered = pred_psd[:, freq_mask]  # [N, n_freq_filtered]
+    target_psd_filtered = target_psd[:, freq_mask]
+
+    # Optional: normalize by total power to focus on spectral shape
+    if normalize_psd:
+        pred_total = pred_psd_filtered.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        target_total = target_psd_filtered.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        pred_psd_filtered = pred_psd_filtered / pred_total
+        target_psd_filtered = target_psd_filtered / target_total
 
     # Convert to dB
     eps = 1e-12
     pred_db = 10 * torch.log10(pred_psd_filtered + eps)
     target_db = 10 * torch.log10(target_psd_filtered + eps)
 
-    # Mean absolute error in dB
+    # Mean absolute error in dB (averaged over frequencies, then over signals)
     psd_err = torch.mean(torch.abs(pred_db - target_db))
 
     return psd_err
@@ -3869,6 +3909,8 @@ def psd_diff_db_torch(
     Positive = prediction has more power than target.
     Negative = prediction has less power than target.
     Closer to 0 is better.
+
+    Uses proper Welch normalization for correct PSD values.
 
     Args:
         pred: Predicted signal [B, C, T]
@@ -3896,40 +3938,161 @@ def psd_diff_db_torch(
         pred = pred.float()
         target = target.float()
 
-    hop = nperseg // 2
-
-    # Vectorized Welch PSD using unfold (no Python loops)
-    pred_segments = pred.unfold(dimension=-1, size=nperseg, step=hop)
-    target_segments = target.unfold(dimension=-1, size=nperseg, step=hop)
-
-    # Apply Hann window
+    # Create window and compute normalization scale
     window = torch.hann_window(nperseg, device=pred.device, dtype=pred.dtype)
-    pred_windowed = pred_segments * window
-    target_windowed = target_segments * window
+    S2 = (window ** 2).sum()  # Window power
+    scale = 2.0 / (fs * S2)  # Welch normalization for one-sided PSD
 
-    # Batched FFT
-    pred_fft = torch.fft.rfft(pred_windowed, dim=-1)
-    target_fft = torch.fft.rfft(target_windowed, dim=-1)
-
-    # PSD: mean over samples and segments
-    pred_psd = torch.mean(torch.abs(pred_fft) ** 2, dim=(0, 1))
-    target_psd = torch.mean(torch.abs(target_fft) ** 2, dim=(0, 1))
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target, fs, nperseg, window, scale)
 
     # Frequency bins
     freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
     freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
 
-    pred_psd_filtered = pred_psd[freq_mask]
-    target_psd_filtered = target_psd[freq_mask]
+    pred_psd_filtered = pred_psd[:, freq_mask]  # [N, n_freq_filtered]
+    target_psd_filtered = target_psd[:, freq_mask]
 
     # Convert to dB and compute mean difference (signed)
     eps = 1e-12
     pred_db = 10 * torch.log10(pred_psd_filtered + eps)
     target_db = 10 * torch.log10(target_psd_filtered + eps)
 
+    # Mean difference (averaged over frequencies, then over signals)
     psd_diff = torch.mean(pred_db - target_db)
 
     return psd_diff
+
+
+def psd_diagnostics_torch(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    fs: float = SAMPLING_RATE_HZ,
+    nperseg: int = 512,
+    freq_range: tuple = (0.0, MAX_FREQ_HZ),
+) -> dict:
+    """Compute detailed PSD diagnostics for debugging.
+
+    Provides comprehensive PSD comparison metrics including:
+    - Total power comparison (helps identify amplitude mismatch)
+    - Per-band power comparison (delta, theta, alpha, beta, gamma)
+    - Spectral shape correlation (amplitude-invariant)
+
+    Args:
+        pred: Predicted signal [B, C, T]
+        target: Target signal [B, C, T]
+        fs: Sampling frequency in Hz
+        nperseg: Segment length for Welch PSD
+        freq_range: (min_freq, max_freq) to consider
+
+    Returns:
+        Dictionary with diagnostic metrics:
+        - total_power_ratio_db: 10*log10(pred_power / target_power)
+        - psd_error_db: Mean |pred_db - target_db| across frequencies
+        - psd_bias_db: Mean (pred_db - target_db) - signed difference
+        - spectral_correlation: Correlation of normalized PSDs (shape similarity)
+        - band_power_ratios_db: Per-band power ratio in dB
+        - pred_std: Standard deviation of predictions
+        - target_std: Standard deviation of targets
+    """
+    # Flatten batch and channel dimensions
+    if pred.ndim == 3:
+        B, C, T = pred.shape
+        pred_flat = pred.view(B * C, T)
+        target_flat = target.view(B * C, T)
+    elif pred.ndim == 2:
+        pred_flat = pred
+        target_flat = target
+    else:
+        pred_flat = pred.unsqueeze(0)
+        target_flat = target.unsqueeze(0)
+
+    # Ensure float32 for FFT
+    if pred_flat.dtype in (torch.bfloat16, torch.float16):
+        pred_flat = pred_flat.float()
+        target_flat = target_flat.float()
+
+    # Compute signal statistics
+    pred_std = pred_flat.std().item()
+    target_std = target_flat.std().item()
+
+    # Create window and compute normalization scale
+    window = torch.hann_window(nperseg, device=pred_flat.device, dtype=pred_flat.dtype)
+    S2 = (window ** 2).sum()
+    scale = 2.0 / (fs * S2)
+
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred_flat, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target_flat, fs, nperseg, window, scale)
+
+    # Average across signals
+    pred_psd_mean = pred_psd.mean(dim=0)  # [n_freq]
+    target_psd_mean = target_psd.mean(dim=0)
+
+    # Frequency bins
+    freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
+    freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
+
+    pred_psd_filtered = pred_psd_mean[freq_mask]
+    target_psd_filtered = target_psd_mean[freq_mask]
+    freqs_filtered = freqs[freq_mask]
+
+    # Total power comparison
+    eps = 1e-12
+    pred_total_power = pred_psd_filtered.sum()
+    target_total_power = target_psd_filtered.sum()
+    total_power_ratio_db = 10 * torch.log10((pred_total_power + eps) / (target_total_power + eps))
+
+    # dB conversion
+    pred_db = 10 * torch.log10(pred_psd_filtered + eps)
+    target_db = 10 * torch.log10(target_psd_filtered + eps)
+
+    # PSD error and bias
+    psd_error_db = torch.mean(torch.abs(pred_db - target_db)).item()
+    psd_bias_db = torch.mean(pred_db - target_db).item()
+
+    # Spectral shape correlation (normalize by total power)
+    pred_norm = pred_psd_filtered / (pred_total_power + eps)
+    target_norm = target_psd_filtered / (target_total_power + eps)
+
+    # Pearson correlation of normalized PSDs
+    pred_centered = pred_norm - pred_norm.mean()
+    target_centered = target_norm - target_norm.mean()
+    spectral_corr = (pred_centered * target_centered).sum() / (
+        (pred_centered.pow(2).sum().sqrt() + eps) * (target_centered.pow(2).sum().sqrt() + eps)
+    )
+
+    # Per-band power ratios
+    band_definitions = {
+        'delta': (0.5, 4.0),
+        'theta': (4.0, 8.0),
+        'alpha': (8.0, 13.0),
+        'beta': (13.0, 30.0),
+        'gamma': (30.0, 100.0),
+    }
+
+    band_power_ratios_db = {}
+    for band_name, (f_low, f_high) in band_definitions.items():
+        band_mask = (freqs_filtered >= f_low) & (freqs_filtered <= f_high)
+        if band_mask.any():
+            pred_band_power = pred_psd_filtered[band_mask].sum()
+            target_band_power = target_psd_filtered[band_mask].sum()
+            ratio_db = 10 * torch.log10((pred_band_power + eps) / (target_band_power + eps))
+            band_power_ratios_db[band_name] = ratio_db.item()
+        else:
+            band_power_ratios_db[band_name] = 0.0
+
+    return {
+        'total_power_ratio_db': total_power_ratio_db.item(),
+        'psd_error_db': psd_error_db,
+        'psd_bias_db': psd_bias_db,
+        'spectral_correlation': spectral_corr.item(),
+        'band_power_ratios_db': band_power_ratios_db,
+        'pred_std': pred_std,
+        'target_std': target_std,
+        'std_ratio': pred_std / (target_std + eps),
+    }
 
 
 # =============================================================================
