@@ -2068,6 +2068,485 @@ class SessionAdaptiveScaling(nn.Module):
         return x * gamma + beta
 
 
+class SessionAdaptiveScalingV3(nn.Module):
+    """Enhanced session-adaptive scaling with multiple transformation types.
+
+    Supports a hierarchy of increasingly expressive transformations:
+
+    1. **scalar** (baseline): Per-channel scale + bias
+       - y_c = γ_c * x_c + β_c
+       - Same as original FiLM, 2*C parameters
+
+    2. **band_wise**: Per-channel, per-frequency-band scale + bias
+       - Different γ, β for delta, theta, alpha, beta, gamma
+       - Can correct session-specific spectral tilts
+       - 2*C*B parameters (B=5 bands)
+
+    3. **spectral**: Full spectral transfer function per channel
+       - Learn frequency-dependent scaling in Fourier domain
+       - Can model complex frequency response differences
+       - C*F parameters (F=frequency bins)
+
+    4. **cross_channel**: Allow channels to influence each other's scaling
+       - γ_c depends on statistics from ALL channels
+       - Important for spatially-related neural channels
+       - Uses attention mechanism over channels
+
+    5. **harmonic**: Model harmonic relationships
+       - Fundamental + harmonics scaled coherently
+       - Neural oscillations often have harmonics at 2f, 3f, ...
+       - Learns harmonic coupling structure
+
+    The transforms can be combined (e.g., band_wise + cross_channel).
+
+    Usage:
+        scaler = SessionAdaptiveScalingV3(
+            n_channels=32,
+            mode="band_wise",  # or "spectral", "cross_channel", "harmonic"
+            n_bands=5,
+            fs=1000.0,
+        )
+        scaled_output = scaler(model_output, raw_input)
+    """
+
+    # Standard neural frequency bands
+    BAND_EDGES = [0.5, 4.0, 8.0, 13.0, 30.0, 100.0]  # delta, theta, alpha, beta, gamma
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_input_channels: int = 32,
+        hidden_dim: int = 128,
+        mode: str = "scalar",  # scalar, band_wise, spectral, cross_channel, harmonic
+        n_bands: int = 5,
+        fs: float = 1000.0,
+        nperseg: int = 256,
+        n_harmonics: int = 3,
+        use_cross_channel: bool = False,  # Can combine with any mode
+    ):
+        """Initialize enhanced session-adaptive scaling.
+
+        Args:
+            n_channels: Number of output channels to transform
+            n_input_channels: Number of input channels (for computing stats)
+            hidden_dim: Hidden layer dimension for predictor networks
+            mode: Transformation type (scalar, band_wise, spectral, harmonic)
+            n_bands: Number of frequency bands for band_wise mode
+            fs: Sampling frequency in Hz
+            nperseg: FFT segment length for spectral operations
+            n_harmonics: Number of harmonics to model (for harmonic mode)
+            use_cross_channel: If True, add cross-channel attention
+        """
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_input_channels = n_input_channels
+        self.mode = mode
+        self.n_bands = n_bands
+        self.fs = fs
+        self.nperseg = nperseg
+        self.n_harmonics = n_harmonics
+        self.use_cross_channel = use_cross_channel
+
+        # Compute number of frequency bins
+        self.n_freq = nperseg // 2 + 1
+
+        # Input statistics dimension
+        # Base: mean + std per channel
+        # Band-wise: add per-band power (n_bands per channel)
+        if mode in ["band_wise", "spectral", "harmonic"]:
+            # Richer input: mean, std, and band powers
+            input_dim = n_input_channels * (2 + n_bands)
+        else:
+            input_dim = n_input_channels * 2
+
+        # Cross-channel attention (optional, can combine with any mode)
+        if use_cross_channel:
+            self.channel_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=4,
+                batch_first=True,
+            )
+            self.channel_proj = nn.Linear(n_input_channels * 2, hidden_dim)
+
+        # Mode-specific output dimensions and predictors
+        if mode == "scalar":
+            # Per-channel scale + bias
+            output_dim = n_channels * 2
+            self._build_scalar_predictor(input_dim, hidden_dim, output_dim)
+
+        elif mode == "band_wise":
+            # Per-channel, per-band scale + bias
+            output_dim = n_channels * n_bands * 2
+            self._build_bandwise_predictor(input_dim, hidden_dim, output_dim)
+            self._precompute_band_masks()
+
+        elif mode == "spectral":
+            # Per-channel spectral transfer function (complex-valued)
+            # Predict log-magnitude and phase adjustment
+            output_dim = n_channels * self.n_freq * 2  # magnitude + phase
+            self._build_spectral_predictor(input_dim, hidden_dim, n_channels)
+
+        elif mode == "harmonic":
+            # Harmonic coupling: learn relationships between f, 2f, 3f, ...
+            self._build_harmonic_predictor(input_dim, hidden_dim, n_channels)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Choose from: scalar, band_wise, spectral, harmonic")
+
+    def _build_scalar_predictor(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """Build predictor for scalar mode (original FiLM)."""
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        # Initialize to identity
+        nn.init.zeros_(self.predictor[-1].weight)
+        with torch.no_grad():
+            self.predictor[-1].bias[:self.n_channels] = 1.0  # scale = 1
+            self.predictor[-1].bias[self.n_channels:] = 0.0  # bias = 0
+
+    def _build_bandwise_predictor(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """Build predictor for band-wise mode."""
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, output_dim),
+        )
+        # Initialize to identity (scale=1, bias=0 for all bands)
+        nn.init.zeros_(self.predictor[-1].weight)
+        with torch.no_grad():
+            n_params_per_type = self.n_channels * self.n_bands
+            self.predictor[-1].bias[:n_params_per_type] = 1.0  # scales = 1
+            self.predictor[-1].bias[n_params_per_type:] = 0.0  # biases = 0
+
+    def _build_spectral_predictor(self, input_dim: int, hidden_dim: int, n_channels: int):
+        """Build predictor for full spectral mode."""
+        # Use a small network per frequency to avoid parameter explosion
+        # Bottleneck: predict a compact representation, then expand
+        bottleneck_dim = 32
+
+        self.spectral_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, bottleneck_dim * n_channels),
+        )
+
+        # Per-channel spectral decoder (shared across channels, conditioned on bottleneck)
+        self.spectral_decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.n_freq),  # log-magnitude adjustment per freq
+        )
+
+        # Initialize to identity (zero adjustment)
+        nn.init.zeros_(self.spectral_decoder[-1].weight)
+        nn.init.zeros_(self.spectral_decoder[-1].bias)
+
+    def _build_harmonic_predictor(self, input_dim: int, hidden_dim: int, n_channels: int):
+        """Build predictor for harmonic mode.
+
+        Learns:
+        - Fundamental frequency enhancement
+        - Harmonic coupling coefficients
+        - Cross-harmonic phase relationships
+        """
+        # Predict fundamental scaling + harmonic coupling matrix
+        # For each channel: 1 fundamental scale + n_harmonics harmonic scales
+        n_harmonic_params = n_channels * (1 + self.n_harmonics)
+
+        self.harmonic_predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_harmonic_params),
+        )
+
+        # Harmonic coupling matrix: how fundamental affects harmonics
+        # [n_channels, n_harmonics, n_harmonics]
+        self.harmonic_coupling = nn.Parameter(
+            torch.eye(self.n_harmonics + 1).unsqueeze(0).expand(n_channels, -1, -1).clone()
+        )
+
+        # Initialize to identity
+        nn.init.zeros_(self.harmonic_predictor[-1].weight)
+        nn.init.ones_(self.harmonic_predictor[-1].bias)
+
+    def _precompute_band_masks(self):
+        """Precompute frequency band masks for efficient band-wise filtering."""
+        freqs = torch.fft.rfftfreq(self.nperseg, d=1.0 / self.fs)
+
+        masks = []
+        for i in range(len(self.BAND_EDGES) - 1):
+            f_low, f_high = self.BAND_EDGES[i], self.BAND_EDGES[i + 1]
+            mask = (freqs >= f_low) & (freqs < f_high)
+            masks.append(mask.float())
+
+        # Register as buffer (not parameter, but moves with model)
+        self.register_buffer("band_masks", torch.stack(masks))  # [n_bands, n_freq]
+
+    def _compute_input_stats(self, raw_input: torch.Tensor) -> torch.Tensor:
+        """Compute session statistics from raw input.
+
+        Args:
+            raw_input: [B, C_in, T]
+
+        Returns:
+            Statistics tensor for predictor input
+        """
+        B, C, T = raw_input.shape
+        device = raw_input.device
+
+        # Basic stats: mean and std per channel
+        mean = raw_input.mean(dim=-1)  # [B, C]
+        std = raw_input.std(dim=-1).clamp(min=1e-6)  # [B, C]
+
+        if self.mode in ["band_wise", "spectral", "harmonic"]:
+            # Add per-band power statistics
+            # Compute PSD via FFT
+            window = torch.hann_window(self.nperseg, device=device, dtype=raw_input.dtype)
+
+            # Use last nperseg samples for efficiency
+            segment = raw_input[:, :, -self.nperseg:] * window
+
+            fft = torch.fft.rfft(segment, dim=-1)
+            psd = torch.abs(fft) ** 2  # [B, C, n_freq]
+
+            # Compute band powers
+            band_powers = []
+            for i in range(self.n_bands):
+                mask = self.band_masks[i].to(device)  # [n_freq]
+                band_power = (psd * mask).sum(dim=-1) / (mask.sum() + 1e-6)  # [B, C]
+                band_powers.append(torch.log10(band_power + 1e-10))  # Log-scale
+
+            band_powers = torch.stack(band_powers, dim=-1)  # [B, C, n_bands]
+            band_powers = band_powers.view(B, -1)  # [B, C * n_bands]
+
+            stats = torch.cat([mean, std, band_powers], dim=-1)
+        else:
+            stats = torch.cat([mean, std], dim=-1)
+
+        return stats
+
+    def _apply_cross_channel_attention(self, stats: torch.Tensor) -> torch.Tensor:
+        """Apply cross-channel attention to allow channels to influence each other.
+
+        Args:
+            stats: [B, C * features]
+
+        Returns:
+            Enhanced stats with cross-channel information
+        """
+        B = stats.shape[0]
+
+        # Reshape to per-channel: [B, C, 2] (mean, std)
+        per_channel = stats[:, :self.n_input_channels * 2].view(B, self.n_input_channels, 2)
+
+        # Project to attention dimension
+        channel_emb = self.channel_proj(per_channel.view(B, self.n_input_channels, -1).expand(-1, -1, 2).reshape(B, self.n_input_channels, -1))
+
+        # Self-attention over channels
+        attended, _ = self.channel_attention(channel_emb, channel_emb, channel_emb)
+
+        # Combine with original stats
+        attended_flat = attended.view(B, -1)
+        return torch.cat([stats, attended_flat], dim=-1)
+
+    def forward(self, x: torch.Tensor, raw_input: torch.Tensor) -> torch.Tensor:
+        """Apply session-adaptive transformation.
+
+        Args:
+            x: Output to transform [B, C, T]
+            raw_input: Raw input signal [B, C_in, T] for computing statistics
+
+        Returns:
+            Transformed output [B, C, T]
+        """
+        B, C, T = x.shape
+        device = x.device
+
+        # Compute input statistics
+        stats = self._compute_input_stats(raw_input)
+
+        # Optional cross-channel attention
+        if self.use_cross_channel:
+            stats = self._apply_cross_channel_attention(stats)
+
+        if self.mode == "scalar":
+            return self._apply_scalar(x, stats)
+        elif self.mode == "band_wise":
+            return self._apply_bandwise(x, stats)
+        elif self.mode == "spectral":
+            return self._apply_spectral(x, stats)
+        elif self.mode == "harmonic":
+            return self._apply_harmonic(x, stats)
+
+    def _apply_scalar(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply scalar (per-channel) transformation."""
+        params = self.predictor(stats)  # [B, 2*C]
+        gamma = params[:, :self.n_channels].unsqueeze(-1)  # [B, C, 1]
+        beta = params[:, self.n_channels:].unsqueeze(-1)   # [B, C, 1]
+        return x * gamma + beta
+
+    def _apply_bandwise(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply band-wise transformation in frequency domain."""
+        B, C, T = x.shape
+
+        # Predict per-band scales and biases
+        params = self.predictor(stats)  # [B, C * n_bands * 2]
+
+        n_band_params = self.n_channels * self.n_bands
+        gamma_bands = params[:, :n_band_params].view(B, C, self.n_bands)  # [B, C, n_bands]
+        beta_bands = params[:, n_band_params:].view(B, C, self.n_bands)   # [B, C, n_bands]
+
+        # Transform in frequency domain
+        # Pad to nperseg for FFT
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        # FFT
+        X = torch.fft.rfft(x_padded, dim=-1)  # [B, C, n_freq]
+
+        # Build frequency-domain scaling from band scales
+        # Interpolate band scales to full frequency resolution
+        freq_gamma = torch.zeros(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+        freq_beta = torch.zeros(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+
+        for i in range(self.n_bands):
+            mask = self.band_masks[i].to(x.device)  # [n_freq]
+            freq_gamma += gamma_bands[:, :, i:i+1] * mask  # [B, C, n_freq]
+            freq_beta += beta_bands[:, :, i:i+1] * mask
+
+        # Apply in frequency domain
+        X_scaled = X * freq_gamma.to(X.dtype)
+
+        # Transform back
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        # Add bias in time domain (after inverse FFT)
+        # Bias is applied as additive offset scaled by band
+        bias_signal = torch.fft.irfft(freq_beta.to(X.dtype) + 0j, n=self.nperseg, dim=-1)
+        x_scaled = x_scaled + bias_signal
+
+        # Crop or pad back to original length
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            # For longer signals, apply transformation in overlapping windows
+            # Simplified: just return the first nperseg samples scaled, rest unchanged
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def _apply_spectral(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply full spectral transformation."""
+        B, C, T = x.shape
+
+        # Encode stats to per-channel bottleneck
+        bottleneck = self.spectral_encoder(stats)  # [B, bottleneck_dim * C]
+        bottleneck = bottleneck.view(B, C, -1)  # [B, C, bottleneck_dim]
+
+        # Decode to spectral adjustment per channel
+        log_mag_adj = []
+        for c in range(C):
+            adj = self.spectral_decoder(bottleneck[:, c])  # [B, n_freq]
+            log_mag_adj.append(adj)
+        log_mag_adj = torch.stack(log_mag_adj, dim=1)  # [B, C, n_freq]
+
+        # Convert to linear scale (centered at 1.0)
+        mag_adj = torch.exp(log_mag_adj * 0.1)  # Small adjustments, centered at 1
+
+        # Apply in frequency domain
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        X = torch.fft.rfft(x_padded, dim=-1)
+        X_scaled = X * mag_adj.to(X.dtype)
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def _apply_harmonic(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply harmonic-aware transformation.
+
+        Models relationships between fundamental and harmonics.
+        """
+        B, C, T = x.shape
+
+        # Predict harmonic scales
+        harmonic_scales = self.harmonic_predictor(stats)  # [B, C * (1 + n_harmonics)]
+        harmonic_scales = harmonic_scales.view(B, C, 1 + self.n_harmonics)  # [B, C, 1+H]
+
+        # Apply harmonic coupling
+        # coupled_scales[c, h] = sum_h' coupling[c, h, h'] * scales[c, h']
+        coupled_scales = torch.einsum('bch,chk->bck', harmonic_scales, self.harmonic_coupling)
+
+        # Transform in frequency domain
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        X = torch.fft.rfft(x_padded, dim=-1)  # [B, C, n_freq]
+
+        # Find dominant frequencies and their harmonics
+        freqs = torch.fft.rfftfreq(self.nperseg, d=1.0 / self.fs).to(x.device)
+
+        # Build harmonic scaling mask
+        # For simplicity, scale bands around typical neural frequencies and their harmonics
+        # Fundamental bands: delta (2Hz), theta (6Hz), alpha (10Hz), beta (20Hz)
+        fundamental_freqs = torch.tensor([2.0, 6.0, 10.0, 20.0], device=x.device)
+
+        harmonic_scaling = torch.ones(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+
+        for f_idx, f0 in enumerate(fundamental_freqs):
+            for h in range(1 + self.n_harmonics):
+                f_h = f0 * (h + 1)  # h=0 is fundamental, h=1 is 2nd harmonic, etc.
+                # Gaussian window around harmonic frequency
+                gaussian = torch.exp(-0.5 * ((freqs - f_h) / 2.0) ** 2)
+                # Scale by predicted harmonic scale
+                scale_idx = min(h, self.n_harmonics)
+                harmonic_scaling += gaussian * (coupled_scales[:, :, scale_idx:scale_idx+1] - 1)
+
+        # Apply harmonic scaling
+        X_scaled = X * harmonic_scaling.to(X.dtype)
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def extra_repr(self) -> str:
+        return (
+            f"n_channels={self.n_channels}, mode={self.mode}, "
+            f"n_bands={self.n_bands}, use_cross_channel={self.use_cross_channel}"
+        )
+
+
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
 
@@ -2169,6 +2648,8 @@ class CondUNet1D(nn.Module):
         conv_kernel_size: int = 7,
         dilations: Tuple[int, ...] = (1, 4, 16, 32),
         use_adaptive_scaling: bool = False,
+        adaptive_scaling_mode: str = "scalar",  # scalar, band_wise, spectral, harmonic
+        adaptive_scaling_cross_channel: bool = False,
         use_session_stats: bool = False,
         session_emb_dim: int = 32,
         session_use_spectral: bool = False,
@@ -2178,6 +2659,7 @@ class CondUNet1D(nn.Module):
         activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
         n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
         skip_type: str = "add",  # Skip connection type: add, concat (future: attention, dense)
+        sampling_rate: float = 1000.0,  # Sampling rate for spectral operations
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2333,14 +2815,26 @@ class CondUNet1D(nn.Module):
         nn.init.zeros_(self.outc.weight)
         nn.init.zeros_(self.outc.bias)
 
-        # Session-adaptive output scaling (FiLM-style)
+        # Session-adaptive output scaling (FiLM-style or enhanced)
         # Predicts scale/bias from input statistics - adapts to each session
         self.use_adaptive_scaling = use_adaptive_scaling
+        self.adaptive_scaling_mode = adaptive_scaling_mode
         if use_adaptive_scaling:
-            self.adaptive_scaler = SessionAdaptiveScaling(
-                n_channels=out_channels,
-                n_input_channels=in_channels,
-            )
+            if adaptive_scaling_mode == "scalar" and not adaptive_scaling_cross_channel:
+                # Original simple FiLM scaler
+                self.adaptive_scaler = SessionAdaptiveScaling(
+                    n_channels=out_channels,
+                    n_input_channels=in_channels,
+                )
+            else:
+                # Enhanced V3 scaler with spectral/harmonic capabilities
+                self.adaptive_scaler = SessionAdaptiveScalingV3(
+                    n_channels=out_channels,
+                    n_input_channels=in_channels,
+                    mode=adaptive_scaling_mode,
+                    use_cross_channel=adaptive_scaling_cross_channel,
+                    fs=sampling_rate,
+                )
 
         # Store architecture parameters for interrogation summary
         self.in_channels = in_channels

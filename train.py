@@ -1728,10 +1728,13 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_mode=config.get("adaptive_scaling_mode", "scalar"),
+            adaptive_scaling_cross_channel=config.get("adaptive_scaling_cross_channel", False),
             # NEW: Ablation-configurable parameters
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
             skip_type=config.get("skip_type", "add"),
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -1784,10 +1787,13 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_mode=config.get("adaptive_scaling_mode", "scalar"),
+            adaptive_scaling_cross_channel=config.get("adaptive_scaling_cross_channel", False),
             # NEW: Ablation-configurable parameters (same as forward)
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
             skip_type=config.get("skip_type", "add"),
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -3102,6 +3108,12 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (FiLM style)")
+    parser.add_argument("--adaptive-scaling-mode", type=str, default="scalar",
+                        choices=["scalar", "band_wise", "spectral", "harmonic"],
+                        help="Session-adaptive scaling mode: scalar (per-channel), band_wise (per-band), "
+                             "spectral (full frequency), harmonic (harmonic coupling)")
+    parser.add_argument("--adaptive-scaling-cross-channel", action="store_true",
+                        help="Add cross-channel attention to adaptive scaling (any mode)")
 
     # =========================================================================
     # Noise Augmentation (Training Robustness)
@@ -3337,6 +3349,8 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
+    config["adaptive_scaling_mode"] = args.adaptive_scaling_mode
+    config["adaptive_scaling_cross_channel"] = args.adaptive_scaling_cross_channel
 
     # =========================================================================
     # Noise Augmentation
