@@ -629,8 +629,9 @@ def run_single_fold(
         # CRITICAL: Use TEST metrics for LOSO evaluation (not validation metrics)
         # Validation metrics were used for model selection (best epoch)
         # Test metrics are from the held-out LOSO session - the unbiased evaluation
-        test_r2 = results.get("test_avg_r2", results.get("best_val_r2", 0.0))
-        test_corr = results.get("test_avg_corr", results.get("best_val_corr", 0.0))
+        test_r2 = results.get("test_avg_r2") or results.get("best_val_r2") or 0.0
+        test_corr = results.get("test_avg_corr") or results.get("best_val_corr") or 0.0
+        test_loss = results.get("test_avg_delta") or results.get("best_val_loss") or float('inf')
 
         # Per-session test results (for the held-out test session)
         per_session_test = results.get("per_session_test_results", [])
@@ -650,7 +651,7 @@ def run_single_fold(
             train_sessions=train_sessions,
             val_r2=test_r2,  # LOSO metric: test R² from held-out session
             val_corr=test_corr,  # LOSO metric: test correlation from held-out session
-            val_loss=results.get("test_avg_delta", results.get("best_val_loss", float('inf'))),
+            val_loss=test_loss,
             train_loss=results.get("final_train_loss", 0.0),
             per_session_r2=per_session_r2,
             per_session_corr=per_session_corr,
@@ -670,10 +671,10 @@ def run_single_fold(
 
         print(f"\nFold {fold_idx} completed:")
         print(f"  Held-out {session_label} (TEST): {test_session}")
-        print(f"  Test R²: {fold_result.val_r2:.4f}")
-        if test_corr != 0.0:
+        print(f"  Test R²: {fold_result.val_r2:.4f}" if fold_result.val_r2 else "  Test R²: N/A")
+        if fold_result.val_corr and fold_result.val_corr != 0.0:
             print(f"  Test Corr: {fold_result.val_corr:.4f}")
-        print(f"  Test Loss: {fold_result.val_loss:.4f}")
+        print(f"  Test Loss: {fold_result.val_loss:.4f}" if fold_result.val_loss != float('inf') else "  Test Loss: N/A")
         print(f"  Time: {elapsed/60:.1f} minutes")
 
         # Print per-session test results if available
