@@ -4703,9 +4703,12 @@ class ModelInterrogator:
                         sig = '*' if adj_p < 0.05 else ''
                         sig += '*' if adj_p < 0.01 else ''
                         sig += '*' if adj_p < 0.001 else ''
+                        # Format p-value correctly
+                        p_str = f"{adj_p:.2e}" if adj_p < 0.001 else f"{adj_p:.4f}"
+                        fdr_str = ' (FDR)' if 'adjusted_p' in comp else ''
                         lines.append(
                             f"    vs {method:12s}: {test['name']}, "
-                            f"p={adj_p:.2e if adj_p < 0.001 else f'{adj_p:.4f}'}{' (FDR)' if 'adjusted_p' in comp else ''}, "
+                            f"p={p_str}{fdr_str}, "
                             f"d={effect['cohens_d']:.2f} [{effect['ci_lower']:.2f}, {effect['ci_upper']:.2f}] "
                             f"({effect['interpretation']}) {sig}"
                         )
@@ -4764,9 +4767,90 @@ class ModelInterrogator:
 
     def save_results(self, path: Optional[str] = None):
         """Save results to JSON."""
+        os.makedirs(self.config.output_dir, exist_ok=True)
         path = path or os.path.join(self.config.output_dir, 'results.json')
         self.results.save(path)
         print(f"Saved to {path}")
+
+    def save_all_figures(self, output_dir: Optional[str] = None):
+        """Save all generated figures to output directory."""
+        output_dir = output_dir or self.config.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"\nSaving figures to {output_dir}...")
+
+        figures_saved = 0
+
+        # Training dynamics
+        if self.results.training_dynamics and 'learning_curves' in self.results.training_dynamics:
+            try:
+                fig = self.analyzers['training'].plot_learning_curves(
+                    save_path=os.path.join(output_dir, 'fig_learning_curves.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_learning_curves.pdf")
+            except Exception as e:
+                print(f"  Skipped learning curves: {e}")
+
+        # Spectral analysis
+        if self.results.spectral_analysis:
+            try:
+                fig = self.analyzers['spectral'].plot_bandwise_comparison(
+                    save_path=os.path.join(output_dir, 'fig_bandwise_r2.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_bandwise_r2.pdf")
+            except Exception as e:
+                print(f"  Skipped bandwise R²: {e}")
+
+            try:
+                fig = self.analyzers['spectral'].plot_psd_comparison(
+                    save_path=os.path.join(output_dir, 'fig_psd_comparison.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_psd_comparison.pdf")
+            except Exception as e:
+                print(f"  Skipped PSD comparison: {e}")
+
+        # Loss landscape
+        if self.results.loss_landscape and 'surface' in self.results.loss_landscape:
+            try:
+                fig = self.analyzers['landscape'].plot_loss_landscape(
+                    save_path=os.path.join(output_dir, 'fig_loss_landscape.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_loss_landscape.pdf")
+            except Exception as e:
+                print(f"  Skipped loss landscape: {e}")
+
+        # Error analysis
+        if self.results.error_analysis and 'distribution' in self.results.error_analysis:
+            try:
+                fig = self.analyzers['error'].plot_error_distribution(
+                    save_path=os.path.join(output_dir, 'fig_error_distribution.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_error_distribution.pdf")
+            except Exception as e:
+                print(f"  Skipped error distribution: {e}")
+
+        # Baseline comparison
+        if self.results.baselines and 'linear' in self.results.baselines:
+            try:
+                fig = self.analyzers['baseline'].plot_baseline_comparison(
+                    save_path=os.path.join(output_dir, 'fig_baseline_comparison.pdf')
+                )
+                plt.close(fig)
+                figures_saved += 1
+                print(f"  Saved: fig_baseline_comparison.pdf")
+            except Exception as e:
+                print(f"  Skipped baseline comparison: {e}")
+
+        print(f"Saved {figures_saved} figures to {output_dir}")
 
     def generate_nature_methods_report(self) -> str:
         """
@@ -4981,6 +5065,7 @@ def main():
 
     print(interrogator.generate_summary_report())
     interrogator.save_results()
+    interrogator.save_all_figures()
 
     print("\nInterrogation complete!")
 
