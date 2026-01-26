@@ -2342,8 +2342,11 @@ class CondUNet1D(nn.Module):
                 n_input_channels=in_channels,
             )
 
-        # Store in_channels for adaptive scaling
+        # Store architecture parameters for interrogation summary
         self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.base = base
+        self.use_attention = use_attention
 
         # Gradient checkpointing: trade compute for memory
         self.gradient_checkpointing = False
@@ -2850,15 +2853,15 @@ class CondUNet1D(nn.Module):
             Dict with architecture details
         """
         return {
-            'n_downsample': self.n_downsample,
-            'in_channels': self.in_channels,
-            'out_channels': self.out_channels,
-            'base_channels': self.base,
-            'cond_mode': self.cond_mode,
-            'skip_type': self.skip_type,
-            'use_attention': self.use_attention,
-            'attention_type': self.attention_type,
-            'use_residual': self.use_residual,
+            'n_downsample': getattr(self, 'n_downsample', None),
+            'in_channels': getattr(self, 'in_channels', None),
+            'out_channels': getattr(self, 'out_channels', None),
+            'base_channels': getattr(self, 'base', None),
+            'cond_mode': getattr(self, 'cond_mode', None),
+            'skip_type': getattr(self, 'skip_type', None),
+            'use_attention': getattr(self, 'use_attention', None),
+            'attention_type': getattr(self, 'attention_type', None),
+            'use_residual': getattr(self, 'use_residual', None),
             'total_params': sum(p.numel() for p in self.parameters()),
             'trainable_params': sum(p.numel() for p in self.parameters() if p.requires_grad),
             'layer_param_counts': self.get_layer_parameter_counts(),
