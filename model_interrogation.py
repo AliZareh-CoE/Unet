@@ -324,8 +324,6 @@ class NatureMethodsStatistics:
         Returns:
             Dict with corrected p-values and significance
         """
-        from scipy.stats import false_discovery_control
-
         p_values = np.asarray(p_values)
         n = len(p_values)
 
@@ -956,6 +954,12 @@ class AnalysisResults:
                 return obj.tolist()
             elif isinstance(obj, torch.Tensor):
                 return obj.detach().cpu().numpy().tolist()
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
             elif isinstance(obj, dict):
                 return {k: convert(v) for k, v in obj.items()}
             elif isinstance(obj, list):
