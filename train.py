@@ -2168,10 +2168,13 @@ def train(
                             print(f"    sess_first mean: {sess_first.mean():.6f}, std: {sess_first.std():.6f}")
                 print()
 
+            # fast_mode=True skips PSD/baseline metrics for speed
+            # Use --compute-psd-validation to enable PSD during validation
+            val_fast_mode = not config.get("compute_psd_validation", False)
             val_metrics = evaluate(
                 model, loaders["val"], device,
                 compute_phase=False, reverse_model=reverse_model, config=config,
-                fast_mode=True,
+                fast_mode=val_fast_mode,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
             )
@@ -2184,7 +2187,7 @@ def train(
                     sess_metrics = evaluate(
                         model, sess_loader, device,
                         compute_phase=False, reverse_model=reverse_model, config=config,
-                        fast_mode=True,
+                        fast_mode=val_fast_mode,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                         cond_encoder=cond_encoder,
                     )
@@ -2234,16 +2237,22 @@ def train(
             if "corr_rev" in val_metrics:
                 rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
+            # Include PSD metrics if computed
+            psd_str = ""
+            if "psd_diff_db" in val_metrics:
+                psd_str = f" | PSD: {val_metrics['psd_diff_db']:+.1f}dB"
+
             print(f"Epoch {epoch}/{num_epochs} | "
                   f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
+                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{psd_str}{rev_str} | "
                   f"Best: {best_val_loss:.3f}")
 
             # Print per-session metrics if available
             if per_session_metrics:
                 sess_strs = []
                 for sess_name, sess_m in per_session_metrics.items():
-                    sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
+                    psd_part = f", PSD={sess_m['psd_diff_db']:+.1f}dB" if "psd_diff_db" in sess_m else ""
+                    sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}{psd_part}")
                 print("  Per-session: " + " | ".join(sess_strs))
 
             # Print session embedding weight stats every 10 epochs
@@ -2968,6 +2977,8 @@ def parse_args():
     # Training speed optimizations
     parser.add_argument("--val-every", type=int, default=1,
                         help="Validate every N epochs (default: 1). Use 5-10 for faster training.")
+    parser.add_argument("--compute-psd-validation", action="store_true",
+                        help="Compute PSD metrics during validation (slower but useful for monitoring spectral fidelity)")
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce memory and allow larger batches")
     parser.add_argument("--num-workers", type=int, default=None,
@@ -3284,6 +3295,7 @@ def main():
 
     # Training speed optimizations
     config["val_every"] = args.val_every  # Validate every N epochs
+    config["compute_psd_validation"] = args.compute_psd_validation  # PSD metrics during validation
     config["gradient_checkpointing"] = args.gradient_checkpointing
     config["num_workers"] = args.num_workers  # None = auto
     config["prefetch_factor"] = args.prefetch_factor
