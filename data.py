@@ -1997,14 +1997,28 @@ def create_dataloaders(
     # prefetch_factor=2 prefetches 2 batches per worker in advance
     persistent = num_workers > 0
 
-    # For small datasets, reduce batch size for val/test to ensure we get at least 1 batch
+    # For small datasets, reduce batch size to ensure we get at least 1 batch per GPU
+    # This is especially important for distributed training where samples are split across GPUs
+    train_batch_size = batch_size
     val_batch_size = batch_size
     test_batch_size = batch_size
+    train_drop_last = True  # Default: drop incomplete batches for training stability
     if distributed:
         import torch.distributed as dist
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # Samples per GPU
+        train_per_gpu = len(train_dataset) // world_size
         val_per_gpu = len(val_dataset) // world_size
         test_per_gpu = len(test_dataset) // world_size
+        # Ensure at least 1 batch per GPU for training
+        if train_per_gpu < batch_size:
+            # Either reduce batch size or set drop_last=False
+            if train_per_gpu >= batch_size // 2:
+                train_batch_size = max(1, train_per_gpu)
+            else:
+                # Very few samples - don't drop last batch
+                train_drop_last = False
+        # Ensure at least 1 batch per GPU for val/test
         if val_per_gpu < batch_size:
             val_batch_size = max(1, val_per_gpu)
         if test_per_gpu < batch_size:
@@ -2019,15 +2033,15 @@ def create_dataloaders(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
-    
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=train_batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=train_drop_last,
         persistent_workers=persistent,
         prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
@@ -2227,17 +2241,28 @@ def create_pfc_dataloaders(
     pin_memory = torch.cuda.is_available()
     persistent = num_workers > 0
 
-    # For small datasets, reduce batch size for val/test to ensure we get at least 1 batch
+    # For small datasets, reduce batch size to ensure we get at least 1 batch per GPU
     # This is especially important for distributed training where samples are split across GPUs
+    train_batch_size = batch_size
     val_batch_size = batch_size
     test_batch_size = batch_size
+    train_drop_last = True  # Default: drop incomplete batches for training stability
     if distributed:
         import torch.distributed as dist
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         # Samples per GPU
+        train_per_gpu = len(train_dataset) // world_size
         val_per_gpu = len(val_dataset) // world_size
         test_per_gpu = len(test_dataset) // world_size
-        # Ensure at least 1 batch per GPU
+        # Ensure at least 1 batch per GPU for training
+        if train_per_gpu < batch_size:
+            # Either reduce batch size or set drop_last=False
+            if train_per_gpu >= batch_size // 2:
+                train_batch_size = max(1, train_per_gpu)
+            else:
+                # Very few samples - don't drop last batch
+                train_drop_last = False
+        # Ensure at least 1 batch per GPU for val/test
         if val_per_gpu < batch_size:
             val_batch_size = max(1, val_per_gpu)
         if test_per_gpu < batch_size:
@@ -2252,15 +2277,15 @@ def create_pfc_dataloaders(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
-    
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=train_batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=train_drop_last,
         persistent_workers=persistent,
         prefetch_factor=4 if num_workers > 0 else None,
         worker_init_fn=worker_init_fn,
@@ -2713,17 +2738,30 @@ def create_pfc_sliding_window_dataloaders(
     val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if distributed else None
     test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if distributed else None
 
+    # For small datasets, adjust batch size to ensure at least 1 batch per GPU
+    train_batch_size = batch_size
+    train_drop_last = True  # Default: drop incomplete batches for training stability
+    if distributed:
+        import torch.distributed as dist
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        train_per_gpu = len(train_dataset) // world_size
+        if train_per_gpu < batch_size:
+            if train_per_gpu >= batch_size // 2:
+                train_batch_size = max(1, train_per_gpu)
+            else:
+                train_drop_last = False
+
     # Create DataLoaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=train_batch_size,
         shuffle=(train_sampler is None),  # Don't shuffle when using sampler
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=persistent_workers and num_workers > 0,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        drop_last=True,
+        drop_last=train_drop_last,
     )
 
     val_loader = DataLoader(

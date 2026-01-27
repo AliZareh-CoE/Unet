@@ -1285,8 +1285,14 @@ def train_epoch(
     # Pre-fetch first batch to reduce perceived delay
     import itertools
     _warmup_iter = iter(loader)
-    _first_batch = next(_warmup_iter)
-    loader_iter = itertools.chain([_first_batch], _warmup_iter)
+    try:
+        _first_batch = next(_warmup_iter)
+        loader_iter = itertools.chain([_first_batch], _warmup_iter)
+    except StopIteration:
+        # Empty loader (can happen with FSDP when samples < num_gpus * batch_size)
+        if is_primary():
+            print(f"Warning: Empty dataloader on this rank (samples may be too few for {get_world_size()} GPUs)")
+        loader_iter = iter([])  # Empty iterator
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False)
