@@ -892,11 +892,12 @@ def evaluate(
             if envelope_matcher_fwd is not None:
                 pred = envelope_matcher_fwd(pred, odor_ids=odor)
 
-            # Apply Wiener boost at inference time (neural net + alpha * Wiener)
+            # Apply Wiener residual learning: pred = NeuralNet(x) + alpha * Wiener(x)
             # Track neural-only prediction for contribution analysis
             pred_neural_only = pred.clone() if (wiener_boost is not None and wiener_boost.is_fitted) else None
             if wiener_boost is not None and wiener_boost.is_fitted:
-                pred = wiener_boost.boost(ob, pred, alpha=wiener_alpha)
+                wiener_pred = wiener_boost.predict(ob)
+                pred = pred + wiener_alpha * wiener_pred
 
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
@@ -1291,6 +1292,7 @@ def train_epoch(
     cond_encoder: Optional[nn.Module] = None,
     noise_augmentor: Optional[NoiseAugmentor] = None,
     metrics_recorder: Optional[TrainingMetricsRecorder] = None,
+    wiener_filter: Optional["WienerBoost"] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1298,6 +1300,7 @@ def train_epoch(
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
         metrics_recorder: Optional recorder for tracking training dynamics
         noise_augmentor: Optional NoiseAugmentor for noise augmentation
+        wiener_filter: Optional pre-fitted Wiener filter for residual learning
     """
     model.train()
     if reverse_model is not None:
@@ -1410,6 +1413,14 @@ def train_epoch(
         else:
             # Other architectures: just pass input
             pred_raw = model(ob)
+
+        # Wiener residual learning: combine neural net + Wiener prediction
+        # pred_combined = NeuralNet(x) + alpha * Wiener(x)
+        if wiener_filter is not None and wiener_filter.is_fitted:
+            wiener_alpha = config.get("wiener_alpha", 1.0)
+            with torch.no_grad():
+                wiener_pred = wiener_filter.predict(ob)
+            pred_raw = pred_raw + wiener_alpha * wiener_pred
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -2166,6 +2177,68 @@ def train(
         print("\n[Interrogation] Training metrics recorder initialized")
         print(f"  Tracking: gradients, weights, loss components, per-session metrics")
 
+    # =========================================================================
+    # WIENER RESIDUAL: Fit Wiener filter BEFORE training (if enabled)
+    # Neural network will learn: y = Wiener(x) + NeuralNet(x)
+    # =========================================================================
+    wiener_filter = None
+    if config.get("wiener_residual", False):
+        if is_primary():
+            print("\n" + "="*60)
+            print("WIENER RESIDUAL LEARNING")
+            print("Fitting Wiener filter on training data...")
+            print("Neural network will learn the residual: y - Wiener(x)")
+            print("="*60)
+
+        # Collect training data for Wiener fitting
+        max_samples = 10000  # Limit samples for Wiener fitting
+        X_train_list, y_train_list = [], []
+        n_collected = 0
+
+        with torch.no_grad():
+            for batch in loaders["train"]:
+                if n_collected >= max_samples:
+                    break
+
+                if len(batch) == 4:
+                    ob, pcx, odor, session_ids_batch = batch
+                else:
+                    ob, pcx, odor = batch
+
+                ob = ob.to(device)
+                pcx = pcx.to(device)
+                pcx = per_channel_normalize(pcx)
+
+                X_train_list.append(ob.cpu())
+                y_train_list.append(pcx.cpu())
+                n_collected += ob.shape[0]
+
+        X_train = torch.cat(X_train_list, dim=0)[:max_samples]
+        y_train = torch.cat(y_train_list, dim=0)[:max_samples]
+
+        # Fit Wiener filter
+        in_channels = config.get("in_channels", 32)
+        out_channels = config.get("out_channels", 32)
+        wiener_filter = WienerBoost(n_in=in_channels, n_out=out_channels)
+        wiener_filter.fit(X_train.to(device), y_train.to(device))
+        wiener_filter.to(device)
+        wiener_filter.eval()  # Freeze Wiener filter
+
+        # Compute Wiener-only baseline R²
+        with torch.no_grad():
+            y_wiener = wiener_filter.predict(X_train.to(device))
+            y_target = y_train.to(device)
+            ss_tot = ((y_target - y_target.mean()) ** 2).sum()
+            ss_res = ((y_target - y_wiener) ** 2).sum()
+            wiener_r2 = (1 - ss_res / ss_tot).item()
+
+        if is_primary():
+            print(f"  Fitted on {n_collected} samples")
+            print(f"  Input channels: {in_channels}, Output channels: {out_channels}")
+            print(f"  Wiener-only R² (baseline): {wiener_r2:.4f}")
+            print(f"  Alpha (contribution weight): {config.get('wiener_alpha', 1.0)}")
+            print("="*60 + "\n")
+
     for epoch in range(1, num_epochs + 1):
         if loaders.get("train_sampler") is not None:
             loaders["train_sampler"].set_epoch(epoch)
@@ -2176,6 +2249,7 @@ def train(
             cond_encoder=cond_encoder,
             noise_augmentor=noise_augmentor,
             metrics_recorder=metrics_recorder,
+            wiener_filter=wiener_filter,
         )
 
         barrier()
@@ -2218,6 +2292,8 @@ def train(
                 fast_mode=val_fast_mode,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
+                wiener_boost=wiener_filter,
+                wiener_alpha=config.get("wiener_alpha", 1.0),
             )
             last_val_metrics = val_metrics  # Cache for non-validation epochs
 
@@ -2231,6 +2307,8 @@ def train(
                         fast_mode=val_fast_mode,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                         cond_encoder=cond_encoder,
+                        wiener_boost=wiener_filter,
+                        wiener_alpha=config.get("wiener_alpha", 1.0),
                     )
                     per_session_metrics[sess_name] = sess_metrics
         else:
@@ -2561,57 +2639,6 @@ def train(
     envelope_matcher_fwd = None
     envelope_matcher_rev = None
 
-    # =========================================================================
-    # WIENER BOOST: Fit Wiener filter on training data (if enabled)
-    # =========================================================================
-    wiener_filter = None
-    if config.get("wiener_boost", False):
-        if is_primary():
-            print("\n" + "="*60)
-            print("FITTING WIENER FILTER ON TRAINING DATA")
-            print("="*60)
-
-        # Collect training data for Wiener fitting
-        # Use a subset to avoid memory issues on large datasets
-        max_samples = 10000  # Limit samples for Wiener fitting
-        X_train_list, y_train_list = [], []
-        n_collected = 0
-
-        model.eval()
-        with torch.no_grad():
-            for batch in loaders["train"]:
-                if n_collected >= max_samples:
-                    break
-
-                if len(batch) == 4:
-                    ob, pcx, odor, session_ids_batch = batch
-                else:
-                    ob, pcx, odor = batch
-
-                ob = ob.to(device)
-                pcx = pcx.to(device)
-                pcx = per_channel_normalize(pcx)
-
-                X_train_list.append(ob.cpu())
-                y_train_list.append(pcx.cpu())
-                n_collected += ob.shape[0]
-
-        X_train = torch.cat(X_train_list, dim=0)[:max_samples]
-        y_train = torch.cat(y_train_list, dim=0)[:max_samples]
-
-        # Fit Wiener filter
-        in_channels = config.get("in_channels", 32)
-        out_channels = config.get("out_channels", 32)
-        wiener_filter = WienerBoost(n_in=in_channels, n_out=out_channels)
-        wiener_filter.fit(X_train.to(device), y_train.to(device))
-        wiener_filter.to(device)
-
-        if is_primary():
-            print(f"  Fitted on {n_collected} samples")
-            print(f"  Input channels: {in_channels}, Output channels: {out_channels}")
-            print(f"  Alpha (contribution weight): {config.get('wiener_alpha', 1.0)}")
-            print("="*60 + "\n")
-
     # Final test evaluation (full metrics, fast_mode=False)
     # Skip if no test set (no_test_set=True means all held-out sessions are validation)
     has_test_set = len(data.get("test_idx", [])) > 0
@@ -2765,6 +2792,8 @@ def train(
                     fast_mode=True,  # Fast mode for per-session eval
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
+                    wiener_boost=wiener_filter,
+                    wiener_alpha=config.get("wiener_alpha", 1.0),
                 )
 
                 per_session_results.append({
@@ -3269,9 +3298,9 @@ def parse_args():
     parser.add_argument("--loso-verbose", action="store_true", default=True,
                         help="Show verbose output during LOSO folds")
 
-    # Wiener boost options
-    parser.add_argument("--wiener-boost", action="store_true",
-                        help="Apply Wiener filter boosting at inference time")
+    # Wiener residual learning options
+    parser.add_argument("--wiener-residual", action="store_true",
+                        help="Use Wiener residual learning: y = Wiener(x) + NeuralNet(x)")
     parser.add_argument("--wiener-alpha", type=float, default=1.0,
                         help="Wiener contribution weight (default: 1.0)")
 
@@ -3479,9 +3508,9 @@ def main():
     config["noise_prob"] = args.noise_prob
 
     # =========================================================================
-    # Wiener Boost (inference-time boosting)
+    # Wiener Residual Learning
     # =========================================================================
-    config["wiener_boost"] = args.wiener_boost
+    config["wiener_residual"] = args.wiener_residual
     config["wiener_alpha"] = args.wiener_alpha
 
     # Print session split info
