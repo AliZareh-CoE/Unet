@@ -3918,14 +3918,47 @@ def prepare_dandi_data(
         _print_primary(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
 
     # Create datasets with consistent channel counts
-    train_dataset = DANDIMovieDataset(
-        train_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
-    )
-    val_dataset = DANDIMovieDataset(
-        val_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
-    )
+    # Special handling for LOSO mode: when test_subjects provided but no val_subjects,
+    # create val set by randomly splitting training windows (not subjects)
+    loso_mode_no_val = (test_subjects is not None and len(test_subjects) > 0 and
+                        (val_subjects is None or len(val_subjects) == 0))
+
+    if loso_mode_no_val and len(train_data) > 0:
+        # LOSO mode: create combined train dataset, then split windows into train/val
+        combined_dataset = DANDIMovieDataset(
+            train_data, window_size, stride, verbose=False,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+
+        # Random 70/30 split of windows
+        n_total = len(combined_dataset)
+        n_train = int(0.7 * n_total)
+        n_val = n_total - n_train
+
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(n_total)
+        train_indices = indices[:n_train].tolist()
+        val_indices = indices[n_train:].tolist()
+
+        # Create subset datasets
+        train_dataset = torch.utils.data.Subset(combined_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(combined_dataset, val_indices)
+
+        if verbose:
+            _print_primary(f"DANDIMovieDataset [LOSO]: {len(train_data)} subjects, "
+                  f"{n_train} train + {n_val} val windows (70/30 split), "
+                  f"window_size={window_size}, stride={stride}, "
+                  f"source_ch={min_source_channels}, target_ch={min_target_channels}")
+    else:
+        train_dataset = DANDIMovieDataset(
+            train_data, window_size, stride, verbose=verbose,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+        val_dataset = DANDIMovieDataset(
+            val_data, window_size, stride, verbose=verbose,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+
     test_dataset = DANDIMovieDataset(
         test_data, window_size, stride, verbose=verbose,
         n_source_channels=min_source_channels, n_target_channels=min_target_channels,
