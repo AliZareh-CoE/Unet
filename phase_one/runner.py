@@ -795,8 +795,7 @@ def load_dandi_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Opti
         source_region="amygdala",
         target_region="hippocampus",
         window_size=5000,
-        train_stride=2500,
-        val_stride=5000,
+        stride=2500,
     )
 
     # DANDI returns datasets, need to extract arrays
@@ -891,6 +890,126 @@ def load_raw_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]
     return X, y, session_ids, idx_to_session
 
 
+def load_raw_dandi_data(
+    window_size: int = 5000,
+    stride: int = 2500,
+    min_channels: int = 12,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) DANDI data with subject info for LOSO.
+
+    For DANDI, "sessions" are subjects (subject-based LOSO).
+
+    Args:
+        window_size: Window size in samples (default: 5000 = 5s at 1kHz)
+        stride: Stride between windows (default: 2500 = 2.5s)
+        min_channels: Minimum channels required in both source and target
+
+    Returns:
+        X: Raw input signals (amygdala) [N, C, T]
+        y: Raw target signals (hippocampus) [N, C, T]
+        subject_ids: Subject ID per window [N]
+        idx_to_subject: Map from subject int ID to subject name
+    """
+    from data import (
+        DANDI_RAW_PATH,
+        list_dandi_nwb_files,
+        load_dandi_subject,
+    )
+
+    print("Loading raw DANDI data for LOSO (no pre-normalization)...")
+    print(f"  Window size: {window_size}, stride: {stride}")
+
+    # Get available subjects
+    nwb_files = list_dandi_nwb_files(DANDI_RAW_PATH)
+    all_subject_ids = []
+
+    for f in nwb_files:
+        stem = f.stem
+        if "sub-" in stem:
+            subj_id = stem.split("_")[0]
+        else:
+            subj_id = stem
+        if subj_id not in all_subject_ids:
+            all_subject_ids.append(subj_id)
+
+    all_subject_ids = sorted(all_subject_ids)
+    print(f"  Found {len(all_subject_ids)} subjects: {all_subject_ids}")
+
+    # Load all subjects without z-scoring (will normalize per-fold in LOSO)
+    subjects_data = []
+    valid_subject_ids = []
+
+    for subj_id in all_subject_ids:
+        try:
+            subj_data = load_dandi_subject(
+                subj_id,
+                DANDI_RAW_PATH,
+                source_region="amygdala",
+                target_region="hippocampus",
+                zscore=False,  # No pre-normalization for LOSO
+            )
+            n_src = subj_data["n_source_channels"]
+            n_tgt = subj_data["n_target_channels"]
+
+            if n_src < min_channels or n_tgt < min_channels:
+                print(f"    Skipping {subj_id}: only {n_src} source / {n_tgt} target channels (min={min_channels})")
+                continue
+
+            subjects_data.append(subj_data)
+            valid_subject_ids.append(subj_id)
+            print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, {subj_data['n_samples']} samples")
+
+        except Exception as e:
+            print(f"    Warning: Could not load {subj_id}: {e}")
+
+    if not subjects_data:
+        raise RuntimeError("No valid DANDI subjects found!")
+
+    # Determine channel counts (use minimum across subjects for consistent shapes)
+    n_source_ch = min(s["n_source_channels"] for s in subjects_data)
+    n_target_ch = min(s["n_target_channels"] for s in subjects_data)
+    print(f"  Using {n_source_ch} source channels, {n_target_ch} target channels")
+
+    # Create subject ID mapping
+    subject_to_idx = {subj_id: idx for idx, subj_id in enumerate(valid_subject_ids)}
+    idx_to_subject = {idx: subj_id for subj_id, idx in subject_to_idx.items()}
+
+    # Create sliding windows for all subjects
+    all_X = []
+    all_y = []
+    all_subject_ids_per_window = []
+
+    for subj_data in subjects_data:
+        subj_id = subj_data["subject_id"]
+        subj_idx = subject_to_idx[subj_id]
+        source = subj_data["source"][:n_source_ch]  # [C, T_total]
+        target = subj_data["target"][:n_target_ch]  # [C, T_total]
+        n_samples = subj_data["n_samples"]
+
+        n_windows = (n_samples - window_size) // stride + 1
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+
+            X_window = source[:, start:end]  # [C, T]
+            y_window = target[:, start:end]  # [C, T]
+
+            all_X.append(X_window)
+            all_y.append(y_window)
+            all_subject_ids_per_window.append(subj_idx)
+
+    # Stack into arrays
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    subject_ids = np.array(all_subject_ids_per_window, dtype=np.int32)
+
+    print(f"  Loaded: Amygdala {X.shape} -> Hippocampus {y.shape}")
+    print(f"  Subjects: {len(idx_to_subject)} unique, {len(X)} total windows")
+
+    return X, y, subject_ids, idx_to_subject
+
+
 def run_loso_evaluation(
     config: "Phase1Config",
     dataset: str = "pfc",
@@ -924,6 +1043,9 @@ def run_loso_evaluation(
         X_raw, y_raw, session_ids, idx_to_session = load_raw_pfc_data()
     elif dataset == "olfactory":
         X_raw, y_raw, session_ids, idx_to_session = load_raw_olfactory_data()
+    elif dataset == "dandi":
+        # For DANDI, "sessions" are subjects (subject-based LOSO)
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_dandi_data()
     else:
         raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
 
