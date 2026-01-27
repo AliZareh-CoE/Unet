@@ -3196,12 +3196,21 @@ def main():
             print()
 
         from LOSO.runner import run_loso
-        from LOSO.config import LOSOConfig
+        from LOSO.config import LOSOConfig, DATASET_CONFIGS
+
+        # Map CLI dataset names to LOSO dataset names
+        # CLI uses: olfactory, pfc, dandi
+        # LOSO uses: olfactory, pfc_hpc, dandi_movie
+        cli_to_loso_dataset = {
+            ds_config.train_py_dataset_name: ds_name
+            for ds_name, ds_config in DATASET_CONFIGS.items()
+        }
+        loso_dataset = cli_to_loso_dataset.get(args.dataset, args.dataset)
 
         # Optimized LOSO defaults from cascading ablation study
         # CLI arguments override these defaults when explicitly provided
         config = LOSOConfig(
-            dataset=args.dataset,
+            dataset=loso_dataset,
             output_dir=Path(args.loso_output_dir),
             # Training (optimized defaults)
             epochs=args.epochs or 80,  # Optimized: 80 epochs
