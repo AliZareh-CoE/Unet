@@ -829,6 +829,7 @@ def evaluate(
 
     # Wiener boost tracking (neural-only vs boosted comparison)
     wiener_neural_only_r2_list = []
+    wiener_only_r2_list = []  # Track Wiener-alone performance
     wiener_contribution_list = []
 
     # Determine compute dtype for FSDP mixed precision compatibility
@@ -971,13 +972,21 @@ def evaluate(
                 else:
                     cross_channel_corr_accumulated += cross_ch_corr.cpu()
 
-                # Track Wiener contribution (neural-only R² vs boosted R²)
-                if pred_neural_only is not None:
+                # Track Wiener contribution (neural-only R², wiener-only R², combined R²)
+                if pred_neural_only is not None and wiener_boost is not None:
                     pred_neural_c = crop_to_target_torch(pred_neural_only)
                     pred_neural_f32 = pred_neural_c.float()
                     neural_only_r2 = explained_variance_torch(pred_neural_f32, pcx_f32).item()
-                    boosted_r2 = r2_list[-1]  # Already computed above
+
+                    # Compute Wiener-only R² (without neural network)
+                    wiener_pred = wiener_boost.predict(ob)
+                    wiener_pred_c = crop_to_target_torch(wiener_pred)
+                    wiener_pred_f32 = wiener_pred_c.float()
+                    wiener_only_r2 = explained_variance_torch(wiener_pred_f32, pcx_f32).item()
+
+                    boosted_r2 = r2_list[-1]  # Already computed above (combined)
                     wiener_neural_only_r2_list.append(neural_only_r2)
+                    wiener_only_r2_list.append(wiener_only_r2)
                     wiener_contribution_list.append(boosted_r2 - neural_only_r2)
 
             # Reverse: PCx → OB (if reverse model exists)
@@ -1243,8 +1252,9 @@ def evaluate(
     # Wiener boost contribution metrics (only computed when wiener_boost is used)
     if wiener_neural_only_r2_list:
         results["wiener_neural_only_r2"] = float(np.mean(wiener_neural_only_r2_list))
+        results["wiener_only_r2"] = float(np.mean(wiener_only_r2_list))
         results["wiener_contribution"] = float(np.mean(wiener_contribution_list))
-        # Boosted R² is already in results["r2"]
+        # Combined R² is already in results["r2"]
 
     return results
 
@@ -2702,17 +2712,26 @@ def train(
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
 
-        # Wiener boost contribution (if enabled)
+        # Wiener contribution analysis (if enabled)
         if "wiener_contribution" in test_metrics:
             neural_only_r2 = test_metrics.get('wiener_neural_only_r2', 0)
-            wiener_contrib = test_metrics.get('wiener_contribution', 0)
-            print(f"\n  Wiener Boost Analysis:")
-            print(f"    Neural-only R²: {neural_only_r2:.4f}")
-            print(f"    Boosted R²: {fwd_r2:.4f}")
-            print(f"    Wiener contribution: {wiener_contrib:+.4f}")
-            if neural_only_r2 > 0:
-                pct_improvement = 100 * wiener_contrib / neural_only_r2
-                print(f"    Relative improvement: {pct_improvement:+.1f}%")
+            wiener_only_r2 = test_metrics.get('wiener_only_r2', 0)
+            combined_r2 = fwd_r2
+            print(f"\n  Wiener + Neural Network Decomposition:")
+            print(f"    ┌─────────────────┬──────────┐")
+            print(f"    │ Component       │    R²    │")
+            print(f"    ├─────────────────┼──────────┤")
+            print(f"    │ Neural-only     │ {neural_only_r2:>8.4f} │")
+            print(f"    │ Wiener-only     │ {wiener_only_r2:>8.4f} │")
+            print(f"    │ Combined        │ {combined_r2:>8.4f} │")
+            print(f"    └─────────────────┴──────────┘")
+            # Compute synergy: is combined > max(neural, wiener)?
+            max_individual = max(neural_only_r2, wiener_only_r2)
+            synergy = combined_r2 - max_individual
+            if synergy > 0:
+                print(f"    Synergy: +{synergy:.4f} (they capture complementary info!)")
+            else:
+                print(f"    Overlap: {synergy:.4f} (redundant information)")
 
         # Print detailed PSD diagnostics if available
         if "psd_diagnostics" in test_metrics:
@@ -4018,9 +4037,10 @@ def main():
         if results['test_metrics']:
             print(f"RESULT_CORR={results['test_metrics']['corr']:.4f}")
             print(f"RESULT_R2={results['test_metrics']['r2']:.4f}")
-            # Wiener boost metrics (if enabled)
+            # Wiener metrics (if enabled)
             if "wiener_contribution" in results['test_metrics']:
                 print(f"RESULT_WIENER_NEURAL_ONLY_R2={results['test_metrics']['wiener_neural_only_r2']:.4f}")
+                print(f"RESULT_WIENER_ONLY_R2={results['test_metrics']['wiener_only_r2']:.4f}")
                 print(f"RESULT_WIENER_CONTRIBUTION={results['test_metrics']['wiener_contribution']:.4f}")
         print(f"RESULT_LOSS={results['best_val_loss']:.4f}")
         if "split_info" in data:
