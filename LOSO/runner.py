@@ -561,6 +561,12 @@ def run_single_fold(
     if config.use_adaptive_scaling:
         cmd.append("--use-adaptive-scaling")
 
+    # Wiener residual learning
+    if config.wiener_residual:
+        cmd.append("--wiener-residual")
+        if config.wiener_alpha != 1.0:
+            cmd.extend(["--wiener-alpha", str(config.wiener_alpha)])
+
     # Noise augmentation (optimized for LOSO)
     if config.use_noise_augmentation:
         cmd.append("--use-noise-augmentation")

@@ -3407,6 +3407,9 @@ def main():
             noise_channel_dropout=args.noise_channel_dropout if args.noise_channel_dropout > 0 else 0.05,
             noise_temporal_dropout=args.noise_temporal_dropout if args.noise_temporal_dropout > 0 else 0.02,
             noise_prob=args.noise_prob,
+            # Wiener residual learning
+            wiener_residual=args.wiener_residual,
+            wiener_alpha=args.wiener_alpha,
         )
 
         print("=" * 60)
