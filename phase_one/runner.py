@@ -747,12 +747,19 @@ def load_pfc_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Option
             val_idx_per_session = {}
             val_sessions = data["split_info"]["val_sessions"]
             val_idx_set = set(val_idx)
-            for sess in val_sessions:
-                sess_mask = metadata["recording_id"] == sess
-                sess_indices = np.where(sess_mask)[0]
-                sess_val_idx = np.array([i for i in sess_indices if i in val_idx_set])
-                if len(sess_val_idx) > 0:
-                    val_idx_per_session[sess] = sess_val_idx
+            # PFC uses 'session' column, olfactory uses 'recording_id'
+            session_col = None
+            for col in ["session", "recording_id", "session_id"]:
+                if col in metadata.columns:
+                    session_col = col
+                    break
+            if session_col:
+                for sess in val_sessions:
+                    sess_mask = metadata[session_col] == sess
+                    sess_indices = np.where(sess_mask)[0]
+                    sess_val_idx = np.array([i for i in sess_indices if i in val_idx_set])
+                    if len(sess_val_idx) > 0:
+                        val_idx_per_session[sess] = sess_val_idx
 
     # Log session split info if available
     if "split_info" in data:
