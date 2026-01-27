@@ -2688,12 +2688,16 @@ class WienerBoost(nn.Module):
 
         N, C_in, T = X.shape
         device = X.device
+        original_dtype = X.dtype
+
+        # FFT requires float32 (doesn't support bfloat16)
+        X_f32 = X.float() if X.dtype == torch.bfloat16 else X
 
         # Reconstruct complex filter
         H = torch.complex(self.H_real.to(device), self.H_imag.to(device))
 
         # FFT of input
-        X_fft = torch.fft.rfft(X, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
+        X_fft = torch.fft.rfft(X_f32, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
 
         # Apply filter: Y_fft[n, c_out, f] = sum_c_in H[c_out, c_in, f] * X_fft[n, c_in, f]
         # Using einsum for clarity
@@ -2704,6 +2708,10 @@ class WienerBoost(nn.Module):
 
         # Trim to original length
         y_pred = y_pred[:, :, :T]
+
+        # Cast back to original dtype
+        if original_dtype == torch.bfloat16:
+            y_pred = y_pred.to(torch.bfloat16)
 
         if squeeze_batch:
             y_pred = y_pred.squeeze(0)
