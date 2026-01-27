@@ -226,7 +226,19 @@ def run_training(
         "--batch-size", str(config["batch_size"]),
         "--lr", str(config["lr"]),
         "--seed", str(seed),
+        # Model architecture (use LOSO-optimized defaults)
+        "--arch", "condunet",
         "--base-channels", str(config.get("base_channels", 64)),
+        "--n-downsample", str(config.get("n_downsample", 2)),
+        "--attention-type", config.get("attention_type", "none"),
+        "--cond-mode", config.get("cond_mode", "cross_attn_gated"),
+        "--conv-type", config.get("conv_type", "modern"),
+        "--activation", config.get("activation", "gelu"),
+        "--skip-type", config.get("skip_type", "add"),
+        "--conditioning", config.get("conditioning", "spectro_temporal"),
+        # Optimizer
+        "--optimizer", config.get("optimizer", "adamw"),
+        "--lr-schedule", config.get("lr_schedule", "cosine_warmup"),
         # Gated options
         "--gated",
         "--gated-sparsity-weight", str(config["sparsity_weight"]),
@@ -240,7 +252,18 @@ def run_training(
         "--no-plots",
         # Quiet mode
         "--quiet",
+        # Disable bidirectional (not supported with gated)
+        "--no-bidirectional",
     ])
+
+    # DANDI-specific arguments
+    if config["dataset"] == "dandi":
+        cmd.extend([
+            "--dandi-source-region", config.get("dandi_source_region", "amygdala"),
+            "--dandi-target-region", config.get("dandi_target_region", "hippocampus"),
+            "--dandi-window-size", str(config.get("dandi_window_size", 5000)),
+            "--dandi-stride-ratio", str(config.get("dandi_stride_ratio", 0.5)),
+        ])
 
     # FSDP options
     if use_fsdp:
@@ -347,6 +370,23 @@ def parse_args():
     parser.add_argument("--baseline-channels", type=int, default=64,
                         help="Hidden channels for baseline predictor")
 
+    # Model architecture (LOSO-optimized defaults)
+    parser.add_argument("--n-downsample", type=int, default=2)
+    parser.add_argument("--attention-type", type=str, default="none")
+    parser.add_argument("--cond-mode", type=str, default="cross_attn_gated")
+    parser.add_argument("--conv-type", type=str, default="modern")
+    parser.add_argument("--activation", type=str, default="gelu")
+    parser.add_argument("--skip-type", type=str, default="add")
+    parser.add_argument("--conditioning", type=str, default="spectro_temporal")
+    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--lr-schedule", type=str, default="cosine_warmup")
+
+    # DANDI-specific
+    parser.add_argument("--dandi-source-region", type=str, default="amygdala")
+    parser.add_argument("--dandi-target-region", type=str, default="hippocampus")
+    parser.add_argument("--dandi-window-size", type=int, default=5000)
+    parser.add_argument("--dandi-stride-ratio", type=float, default=0.5)
+
     # Cross-validation
     parser.add_argument("--n-folds", type=int, default=3,
                         help="Number of CV folds")
@@ -390,10 +430,26 @@ def main():
         "batch_size": args.batch_size,
         "lr": args.lr,
         "base_channels": args.base_channels,
+        # Gating
         "sparsity_weight": args.sparsity_weight,
         "sparsity_target": args.sparsity_target,
         "gate_channels": args.gate_channels,
         "baseline_channels": args.baseline_channels,
+        # Model architecture
+        "n_downsample": args.n_downsample,
+        "attention_type": args.attention_type,
+        "cond_mode": args.cond_mode,
+        "conv_type": args.conv_type,
+        "activation": args.activation,
+        "skip_type": args.skip_type,
+        "conditioning": args.conditioning,
+        "optimizer": args.optimizer,
+        "lr_schedule": args.lr_schedule,
+        # DANDI-specific
+        "dandi_source_region": args.dandi_source_region,
+        "dandi_target_region": args.dandi_target_region,
+        "dandi_window_size": args.dandi_window_size,
+        "dandi_stride_ratio": args.dandi_stride_ratio,
     }
 
     if args.dry_run:
