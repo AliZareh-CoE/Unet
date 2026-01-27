@@ -1683,9 +1683,9 @@ def train(
             )
 
         # Update in_channels and out_channels from actual data
-        # Get a sample batch to determine shapes (collate_fn returns tuple: source, target, label)
+        # Get a sample batch to determine shapes (collate_fn returns tuple: source, target, label, session_id)
         sample_batch = next(iter(loaders["train"]))
-        source_batch, target_batch, _ = sample_batch
+        source_batch, target_batch, *_ = sample_batch
         config["in_channels"] = source_batch.shape[1]  # [B, C, T]
         config["out_channels"] = target_batch.shape[1]
 
