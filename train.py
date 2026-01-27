@@ -99,6 +99,9 @@ from models import (
     TrainingMetricsRecorder,
     # Wiener filter for inference-time boosting
     WienerBoost,
+    # Gated translator for learnable communication windows
+    GatedTranslator,
+    create_gated_translator,
 )
 from data import (
     prepare_data,
@@ -1411,18 +1414,32 @@ def train_epoch(
         # For CondUNet: use cond_emb if available, otherwise odor_ids
         # For other architectures: just pass input directly
         arch = config.get("arch", "condunet")
+        use_gated = config.get("use_gated", False)
+        gate_values = None  # For gated models, stores gate tensor
 
         if arch == "condunet":
             # CondUNet with conditioning
             # Use proper session_ids from dataloader (only needed for learnable session embedding)
             session_ids = session_ids_batch if config.get("use_session_embedding", False) else None
-            if cond_emb is not None:
-                pred_raw = model(ob, cond_emb=cond_emb, session_ids=session_ids)
+            if use_gated:
+                # GatedTranslator wraps CondUNet - pass kwargs through
+                if cond_emb is not None:
+                    pred_raw, gate_components = model(ob, return_components=True, cond_emb=cond_emb, session_ids=session_ids)
+                else:
+                    pred_raw, gate_components = model(ob, return_components=True, odor=odor, session_ids=session_ids)
+                gate_values = gate_components["gate"]
             else:
-                pred_raw = model(ob, odor, session_ids=session_ids)
+                if cond_emb is not None:
+                    pred_raw = model(ob, cond_emb=cond_emb, session_ids=session_ids)
+                else:
+                    pred_raw = model(ob, odor, session_ids=session_ids)
         else:
             # Other architectures: just pass input
-            pred_raw = model(ob)
+            if use_gated:
+                pred_raw, gate_components = model(ob, return_components=True)
+                gate_values = gate_components["gate"]
+            else:
+                pred_raw = model(ob)
 
         # Wiener residual learning: combine neural net + Wiener prediction
         # pred_combined = NeuralNet(x) + alpha * Wiener(x)
@@ -1440,6 +1457,16 @@ def train_epoch(
         recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
         loss = recon_loss
         loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
+
+        # Gated translator sparsity loss
+        if gate_values is not None:
+            sparsity_target = config.get("gated_sparsity_target", 0.3)
+            sparsity_weight = config.get("gated_sparsity_weight", 0.01)
+            gate_mean = gate_values.mean()
+            sparsity_loss = sparsity_weight * (gate_mean - sparsity_target).pow(2)
+            loss = loss + sparsity_loss
+            loss_components["gate_sparsity"] = loss_components["gate_sparsity"] + sparsity_loss.detach()
+            loss_components["gate_mean"] = loss_components["gate_mean"] + gate_mean.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -1933,6 +1960,36 @@ def train(
             reverse_model.set_gradient_checkpointing(True)
         if is_primary():
             print("Gradient checkpointing ENABLED (saves ~40% memory, costs ~30% more compute)")
+
+    # Wrap with GatedTranslator if requested (learnable communication windows)
+    if config.get("use_gated", False):
+        if is_primary():
+            print(f"Wrapping model with GatedTranslator:")
+            print(f"  Sparsity target: {config.get('gated_sparsity_target', 0.3)}")
+            print(f"  Sparsity weight: {config.get('gated_sparsity_weight', 0.01)}")
+
+        model = create_gated_translator(
+            translator=model,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            sparsity_weight=config.get("gated_sparsity_weight", 0.01),
+            sparsity_target=config.get("gated_sparsity_target", 0.3),
+            gate_hidden_channels=config.get("gated_gate_channels", 64),
+            baseline_hidden_channels=config.get("gated_baseline_channels", 64),
+        )
+
+        # Update parameter count
+        gated_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        config["model_n_params"] = gated_params
+        if is_primary():
+            print(f"  GatedTranslator parameters: {gated_params:,}")
+
+        # Disable reverse model for gated (not supported)
+        if reverse_model is not None:
+            if is_primary():
+                print("  Warning: Bidirectional training not supported with --gated, disabling")
+            reverse_model = None
+            config["use_bidirectional"] = False
 
     # Wrap for distributed training
     is_fsdp_wrapped = False
@@ -3323,6 +3380,18 @@ def parse_args():
     parser.add_argument("--wiener-alpha", type=float, default=1.0,
                         help="Wiener contribution weight (default: 1.0)")
 
+    # Gated translator options (learnable communication windows)
+    parser.add_argument("--gated", action="store_true",
+                        help="Wrap model with GatedTranslator for learnable communication windows")
+    parser.add_argument("--gated-sparsity-weight", type=float, default=0.01,
+                        help="Weight for gate sparsity penalty (default: 0.01)")
+    parser.add_argument("--gated-sparsity-target", type=float, default=0.3,
+                        help="Target gate activation rate 0-1 (default: 0.3)")
+    parser.add_argument("--gated-gate-channels", type=int, default=64,
+                        help="Hidden channels for gate network (default: 64)")
+    parser.add_argument("--gated-baseline-channels", type=int, default=64,
+                        help="Hidden channels for baseline predictor (default: 64)")
+
     return parser.parse_args()
 
 
@@ -3534,6 +3603,15 @@ def main():
     # =========================================================================
     config["wiener_residual"] = args.wiener_residual
     config["wiener_alpha"] = args.wiener_alpha
+
+    # =========================================================================
+    # Gated Translator (Learnable Communication Windows)
+    # =========================================================================
+    config["use_gated"] = args.gated
+    config["gated_sparsity_weight"] = args.gated_sparsity_weight
+    config["gated_sparsity_target"] = args.gated_sparsity_target
+    config["gated_gate_channels"] = args.gated_gate_channels
+    config["gated_baseline_channels"] = args.gated_baseline_channels
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
