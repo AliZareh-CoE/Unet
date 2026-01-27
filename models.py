@@ -4946,5 +4946,457 @@ class NoiseAugmentor(nn.Module):
         return x
 
 
+# =============================================================================
+# Gated Translator: Learnable Communication Windows
+# =============================================================================
+
+
+class GateNetwork(nn.Module):
+    """Predicts per-timepoint gate values from source signal.
+
+    The gate learns to detect communication signatures in the source signal
+    (coherence bursts, specific oscillatory patterns, etc.) and outputs
+    values in [0, 1] indicating when cross-region communication is occurring.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int = 64,
+        kernel_size: int = 31,
+        num_layers: int = 3,
+    ):
+        """Initialize gate network.
+
+        Args:
+            in_channels: Number of input (source) channels
+            hidden_channels: Hidden layer channels
+            kernel_size: Temporal convolution kernel size
+            num_layers: Number of conv layers
+        """
+        super().__init__()
+
+        layers = []
+        current_channels = in_channels
+
+        for i in range(num_layers):
+            out_ch = hidden_channels if i < num_layers - 1 else 1
+            layers.extend([
+                nn.Conv1d(
+                    current_channels,
+                    out_ch,
+                    kernel_size=kernel_size,
+                    padding=kernel_size // 2,
+                ),
+                nn.GroupNorm(1, out_ch) if out_ch > 1 else nn.Identity(),
+                nn.GELU() if i < num_layers - 1 else nn.Sigmoid(),
+            ])
+            current_channels = hidden_channels
+
+        self.net = nn.Sequential(*layers)
+
+        # Initialize to output ~0.5 (neutral) at start
+        self._init_neutral()
+
+    def _init_neutral(self):
+        """Initialize to output near 0.5 (neutral gate)."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict gate values.
+
+        Args:
+            x: Source signal [B, C_in, T]
+
+        Returns:
+            Gate values [B, 1, T] in [0, 1]
+        """
+        return self.net(x)
+
+
+class BaselinePredictor(nn.Module):
+    """Predicts target estimate from source during non-communication periods.
+
+    This is a simpler/more conservative estimate compared to full translation.
+    During periods when regions aren't communicating, this provides a
+    reasonable default prediction.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int = 64,
+        kernel_size: int = 15,
+    ):
+        """Initialize baseline predictor.
+
+        Args:
+            in_channels: Number of input (source) channels
+            out_channels: Number of output (target) channels
+            hidden_channels: Hidden layer channels
+            kernel_size: Temporal convolution kernel size
+        """
+        super().__init__()
+
+        # Simple 2-layer conv network - intentionally limited capacity
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(8, hidden_channels),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, out_channels, kernel_size, padding=kernel_size // 2),
+        )
+
+        # Initialize to low-magnitude outputs
+        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.1)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict baseline target estimate.
+
+        Args:
+            x: Source signal [B, C_in, T]
+
+        Returns:
+            Baseline prediction [B, C_out, T]
+        """
+        return self.net(x)
+
+
+class GatedTranslator(nn.Module):
+    """Neural translator with learnable communication gating.
+
+    Learns when brain regions are communicating vs when translation is noise.
+
+    Architecture:
+        y_pred[t] = gate[t] * y_translated[t] + (1 - gate[t]) * y_baseline[t]
+
+    Where all outputs are source-derived:
+        - y_translated: Full translation network output
+        - y_baseline: Simpler source-derived estimate for non-communication periods
+        - gate: Per-timepoint gate in [0, 1] predicting communication
+
+    Training dynamics:
+        - When regions communicate: translation accurate → loss lower with gate=1 → gate ON
+        - When regions don't: translation is noise → loss lower with gate=0 → gate OFF
+        - Sparsity penalty encourages gate OFF by default
+
+    Loss:
+        loss = reconstruction_loss(y_pred, y_target) + sparsity_weight * sparsity_penalty(gate)
+    """
+
+    def __init__(
+        self,
+        translator: nn.Module,
+        in_channels: int,
+        out_channels: int,
+        gate_hidden_channels: int = 64,
+        gate_kernel_size: int = 31,
+        gate_num_layers: int = 3,
+        baseline_hidden_channels: int = 64,
+        baseline_kernel_size: int = 15,
+        sparsity_weight: float = 0.01,
+        sparsity_target: float = 0.3,  # Target fraction of time gate is ON
+    ):
+        """Initialize gated translator.
+
+        Args:
+            translator: The main translation network (source → target)
+            in_channels: Number of input (source) channels
+            out_channels: Number of output (target) channels
+            gate_hidden_channels: Hidden channels for gate network
+            gate_kernel_size: Kernel size for gate network
+            gate_num_layers: Number of layers in gate network
+            baseline_hidden_channels: Hidden channels for baseline predictor
+            baseline_kernel_size: Kernel size for baseline predictor
+            sparsity_weight: Weight for sparsity penalty in loss
+            sparsity_target: Target gate activation rate (encourages this fraction ON)
+        """
+        super().__init__()
+
+        self.translator = translator
+        self.gate = GateNetwork(
+            in_channels=in_channels,
+            hidden_channels=gate_hidden_channels,
+            kernel_size=gate_kernel_size,
+            num_layers=gate_num_layers,
+        )
+        self.baseline = BaselinePredictor(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            hidden_channels=baseline_hidden_channels,
+            kernel_size=baseline_kernel_size,
+        )
+
+        self.sparsity_weight = sparsity_weight
+        self.sparsity_target = sparsity_target
+
+        # Gate logging for analysis
+        self._last_gate: Optional[torch.Tensor] = None
+        self._gate_history: List[torch.Tensor] = []  # For tracking across batches
+        self._logging_enabled: bool = False
+        self._max_history: int = 100  # Max batches to store
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_components: bool = False,
+        **translator_kwargs,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """Forward pass with gated translation.
+
+        Args:
+            x: Source signal [B, C_in, T]
+            return_components: If True, return dict with gate, translated, baseline
+            **translator_kwargs: Additional args for the translator
+
+        Returns:
+            If return_components=False:
+                y_pred [B, C_out, T]
+            If return_components=True:
+                (y_pred, {'gate': gate, 'translated': y_trans, 'baseline': y_base})
+        """
+        # Get all components
+        y_translated = self.translator(x, **translator_kwargs)
+        y_baseline = self.baseline(x)
+        gate = self.gate(x)  # [B, 1, T]
+
+        # Store for analysis
+        self._last_gate = gate.detach()
+
+        # Log gate values if enabled
+        if self._logging_enabled:
+            self._gate_history.append(gate.detach().cpu())
+            if len(self._gate_history) > self._max_history:
+                self._gate_history.pop(0)
+
+        # Gated combination
+        y_pred = gate * y_translated + (1 - gate) * y_baseline
+
+        if return_components:
+            return y_pred, {
+                'gate': gate,
+                'translated': y_translated,
+                'baseline': y_baseline,
+            }
+        return y_pred
+
+    def compute_loss(
+        self,
+        y_pred: torch.Tensor,
+        y_target: torch.Tensor,
+        gate: torch.Tensor,
+        reduction: str = 'mean',
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute total loss with sparsity penalty.
+
+        Args:
+            y_pred: Predicted output [B, C_out, T]
+            y_target: Target output [B, C_out, T]
+            gate: Gate values [B, 1, T]
+            reduction: Loss reduction method
+
+        Returns:
+            (total_loss, {'reconstruction': recon_loss, 'sparsity': sparsity_loss})
+        """
+        # Reconstruction loss (MSE)
+        recon_loss = F.mse_loss(y_pred, y_target, reduction=reduction)
+
+        # Sparsity penalty: encourage gate to be near target rate
+        # Using soft constraint: penalize deviation from target mean activation
+        gate_mean = gate.mean()
+        sparsity_loss = (gate_mean - self.sparsity_target).pow(2)
+
+        total_loss = recon_loss + self.sparsity_weight * sparsity_loss
+
+        return total_loss, {
+            'reconstruction': recon_loss.detach(),
+            'sparsity': sparsity_loss.detach(),
+            'gate_mean': gate_mean.detach(),
+        }
+
+    def get_gate_statistics(self) -> Dict[str, float]:
+        """Get statistics about the last forward pass gate values."""
+        if self._last_gate is None:
+            return {}
+
+        gate = self._last_gate
+        return {
+            'gate_mean': gate.mean().item(),
+            'gate_std': gate.std().item(),
+            'gate_min': gate.min().item(),
+            'gate_max': gate.max().item(),
+            'gate_on_frac': (gate > 0.5).float().mean().item(),
+        }
+
+    def enable_logging(self, max_history: int = 100):
+        """Enable gate logging for analysis.
+
+        Args:
+            max_history: Maximum number of batches to store
+        """
+        self._logging_enabled = True
+        self._max_history = max_history
+        self._gate_history = []
+
+    def disable_logging(self):
+        """Disable gate logging."""
+        self._logging_enabled = False
+
+    def clear_history(self):
+        """Clear stored gate history."""
+        self._gate_history = []
+
+    def get_gate_history(self) -> torch.Tensor:
+        """Get concatenated gate history.
+
+        Returns:
+            Gate values [N, 1, T] concatenated across logged batches
+        """
+        if not self._gate_history:
+            return torch.tensor([])
+        return torch.cat(self._gate_history, dim=0)
+
+    def compute_coherence_correlation(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        fs: float = 1000.0,
+        nperseg: int = 256,
+    ) -> Dict[str, float]:
+        """Compute correlation between gate and source-target coherence.
+
+        This validates whether the gate learns to detect actual communication.
+        High correlation means gate correctly identifies coherent periods.
+
+        Args:
+            source: Source signal [B, C_src, T]
+            target: Target signal [B, C_tgt, T] (ground truth, only for analysis)
+            fs: Sampling frequency
+            nperseg: Segment length for coherence computation
+
+        Returns:
+            Dict with correlation metrics
+        """
+        if self._last_gate is None:
+            return {'correlation': float('nan'), 'p_value': float('nan')}
+
+        try:
+            from scipy import signal as sig
+            from scipy.stats import pearsonr
+        except ImportError:
+            return {'correlation': float('nan'), 'error': 'scipy not available'}
+
+        gate = self._last_gate.cpu().numpy()  # [B, 1, T]
+        src = source.detach().cpu().numpy()   # [B, C_src, T]
+        tgt = target.detach().cpu().numpy()   # [B, C_tgt, T]
+
+        correlations = []
+        for b in range(gate.shape[0]):
+            # Compute coherence between first source and target channel
+            # (simplified - could average over channel pairs)
+            f, Cxy = sig.coherence(
+                src[b, 0, :],
+                tgt[b, 0, :],
+                fs=fs,
+                nperseg=min(nperseg, src.shape[-1] // 4),
+            )
+            # Average coherence across frequencies
+            mean_coherence = Cxy.mean()
+
+            # Gate mean for this sample
+            gate_mean = gate[b, 0, :].mean()
+
+            # For per-timepoint correlation, we'd need sliding window coherence
+            # Here we just compare means
+            correlations.append((gate_mean, mean_coherence))
+
+        if len(correlations) < 2:
+            return {'correlation': float('nan'), 'error': 'need more samples'}
+
+        gate_vals = [c[0] for c in correlations]
+        coh_vals = [c[1] for c in correlations]
+
+        try:
+            corr, p_val = pearsonr(gate_vals, coh_vals)
+        except Exception:
+            corr, p_val = float('nan'), float('nan')
+
+        return {
+            'gate_coherence_correlation': corr,
+            'p_value': p_val,
+            'mean_gate': np.mean(gate_vals),
+            'mean_coherence': np.mean(coh_vals),
+        }
+
+    def analyze_sparsity(self) -> Dict[str, float]:
+        """Analyze gate sparsity across logged history.
+
+        Returns:
+            Dict with sparsity metrics for monitoring
+        """
+        if not self._gate_history:
+            if self._last_gate is not None:
+                gate = self._last_gate
+            else:
+                return {}
+        else:
+            gate = torch.cat(self._gate_history, dim=0)
+
+        return {
+            'sparsity_mean': gate.mean().item(),
+            'sparsity_std': gate.std().item(),
+            'sparsity_on_frac': (gate > 0.5).float().mean().item(),
+            'sparsity_high_on_frac': (gate > 0.8).float().mean().item(),
+            'sparsity_low_off_frac': (gate < 0.2).float().mean().item(),
+            'is_sparse_enough': gate.mean().item() < self.sparsity_target * 1.5,
+        }
+
+
+def create_gated_translator(
+    translator: nn.Module,
+    in_channels: int,
+    out_channels: int,
+    sparsity_weight: float = 0.01,
+    sparsity_target: float = 0.3,
+    **kwargs,
+) -> GatedTranslator:
+    """Factory function to wrap any translator with gating mechanism.
+
+    Args:
+        translator: The translation model to wrap
+        in_channels: Number of source channels
+        out_channels: Number of target channels
+        sparsity_weight: Weight for sparsity penalty
+        sparsity_target: Target gate activation rate
+        **kwargs: Additional args for GatedTranslator
+
+    Returns:
+        GatedTranslator wrapping the provided translator
+
+    Example:
+        >>> from models import CondUNet1D, create_gated_translator
+        >>> base_model = CondUNet1D(in_channels=32, out_channels=32)
+        >>> gated_model = create_gated_translator(
+        ...     translator=base_model,
+        ...     in_channels=32,
+        ...     out_channels=32,
+        ...     sparsity_weight=0.01,
+        ...     sparsity_target=0.3,
+        ... )
+    """
+    return GatedTranslator(
+        translator=translator,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        sparsity_weight=sparsity_weight,
+        sparsity_target=sparsity_target,
+        **kwargs,
+    )
+
 
 
