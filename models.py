@@ -2547,6 +2547,236 @@ class SessionAdaptiveScalingV3(nn.Module):
         )
 
 
+class WienerBoost(nn.Module):
+    """Wiener filter for inference-time boosting of neural network predictions.
+
+    This implements Option A from the Wiener+Neural hybrid approach:
+    - Training: Neural network learns alone (no Wiener assistance)
+    - Inference: y_pred = NeuralNet(x) + α * Wiener(x)
+
+    The Wiener filter is fit on training data and frozen. It captures
+    optimal linear prediction, while the neural net learns nonlinear residuals.
+
+    This ensures the neural network can't be "lazy" - it must learn something
+    useful during training since Wiener is not available then.
+
+    Usage:
+        # After training, fit Wiener on training data
+        wiener = WienerBoost(n_in=64, n_out=32)
+        wiener.fit(X_train, y_train)  # X: [N, C_in, T], y: [N, C_out, T]
+
+        # At inference, boost neural net predictions
+        y_neural = model(x)
+        y_boosted = wiener.boost(x, y_neural, alpha=1.0)
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        n_fft: Optional[int] = None,
+        regularization: float = 1e-6,
+    ):
+        """Initialize WienerBoost.
+
+        Args:
+            n_in: Number of input channels
+            n_out: Number of output channels
+            n_fft: FFT size (None = auto)
+            regularization: Regularization for spectral division
+        """
+        super().__init__()
+        self.n_in = n_in
+        self.n_out = n_out
+        self.n_fft_init = n_fft
+        self.n_fft: Optional[int] = None
+        self.regularization = regularization
+
+        # Wiener filter coefficients H[f] - will be set by fit()
+        # H is complex: [n_out, n_in, n_freq]
+        self.register_buffer('H_real', None)
+        self.register_buffer('H_imag', None)
+        self._fitted = False
+        self._signal_length: Optional[int] = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._fitted
+
+    def fit(self, X: torch.Tensor, y: torch.Tensor) -> "WienerBoost":
+        """Fit Wiener filter from training data.
+
+        Computes H(f) = S_xy(f) / S_xx(f) for each output-input channel pair.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y: Target signals [N, C_out, T]
+
+        Returns:
+            self
+        """
+        device = X.device
+        N, C_in, T = X.shape
+        _, C_out, _ = y.shape
+
+        assert C_in == self.n_in, f"Expected {self.n_in} input channels, got {C_in}"
+        assert C_out == self.n_out, f"Expected {self.n_out} output channels, got {C_out}"
+
+        # Determine FFT size
+        if self.n_fft_init is None:
+            self.n_fft = 2 ** int(np.ceil(np.log2(T)))
+        else:
+            self.n_fft = self.n_fft_init
+        self._signal_length = T
+
+        n_freq = self.n_fft // 2 + 1
+
+        # Compute FFT of all signals
+        X_fft = torch.fft.rfft(X, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
+        y_fft = torch.fft.rfft(y, n=self.n_fft, dim=-1)  # [N, C_out, n_freq]
+
+        # Initialize filter coefficients
+        H = torch.zeros(C_out, C_in, n_freq, dtype=torch.complex64, device=device)
+
+        # Compute Wiener filter for each output channel
+        # For simplicity, use matched input-output channels if dimensions match,
+        # otherwise use all inputs for each output (MIMO)
+        if C_in == C_out:
+            # Matched channels: H[c, c, f] = S_xy[c, f] / S_xx[c, f]
+            for c in range(C_out):
+                S_xx = torch.mean(torch.abs(X_fft[:, c, :]) ** 2, dim=0)  # [n_freq]
+                S_xy = torch.mean(torch.conj(X_fft[:, c, :]) * y_fft[:, c, :], dim=0)  # [n_freq]
+                H[c, c, :] = S_xy / (S_xx + self.regularization)
+        else:
+            # MIMO: For each output, use corresponding input if available
+            # This is a simplified approach - full MIMO would use matrix inversion
+            n_matched = min(C_in, C_out)
+            for c in range(n_matched):
+                S_xx = torch.mean(torch.abs(X_fft[:, c, :]) ** 2, dim=0)
+                S_xy = torch.mean(torch.conj(X_fft[:, c, :]) * y_fft[:, c, :], dim=0)
+                H[c, c, :] = S_xy / (S_xx + self.regularization)
+
+            # For remaining outputs, average over all inputs
+            for c in range(n_matched, C_out):
+                S_xx = torch.mean(torch.abs(X_fft) ** 2, dim=(0, 1))  # [n_freq]
+                S_xy = torch.mean(torch.conj(X_fft) * y_fft[:, c:c+1, :], dim=(0, 1))
+                H[c, 0, :] = S_xy / (S_xx + self.regularization)
+
+        # Store as real/imag buffers (can't store complex in buffer easily)
+        self.H_real = H.real.clone()
+        self.H_imag = H.imag.clone()
+        self._fitted = True
+
+        return self
+
+    def predict(self, X: torch.Tensor) -> torch.Tensor:
+        """Apply Wiener filter to input signals.
+
+        Args:
+            X: Input signals [N, C_in, T] or [C_in, T]
+
+        Returns:
+            Filtered output [N, C_out, T] or [C_out, T]
+        """
+        if not self._fitted:
+            raise RuntimeError("WienerBoost must be fit() before predict()")
+
+        squeeze_batch = False
+        if X.ndim == 2:
+            X = X.unsqueeze(0)
+            squeeze_batch = True
+
+        N, C_in, T = X.shape
+        device = X.device
+
+        # Reconstruct complex filter
+        H = torch.complex(self.H_real.to(device), self.H_imag.to(device))
+
+        # FFT of input
+        X_fft = torch.fft.rfft(X, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
+
+        # Apply filter: Y_fft[n, c_out, f] = sum_c_in H[c_out, c_in, f] * X_fft[n, c_in, f]
+        # Using einsum for clarity
+        Y_fft = torch.einsum('oif,nif->nof', H, X_fft)  # [N, C_out, n_freq]
+
+        # Inverse FFT
+        y_pred = torch.fft.irfft(Y_fft, n=self.n_fft, dim=-1)
+
+        # Trim to original length
+        y_pred = y_pred[:, :, :T]
+
+        if squeeze_batch:
+            y_pred = y_pred.squeeze(0)
+
+        return y_pred
+
+    def boost(
+        self,
+        X: torch.Tensor,
+        y_neural: torch.Tensor,
+        alpha: float = 1.0
+    ) -> torch.Tensor:
+        """Boost neural network predictions with Wiener filter.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y_neural: Neural network predictions [N, C_out, T]
+            alpha: Wiener contribution weight (default 1.0)
+
+        Returns:
+            Boosted predictions: y_neural + alpha * Wiener(X)
+        """
+        y_wiener = self.predict(X)
+        return y_neural + alpha * y_wiener
+
+    def get_contribution_stats(
+        self,
+        X: torch.Tensor,
+        y_neural: torch.Tensor,
+        y_target: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Compute contribution statistics for neural vs Wiener.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y_neural: Neural network predictions [N, C_out, T]
+            y_target: Ground truth [N, C_out, T]
+
+        Returns:
+            Dict with R² for neural-only, wiener-only, and combined
+        """
+        y_wiener = self.predict(X)
+        y_combined = y_neural + y_wiener
+
+        # Flatten for R² computation
+        y_target_flat = y_target.flatten()
+        y_neural_flat = y_neural.flatten()
+        y_wiener_flat = y_wiener.flatten()
+        y_combined_flat = y_combined.flatten()
+
+        # Compute R² scores
+        ss_tot = torch.sum((y_target_flat - y_target_flat.mean()) ** 2)
+
+        ss_res_neural = torch.sum((y_target_flat - y_neural_flat) ** 2)
+        ss_res_wiener = torch.sum((y_target_flat - y_wiener_flat) ** 2)
+        ss_res_combined = torch.sum((y_target_flat - y_combined_flat) ** 2)
+
+        r2_neural = 1 - ss_res_neural / ss_tot
+        r2_wiener = 1 - ss_res_wiener / ss_tot
+        r2_combined = 1 - ss_res_combined / ss_tot
+
+        return {
+            "r2_neural_only": r2_neural.item(),
+            "r2_wiener_only": r2_wiener.item(),
+            "r2_combined": r2_combined.item(),
+            "wiener_contribution": (r2_combined - r2_neural).item(),
+            "neural_contribution": (r2_combined - r2_wiener).item(),
+        }
+
+    def extra_repr(self) -> str:
+        return f"n_in={self.n_in}, n_out={self.n_out}, fitted={self._fitted}"
+
+
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
 

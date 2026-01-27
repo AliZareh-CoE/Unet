@@ -97,6 +97,8 @@ from models import (
     NoiseAugmentor,
     # Training metrics recorder for model interrogation
     TrainingMetricsRecorder,
+    # Wiener filter for inference-time boosting
+    WienerBoost,
 )
 from data import (
     prepare_data,
@@ -768,6 +770,8 @@ def evaluate(
     cond_encoder: Optional[nn.Module] = None,
     envelope_matcher_fwd: Optional[nn.Module] = None,
     envelope_matcher_rev: Optional[nn.Module] = None,
+    wiener_boost: Optional["WienerBoost"] = None,
+    wiener_alpha: float = 1.0,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -822,6 +826,10 @@ def evaluate(
     # Per-channel metrics (computed in non-fast mode only)
     per_channel_corr_list = []
     cross_channel_corr_accumulated = None
+
+    # Wiener boost tracking (neural-only vs boosted comparison)
+    wiener_neural_only_r2_list = []
+    wiener_contribution_list = []
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
@@ -883,6 +891,12 @@ def evaluate(
             # This corrects bursty vs smooth characteristics
             if envelope_matcher_fwd is not None:
                 pred = envelope_matcher_fwd(pred, odor_ids=odor)
+
+            # Apply Wiener boost at inference time (neural net + alpha * Wiener)
+            # Track neural-only prediction for contribution analysis
+            pred_neural_only = pred.clone() if (wiener_boost is not None and wiener_boost.is_fitted) else None
+            if wiener_boost is not None and wiener_boost.is_fitted:
+                pred = wiener_boost.boost(ob, pred, alpha=wiener_alpha)
 
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
@@ -955,6 +969,15 @@ def evaluate(
                     cross_channel_corr_accumulated = cross_ch_corr.cpu()
                 else:
                     cross_channel_corr_accumulated += cross_ch_corr.cpu()
+
+                # Track Wiener contribution (neural-only R² vs boosted R²)
+                if pred_neural_only is not None:
+                    pred_neural_c = crop_to_target_torch(pred_neural_only)
+                    pred_neural_f32 = pred_neural_c.float()
+                    neural_only_r2 = explained_variance_torch(pred_neural_f32, pcx_f32).item()
+                    boosted_r2 = r2_list[-1]  # Already computed above
+                    wiener_neural_only_r2_list.append(neural_only_r2)
+                    wiener_contribution_list.append(boosted_r2 - neural_only_r2)
 
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
@@ -1215,6 +1238,12 @@ def evaluate(
             val_loss += w_l1 * results["mae_rev"]
 
         results["loss"] = val_loss
+
+    # Wiener boost contribution metrics (only computed when wiener_boost is used)
+    if wiener_neural_only_r2_list:
+        results["wiener_neural_only_r2"] = float(np.mean(wiener_neural_only_r2_list))
+        results["wiener_contribution"] = float(np.mean(wiener_contribution_list))
+        # Boosted R² is already in results["r2"]
 
     return results
 
@@ -2532,6 +2561,57 @@ def train(
     envelope_matcher_fwd = None
     envelope_matcher_rev = None
 
+    # =========================================================================
+    # WIENER BOOST: Fit Wiener filter on training data (if enabled)
+    # =========================================================================
+    wiener_filter = None
+    if config.get("wiener_boost", False):
+        if is_primary():
+            print("\n" + "="*60)
+            print("FITTING WIENER FILTER ON TRAINING DATA")
+            print("="*60)
+
+        # Collect training data for Wiener fitting
+        # Use a subset to avoid memory issues on large datasets
+        max_samples = 10000  # Limit samples for Wiener fitting
+        X_train_list, y_train_list = [], []
+        n_collected = 0
+
+        model.eval()
+        with torch.no_grad():
+            for batch in loaders["train"]:
+                if n_collected >= max_samples:
+                    break
+
+                if len(batch) == 4:
+                    ob, pcx, odor, session_ids_batch = batch
+                else:
+                    ob, pcx, odor = batch
+
+                ob = ob.to(device)
+                pcx = pcx.to(device)
+                pcx = per_channel_normalize(pcx)
+
+                X_train_list.append(ob.cpu())
+                y_train_list.append(pcx.cpu())
+                n_collected += ob.shape[0]
+
+        X_train = torch.cat(X_train_list, dim=0)[:max_samples]
+        y_train = torch.cat(y_train_list, dim=0)[:max_samples]
+
+        # Fit Wiener filter
+        in_channels = config.get("in_channels", 32)
+        out_channels = config.get("out_channels", 32)
+        wiener_filter = WienerBoost(n_in=in_channels, n_out=out_channels)
+        wiener_filter.fit(X_train.to(device), y_train.to(device))
+        wiener_filter.to(device)
+
+        if is_primary():
+            print(f"  Fitted on {n_collected} samples")
+            print(f"  Input channels: {in_channels}, Output channels: {out_channels}")
+            print(f"  Alpha (contribution weight): {config.get('wiener_alpha', 1.0)}")
+            print("="*60 + "\n")
+
     # Final test evaluation (full metrics, fast_mode=False)
     # Skip if no test set (no_test_set=True means all held-out sessions are validation)
     has_test_set = len(data.get("test_idx", [])) > 0
@@ -2544,6 +2624,8 @@ def train(
             cond_encoder=cond_encoder,
             envelope_matcher_fwd=envelope_matcher_fwd,
             envelope_matcher_rev=envelope_matcher_rev,
+            wiener_boost=wiener_filter,
+            wiener_alpha=config.get("wiener_alpha", 1.0),
         )
     else:
         test_metrics = {}
@@ -2592,6 +2674,18 @@ def train(
         print(f"  R²: {fwd_r2:.4f} (Δ={delta_r2:+.4f})")
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
+
+        # Wiener boost contribution (if enabled)
+        if "wiener_contribution" in test_metrics:
+            neural_only_r2 = test_metrics.get('wiener_neural_only_r2', 0)
+            wiener_contrib = test_metrics.get('wiener_contribution', 0)
+            print(f"\n  Wiener Boost Analysis:")
+            print(f"    Neural-only R²: {neural_only_r2:.4f}")
+            print(f"    Boosted R²: {fwd_r2:.4f}")
+            print(f"    Wiener contribution: {wiener_contrib:+.4f}")
+            if neural_only_r2 > 0:
+                pct_improvement = 100 * wiener_contrib / neural_only_r2
+                print(f"    Relative improvement: {pct_improvement:+.1f}%")
 
         # Print detailed PSD diagnostics if available
         if "psd_diagnostics" in test_metrics:
@@ -3175,6 +3269,12 @@ def parse_args():
     parser.add_argument("--loso-verbose", action="store_true", default=True,
                         help="Show verbose output during LOSO folds")
 
+    # Wiener boost options
+    parser.add_argument("--wiener-boost", action="store_true",
+                        help="Apply Wiener filter boosting at inference time")
+    parser.add_argument("--wiener-alpha", type=float, default=1.0,
+                        help="Wiener contribution weight (default: 1.0)")
+
     return parser.parse_args()
 
 
@@ -3377,6 +3477,12 @@ def main():
     config["noise_channel_dropout"] = args.noise_channel_dropout
     config["noise_temporal_dropout"] = args.noise_temporal_dropout
     config["noise_prob"] = args.noise_prob
+
+    # =========================================================================
+    # Wiener Boost (inference-time boosting)
+    # =========================================================================
+    config["wiener_boost"] = args.wiener_boost
+    config["wiener_alpha"] = args.wiener_alpha
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -3883,6 +3989,10 @@ def main():
         if results['test_metrics']:
             print(f"RESULT_CORR={results['test_metrics']['corr']:.4f}")
             print(f"RESULT_R2={results['test_metrics']['r2']:.4f}")
+            # Wiener boost metrics (if enabled)
+            if "wiener_contribution" in results['test_metrics']:
+                print(f"RESULT_WIENER_NEURAL_ONLY_R2={results['test_metrics']['wiener_neural_only_r2']:.4f}")
+                print(f"RESULT_WIENER_CONTRIBUTION={results['test_metrics']['wiener_contribution']:.4f}")
         print(f"RESULT_LOSS={results['best_val_loss']:.4f}")
         if "split_info" in data:
             print(f"RESULT_SPLIT_TYPE=session_holdout")
