@@ -831,6 +831,275 @@ def load_dandi_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Opti
     return X, y, train_idx, val_idx, test_idx, None
 
 
+# =============================================================================
+# LOSO (Leave-One-Session-Out) Functions
+# =============================================================================
+
+def load_raw_pfc_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) PFC data with session info for LOSO.
+
+    Returns:
+        X: Raw input signals (PFC) [N, C, T]
+        y: Raw target signals (CA1) [N, C, T]
+        session_ids: Session ID per trial [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import load_pfc_signals, load_pfc_metadata, load_pfc_session_ids, PFC_DATA_PATH, PFC_META_PATH
+
+    print("Loading raw PFC data for LOSO (no pre-normalization)...")
+
+    # Load raw signals
+    pfc, ca1 = load_pfc_signals(PFC_DATA_PATH)
+    num_trials = pfc.shape[0]
+
+    # Load session info
+    session_ids, session_to_idx, idx_to_session = load_pfc_session_ids(PFC_META_PATH, num_trials)
+
+    print(f"  Loaded: PFC {pfc.shape} -> CA1 {ca1.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique")
+
+    return pfc, ca1, session_ids, idx_to_session
+
+
+def load_raw_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) olfactory data with session info for LOSO.
+
+    Returns:
+        X: Raw input signals (OB) [N, C, T]
+        y: Raw target signals (PCx) [N, C, T]
+        session_ids: Session ID per trial [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import load_signals, extract_window, load_session_ids, DATA_PATH, ODOR_CSV_PATH
+
+    print("Loading raw olfactory data for LOSO (no pre-normalization)...")
+
+    # Load raw signals
+    signals = load_signals(DATA_PATH)
+    windowed = extract_window(signals)  # [N, 2, C, T]
+    X = windowed[:, 0]  # OB
+    y = windowed[:, 1]  # PCx
+
+    # Load session info
+    session_ids, session_to_idx, idx_to_session = load_session_ids(
+        ODOR_CSV_PATH, session_column="recording_id", num_trials=X.shape[0]
+    )
+
+    print(f"  Loaded: OB {X.shape} -> PCx {y.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique")
+
+    return X, y, session_ids, idx_to_session
+
+
+def run_loso_evaluation(
+    config: "Phase1Config",
+    dataset: str = "pfc",
+) -> "Phase1Result":
+    """Run Leave-One-Session-Out cross-validation.
+
+    For each session:
+    1. Hold out that session as test
+    2. Train on all other sessions
+    3. Compute normalization from training sessions ONLY (no leakage)
+    4. Evaluate baselines on held-out session
+
+    Args:
+        config: Phase1 configuration
+        dataset: Dataset name ('pfc', 'olfactory')
+
+    Returns:
+        Phase1Result with aggregated metrics
+    """
+    from data import compute_normalization, normalize
+
+    print("\n" + "=" * 70)
+    print("PHASE 1: LOSO (Leave-One-Session-Out) Evaluation")
+    print("=" * 70)
+    print(f"Dataset: {dataset}")
+    print("Mode: True LOSO - each session held out once, normalization per-fold")
+    print()
+
+    # Load raw data based on dataset
+    if dataset == "pfc":
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_pfc_data()
+    elif dataset == "olfactory":
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_olfactory_data()
+    else:
+        raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
+
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+    all_session_names = [idx_to_session[sid] for sid in sorted(unique_sessions)]
+
+    print(f"\nTotal sessions: {n_sessions}")
+    print(f"Sessions: {all_session_names}")
+    print(f"Methods: {', '.join(config.baselines)}")
+    print()
+
+    # Initialize metrics calculator
+    metrics_calc = MetricsCalculator(
+        sample_rate=config.sample_rate,
+        n_bootstrap=config.n_bootstrap,
+        ci_level=config.ci_level,
+    )
+
+    # Store results per method
+    method_fold_results: Dict[str, List[Dict]] = {name: [] for name in config.baselines}
+    method_session_r2: Dict[str, Dict[str, float]] = {name: {} for name in config.baselines}
+
+    # LOSO: iterate over each session as held-out test
+    for fold_idx, test_session_id in enumerate(sorted(unique_sessions)):
+        test_session_name = idx_to_session[test_session_id]
+        train_session_ids = [sid for sid in unique_sessions if sid != test_session_id]
+
+        # Get indices
+        test_mask = session_ids == test_session_id
+        train_mask = np.isin(session_ids, train_session_ids)
+        test_idx = np.where(test_mask)[0]
+        train_idx = np.where(train_mask)[0]
+
+        print(f"\n{'='*60}")
+        print(f"LOSO Fold {fold_idx + 1}/{n_sessions}: Test Session = {test_session_name}")
+        print(f"{'='*60}")
+        print(f"  Train: {len(train_idx)} samples from {len(train_session_ids)} sessions")
+        print(f"  Test: {len(test_idx)} samples from session {test_session_name}")
+
+        # CRITICAL: Compute normalization from TRAINING sessions only
+        # For PFC: X_raw is [N, C, T], need to handle differently than olfactory
+        if X_raw.ndim == 3:
+            # PFC format: [N, C, T] - compute mean/std per channel over (trials, time)
+            X_train_subset = X_raw[train_idx]
+            y_train_subset = y_raw[train_idx]
+            X_mean = X_train_subset.mean(axis=(0, 2), keepdims=True)
+            X_std = X_train_subset.std(axis=(0, 2), keepdims=True)
+            X_std[X_std < 1e-6] = 1e-6
+            y_mean = y_train_subset.mean(axis=(0, 2), keepdims=True)
+            y_std = y_train_subset.std(axis=(0, 2), keepdims=True)
+            y_std[y_std < 1e-6] = 1e-6
+
+            # Normalize ALL data using training stats
+            X_normalized = (X_raw - X_mean) / X_std
+            y_normalized = (y_raw - y_mean) / y_std
+        else:
+            raise ValueError(f"Unexpected data shape: {X_raw.shape}")
+
+        # Extract train and test sets
+        X_train = X_normalized[train_idx].astype(np.float32)
+        y_train = y_normalized[train_idx].astype(np.float32)
+        X_test = X_normalized[test_idx].astype(np.float32)
+        y_test = y_normalized[test_idx].astype(np.float32)
+
+        # Evaluate each baseline
+        for method_name in config.baselines:
+            try:
+                model = create_baseline(method_name)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+                # Compute metrics
+                metrics = metrics_calc.compute(y_pred, y_test)
+                r2 = metrics.get("r2", np.nan)
+
+                method_fold_results[method_name].append(metrics)
+                method_session_r2[method_name][test_session_name] = float(r2)
+
+                print(f"    {method_name}: R² = {r2:.4f}")
+
+            except Exception as e:
+                print(f"    {method_name}: FAILED - {e}")
+                method_fold_results[method_name].append({"r2": np.nan})
+                method_session_r2[method_name][test_session_name] = np.nan
+
+    # Aggregate results across folds
+    print("\n" + "=" * 70)
+    print("LOSO RESULTS SUMMARY")
+    print("=" * 70)
+    print(f"{'Method':<20} {'Mean R²':<12} {'Std':<10} {'Min':<10} {'Max':<10}")
+    print("-" * 70)
+
+    all_metrics = []
+    best_r2 = -np.inf
+    best_method = None
+
+    for method_name in config.baselines:
+        fold_r2s = [r.get("r2", np.nan) for r in method_fold_results[method_name]]
+        valid_r2s = [r for r in fold_r2s if not np.isnan(r)]
+
+        if valid_r2s:
+            mean_r2 = np.mean(valid_r2s)
+            std_r2 = np.std(valid_r2s)
+            min_r2 = np.min(valid_r2s)
+            max_r2 = np.max(valid_r2s)
+        else:
+            mean_r2 = std_r2 = min_r2 = max_r2 = np.nan
+
+        print(f"{method_name:<20} {mean_r2:<12.4f} {std_r2:<10.4f} {min_r2:<10.4f} {max_r2:<10.4f}")
+
+        if mean_r2 > best_r2:
+            best_r2 = mean_r2
+            best_method = method_name
+
+        # Create Phase1Metrics object
+        fold_maes = [r.get("mae", np.nan) for r in method_fold_results[method_name]]
+        fold_pearsons = [r.get("pearson", np.nan) for r in method_fold_results[method_name]]
+
+        metrics_obj = Phase1Metrics(
+            method=method_name,
+            r2_mean=float(mean_r2) if not np.isnan(mean_r2) else np.nan,
+            r2_std=float(std_r2) if not np.isnan(std_r2) else 0.0,
+            r2_ci=(float(min_r2), float(max_r2)),
+            mae_mean=float(np.nanmean(fold_maes)),
+            mae_std=float(np.nanstd(fold_maes)),
+            pearson_mean=float(np.nanmean(fold_pearsons)),
+            pearson_std=float(np.nanstd(fold_pearsons)),
+            spearman_mean=0.0,
+            spearman_std=0.0,
+            psd_error_db=0.0,
+            band_r2={},
+            fold_r2s=fold_r2s,
+            fold_maes=fold_maes,
+            fold_pearsons=fold_pearsons,
+            n_folds=n_sessions,
+            n_samples=len(X_raw),
+        )
+        all_metrics.append(metrics_obj)
+
+    # Per-session summary
+    print("\n" + "-" * 70)
+    print("PER-SESSION R² (each row = method, each column = held-out session):")
+    print("-" * 70)
+
+    header = f"{'Method':<18}" + "".join(f"{s[:10]:>12}" for s in all_session_names)
+    print(header)
+    for method_name in config.baselines:
+        row = f"{method_name:<18}"
+        for sess_name in all_session_names:
+            r2 = method_session_r2[method_name].get(sess_name, np.nan)
+            row += f"{r2:>12.4f}"
+        print(row)
+
+    # Gate threshold
+    gate_threshold = best_r2 + 0.05 * abs(best_r2) if best_r2 > 0 else best_r2 + 0.05
+    print("\n" + "=" * 70)
+    print(f"LOSO CLASSICAL FLOOR: R² = {best_r2:.4f} ({best_method})")
+    print(f"GATE THRESHOLD: Neural methods must achieve R² >= {gate_threshold:.4f}")
+    print("=" * 70)
+
+    # Create result
+    result = Phase1Result(
+        metrics=all_metrics,
+        best_method=best_method,
+        best_r2=best_r2,
+        gate_threshold=gate_threshold,
+        config=config.to_dict(),
+        timestamp=datetime.now().isoformat(),
+        predictions={},
+        models={},
+    )
+
+    return result
+
+
 def create_synthetic_data(
     n_samples: int = 200,
     n_channels: int = 32,
@@ -2202,6 +2471,8 @@ def main():
         epilog="""
 Examples:
     python -m phase_one.runner --dataset olfactory
+    python -m phase_one.runner --dataset pfc --loso  # True LOSO evaluation (recommended)
+    python -m phase_one.runner --dataset pfc --loso --fast  # Fast LOSO (ridge, wiener only)
     python -m phase_one.runner --dry-run  # Quick test
     python -m phase_one.runner --output results/phase1/
     python -m phase_one.runner --3fold-3seed  # Full 3-fold × 3-seed evaluation (aligned with ablation)
@@ -2295,6 +2566,11 @@ Examples:
         default=3,
         help="Number of seeds per fold (for --3fold-3seed mode)",
     )
+    parser.add_argument(
+        "--loso",
+        action="store_true",
+        help="Use true LOSO (Leave-One-Session-Out) evaluation with per-fold normalization",
+    )
 
     args = parser.parse_args()
 
@@ -2364,6 +2640,24 @@ Examples:
         run_session_cv(config, n_folds=3)
         print("\nSession-CV investigation complete!")
         return None
+
+    # Handle LOSO mode (true leave-one-session-out)
+    if args.loso:
+        print("\n[LOSO MODE] Leave-One-Session-Out Evaluation")
+        result = run_loso_evaluation(
+            config=config,
+            dataset=args.dataset,
+        )
+
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = config.output_dir / f"phase1_loso_{args.dataset}_{timestamp}.json"
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        result.save(results_file)
+        print(f"\nResults saved to: {results_file}")
+
+        print("\nPhase 1 (LOSO) complete!")
+        return result
 
     # Handle 3-fold × 3-seed mode (aligned with ablation study)
     if args.fold3_seed3:
