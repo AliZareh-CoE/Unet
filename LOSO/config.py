@@ -196,6 +196,10 @@ class LOSOConfig:
     session_use_spectral: bool = False
     use_bidirectional: bool = False
 
+    # Wiener residual learning
+    wiener_residual: bool = False
+    wiener_alpha: float = 1.0
+
     # FSDP
     use_fsdp: bool = False
     fsdp_strategy: str = "full"

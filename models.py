@@ -2068,6 +2068,723 @@ class SessionAdaptiveScaling(nn.Module):
         return x * gamma + beta
 
 
+class SessionAdaptiveScalingV3(nn.Module):
+    """Enhanced session-adaptive scaling with multiple transformation types.
+
+    Supports a hierarchy of increasingly expressive transformations:
+
+    1. **scalar** (baseline): Per-channel scale + bias
+       - y_c = γ_c * x_c + β_c
+       - Same as original FiLM, 2*C parameters
+
+    2. **band_wise**: Per-channel, per-frequency-band scale + bias
+       - Different γ, β for delta, theta, alpha, beta, gamma
+       - Can correct session-specific spectral tilts
+       - 2*C*B parameters (B=5 bands)
+
+    3. **spectral**: Full spectral transfer function per channel
+       - Learn frequency-dependent scaling in Fourier domain
+       - Can model complex frequency response differences
+       - C*F parameters (F=frequency bins)
+
+    4. **cross_channel**: Allow channels to influence each other's scaling
+       - γ_c depends on statistics from ALL channels
+       - Important for spatially-related neural channels
+       - Uses attention mechanism over channels
+
+    5. **harmonic**: Model harmonic relationships
+       - Fundamental + harmonics scaled coherently
+       - Neural oscillations often have harmonics at 2f, 3f, ...
+       - Learns harmonic coupling structure
+
+    The transforms can be combined (e.g., band_wise + cross_channel).
+
+    Usage:
+        scaler = SessionAdaptiveScalingV3(
+            n_channels=32,
+            mode="band_wise",  # or "spectral", "cross_channel", "harmonic"
+            n_bands=5,
+            fs=1000.0,
+        )
+        scaled_output = scaler(model_output, raw_input)
+    """
+
+    # Standard neural frequency bands
+    BAND_EDGES = [0.5, 4.0, 8.0, 13.0, 30.0, 100.0]  # delta, theta, alpha, beta, gamma
+
+    def __init__(
+        self,
+        n_channels: int,
+        n_input_channels: int = 32,
+        hidden_dim: int = 128,
+        mode: str = "scalar",  # scalar, band_wise, spectral, cross_channel, harmonic
+        n_bands: int = 5,
+        fs: float = 1000.0,
+        nperseg: int = 256,
+        n_harmonics: int = 3,
+        use_cross_channel: bool = False,  # Can combine with any mode
+    ):
+        """Initialize enhanced session-adaptive scaling.
+
+        Args:
+            n_channels: Number of output channels to transform
+            n_input_channels: Number of input channels (for computing stats)
+            hidden_dim: Hidden layer dimension for predictor networks
+            mode: Transformation type (scalar, band_wise, spectral, harmonic)
+            n_bands: Number of frequency bands for band_wise mode
+            fs: Sampling frequency in Hz
+            nperseg: FFT segment length for spectral operations
+            n_harmonics: Number of harmonics to model (for harmonic mode)
+            use_cross_channel: If True, add cross-channel attention
+        """
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_input_channels = n_input_channels
+        self.mode = mode
+        self.n_bands = n_bands
+        self.fs = fs
+        self.nperseg = nperseg
+        self.n_harmonics = n_harmonics
+        self.use_cross_channel = use_cross_channel
+
+        # Compute number of frequency bins
+        self.n_freq = nperseg // 2 + 1
+
+        # Input statistics dimension
+        # Base: mean + std per channel
+        # Band-wise: add per-band power (n_bands per channel)
+        if mode in ["band_wise", "spectral", "harmonic"]:
+            # Richer input: mean, std, and band powers
+            input_dim = n_input_channels * (2 + n_bands)
+        else:
+            input_dim = n_input_channels * 2
+
+        # Cross-channel attention (optional, can combine with any mode)
+        if use_cross_channel:
+            self.channel_attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=4,
+                batch_first=True,
+            )
+            self.channel_proj = nn.Linear(n_input_channels * 2, hidden_dim)
+
+        # Mode-specific output dimensions and predictors
+        if mode == "scalar":
+            # Per-channel scale + bias
+            output_dim = n_channels * 2
+            self._build_scalar_predictor(input_dim, hidden_dim, output_dim)
+
+        elif mode == "band_wise":
+            # Per-channel, per-band scale + bias
+            output_dim = n_channels * n_bands * 2
+            self._build_bandwise_predictor(input_dim, hidden_dim, output_dim)
+            self._precompute_band_masks()
+
+        elif mode == "spectral":
+            # Per-channel spectral transfer function (complex-valued)
+            # Predict log-magnitude and phase adjustment
+            output_dim = n_channels * self.n_freq * 2  # magnitude + phase
+            self._build_spectral_predictor(input_dim, hidden_dim, n_channels)
+
+        elif mode == "harmonic":
+            # Harmonic coupling: learn relationships between f, 2f, 3f, ...
+            self._build_harmonic_predictor(input_dim, hidden_dim, n_channels)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Choose from: scalar, band_wise, spectral, harmonic")
+
+    def _build_scalar_predictor(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """Build predictor for scalar mode (original FiLM)."""
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        # Initialize to identity
+        nn.init.zeros_(self.predictor[-1].weight)
+        with torch.no_grad():
+            self.predictor[-1].bias[:self.n_channels] = 1.0  # scale = 1
+            self.predictor[-1].bias[self.n_channels:] = 0.0  # bias = 0
+
+    def _build_bandwise_predictor(self, input_dim: int, hidden_dim: int, output_dim: int):
+        """Build predictor for band-wise mode."""
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, output_dim),
+        )
+        # Initialize to identity (scale=1, bias=0 for all bands)
+        nn.init.zeros_(self.predictor[-1].weight)
+        with torch.no_grad():
+            n_params_per_type = self.n_channels * self.n_bands
+            self.predictor[-1].bias[:n_params_per_type] = 1.0  # scales = 1
+            self.predictor[-1].bias[n_params_per_type:] = 0.0  # biases = 0
+
+    def _build_spectral_predictor(self, input_dim: int, hidden_dim: int, n_channels: int):
+        """Build predictor for full spectral mode."""
+        # Use a small network per frequency to avoid parameter explosion
+        # Bottleneck: predict a compact representation, then expand
+        bottleneck_dim = 32
+
+        self.spectral_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, bottleneck_dim * n_channels),
+        )
+
+        # Per-channel spectral decoder (shared across channels, conditioned on bottleneck)
+        self.spectral_decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.n_freq),  # log-magnitude adjustment per freq
+        )
+
+        # Initialize to identity (zero adjustment)
+        nn.init.zeros_(self.spectral_decoder[-1].weight)
+        nn.init.zeros_(self.spectral_decoder[-1].bias)
+
+    def _build_harmonic_predictor(self, input_dim: int, hidden_dim: int, n_channels: int):
+        """Build predictor for harmonic mode.
+
+        Learns:
+        - Fundamental frequency enhancement
+        - Harmonic coupling coefficients
+        - Cross-harmonic phase relationships
+        """
+        # Predict fundamental scaling + harmonic coupling matrix
+        # For each channel: 1 fundamental scale + n_harmonics harmonic scales
+        n_harmonic_params = n_channels * (1 + self.n_harmonics)
+
+        self.harmonic_predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_harmonic_params),
+        )
+
+        # Harmonic coupling matrix: how fundamental affects harmonics
+        # [n_channels, n_harmonics, n_harmonics]
+        self.harmonic_coupling = nn.Parameter(
+            torch.eye(self.n_harmonics + 1).unsqueeze(0).expand(n_channels, -1, -1).clone()
+        )
+
+        # Initialize to identity
+        nn.init.zeros_(self.harmonic_predictor[-1].weight)
+        nn.init.ones_(self.harmonic_predictor[-1].bias)
+
+    def _precompute_band_masks(self):
+        """Precompute frequency band masks for efficient band-wise filtering."""
+        freqs = torch.fft.rfftfreq(self.nperseg, d=1.0 / self.fs)
+
+        masks = []
+        for i in range(len(self.BAND_EDGES) - 1):
+            f_low, f_high = self.BAND_EDGES[i], self.BAND_EDGES[i + 1]
+            mask = (freqs >= f_low) & (freqs < f_high)
+            masks.append(mask.float())
+
+        # Register as buffer (not parameter, but moves with model)
+        self.register_buffer("band_masks", torch.stack(masks))  # [n_bands, n_freq]
+
+    def _compute_input_stats(self, raw_input: torch.Tensor) -> torch.Tensor:
+        """Compute session statistics from raw input.
+
+        Args:
+            raw_input: [B, C_in, T]
+
+        Returns:
+            Statistics tensor for predictor input
+        """
+        B, C, T = raw_input.shape
+        device = raw_input.device
+
+        # Basic stats: mean and std per channel
+        mean = raw_input.mean(dim=-1)  # [B, C]
+        std = raw_input.std(dim=-1).clamp(min=1e-6)  # [B, C]
+
+        if self.mode in ["band_wise", "spectral", "harmonic"]:
+            # Add per-band power statistics
+            # Compute PSD via FFT
+            window = torch.hann_window(self.nperseg, device=device, dtype=raw_input.dtype)
+
+            # Use last nperseg samples for efficiency
+            segment = raw_input[:, :, -self.nperseg:] * window
+
+            fft = torch.fft.rfft(segment, dim=-1)
+            psd = torch.abs(fft) ** 2  # [B, C, n_freq]
+
+            # Compute band powers
+            band_powers = []
+            for i in range(self.n_bands):
+                mask = self.band_masks[i].to(device)  # [n_freq]
+                band_power = (psd * mask).sum(dim=-1) / (mask.sum() + 1e-6)  # [B, C]
+                band_powers.append(torch.log10(band_power + 1e-10))  # Log-scale
+
+            band_powers = torch.stack(band_powers, dim=-1)  # [B, C, n_bands]
+            band_powers = band_powers.view(B, -1)  # [B, C * n_bands]
+
+            stats = torch.cat([mean, std, band_powers], dim=-1)
+        else:
+            stats = torch.cat([mean, std], dim=-1)
+
+        return stats
+
+    def _apply_cross_channel_attention(self, stats: torch.Tensor) -> torch.Tensor:
+        """Apply cross-channel attention to allow channels to influence each other.
+
+        Args:
+            stats: [B, C * features]
+
+        Returns:
+            Enhanced stats with cross-channel information
+        """
+        B = stats.shape[0]
+
+        # Reshape to per-channel: [B, C, 2] (mean, std)
+        per_channel = stats[:, :self.n_input_channels * 2].view(B, self.n_input_channels, 2)
+
+        # Project to attention dimension
+        channel_emb = self.channel_proj(per_channel.view(B, self.n_input_channels, -1).expand(-1, -1, 2).reshape(B, self.n_input_channels, -1))
+
+        # Self-attention over channels
+        attended, _ = self.channel_attention(channel_emb, channel_emb, channel_emb)
+
+        # Combine with original stats
+        attended_flat = attended.view(B, -1)
+        return torch.cat([stats, attended_flat], dim=-1)
+
+    def forward(self, x: torch.Tensor, raw_input: torch.Tensor) -> torch.Tensor:
+        """Apply session-adaptive transformation.
+
+        Args:
+            x: Output to transform [B, C, T]
+            raw_input: Raw input signal [B, C_in, T] for computing statistics
+
+        Returns:
+            Transformed output [B, C, T]
+        """
+        B, C, T = x.shape
+        device = x.device
+
+        # Compute input statistics
+        stats = self._compute_input_stats(raw_input)
+
+        # Optional cross-channel attention
+        if self.use_cross_channel:
+            stats = self._apply_cross_channel_attention(stats)
+
+        if self.mode == "scalar":
+            return self._apply_scalar(x, stats)
+        elif self.mode == "band_wise":
+            return self._apply_bandwise(x, stats)
+        elif self.mode == "spectral":
+            return self._apply_spectral(x, stats)
+        elif self.mode == "harmonic":
+            return self._apply_harmonic(x, stats)
+
+    def _apply_scalar(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply scalar (per-channel) transformation."""
+        params = self.predictor(stats)  # [B, 2*C]
+        gamma = params[:, :self.n_channels].unsqueeze(-1)  # [B, C, 1]
+        beta = params[:, self.n_channels:].unsqueeze(-1)   # [B, C, 1]
+        return x * gamma + beta
+
+    def _apply_bandwise(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply band-wise transformation in frequency domain."""
+        B, C, T = x.shape
+
+        # Predict per-band scales and biases
+        params = self.predictor(stats)  # [B, C * n_bands * 2]
+
+        n_band_params = self.n_channels * self.n_bands
+        gamma_bands = params[:, :n_band_params].view(B, C, self.n_bands)  # [B, C, n_bands]
+        beta_bands = params[:, n_band_params:].view(B, C, self.n_bands)   # [B, C, n_bands]
+
+        # Transform in frequency domain
+        # Pad to nperseg for FFT
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        # FFT
+        X = torch.fft.rfft(x_padded, dim=-1)  # [B, C, n_freq]
+
+        # Build frequency-domain scaling from band scales
+        # Interpolate band scales to full frequency resolution
+        freq_gamma = torch.zeros(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+        freq_beta = torch.zeros(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+
+        for i in range(self.n_bands):
+            mask = self.band_masks[i].to(x.device)  # [n_freq]
+            freq_gamma += gamma_bands[:, :, i:i+1] * mask  # [B, C, n_freq]
+            freq_beta += beta_bands[:, :, i:i+1] * mask
+
+        # Apply in frequency domain
+        X_scaled = X * freq_gamma.to(X.dtype)
+
+        # Transform back
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        # Add bias in time domain (after inverse FFT)
+        # Bias is applied as additive offset scaled by band
+        bias_signal = torch.fft.irfft(freq_beta.to(X.dtype) + 0j, n=self.nperseg, dim=-1)
+        x_scaled = x_scaled + bias_signal
+
+        # Crop or pad back to original length
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            # For longer signals, apply transformation in overlapping windows
+            # Simplified: just return the first nperseg samples scaled, rest unchanged
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def _apply_spectral(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply full spectral transformation."""
+        B, C, T = x.shape
+
+        # Encode stats to per-channel bottleneck
+        bottleneck = self.spectral_encoder(stats)  # [B, bottleneck_dim * C]
+        bottleneck = bottleneck.view(B, C, -1)  # [B, C, bottleneck_dim]
+
+        # Decode to spectral adjustment per channel
+        log_mag_adj = []
+        for c in range(C):
+            adj = self.spectral_decoder(bottleneck[:, c])  # [B, n_freq]
+            log_mag_adj.append(adj)
+        log_mag_adj = torch.stack(log_mag_adj, dim=1)  # [B, C, n_freq]
+
+        # Convert to linear scale (centered at 1.0)
+        mag_adj = torch.exp(log_mag_adj * 0.1)  # Small adjustments, centered at 1
+
+        # Apply in frequency domain
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        X = torch.fft.rfft(x_padded, dim=-1)
+        X_scaled = X * mag_adj.to(X.dtype)
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def _apply_harmonic(self, x: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        """Apply harmonic-aware transformation.
+
+        Models relationships between fundamental and harmonics.
+        """
+        B, C, T = x.shape
+
+        # Predict harmonic scales
+        harmonic_scales = self.harmonic_predictor(stats)  # [B, C * (1 + n_harmonics)]
+        harmonic_scales = harmonic_scales.view(B, C, 1 + self.n_harmonics)  # [B, C, 1+H]
+
+        # Apply harmonic coupling
+        # coupled_scales[c, h] = sum_h' coupling[c, h, h'] * scales[c, h']
+        coupled_scales = torch.einsum('bch,chk->bck', harmonic_scales, self.harmonic_coupling)
+
+        # Transform in frequency domain
+        if T < self.nperseg:
+            x_padded = F.pad(x, (0, self.nperseg - T))
+        else:
+            x_padded = x[:, :, :self.nperseg]
+
+        X = torch.fft.rfft(x_padded, dim=-1)  # [B, C, n_freq]
+
+        # Find dominant frequencies and their harmonics
+        freqs = torch.fft.rfftfreq(self.nperseg, d=1.0 / self.fs).to(x.device)
+
+        # Build harmonic scaling mask
+        # For simplicity, scale bands around typical neural frequencies and their harmonics
+        # Fundamental bands: delta (2Hz), theta (6Hz), alpha (10Hz), beta (20Hz)
+        fundamental_freqs = torch.tensor([2.0, 6.0, 10.0, 20.0], device=x.device)
+
+        harmonic_scaling = torch.ones(B, C, self.n_freq, device=x.device, dtype=x.dtype)
+
+        for f_idx, f0 in enumerate(fundamental_freqs):
+            for h in range(1 + self.n_harmonics):
+                f_h = f0 * (h + 1)  # h=0 is fundamental, h=1 is 2nd harmonic, etc.
+                # Gaussian window around harmonic frequency
+                gaussian = torch.exp(-0.5 * ((freqs - f_h) / 2.0) ** 2)
+                # Scale by predicted harmonic scale
+                scale_idx = min(h, self.n_harmonics)
+                harmonic_scaling += gaussian * (coupled_scales[:, :, scale_idx:scale_idx+1] - 1)
+
+        # Apply harmonic scaling
+        X_scaled = X * harmonic_scaling.to(X.dtype)
+        x_scaled = torch.fft.irfft(X_scaled, n=self.nperseg, dim=-1)
+
+        if T < self.nperseg:
+            return x_scaled[:, :, :T]
+        else:
+            result = x.clone()
+            result[:, :, :self.nperseg] = x_scaled
+            return result
+
+    def extra_repr(self) -> str:
+        return (
+            f"n_channels={self.n_channels}, mode={self.mode}, "
+            f"n_bands={self.n_bands}, use_cross_channel={self.use_cross_channel}"
+        )
+
+
+class WienerBoost(nn.Module):
+    """Wiener filter for inference-time boosting of neural network predictions.
+
+    This implements Option A from the Wiener+Neural hybrid approach:
+    - Training: Neural network learns alone (no Wiener assistance)
+    - Inference: y_pred = NeuralNet(x) + α * Wiener(x)
+
+    The Wiener filter is fit on training data and frozen. It captures
+    optimal linear prediction, while the neural net learns nonlinear residuals.
+
+    This ensures the neural network can't be "lazy" - it must learn something
+    useful during training since Wiener is not available then.
+
+    Usage:
+        # After training, fit Wiener on training data
+        wiener = WienerBoost(n_in=64, n_out=32)
+        wiener.fit(X_train, y_train)  # X: [N, C_in, T], y: [N, C_out, T]
+
+        # At inference, boost neural net predictions
+        y_neural = model(x)
+        y_boosted = wiener.boost(x, y_neural, alpha=1.0)
+    """
+
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        n_fft: Optional[int] = None,
+        regularization: float = 1e-6,
+    ):
+        """Initialize WienerBoost.
+
+        Args:
+            n_in: Number of input channels
+            n_out: Number of output channels
+            n_fft: FFT size (None = auto)
+            regularization: Regularization for spectral division
+        """
+        super().__init__()
+        self.n_in = n_in
+        self.n_out = n_out
+        self.n_fft_init = n_fft
+        self.n_fft: Optional[int] = None
+        self.regularization = regularization
+
+        # Wiener filter coefficients H[f] - will be set by fit()
+        # H is complex: [n_out, n_in, n_freq]
+        self.register_buffer('H_real', None)
+        self.register_buffer('H_imag', None)
+        self._fitted = False
+        self._signal_length: Optional[int] = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._fitted
+
+    def fit(self, X: torch.Tensor, y: torch.Tensor) -> "WienerBoost":
+        """Fit Wiener filter from training data.
+
+        Computes H(f) = S_xy(f) / S_xx(f) for each output-input channel pair.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y: Target signals [N, C_out, T]
+
+        Returns:
+            self
+        """
+        device = X.device
+        N, C_in, T = X.shape
+        _, C_out, _ = y.shape
+
+        assert C_in == self.n_in, f"Expected {self.n_in} input channels, got {C_in}"
+        assert C_out == self.n_out, f"Expected {self.n_out} output channels, got {C_out}"
+
+        # Determine FFT size
+        if self.n_fft_init is None:
+            self.n_fft = 2 ** int(np.ceil(np.log2(T)))
+        else:
+            self.n_fft = self.n_fft_init
+        self._signal_length = T
+
+        n_freq = self.n_fft // 2 + 1
+
+        # Compute FFT of all signals
+        X_fft = torch.fft.rfft(X, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
+        y_fft = torch.fft.rfft(y, n=self.n_fft, dim=-1)  # [N, C_out, n_freq]
+
+        # Initialize filter coefficients
+        H = torch.zeros(C_out, C_in, n_freq, dtype=torch.complex64, device=device)
+
+        # Compute Wiener filter for each output channel
+        # For simplicity, use matched input-output channels if dimensions match,
+        # otherwise use all inputs for each output (MIMO)
+        if C_in == C_out:
+            # Matched channels: H[c, c, f] = S_xy[c, f] / S_xx[c, f]
+            for c in range(C_out):
+                S_xx = torch.mean(torch.abs(X_fft[:, c, :]) ** 2, dim=0)  # [n_freq]
+                S_xy = torch.mean(torch.conj(X_fft[:, c, :]) * y_fft[:, c, :], dim=0)  # [n_freq]
+                H[c, c, :] = S_xy / (S_xx + self.regularization)
+        else:
+            # MIMO: For each output, use corresponding input if available
+            # This is a simplified approach - full MIMO would use matrix inversion
+            n_matched = min(C_in, C_out)
+            for c in range(n_matched):
+                S_xx = torch.mean(torch.abs(X_fft[:, c, :]) ** 2, dim=0)
+                S_xy = torch.mean(torch.conj(X_fft[:, c, :]) * y_fft[:, c, :], dim=0)
+                H[c, c, :] = S_xy / (S_xx + self.regularization)
+
+            # For remaining outputs, average over all inputs
+            for c in range(n_matched, C_out):
+                S_xx = torch.mean(torch.abs(X_fft) ** 2, dim=(0, 1))  # [n_freq]
+                S_xy = torch.mean(torch.conj(X_fft) * y_fft[:, c:c+1, :], dim=(0, 1))
+                H[c, 0, :] = S_xy / (S_xx + self.regularization)
+
+        # Store as real/imag buffers (can't store complex in buffer easily)
+        self.H_real = H.real.clone()
+        self.H_imag = H.imag.clone()
+        self._fitted = True
+
+        return self
+
+    def predict(self, X: torch.Tensor) -> torch.Tensor:
+        """Apply Wiener filter to input signals.
+
+        Args:
+            X: Input signals [N, C_in, T] or [C_in, T]
+
+        Returns:
+            Filtered output [N, C_out, T] or [C_out, T]
+        """
+        if not self._fitted:
+            raise RuntimeError("WienerBoost must be fit() before predict()")
+
+        squeeze_batch = False
+        if X.ndim == 2:
+            X = X.unsqueeze(0)
+            squeeze_batch = True
+
+        N, C_in, T = X.shape
+        device = X.device
+        original_dtype = X.dtype
+
+        # FFT requires float32 (doesn't support bfloat16)
+        X_f32 = X.float() if X.dtype == torch.bfloat16 else X
+
+        # Reconstruct complex filter
+        H = torch.complex(self.H_real.to(device), self.H_imag.to(device))
+
+        # FFT of input
+        X_fft = torch.fft.rfft(X_f32, n=self.n_fft, dim=-1)  # [N, C_in, n_freq]
+
+        # Apply filter: Y_fft[n, c_out, f] = sum_c_in H[c_out, c_in, f] * X_fft[n, c_in, f]
+        # Using einsum for clarity
+        Y_fft = torch.einsum('oif,nif->nof', H, X_fft)  # [N, C_out, n_freq]
+
+        # Inverse FFT
+        y_pred = torch.fft.irfft(Y_fft, n=self.n_fft, dim=-1)
+
+        # Trim to original length
+        y_pred = y_pred[:, :, :T]
+
+        # Cast back to original dtype
+        if original_dtype == torch.bfloat16:
+            y_pred = y_pred.to(torch.bfloat16)
+
+        if squeeze_batch:
+            y_pred = y_pred.squeeze(0)
+
+        return y_pred
+
+    def boost(
+        self,
+        X: torch.Tensor,
+        y_neural: torch.Tensor,
+        alpha: float = 1.0
+    ) -> torch.Tensor:
+        """Boost neural network predictions with Wiener filter.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y_neural: Neural network predictions [N, C_out, T]
+            alpha: Wiener contribution weight (default 1.0)
+
+        Returns:
+            Boosted predictions: y_neural + alpha * Wiener(X)
+        """
+        y_wiener = self.predict(X)
+        return y_neural + alpha * y_wiener
+
+    def get_contribution_stats(
+        self,
+        X: torch.Tensor,
+        y_neural: torch.Tensor,
+        y_target: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Compute contribution statistics for neural vs Wiener.
+
+        Args:
+            X: Input signals [N, C_in, T]
+            y_neural: Neural network predictions [N, C_out, T]
+            y_target: Ground truth [N, C_out, T]
+
+        Returns:
+            Dict with R² for neural-only, wiener-only, and combined
+        """
+        y_wiener = self.predict(X)
+        y_combined = y_neural + y_wiener
+
+        # Flatten for R² computation
+        y_target_flat = y_target.flatten()
+        y_neural_flat = y_neural.flatten()
+        y_wiener_flat = y_wiener.flatten()
+        y_combined_flat = y_combined.flatten()
+
+        # Compute R² scores
+        ss_tot = torch.sum((y_target_flat - y_target_flat.mean()) ** 2)
+
+        ss_res_neural = torch.sum((y_target_flat - y_neural_flat) ** 2)
+        ss_res_wiener = torch.sum((y_target_flat - y_wiener_flat) ** 2)
+        ss_res_combined = torch.sum((y_target_flat - y_combined_flat) ** 2)
+
+        r2_neural = 1 - ss_res_neural / ss_tot
+        r2_wiener = 1 - ss_res_wiener / ss_tot
+        r2_combined = 1 - ss_res_combined / ss_tot
+
+        return {
+            "r2_neural_only": r2_neural.item(),
+            "r2_wiener_only": r2_wiener.item(),
+            "r2_combined": r2_combined.item(),
+            "wiener_contribution": (r2_combined - r2_neural).item(),
+            "neural_contribution": (r2_combined - r2_wiener).item(),
+        }
+
+    def extra_repr(self) -> str:
+        return f"n_in={self.n_in}, n_out={self.n_out}, fitted={self._fitted}"
+
+
 class CovarianceExpansionAugmentation(nn.Module):
     """Generate synthetic sessions via covariance-based transformations.
 
@@ -2169,6 +2886,8 @@ class CondUNet1D(nn.Module):
         conv_kernel_size: int = 7,
         dilations: Tuple[int, ...] = (1, 4, 16, 32),
         use_adaptive_scaling: bool = False,
+        adaptive_scaling_mode: str = "scalar",  # scalar, band_wise, spectral, harmonic
+        adaptive_scaling_cross_channel: bool = False,
         use_session_stats: bool = False,
         session_emb_dim: int = 32,
         session_use_spectral: bool = False,
@@ -2178,6 +2897,7 @@ class CondUNet1D(nn.Module):
         activation: str = "relu",  # Activation function: relu, leaky_relu, gelu, silu, mish
         n_heads: int = 4,  # Number of attention heads (for cross-frequency attention)
         skip_type: str = "add",  # Skip connection type: add, concat (future: attention, dense)
+        sampling_rate: float = 1000.0,  # Sampling rate for spectral operations
     ):
         super().__init__()
         self.cond_mode = cond_mode
@@ -2333,14 +3053,26 @@ class CondUNet1D(nn.Module):
         nn.init.zeros_(self.outc.weight)
         nn.init.zeros_(self.outc.bias)
 
-        # Session-adaptive output scaling (FiLM-style)
+        # Session-adaptive output scaling (FiLM-style or enhanced)
         # Predicts scale/bias from input statistics - adapts to each session
         self.use_adaptive_scaling = use_adaptive_scaling
+        self.adaptive_scaling_mode = adaptive_scaling_mode
         if use_adaptive_scaling:
-            self.adaptive_scaler = SessionAdaptiveScaling(
-                n_channels=out_channels,
-                n_input_channels=in_channels,
-            )
+            if adaptive_scaling_mode == "scalar" and not adaptive_scaling_cross_channel:
+                # Original simple FiLM scaler
+                self.adaptive_scaler = SessionAdaptiveScaling(
+                    n_channels=out_channels,
+                    n_input_channels=in_channels,
+                )
+            else:
+                # Enhanced V3 scaler with spectral/harmonic capabilities
+                self.adaptive_scaler = SessionAdaptiveScalingV3(
+                    n_channels=out_channels,
+                    n_input_channels=in_channels,
+                    mode=adaptive_scaling_mode,
+                    use_cross_channel=adaptive_scaling_cross_channel,
+                    fs=sampling_rate,
+                )
 
         # Store architecture parameters for interrogation summary
         self.in_channels = in_channels
@@ -3777,17 +4509,61 @@ def pli_torch(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return pli
 
 
+def _compute_welch_psd_torch(
+    signal: torch.Tensor,
+    fs: float,
+    nperseg: int,
+    window: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Compute properly normalized Welch PSD for a batch of signals.
+
+    Args:
+        signal: Input signal [N, T]
+        fs: Sampling frequency
+        nperseg: Segment length
+        window: Pre-computed Hann window [nperseg]
+        scale: Normalization scale factor (2 / (fs * S2) for density)
+
+    Returns:
+        PSD [N, n_freq] - properly normalized power spectral density
+    """
+    hop = nperseg // 2
+
+    # Extract segments: [N, T] -> [N, n_segments, nperseg]
+    segments = signal.unfold(dimension=-1, size=nperseg, step=hop)
+
+    # Apply window
+    windowed = segments * window  # [N, n_seg, nperseg]
+
+    # FFT
+    fft_result = torch.fft.rfft(windowed, dim=-1)  # [N, n_seg, n_freq]
+
+    # Power: |FFT|^2, averaged over segments
+    psd = torch.mean(torch.abs(fft_result) ** 2, dim=1)  # [N, n_freq]
+
+    # Apply proper Welch normalization
+    # scale = 2 / (fs * S2) where S2 = sum(window^2)
+    # Factor of 2 for one-sided spectrum
+    psd = psd * scale
+
+    return psd
+
+
 def psd_error_db_torch(
     pred: torch.Tensor,
     target: torch.Tensor,
     fs: float = SAMPLING_RATE_HZ,
     nperseg: int = 512,
     freq_range: tuple = (0.0, MAX_FREQ_HZ),
+    normalize_psd: bool = False,
 ) -> torch.Tensor:
     """Compute PSD error in dB (GPU-accelerated, fully vectorized).
 
     Computes mean absolute error between PSDs in decibels.
     Lower is better (0 = perfect match).
+
+    Uses proper Welch normalization for correct PSD values.
 
     Args:
         pred: Predicted signal [B, C, T]
@@ -3795,6 +4571,8 @@ def psd_error_db_torch(
         fs: Sampling frequency in Hz
         nperseg: Segment length for Welch PSD
         freq_range: (min_freq, max_freq) to consider
+        normalize_psd: If True, normalize PSDs by total power before comparison.
+                       This focuses on spectral SHAPE rather than absolute power.
 
     Returns:
         PSD error in dB (scalar tensor). Lower is better.
@@ -3815,27 +4593,14 @@ def psd_error_db_torch(
         pred = pred.float()
         target = target.float()
 
-    n_samples = pred.shape[-1]
-    hop = nperseg // 2
-
-    # Vectorized Welch PSD using unfold (no Python loops)
-    # Extract all segments at once: [N, T] -> [N, n_segments, nperseg]
-    pred_segments = pred.unfold(dimension=-1, size=nperseg, step=hop)
-    target_segments = target.unfold(dimension=-1, size=nperseg, step=hop)
-    n_segments = pred_segments.shape[1]
-
-    # Apply Hann window [nperseg] -> broadcasted
+    # Create window and compute normalization scale
     window = torch.hann_window(nperseg, device=pred.device, dtype=pred.dtype)
-    pred_windowed = pred_segments * window  # [N, n_seg, nperseg]
-    target_windowed = target_segments * window
+    S2 = (window ** 2).sum()  # Window power
+    scale = 2.0 / (fs * S2)  # Welch normalization for one-sided PSD
 
-    # Batched FFT over all segments at once
-    pred_fft = torch.fft.rfft(pred_windowed, dim=-1)  # [N, n_seg, n_freq]
-    target_fft = torch.fft.rfft(target_windowed, dim=-1)
-
-    # PSD: mean over samples and segments
-    pred_psd = torch.mean(torch.abs(pred_fft) ** 2, dim=(0, 1))  # [n_freq]
-    target_psd = torch.mean(torch.abs(target_fft) ** 2, dim=(0, 1))
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target, fs, nperseg, window, scale)
 
     # Frequency bins
     freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
@@ -3843,15 +4608,22 @@ def psd_error_db_torch(
     # Filter to freq_range
     freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
 
-    pred_psd_filtered = pred_psd[freq_mask]
-    target_psd_filtered = target_psd[freq_mask]
+    pred_psd_filtered = pred_psd[:, freq_mask]  # [N, n_freq_filtered]
+    target_psd_filtered = target_psd[:, freq_mask]
+
+    # Optional: normalize by total power to focus on spectral shape
+    if normalize_psd:
+        pred_total = pred_psd_filtered.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        target_total = target_psd_filtered.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        pred_psd_filtered = pred_psd_filtered / pred_total
+        target_psd_filtered = target_psd_filtered / target_total
 
     # Convert to dB
     eps = 1e-12
     pred_db = 10 * torch.log10(pred_psd_filtered + eps)
     target_db = 10 * torch.log10(target_psd_filtered + eps)
 
-    # Mean absolute error in dB
+    # Mean absolute error in dB (averaged over frequencies, then over signals)
     psd_err = torch.mean(torch.abs(pred_db - target_db))
 
     return psd_err
@@ -3869,6 +4641,8 @@ def psd_diff_db_torch(
     Positive = prediction has more power than target.
     Negative = prediction has less power than target.
     Closer to 0 is better.
+
+    Uses proper Welch normalization for correct PSD values.
 
     Args:
         pred: Predicted signal [B, C, T]
@@ -3896,40 +4670,161 @@ def psd_diff_db_torch(
         pred = pred.float()
         target = target.float()
 
-    hop = nperseg // 2
-
-    # Vectorized Welch PSD using unfold (no Python loops)
-    pred_segments = pred.unfold(dimension=-1, size=nperseg, step=hop)
-    target_segments = target.unfold(dimension=-1, size=nperseg, step=hop)
-
-    # Apply Hann window
+    # Create window and compute normalization scale
     window = torch.hann_window(nperseg, device=pred.device, dtype=pred.dtype)
-    pred_windowed = pred_segments * window
-    target_windowed = target_segments * window
+    S2 = (window ** 2).sum()  # Window power
+    scale = 2.0 / (fs * S2)  # Welch normalization for one-sided PSD
 
-    # Batched FFT
-    pred_fft = torch.fft.rfft(pred_windowed, dim=-1)
-    target_fft = torch.fft.rfft(target_windowed, dim=-1)
-
-    # PSD: mean over samples and segments
-    pred_psd = torch.mean(torch.abs(pred_fft) ** 2, dim=(0, 1))
-    target_psd = torch.mean(torch.abs(target_fft) ** 2, dim=(0, 1))
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target, fs, nperseg, window, scale)
 
     # Frequency bins
     freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
     freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
 
-    pred_psd_filtered = pred_psd[freq_mask]
-    target_psd_filtered = target_psd[freq_mask]
+    pred_psd_filtered = pred_psd[:, freq_mask]  # [N, n_freq_filtered]
+    target_psd_filtered = target_psd[:, freq_mask]
 
     # Convert to dB and compute mean difference (signed)
     eps = 1e-12
     pred_db = 10 * torch.log10(pred_psd_filtered + eps)
     target_db = 10 * torch.log10(target_psd_filtered + eps)
 
+    # Mean difference (averaged over frequencies, then over signals)
     psd_diff = torch.mean(pred_db - target_db)
 
     return psd_diff
+
+
+def psd_diagnostics_torch(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    fs: float = SAMPLING_RATE_HZ,
+    nperseg: int = 512,
+    freq_range: tuple = (0.0, MAX_FREQ_HZ),
+) -> dict:
+    """Compute detailed PSD diagnostics for debugging.
+
+    Provides comprehensive PSD comparison metrics including:
+    - Total power comparison (helps identify amplitude mismatch)
+    - Per-band power comparison (delta, theta, alpha, beta, gamma)
+    - Spectral shape correlation (amplitude-invariant)
+
+    Args:
+        pred: Predicted signal [B, C, T]
+        target: Target signal [B, C, T]
+        fs: Sampling frequency in Hz
+        nperseg: Segment length for Welch PSD
+        freq_range: (min_freq, max_freq) to consider
+
+    Returns:
+        Dictionary with diagnostic metrics:
+        - total_power_ratio_db: 10*log10(pred_power / target_power)
+        - psd_error_db: Mean |pred_db - target_db| across frequencies
+        - psd_bias_db: Mean (pred_db - target_db) - signed difference
+        - spectral_correlation: Correlation of normalized PSDs (shape similarity)
+        - band_power_ratios_db: Per-band power ratio in dB
+        - pred_std: Standard deviation of predictions
+        - target_std: Standard deviation of targets
+    """
+    # Flatten batch and channel dimensions
+    if pred.ndim == 3:
+        B, C, T = pred.shape
+        pred_flat = pred.view(B * C, T)
+        target_flat = target.view(B * C, T)
+    elif pred.ndim == 2:
+        pred_flat = pred
+        target_flat = target
+    else:
+        pred_flat = pred.unsqueeze(0)
+        target_flat = target.unsqueeze(0)
+
+    # Ensure float32 for FFT
+    if pred_flat.dtype in (torch.bfloat16, torch.float16):
+        pred_flat = pred_flat.float()
+        target_flat = target_flat.float()
+
+    # Compute signal statistics
+    pred_std = pred_flat.std().item()
+    target_std = target_flat.std().item()
+
+    # Create window and compute normalization scale
+    window = torch.hann_window(nperseg, device=pred_flat.device, dtype=pred_flat.dtype)
+    S2 = (window ** 2).sum()
+    scale = 2.0 / (fs * S2)
+
+    # Compute PSDs per signal [N, n_freq]
+    pred_psd = _compute_welch_psd_torch(pred_flat, fs, nperseg, window, scale)
+    target_psd = _compute_welch_psd_torch(target_flat, fs, nperseg, window, scale)
+
+    # Average across signals
+    pred_psd_mean = pred_psd.mean(dim=0)  # [n_freq]
+    target_psd_mean = target_psd.mean(dim=0)
+
+    # Frequency bins
+    freqs = torch.fft.rfftfreq(nperseg, d=1.0 / fs)
+    freq_mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
+
+    pred_psd_filtered = pred_psd_mean[freq_mask]
+    target_psd_filtered = target_psd_mean[freq_mask]
+    freqs_filtered = freqs[freq_mask]
+
+    # Total power comparison
+    eps = 1e-12
+    pred_total_power = pred_psd_filtered.sum()
+    target_total_power = target_psd_filtered.sum()
+    total_power_ratio_db = 10 * torch.log10((pred_total_power + eps) / (target_total_power + eps))
+
+    # dB conversion
+    pred_db = 10 * torch.log10(pred_psd_filtered + eps)
+    target_db = 10 * torch.log10(target_psd_filtered + eps)
+
+    # PSD error and bias
+    psd_error_db = torch.mean(torch.abs(pred_db - target_db)).item()
+    psd_bias_db = torch.mean(pred_db - target_db).item()
+
+    # Spectral shape correlation (normalize by total power)
+    pred_norm = pred_psd_filtered / (pred_total_power + eps)
+    target_norm = target_psd_filtered / (target_total_power + eps)
+
+    # Pearson correlation of normalized PSDs
+    pred_centered = pred_norm - pred_norm.mean()
+    target_centered = target_norm - target_norm.mean()
+    spectral_corr = (pred_centered * target_centered).sum() / (
+        (pred_centered.pow(2).sum().sqrt() + eps) * (target_centered.pow(2).sum().sqrt() + eps)
+    )
+
+    # Per-band power ratios
+    band_definitions = {
+        'delta': (0.5, 4.0),
+        'theta': (4.0, 8.0),
+        'alpha': (8.0, 13.0),
+        'beta': (13.0, 30.0),
+        'gamma': (30.0, 100.0),
+    }
+
+    band_power_ratios_db = {}
+    for band_name, (f_low, f_high) in band_definitions.items():
+        band_mask = (freqs_filtered >= f_low) & (freqs_filtered <= f_high)
+        if band_mask.any():
+            pred_band_power = pred_psd_filtered[band_mask].sum()
+            target_band_power = target_psd_filtered[band_mask].sum()
+            ratio_db = 10 * torch.log10((pred_band_power + eps) / (target_band_power + eps))
+            band_power_ratios_db[band_name] = ratio_db.item()
+        else:
+            band_power_ratios_db[band_name] = 0.0
+
+    return {
+        'total_power_ratio_db': total_power_ratio_db.item(),
+        'psd_error_db': psd_error_db,
+        'psd_bias_db': psd_bias_db,
+        'spectral_correlation': spectral_corr.item(),
+        'band_power_ratios_db': band_power_ratios_db,
+        'pred_std': pred_std,
+        'target_std': target_std,
+        'std_ratio': pred_std / (target_std + eps),
+    }
 
 
 # =============================================================================

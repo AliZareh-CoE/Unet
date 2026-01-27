@@ -82,6 +82,7 @@ from models import (
     normalized_rmse_torch,
     psd_error_db_torch,
     psd_diff_db_torch,
+    psd_diagnostics_torch,
     MAX_FREQ_HZ,
     # Conditioning encoders
     SpectroTemporalEncoder,
@@ -96,6 +97,8 @@ from models import (
     NoiseAugmentor,
     # Training metrics recorder for model interrogation
     TrainingMetricsRecorder,
+    # Wiener filter for inference-time boosting
+    WienerBoost,
 )
 from data import (
     prepare_data,
@@ -767,6 +770,8 @@ def evaluate(
     cond_encoder: Optional[nn.Module] = None,
     envelope_matcher_fwd: Optional[nn.Module] = None,
     envelope_matcher_rev: Optional[nn.Module] = None,
+    wiener_boost: Optional["WienerBoost"] = None,
+    wiener_alpha: float = 1.0,
 ) -> Dict[str, float]:
     """Evaluate model on a dataloader (supports bidirectional).
 
@@ -787,6 +792,7 @@ def evaluate(
     mse_list, mae_list, corr_list = [], [], []
     r2_list, nrmse_list = [], []
     psd_err_list, psd_diff_list = [], []
+    psd_diagnostics_collected = None  # Collect detailed PSD diagnostics on first batch
 
     # Accumulators for pooled R² and correlation
     pooled_n = 0
@@ -820,6 +826,11 @@ def evaluate(
     # Per-channel metrics (computed in non-fast mode only)
     per_channel_corr_list = []
     cross_channel_corr_accumulated = None
+
+    # Wiener boost tracking (neural-only vs boosted comparison)
+    wiener_neural_only_r2_list = []
+    wiener_only_r2_list = []  # Track Wiener-alone performance
+    wiener_contribution_list = []
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False) if config else False
@@ -882,6 +893,13 @@ def evaluate(
             if envelope_matcher_fwd is not None:
                 pred = envelope_matcher_fwd(pred, odor_ids=odor)
 
+            # Apply Wiener residual learning: pred = NeuralNet(x) + alpha * Wiener(x)
+            # Track neural-only prediction for contribution analysis
+            pred_neural_only = pred.clone() if (wiener_boost is not None and wiener_boost.is_fitted) else None
+            if wiener_boost is not None and wiener_boost.is_fitted:
+                wiener_pred = wiener_boost.predict(ob)
+                pred = pred + wiener_alpha * wiener_pred
+
             pred_c = crop_to_target_torch(pred)
             pcx_c = crop_to_target_torch(pcx)
             ob_c = crop_to_target_torch(ob)
@@ -920,6 +938,10 @@ def evaluate(
                 psd_err_list.append(psd_error_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
                 psd_diff_list.append(psd_diff_db_torch(pred_f32, pcx_f32, fs=sampling_rate).item())
 
+                # Collect detailed PSD diagnostics on first batch (for debugging)
+                if psd_diagnostics_collected is None:
+                    psd_diagnostics_collected = psd_diagnostics_torch(pred_f32, pcx_f32, fs=sampling_rate)
+
             # Baseline metrics: Compare raw source vs target
             # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
             # This gives a meaningful "how similar are these brain regions" baseline
@@ -949,6 +971,23 @@ def evaluate(
                     cross_channel_corr_accumulated = cross_ch_corr.cpu()
                 else:
                     cross_channel_corr_accumulated += cross_ch_corr.cpu()
+
+                # Track Wiener contribution (neural-only R², wiener-only R², combined R²)
+                if pred_neural_only is not None and wiener_boost is not None:
+                    pred_neural_c = crop_to_target_torch(pred_neural_only)
+                    pred_neural_f32 = pred_neural_c.float()
+                    neural_only_r2 = explained_variance_torch(pred_neural_f32, pcx_f32).item()
+
+                    # Compute Wiener-only R² (without neural network)
+                    wiener_pred = wiener_boost.predict(ob)
+                    wiener_pred_c = crop_to_target_torch(wiener_pred)
+                    wiener_pred_f32 = wiener_pred_c.float()
+                    wiener_only_r2 = explained_variance_torch(wiener_pred_f32, pcx_f32).item()
+
+                    boosted_r2 = r2_list[-1]  # Already computed above (combined)
+                    wiener_neural_only_r2_list.append(neural_only_r2)
+                    wiener_only_r2_list.append(wiener_only_r2)
+                    wiener_contribution_list.append(boosted_r2 - neural_only_r2)
 
             # Reverse: PCx → OB (if reverse model exists)
             if reverse_model is not None:
@@ -1086,6 +1125,8 @@ def evaluate(
         results["psd_err_db"] = float(np.mean(psd_err_list))
     if psd_diff_list:
         results["psd_diff_db"] = float(np.mean(psd_diff_list))
+    if psd_diagnostics_collected is not None:
+        results["psd_diagnostics"] = psd_diagnostics_collected
 
     # Reverse results (PCx→OB) - also use TRUE POOLED metrics
     if mse_list_rev:
@@ -1208,6 +1249,13 @@ def evaluate(
 
         results["loss"] = val_loss
 
+    # Wiener boost contribution metrics (only computed when wiener_boost is used)
+    if wiener_neural_only_r2_list:
+        results["wiener_neural_only_r2"] = float(np.mean(wiener_neural_only_r2_list))
+        results["wiener_only_r2"] = float(np.mean(wiener_only_r2_list))
+        results["wiener_contribution"] = float(np.mean(wiener_contribution_list))
+        # Combined R² is already in results["r2"]
+
     return results
 
 
@@ -1254,6 +1302,7 @@ def train_epoch(
     cond_encoder: Optional[nn.Module] = None,
     noise_augmentor: Optional[NoiseAugmentor] = None,
     metrics_recorder: Optional[TrainingMetricsRecorder] = None,
+    wiener_filter: Optional["WienerBoost"] = None,
 ) -> Dict[str, float]:
     """Train one epoch (supports bidirectional with cycle consistency).
 
@@ -1261,6 +1310,7 @@ def train_epoch(
         cond_encoder: Optional conditioning encoder for auto-conditioning modes
         metrics_recorder: Optional recorder for tracking training dynamics
         noise_augmentor: Optional NoiseAugmentor for noise augmentation
+        wiener_filter: Optional pre-fitted Wiener filter for residual learning
     """
     model.train()
     if reverse_model is not None:
@@ -1277,8 +1327,14 @@ def train_epoch(
     # Pre-fetch first batch to reduce perceived delay
     import itertools
     _warmup_iter = iter(loader)
-    _first_batch = next(_warmup_iter)
-    loader_iter = itertools.chain([_first_batch], _warmup_iter)
+    try:
+        _first_batch = next(_warmup_iter)
+        loader_iter = itertools.chain([_first_batch], _warmup_iter)
+    except StopIteration:
+        # Empty loader (can happen with FSDP when samples < num_gpus * batch_size)
+        if is_primary():
+            print(f"Warning: Empty dataloader on this rank (samples may be too few for {get_world_size()} GPUs)")
+        loader_iter = iter([])  # Empty iterator
 
     # Determine compute dtype for FSDP mixed precision compatibility
     use_bf16 = config.get("fsdp_bf16", False)
@@ -1367,6 +1423,14 @@ def train_epoch(
         else:
             # Other architectures: just pass input
             pred_raw = model(ob)
+
+        # Wiener residual learning: combine neural net + Wiener prediction
+        # pred_combined = NeuralNet(x) + alpha * Wiener(x)
+        if wiener_filter is not None and wiener_filter.is_fitted:
+            wiener_alpha = config.get("wiener_alpha", 1.0)
+            with torch.no_grad():
+                wiener_pred = wiener_filter.predict(ob)
+            pred_raw = pred_raw + wiener_alpha * wiener_pred
 
         pred_raw_c = crop_to_target_torch(pred_raw)
         pcx_c = crop_to_target_torch(pcx)
@@ -1720,10 +1784,13 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_mode=config.get("adaptive_scaling_mode", "scalar"),
+            adaptive_scaling_cross_channel=config.get("adaptive_scaling_cross_channel", False),
             # NEW: Ablation-configurable parameters
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
             skip_type=config.get("skip_type", "add"),
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
         )
     else:
         # Use Phase 2 architectures for comparison
@@ -1776,10 +1843,13 @@ def train(
             n_sessions=config.get("n_sessions", 0),
             # Session-adaptive output scaling
             use_adaptive_scaling=config.get("use_adaptive_scaling", False),
+            adaptive_scaling_mode=config.get("adaptive_scaling_mode", "scalar"),
+            adaptive_scaling_cross_channel=config.get("adaptive_scaling_cross_channel", False),
             # NEW: Ablation-configurable parameters (same as forward)
             activation=config.get("activation", "relu"),
             n_heads=config.get("n_heads", 4),
             skip_type=config.get("skip_type", "add"),
+            sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
         )
         if is_primary():
             print("Bidirectional training ENABLED")
@@ -2117,6 +2187,68 @@ def train(
         print("\n[Interrogation] Training metrics recorder initialized")
         print(f"  Tracking: gradients, weights, loss components, per-session metrics")
 
+    # =========================================================================
+    # WIENER RESIDUAL: Fit Wiener filter BEFORE training (if enabled)
+    # Neural network will learn: y = Wiener(x) + NeuralNet(x)
+    # =========================================================================
+    wiener_filter = None
+    if config.get("wiener_residual", False):
+        if is_primary():
+            print("\n" + "="*60)
+            print("WIENER RESIDUAL LEARNING")
+            print("Fitting Wiener filter on training data...")
+            print("Neural network will learn the residual: y - Wiener(x)")
+            print("="*60)
+
+        # Collect training data for Wiener fitting
+        max_samples = 10000  # Limit samples for Wiener fitting
+        X_train_list, y_train_list = [], []
+        n_collected = 0
+
+        with torch.no_grad():
+            for batch in loaders["train"]:
+                if n_collected >= max_samples:
+                    break
+
+                if len(batch) == 4:
+                    ob, pcx, odor, session_ids_batch = batch
+                else:
+                    ob, pcx, odor = batch
+
+                ob = ob.to(device)
+                pcx = pcx.to(device)
+                pcx = per_channel_normalize(pcx)
+
+                X_train_list.append(ob.cpu())
+                y_train_list.append(pcx.cpu())
+                n_collected += ob.shape[0]
+
+        X_train = torch.cat(X_train_list, dim=0)[:max_samples]
+        y_train = torch.cat(y_train_list, dim=0)[:max_samples]
+
+        # Fit Wiener filter
+        in_channels = config.get("in_channels", 32)
+        out_channels = config.get("out_channels", 32)
+        wiener_filter = WienerBoost(n_in=in_channels, n_out=out_channels)
+        wiener_filter.fit(X_train.to(device), y_train.to(device))
+        wiener_filter.to(device)
+        wiener_filter.eval()  # Freeze Wiener filter
+
+        # Compute Wiener-only baseline R²
+        with torch.no_grad():
+            y_wiener = wiener_filter.predict(X_train.to(device))
+            y_target = y_train.to(device)
+            ss_tot = ((y_target - y_target.mean()) ** 2).sum()
+            ss_res = ((y_target - y_wiener) ** 2).sum()
+            wiener_r2 = (1 - ss_res / ss_tot).item()
+
+        if is_primary():
+            print(f"  Fitted on {n_collected} samples")
+            print(f"  Input channels: {in_channels}, Output channels: {out_channels}")
+            print(f"  Wiener-only R² (baseline): {wiener_r2:.4f}")
+            print(f"  Alpha (contribution weight): {config.get('wiener_alpha', 1.0)}")
+            print("="*60 + "\n")
+
     for epoch in range(1, num_epochs + 1):
         if loaders.get("train_sampler") is not None:
             loaders["train_sampler"].set_epoch(epoch)
@@ -2127,6 +2259,7 @@ def train(
             cond_encoder=cond_encoder,
             noise_augmentor=noise_augmentor,
             metrics_recorder=metrics_recorder,
+            wiener_filter=wiener_filter,
         )
 
         barrier()
@@ -2160,12 +2293,17 @@ def train(
                             print(f"    sess_first mean: {sess_first.mean():.6f}, std: {sess_first.std():.6f}")
                 print()
 
+            # fast_mode=True skips PSD/baseline metrics for speed
+            # Use --compute-psd-validation to enable PSD during validation
+            val_fast_mode = not config.get("compute_psd_validation", False)
             val_metrics = evaluate(
                 model, loaders["val"], device,
                 compute_phase=False, reverse_model=reverse_model, config=config,
-                fast_mode=True,
+                fast_mode=val_fast_mode,
                 sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                 cond_encoder=cond_encoder,
+                wiener_boost=wiener_filter,
+                wiener_alpha=config.get("wiener_alpha", 1.0),
             )
             last_val_metrics = val_metrics  # Cache for non-validation epochs
 
@@ -2176,9 +2314,11 @@ def train(
                     sess_metrics = evaluate(
                         model, sess_loader, device,
                         compute_phase=False, reverse_model=reverse_model, config=config,
-                        fast_mode=True,
+                        fast_mode=val_fast_mode,
                         sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                         cond_encoder=cond_encoder,
+                        wiener_boost=wiener_filter,
+                        wiener_alpha=config.get("wiener_alpha", 1.0),
                     )
                     per_session_metrics[sess_name] = sess_metrics
         else:
@@ -2226,16 +2366,22 @@ def train(
             if "corr_rev" in val_metrics:
                 rev_str = f" | Rev: r={val_metrics['corr_rev']:.3f}, r²={val_metrics.get('r2_rev', 0):.3f}"
 
+            # Include PSD metrics if computed
+            psd_str = ""
+            if "psd_diff_db" in val_metrics:
+                psd_str = f" | PSD: {val_metrics['psd_diff_db']:+.1f}dB"
+
             print(f"Epoch {epoch}/{num_epochs} | "
                   f"Train: {train_metrics['loss']:.3f} | Val: {val_metrics['loss']:.3f} | "
-                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{rev_str} | "
+                  f"Fwd: r={val_metrics['corr']:.3f}, r²={val_metrics.get('r2', 0):.3f}{psd_str}{rev_str} | "
                   f"Best: {best_val_loss:.3f}")
 
             # Print per-session metrics if available
             if per_session_metrics:
                 sess_strs = []
                 for sess_name, sess_m in per_session_metrics.items():
-                    sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}")
+                    psd_part = f", PSD={sess_m['psd_diff_db']:+.1f}dB" if "psd_diff_db" in sess_m else ""
+                    sess_strs.append(f"  {sess_name}: r={sess_m['corr']:.3f}, r²={sess_m.get('r2', 0):.3f}{psd_part}")
                 print("  Per-session: " + " | ".join(sess_strs))
 
             # Print session embedding weight stats every 10 epochs
@@ -2515,6 +2661,8 @@ def train(
             cond_encoder=cond_encoder,
             envelope_matcher_fwd=envelope_matcher_fwd,
             envelope_matcher_rev=envelope_matcher_rev,
+            wiener_boost=wiener_filter,
+            wiener_alpha=config.get("wiener_alpha", 1.0),
         )
     else:
         test_metrics = {}
@@ -2563,6 +2711,38 @@ def train(
         print(f"  R²: {fwd_r2:.4f} (Δ={delta_r2:+.4f})")
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
+
+        # Wiener contribution analysis (if enabled)
+        if "wiener_contribution" in test_metrics:
+            neural_only_r2 = test_metrics.get('wiener_neural_only_r2', 0)
+            wiener_only_r2 = test_metrics.get('wiener_only_r2', 0)
+            combined_r2 = fwd_r2
+            print(f"\n  Wiener + Neural Network Decomposition:")
+            print(f"    ┌─────────────────┬──────────┐")
+            print(f"    │ Component       │    R²    │")
+            print(f"    ├─────────────────┼──────────┤")
+            print(f"    │ Neural-only     │ {neural_only_r2:>8.4f} │")
+            print(f"    │ Wiener-only     │ {wiener_only_r2:>8.4f} │")
+            print(f"    │ Combined        │ {combined_r2:>8.4f} │")
+            print(f"    └─────────────────┴──────────┘")
+            # Compute synergy: is combined > max(neural, wiener)?
+            max_individual = max(neural_only_r2, wiener_only_r2)
+            synergy = combined_r2 - max_individual
+            if synergy > 0:
+                print(f"    Synergy: +{synergy:.4f} (they capture complementary info!)")
+            else:
+                print(f"    Overlap: {synergy:.4f} (redundant information)")
+
+        # Print detailed PSD diagnostics if available
+        if "psd_diagnostics" in test_metrics:
+            diag = test_metrics["psd_diagnostics"]
+            print(f"\n  PSD Diagnostics (first batch):")
+            print(f"    Signal STD ratio (pred/target): {diag['std_ratio']:.4f}")
+            print(f"    Total power ratio: {diag['total_power_ratio_db']:+.2f} dB")
+            print(f"    Spectral shape correlation: {diag['spectral_correlation']:.4f}")
+            print(f"    Per-band power ratios (dB):")
+            for band, ratio in diag['band_power_ratios_db'].items():
+                print(f"      {band}: {ratio:+.2f}")
 
         if "corr_rev" in test_metrics:
             print("\nReverse Direction (PCx → OB):")
@@ -2631,6 +2811,8 @@ def train(
                     fast_mode=True,  # Fast mode for per-session eval
                     sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
                     cond_encoder=cond_encoder,
+                    wiener_boost=wiener_filter,
+                    wiener_alpha=config.get("wiener_alpha", 1.0),
                 )
 
                 per_session_results.append({
@@ -2949,6 +3131,8 @@ def parse_args():
     # Training speed optimizations
     parser.add_argument("--val-every", type=int, default=1,
                         help="Validate every N epochs (default: 1). Use 5-10 for faster training.")
+    parser.add_argument("--compute-psd-validation", action="store_true",
+                        help="Compute PSD metrics during validation (slower but useful for monitoring spectral fidelity)")
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Enable gradient checkpointing to reduce memory and allow larger batches")
     parser.add_argument("--num-workers", type=int, default=None,
@@ -3072,6 +3256,12 @@ def parse_args():
                         help="Include spectral features in session statistics encoder")
     parser.add_argument("--use-adaptive-scaling", action="store_true",
                         help="Use session-adaptive output scaling (FiLM style)")
+    parser.add_argument("--adaptive-scaling-mode", type=str, default="scalar",
+                        choices=["scalar", "band_wise", "spectral", "harmonic"],
+                        help="Session-adaptive scaling mode: scalar (per-channel), band_wise (per-band), "
+                             "spectral (full frequency), harmonic (harmonic coupling)")
+    parser.add_argument("--adaptive-scaling-cross-channel", action="store_true",
+                        help="Add cross-channel attention to adaptive scaling (any mode)")
 
     # =========================================================================
     # Noise Augmentation (Training Robustness)
@@ -3127,6 +3317,12 @@ def parse_args():
     parser.add_argument("--loso-verbose", action="store_true", default=True,
                         help="Show verbose output during LOSO folds")
 
+    # Wiener residual learning options
+    parser.add_argument("--wiener-residual", action="store_true",
+                        help="Use Wiener residual learning: y = Wiener(x) + NeuralNet(x)")
+    parser.add_argument("--wiener-alpha", type=float, default=1.0,
+                        help="Wiener contribution weight (default: 1.0)")
+
     return parser.parse_args()
 
 
@@ -3154,12 +3350,21 @@ def main():
             print()
 
         from LOSO.runner import run_loso
-        from LOSO.config import LOSOConfig
+        from LOSO.config import LOSOConfig, DATASET_CONFIGS
+
+        # Map CLI dataset names to LOSO dataset names
+        # CLI uses: olfactory, pfc, dandi
+        # LOSO uses: olfactory, pfc_hpc, dandi_movie
+        cli_to_loso_dataset = {
+            ds_config.train_py_dataset_name: ds_name
+            for ds_name, ds_config in DATASET_CONFIGS.items()
+        }
+        loso_dataset = cli_to_loso_dataset.get(args.dataset, args.dataset)
 
         # Optimized LOSO defaults from cascading ablation study
         # CLI arguments override these defaults when explicitly provided
         config = LOSOConfig(
-            dataset=args.dataset,
+            dataset=loso_dataset,
             output_dir=Path(args.loso_output_dir),
             # Training (optimized defaults)
             epochs=args.epochs or 80,  # Optimized: 80 epochs
@@ -3202,6 +3407,9 @@ def main():
             noise_channel_dropout=args.noise_channel_dropout if args.noise_channel_dropout > 0 else 0.05,
             noise_temporal_dropout=args.noise_temporal_dropout if args.noise_temporal_dropout > 0 else 0.02,
             noise_prob=args.noise_prob,
+            # Wiener residual learning
+            wiener_residual=args.wiener_residual,
+            wiener_alpha=args.wiener_alpha,
         )
 
         print("=" * 60)
@@ -3265,6 +3473,7 @@ def main():
 
     # Training speed optimizations
     config["val_every"] = args.val_every  # Validate every N epochs
+    config["compute_psd_validation"] = args.compute_psd_validation  # PSD metrics during validation
     config["gradient_checkpointing"] = args.gradient_checkpointing
     config["num_workers"] = args.num_workers  # None = auto
     config["prefetch_factor"] = args.prefetch_factor
@@ -3306,6 +3515,8 @@ def main():
     config["use_session_stats"] = args.use_session_stats
     config["session_use_spectral"] = args.session_use_spectral
     config["use_adaptive_scaling"] = args.use_adaptive_scaling
+    config["adaptive_scaling_mode"] = args.adaptive_scaling_mode
+    config["adaptive_scaling_cross_channel"] = args.adaptive_scaling_cross_channel
 
     # =========================================================================
     # Noise Augmentation
@@ -3317,6 +3528,12 @@ def main():
     config["noise_channel_dropout"] = args.noise_channel_dropout
     config["noise_temporal_dropout"] = args.noise_temporal_dropout
     config["noise_prob"] = args.noise_prob
+
+    # =========================================================================
+    # Wiener Residual Learning
+    # =========================================================================
+    config["wiener_residual"] = args.wiener_residual
+    config["wiener_alpha"] = args.wiener_alpha
 
     # Print session split info
     if is_primary() and config["split_by_session"]:
@@ -3823,6 +4040,11 @@ def main():
         if results['test_metrics']:
             print(f"RESULT_CORR={results['test_metrics']['corr']:.4f}")
             print(f"RESULT_R2={results['test_metrics']['r2']:.4f}")
+            # Wiener metrics (if enabled)
+            if "wiener_contribution" in results['test_metrics']:
+                print(f"RESULT_WIENER_NEURAL_ONLY_R2={results['test_metrics']['wiener_neural_only_r2']:.4f}")
+                print(f"RESULT_WIENER_ONLY_R2={results['test_metrics']['wiener_only_r2']:.4f}")
+                print(f"RESULT_WIENER_CONTRIBUTION={results['test_metrics']['wiener_contribution']:.4f}")
         print(f"RESULT_LOSS={results['best_val_loss']:.4f}")
         if "split_info" in data:
             print(f"RESULT_SPLIT_TYPE=session_holdout")

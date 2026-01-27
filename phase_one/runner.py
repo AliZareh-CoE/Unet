@@ -711,6 +711,395 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, 
     return ob, pcx, train_idx, val_idx, test_idx, val_idx_per_session
 
 
+def load_pfc_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load PFC dataset (PFC -> CA1 translation).
+
+    Returns:
+        X: Input signals (PFC) [N, C, T]
+        y: Target signals (CA1) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices (held out)
+        val_idx_per_session: Dict mapping session name -> validation indices for that session
+    """
+    from data import prepare_pfc_data
+
+    print("Loading PFC dataset (cross-subject: 3 held-out sessions, no test set)...")
+    data = prepare_pfc_data(
+        split_by_session=True,
+        n_test_sessions=0,   # No separate test set (matches Phase 3)
+        n_val_sessions=3,    # 3 sessions held out for validation
+        force_recreate_splits=True,
+    )
+
+    pfc = data["pfc"]   # [N, C, T] - Prefrontal Cortex
+    ca1 = data["ca1"]   # [N, C, T] - Hippocampal CA1
+
+    train_idx = data["train_idx"]
+    val_idx = data["val_idx"]
+    test_idx = data["test_idx"]
+
+    # Build per-session val indices from metadata
+    val_idx_per_session = None
+    if "split_info" in data and "val_sessions" in data["split_info"]:
+        metadata = data.get("metadata")
+        if metadata is not None:
+            val_idx_per_session = {}
+            val_sessions = data["split_info"]["val_sessions"]
+            val_idx_set = set(val_idx)
+            # PFC uses 'session' column, olfactory uses 'recording_id'
+            session_col = None
+            for col in ["session", "recording_id", "session_id"]:
+                if col in metadata.columns:
+                    session_col = col
+                    break
+            if session_col:
+                for sess in val_sessions:
+                    sess_mask = metadata[session_col] == sess
+                    sess_indices = np.where(sess_mask)[0]
+                    sess_val_idx = np.array([i for i in sess_indices if i in val_idx_set])
+                    if len(sess_val_idx) > 0:
+                        val_idx_per_session[sess] = sess_val_idx
+
+    # Log session split info if available
+    if "split_info" in data:
+        split_info = data["split_info"]
+        print(f"  Train sessions: {split_info.get('train_sessions', 'N/A')}")
+        print(f"  Val sessions: {split_info.get('val_sessions', 'N/A')}")
+        print(f"  Test sessions: {split_info.get('test_sessions', 'N/A')}")
+
+    print(f"  Loaded: PFC {pfc.shape} -> CA1 {ca1.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    if val_idx_per_session:
+        for sess_name, sess_idx in val_idx_per_session.items():
+            print(f"    Val session {sess_name}: {len(sess_idx)} samples")
+
+    return pfc, ca1, train_idx, val_idx, test_idx, val_idx_per_session
+
+
+def load_dandi_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load DANDI dataset (amygdala -> hippocampus translation).
+
+    Returns:
+        X: Input signals (source region) [N, C, T]
+        y: Target signals (target region) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices
+        val_idx_per_session: Dict mapping session name -> validation indices (None for DANDI)
+    """
+    from data import prepare_dandi_data
+
+    print("Loading DANDI dataset (amygdala -> hippocampus)...")
+    data = prepare_dandi_data(
+        source_region="amygdala",
+        target_region="hippocampus",
+        window_size=5000,
+        train_stride=2500,
+        val_stride=5000,
+    )
+
+    # DANDI returns datasets, need to extract arrays
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Convert to arrays
+    def dataset_to_arrays(dataset):
+        sources, targets = [], []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            sources.append(item["source"].numpy())
+            targets.append(item["target"].numpy())
+        return np.stack(sources), np.stack(targets)
+
+    X_train, y_train = dataset_to_arrays(train_dataset)
+    X_val, y_val = dataset_to_arrays(val_dataset)
+    X_test, y_test = dataset_to_arrays(test_dataset) if test_dataset else (np.array([]), np.array([]))
+
+    # Combine into full arrays
+    X = np.concatenate([X_train, X_val] + ([X_test] if len(X_test) > 0 else []))
+    y = np.concatenate([y_train, y_val] + ([y_test] if len(y_test) > 0 else []))
+
+    train_idx = np.arange(len(X_train))
+    val_idx = np.arange(len(X_train), len(X_train) + len(X_val))
+    test_idx = np.arange(len(X_train) + len(X_val), len(X)) if len(X_test) > 0 else np.array([])
+
+    print(f"  Loaded: Source {X.shape} -> Target {y.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    return X, y, train_idx, val_idx, test_idx, None
+
+
+# =============================================================================
+# LOSO (Leave-One-Session-Out) Functions
+# =============================================================================
+
+def load_raw_pfc_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) PFC data with session info for LOSO.
+
+    Returns:
+        X: Raw input signals (PFC) [N, C, T]
+        y: Raw target signals (CA1) [N, C, T]
+        session_ids: Session ID per trial [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import load_pfc_signals, load_pfc_metadata, load_pfc_session_ids, PFC_DATA_PATH, PFC_META_PATH
+
+    print("Loading raw PFC data for LOSO (no pre-normalization)...")
+
+    # Load raw signals
+    pfc, ca1 = load_pfc_signals(PFC_DATA_PATH)
+    num_trials = pfc.shape[0]
+
+    # Load session info
+    session_ids, session_to_idx, idx_to_session = load_pfc_session_ids(PFC_META_PATH, num_trials)
+
+    print(f"  Loaded: PFC {pfc.shape} -> CA1 {ca1.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique")
+
+    return pfc, ca1, session_ids, idx_to_session
+
+
+def load_raw_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) olfactory data with session info for LOSO.
+
+    Returns:
+        X: Raw input signals (OB) [N, C, T]
+        y: Raw target signals (PCx) [N, C, T]
+        session_ids: Session ID per trial [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import load_signals, extract_window, load_session_ids, DATA_PATH, ODOR_CSV_PATH
+
+    print("Loading raw olfactory data for LOSO (no pre-normalization)...")
+
+    # Load raw signals
+    signals = load_signals(DATA_PATH)
+    windowed = extract_window(signals)  # [N, 2, C, T]
+    X = windowed[:, 0]  # OB
+    y = windowed[:, 1]  # PCx
+
+    # Load session info
+    session_ids, session_to_idx, idx_to_session = load_session_ids(
+        ODOR_CSV_PATH, session_column="recording_id", num_trials=X.shape[0]
+    )
+
+    print(f"  Loaded: OB {X.shape} -> PCx {y.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique")
+
+    return X, y, session_ids, idx_to_session
+
+
+def run_loso_evaluation(
+    config: "Phase1Config",
+    dataset: str = "pfc",
+) -> "Phase1Result":
+    """Run Leave-One-Session-Out cross-validation.
+
+    For each session:
+    1. Hold out that session as test
+    2. Train on all other sessions
+    3. Compute normalization from training sessions ONLY (no leakage)
+    4. Evaluate baselines on held-out session
+
+    Args:
+        config: Phase1 configuration
+        dataset: Dataset name ('pfc', 'olfactory')
+
+    Returns:
+        Phase1Result with aggregated metrics
+    """
+    from data import compute_normalization, normalize
+
+    print("\n" + "=" * 70)
+    print("PHASE 1: LOSO (Leave-One-Session-Out) Evaluation")
+    print("=" * 70)
+    print(f"Dataset: {dataset}")
+    print("Mode: True LOSO - each session held out once, normalization per-fold")
+    print()
+
+    # Load raw data based on dataset
+    if dataset == "pfc":
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_pfc_data()
+    elif dataset == "olfactory":
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_olfactory_data()
+    else:
+        raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
+
+    unique_sessions = np.unique(session_ids)
+    n_sessions = len(unique_sessions)
+    all_session_names = [idx_to_session[sid] for sid in sorted(unique_sessions)]
+
+    print(f"\nTotal sessions: {n_sessions}")
+    print(f"Sessions: {all_session_names}")
+    print(f"Methods: {', '.join(config.baselines)}")
+    print()
+
+    # Initialize metrics calculator
+    metrics_calc = MetricsCalculator(
+        sample_rate=config.sample_rate,
+        n_bootstrap=config.n_bootstrap,
+        ci_level=config.ci_level,
+    )
+
+    # Store results per method
+    method_fold_results: Dict[str, List[Dict]] = {name: [] for name in config.baselines}
+    method_session_r2: Dict[str, Dict[str, float]] = {name: {} for name in config.baselines}
+
+    # LOSO: iterate over each session as held-out test
+    for fold_idx, test_session_id in enumerate(sorted(unique_sessions)):
+        test_session_name = idx_to_session[test_session_id]
+        train_session_ids = [sid for sid in unique_sessions if sid != test_session_id]
+
+        # Get indices
+        test_mask = session_ids == test_session_id
+        train_mask = np.isin(session_ids, train_session_ids)
+        test_idx = np.where(test_mask)[0]
+        train_idx = np.where(train_mask)[0]
+
+        print(f"\n{'='*60}")
+        print(f"LOSO Fold {fold_idx + 1}/{n_sessions}: Test Session = {test_session_name}")
+        print(f"{'='*60}")
+        print(f"  Train: {len(train_idx)} samples from {len(train_session_ids)} sessions")
+        print(f"  Test: {len(test_idx)} samples from session {test_session_name}")
+
+        # CRITICAL: Compute normalization from TRAINING sessions only
+        # For PFC: X_raw is [N, C, T], need to handle differently than olfactory
+        if X_raw.ndim == 3:
+            # PFC format: [N, C, T] - compute mean/std per channel over (trials, time)
+            X_train_subset = X_raw[train_idx]
+            y_train_subset = y_raw[train_idx]
+            X_mean = X_train_subset.mean(axis=(0, 2), keepdims=True)
+            X_std = X_train_subset.std(axis=(0, 2), keepdims=True)
+            X_std[X_std < 1e-6] = 1e-6
+            y_mean = y_train_subset.mean(axis=(0, 2), keepdims=True)
+            y_std = y_train_subset.std(axis=(0, 2), keepdims=True)
+            y_std[y_std < 1e-6] = 1e-6
+
+            # Normalize ALL data using training stats
+            X_normalized = (X_raw - X_mean) / X_std
+            y_normalized = (y_raw - y_mean) / y_std
+        else:
+            raise ValueError(f"Unexpected data shape: {X_raw.shape}")
+
+        # Extract train and test sets
+        X_train = X_normalized[train_idx].astype(np.float32)
+        y_train = y_normalized[train_idx].astype(np.float32)
+        X_test = X_normalized[test_idx].astype(np.float32)
+        y_test = y_normalized[test_idx].astype(np.float32)
+
+        # Evaluate each baseline
+        for method_name in config.baselines:
+            try:
+                model = create_baseline(method_name)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+                # Compute metrics
+                metrics = metrics_calc.compute(y_pred, y_test)
+                r2 = metrics.get("r2", np.nan)
+
+                method_fold_results[method_name].append(metrics)
+                method_session_r2[method_name][test_session_name] = float(r2)
+
+                print(f"    {method_name}: R² = {r2:.4f}")
+
+            except Exception as e:
+                print(f"    {method_name}: FAILED - {e}")
+                method_fold_results[method_name].append({"r2": np.nan})
+                method_session_r2[method_name][test_session_name] = np.nan
+
+    # Aggregate results across folds
+    print("\n" + "=" * 70)
+    print("LOSO RESULTS SUMMARY")
+    print("=" * 70)
+    print(f"{'Method':<20} {'Mean R²':<12} {'Std':<10} {'Min':<10} {'Max':<10}")
+    print("-" * 70)
+
+    all_metrics = []
+    best_r2 = -np.inf
+    best_method = None
+
+    for method_name in config.baselines:
+        fold_r2s = [r.get("r2", np.nan) for r in method_fold_results[method_name]]
+        valid_r2s = [r for r in fold_r2s if not np.isnan(r)]
+
+        if valid_r2s:
+            mean_r2 = np.mean(valid_r2s)
+            std_r2 = np.std(valid_r2s)
+            min_r2 = np.min(valid_r2s)
+            max_r2 = np.max(valid_r2s)
+        else:
+            mean_r2 = std_r2 = min_r2 = max_r2 = np.nan
+
+        print(f"{method_name:<20} {mean_r2:<12.4f} {std_r2:<10.4f} {min_r2:<10.4f} {max_r2:<10.4f}")
+
+        if mean_r2 > best_r2:
+            best_r2 = mean_r2
+            best_method = method_name
+
+        # Create Phase1Metrics object
+        fold_maes = [r.get("mae", np.nan) for r in method_fold_results[method_name]]
+        fold_pearsons = [r.get("pearson", np.nan) for r in method_fold_results[method_name]]
+
+        metrics_obj = Phase1Metrics(
+            method=method_name,
+            r2_mean=float(mean_r2) if not np.isnan(mean_r2) else np.nan,
+            r2_std=float(std_r2) if not np.isnan(std_r2) else 0.0,
+            r2_ci=(float(min_r2), float(max_r2)),
+            mae_mean=float(np.nanmean(fold_maes)),
+            mae_std=float(np.nanstd(fold_maes)),
+            pearson_mean=float(np.nanmean(fold_pearsons)),
+            pearson_std=float(np.nanstd(fold_pearsons)),
+            spearman_mean=0.0,
+            spearman_std=0.0,
+            psd_error_db=0.0,
+            band_r2={},
+            fold_r2s=fold_r2s,
+            fold_maes=fold_maes,
+            fold_pearsons=fold_pearsons,
+            n_folds=n_sessions,
+            n_samples=len(X_raw),
+        )
+        all_metrics.append(metrics_obj)
+
+    # Per-session summary
+    print("\n" + "-" * 70)
+    print("PER-SESSION R² (each row = method, each column = held-out session):")
+    print("-" * 70)
+
+    header = f"{'Method':<18}" + "".join(f"{s[:10]:>12}" for s in all_session_names)
+    print(header)
+    for method_name in config.baselines:
+        row = f"{method_name:<18}"
+        for sess_name in all_session_names:
+            r2 = method_session_r2[method_name].get(sess_name, np.nan)
+            row += f"{r2:>12.4f}"
+        print(row)
+
+    # Gate threshold
+    gate_threshold = best_r2 + 0.05 * abs(best_r2) if best_r2 > 0 else best_r2 + 0.05
+    print("\n" + "=" * 70)
+    print(f"LOSO CLASSICAL FLOOR: R² = {best_r2:.4f} ({best_method})")
+    print(f"GATE THRESHOLD: Neural methods must achieve R² >= {gate_threshold:.4f}")
+    print("=" * 70)
+
+    # Create result
+    result = Phase1Result(
+        metrics=all_metrics,
+        best_method=best_method,
+        best_r2=best_r2,
+        gate_threshold=gate_threshold,
+        config=config.to_dict(),
+        timestamp=datetime.now().isoformat(),
+        predictions={},
+        models={},
+    )
+
+    return result
+
+
 def create_synthetic_data(
     n_samples: int = 200,
     n_channels: int = 32,
@@ -2082,6 +2471,8 @@ def main():
         epilog="""
 Examples:
     python -m phase_one.runner --dataset olfactory
+    python -m phase_one.runner --dataset pfc --loso  # True LOSO evaluation (recommended)
+    python -m phase_one.runner --dataset pfc --loso --fast  # Fast LOSO (ridge, wiener only)
     python -m phase_one.runner --dry-run  # Quick test
     python -m phase_one.runner --output results/phase1/
     python -m phase_one.runner --3fold-3seed  # Full 3-fold × 3-seed evaluation (aligned with ablation)
@@ -2175,6 +2566,11 @@ Examples:
         default=3,
         help="Number of seeds per fold (for --3fold-3seed mode)",
     )
+    parser.add_argument(
+        "--loso",
+        action="store_true",
+        help="Use true LOSO (Leave-One-Session-Out) evaluation with per-fold normalization",
+    )
 
     args = parser.parse_args()
 
@@ -2245,6 +2641,24 @@ Examples:
         print("\nSession-CV investigation complete!")
         return None
 
+    # Handle LOSO mode (true leave-one-session-out)
+    if args.loso:
+        print("\n[LOSO MODE] Leave-One-Session-Out Evaluation")
+        result = run_loso_evaluation(
+            config=config,
+            dataset=args.dataset,
+        )
+
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = config.output_dir / f"phase1_loso_{args.dataset}_{timestamp}.json"
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        result.save(results_file)
+        print(f"\nResults saved to: {results_file}")
+
+        print("\nPhase 1 (LOSO) complete!")
+        return result
+
     # Handle 3-fold × 3-seed mode (aligned with ablation study)
     if args.fold3_seed3:
         print("\n[3-FOLD × 3-SEED MODE]")
@@ -2303,7 +2717,14 @@ Examples:
         print(f"  Within-subject split: {len(cv_idx)} samples for K-fold CV")
     else:
         try:
-            X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
+            # Load data based on dataset config
+            if config.dataset == "pfc":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pfc_data()
+            elif config.dataset == "dandi":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_dandi_data()
+            else:  # olfactory (default)
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
+
             # Cross-subject evaluation: train on train sessions, eval on held-out val sessions
             # NO mixing of sessions - this ensures true cross-subject generalization
             X_train = X[train_idx]
@@ -2315,6 +2736,8 @@ Examples:
             print(f"  Cross-subject split: Train {X_train.shape[0]} samples, Val {X_val.shape[0]} samples (held-out sessions)")
         except Exception as e:
             print(f"Warning: Could not load data ({e}). Using synthetic data.")
+            import traceback
+            traceback.print_exc()
             X, y = create_synthetic_data()
             X_train, y_train = X, y
             X_val, y_val = None, None
