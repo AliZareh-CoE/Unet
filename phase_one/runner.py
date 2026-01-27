@@ -711,6 +711,119 @@ def load_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, 
     return ob, pcx, train_idx, val_idx, test_idx, val_idx_per_session
 
 
+def load_pfc_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load PFC dataset (PFC -> CA1 translation).
+
+    Returns:
+        X: Input signals (PFC) [N, C, T]
+        y: Target signals (CA1) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices (held out)
+        val_idx_per_session: Dict mapping session name -> validation indices for that session
+    """
+    from data import prepare_pfc_data
+
+    print("Loading PFC dataset (cross-subject: 3 held-out sessions, no test set)...")
+    data = prepare_pfc_data(
+        split_by_session=True,
+        n_test_sessions=0,   # No separate test set (matches Phase 3)
+        n_val_sessions=3,    # 3 sessions held out for validation
+        force_recreate_splits=True,
+    )
+
+    pfc = data["pfc"]   # [N, C, T] - Prefrontal Cortex
+    ca1 = data["ca1"]   # [N, C, T] - Hippocampal CA1
+
+    train_idx = data["train_idx"]
+    val_idx = data["val_idx"]
+    test_idx = data["test_idx"]
+
+    # Build per-session val indices from metadata
+    val_idx_per_session = None
+    if "split_info" in data and "val_sessions" in data["split_info"]:
+        metadata = data.get("metadata")
+        if metadata is not None:
+            val_idx_per_session = {}
+            val_sessions = data["split_info"]["val_sessions"]
+            val_idx_set = set(val_idx)
+            for sess in val_sessions:
+                sess_mask = metadata["recording_id"] == sess
+                sess_indices = np.where(sess_mask)[0]
+                sess_val_idx = np.array([i for i in sess_indices if i in val_idx_set])
+                if len(sess_val_idx) > 0:
+                    val_idx_per_session[sess] = sess_val_idx
+
+    # Log session split info if available
+    if "split_info" in data:
+        split_info = data["split_info"]
+        print(f"  Train sessions: {split_info.get('train_sessions', 'N/A')}")
+        print(f"  Val sessions: {split_info.get('val_sessions', 'N/A')}")
+        print(f"  Test sessions: {split_info.get('test_sessions', 'N/A')}")
+
+    print(f"  Loaded: PFC {pfc.shape} -> CA1 {ca1.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    if val_idx_per_session:
+        for sess_name, sess_idx in val_idx_per_session.items():
+            print(f"    Val session {sess_name}: {len(sess_idx)} samples")
+
+    return pfc, ca1, train_idx, val_idx, test_idx, val_idx_per_session
+
+
+def load_dandi_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load DANDI dataset (amygdala -> hippocampus translation).
+
+    Returns:
+        X: Input signals (source region) [N, C, T]
+        y: Target signals (target region) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices
+        val_idx_per_session: Dict mapping session name -> validation indices (None for DANDI)
+    """
+    from data import prepare_dandi_data
+
+    print("Loading DANDI dataset (amygdala -> hippocampus)...")
+    data = prepare_dandi_data(
+        source_region="amygdala",
+        target_region="hippocampus",
+        window_size=5000,
+        train_stride=2500,
+        val_stride=5000,
+    )
+
+    # DANDI returns datasets, need to extract arrays
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Convert to arrays
+    def dataset_to_arrays(dataset):
+        sources, targets = [], []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            sources.append(item["source"].numpy())
+            targets.append(item["target"].numpy())
+        return np.stack(sources), np.stack(targets)
+
+    X_train, y_train = dataset_to_arrays(train_dataset)
+    X_val, y_val = dataset_to_arrays(val_dataset)
+    X_test, y_test = dataset_to_arrays(test_dataset) if test_dataset else (np.array([]), np.array([]))
+
+    # Combine into full arrays
+    X = np.concatenate([X_train, X_val] + ([X_test] if len(X_test) > 0 else []))
+    y = np.concatenate([y_train, y_val] + ([y_test] if len(y_test) > 0 else []))
+
+    train_idx = np.arange(len(X_train))
+    val_idx = np.arange(len(X_train), len(X_train) + len(X_val))
+    test_idx = np.arange(len(X_train) + len(X_val), len(X)) if len(X_test) > 0 else np.array([])
+
+    print(f"  Loaded: Source {X.shape} -> Target {y.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    return X, y, train_idx, val_idx, test_idx, None
+
+
 def create_synthetic_data(
     n_samples: int = 200,
     n_channels: int = 32,
@@ -2303,7 +2416,14 @@ Examples:
         print(f"  Within-subject split: {len(cv_idx)} samples for K-fold CV")
     else:
         try:
-            X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
+            # Load data based on dataset config
+            if config.dataset == "pfc":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pfc_data()
+            elif config.dataset == "dandi":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_dandi_data()
+            else:  # olfactory (default)
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
+
             # Cross-subject evaluation: train on train sessions, eval on held-out val sessions
             # NO mixing of sessions - this ensures true cross-subject generalization
             X_train = X[train_idx]
@@ -2315,6 +2435,8 @@ Examples:
             print(f"  Cross-subject split: Train {X_train.shape[0]} samples, Val {X_val.shape[0]} samples (held-out sessions)")
         except Exception as e:
             print(f"Warning: Could not load data ({e}). Using synthetic data.")
+            import traceback
+            traceback.print_exc()
             X, y = create_synthetic_data()
             X_train, y_train = X, y
             X_val, y_val = None, None
