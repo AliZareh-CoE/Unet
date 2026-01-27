@@ -285,18 +285,22 @@ def run_training(
                 cmd,
                 cwd=str(PROJECT_ROOT),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 env=env,
             )
+            stdout_lines = []
             for line in process.stdout:
+                stdout_lines.append(line)
                 # Filter to show only key lines
-                if any(x in line for x in ["Epoch", "R²", "loss", "gate", "Best", "Final"]):
+                if any(x in line for x in ["Epoch", "R²", "loss", "gate", "Best", "Final", "Error", "error", "Exception", "Traceback"]):
                     print(f"    {line.rstrip()}")
             process.wait()
+            stderr_output = process.stderr.read()
             if process.returncode != 0:
-                raise subprocess.CalledProcessError(process.returncode, cmd)
+                print(f"  STDERR: {stderr_output[:2000]}")
+                raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_output)
         else:
             result = subprocess.run(
                 cmd,
@@ -310,7 +314,7 @@ def run_training(
         print(f"ERROR: Training failed for fold {fold_idx}")
         print(f"  Command: {' '.join(cmd)}")
         if hasattr(e, 'stderr') and e.stderr:
-            print(f"  stderr: {e.stderr[:1000]}...")
+            print(f"  stderr: {e.stderr[:2000]}")
         return None
 
     elapsed = time.time() - start_time
