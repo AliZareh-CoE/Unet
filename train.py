@@ -4188,6 +4188,12 @@ def main():
             actual_test_corr = test_metrics.get("corr") if test_metrics else results.get("test_avg_corr")
             actual_test_loss = test_metrics.get("loss") if test_metrics else results.get("test_avg_delta")
 
+            # Extract gate_mean from last epoch if gated mode was used
+            final_gate_mean = None
+            if history:
+                final_entry = history[-1]
+                final_gate_mean = final_entry.get("gate_mean", None)
+
             output_results = {
                 "architecture": args.arch,
                 "fold": args.fold if args.fold is not None else 0,
@@ -4213,6 +4219,8 @@ def main():
                 "epochs_trained": len(history),
                 "n_parameters": n_params,
                 "completed_successfully": True,
+                # Gated translator metrics
+                "gate_mean": final_gate_mean,
             }
             output_path = Path(args.output_results_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
