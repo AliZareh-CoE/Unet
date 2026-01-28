@@ -986,20 +986,20 @@ def parse_args() -> argparse.Namespace:
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=80, help="Training epochs per fold (no early stopping)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size (optimized: 64)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # Model architecture
+    # Model architecture (defaults from optimized LOSOConfig)
     parser.add_argument("--arch", type=str, default="condunet", help="Model architecture")
-    parser.add_argument("--base-channels", type=int, default=128, help="Base channel count")
+    parser.add_argument("--base-channels", type=int, default=256, help="Base channel count (optimized: 256)")
     parser.add_argument("--n-downsample", type=int, default=2, help="Downsample layers")
     parser.add_argument(
         "--attention-type",
         type=str,
-        default="cross_freq_v2",
+        default="none",
         choices=["none", "basic", "cross_freq_v2"],
-        help="Attention type",
+        help="Attention type (optimized: none)",
     )
     parser.add_argument(
         "--cond-mode",
