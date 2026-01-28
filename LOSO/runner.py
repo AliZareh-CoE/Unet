@@ -974,7 +974,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc_hpc", "dandi_movie"],
+        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1"],
         help="Dataset to use",
     )
     parser.add_argument(
