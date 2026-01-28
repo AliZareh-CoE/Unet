@@ -122,6 +122,20 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         default_stride_ratio=0.5,
         train_py_dataset_name="dandi",
     ),
+    "pcx1": DatasetConfig(
+        name="pcx1",
+        description="Continuous OB to PCx translation (1kHz LFP)",
+        session_type="session",
+        in_channels=32,
+        out_channels=32,
+        sampling_rate=1000,
+        source_region="OB",
+        target_region="PCx",
+        uses_sliding_window=True,
+        default_window_size=5000,
+        default_stride_ratio=0.5,
+        train_py_dataset_name="pcx1",
+    ),
 }
 
 
@@ -225,6 +239,10 @@ class LOSOConfig:
     dandi_window_size: int = 5000
     dandi_stride_ratio: float = 0.5
 
+    # PCx1 dataset options
+    pcx1_window_size: int = 5000
+    pcx1_stride_ratio: float = 0.5
+
     # PFC/HPC dataset options
     pfc_resample_to_1khz: bool = False
     pfc_sliding_window: bool = False
@@ -254,6 +272,9 @@ class LOSOConfig:
             ds_config.target_region = self.dandi_target_region
             ds_config.default_window_size = self.dandi_window_size
             ds_config.default_stride_ratio = self.dandi_stride_ratio
+        elif self.dataset == "pcx1":
+            ds_config.default_window_size = self.pcx1_window_size
+            ds_config.default_stride_ratio = self.pcx1_stride_ratio
 
         return ds_config
 

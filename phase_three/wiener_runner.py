@@ -241,6 +241,207 @@ def load_raw_olfactory_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]
     return X, y, session_ids, idx_to_session
 
 
+def load_raw_pfc_data() -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw PFC->HPC data with session info.
+
+    Returns:
+        X: Raw input signals (PFC) [N, C, T]
+        y: Raw target signals (HPC) [N, C, T]
+        session_ids: Session ID per trial [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import load_pfc_signals, load_pfc_session_ids, PFC_DATA_PATH, PFC_META_PATH
+
+    print("Loading raw PFC->HPC data...")
+
+    # Load raw signals
+    signals = load_pfc_signals(PFC_DATA_PATH)
+    X = signals[:, 0]  # PFC
+    y = signals[:, 1]  # HPC
+
+    # Load session info
+    session_ids, session_to_idx, idx_to_session = load_pfc_session_ids(PFC_META_PATH)
+
+    print(f"  Loaded: PFC {X.shape} -> HPC {y.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique")
+
+    return X, y, session_ids, idx_to_session
+
+
+def load_raw_pcx1_data(
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw PCx1 continuous data with session info.
+
+    Args:
+        window_size: Window size in samples
+        stride_ratio: Stride as fraction of window size
+
+    Returns:
+        X: Raw input signals (OB) [N, C, T]
+        y: Raw target signals (PCx) [N, C, T]
+        session_ids: Session ID per window [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import list_pcx1_sessions, load_pcx1_session
+
+    print("Loading raw PCx1 continuous data...")
+
+    sessions = list_pcx1_sessions()
+    stride = int(window_size * stride_ratio)
+
+    all_X = []
+    all_y = []
+    all_session_ids = []
+    session_to_idx = {s: i for i, s in enumerate(sessions)}
+    idx_to_session = {i: s for i, s in enumerate(sessions)}
+
+    for sess_idx, sess_name in enumerate(sessions):
+        ob, pcx = load_pcx1_session(sess_name)  # [C, T_total]
+
+        # Sliding window
+        n_windows = (ob.shape[1] - window_size) // stride + 1
+        for i in range(n_windows):
+            start = i * stride
+            end = start + window_size
+            all_X.append(ob[:, start:end])
+            all_y.append(pcx[:, start:end])
+            all_session_ids.append(sess_idx)
+
+    X = np.stack(all_X, axis=0)  # [N, C, T]
+    y = np.stack(all_y, axis=0)
+    session_ids = np.array(all_session_ids)
+
+    print(f"  Loaded: OB {X.shape} -> PCx {y.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique, {len(X)} windows")
+
+    return X, y, session_ids, idx_to_session
+
+
+def load_raw_dandi_data(
+    source_region: str = "amygdala",
+    target_region: str = "hippocampus",
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw DANDI movie data with subject info.
+
+    Args:
+        source_region: Source brain region
+        target_region: Target brain region
+        window_size: Window size in samples
+        stride_ratio: Stride as fraction of window size
+
+    Returns:
+        X: Raw input signals [N, C, T]
+        y: Raw target signals [N, C, T]
+        subject_ids: Subject ID per window [N]
+        idx_to_subject: Map from subject int ID to subject name
+    """
+    from data import _DANDI_DATA_DIR, list_dandi_nwb_files, load_dandi_regions
+
+    print(f"Loading raw DANDI data ({source_region} -> {target_region})...")
+
+    nwb_files = list_dandi_nwb_files(_DANDI_DATA_DIR)
+    stride = int(window_size * stride_ratio)
+
+    # Extract unique subjects
+    subjects = []
+    for f in nwb_files:
+        stem = f.stem
+        if "sub-" in stem:
+            subj_id = stem.split("_")[0]
+        else:
+            subj_id = stem
+        if subj_id not in subjects:
+            subjects.append(subj_id)
+    subjects = sorted(subjects)
+
+    subject_to_idx = {s: i for i, s in enumerate(subjects)}
+    idx_to_subject = {i: s for i, s in enumerate(subjects)}
+
+    all_X = []
+    all_y = []
+    all_subject_ids = []
+
+    for nwb_file in nwb_files:
+        stem = nwb_file.stem
+        if "sub-" in stem:
+            subj_id = stem.split("_")[0]
+        else:
+            subj_id = stem
+        subj_idx = subject_to_idx[subj_id]
+
+        try:
+            source, target = load_dandi_regions(
+                nwb_file, source_region, target_region
+            )  # [C, T_total]
+        except Exception as e:
+            print(f"  Skipping {nwb_file.name}: {e}")
+            continue
+
+        # Sliding window
+        min_len = min(source.shape[1], target.shape[1])
+        n_windows = (min_len - window_size) // stride + 1
+        for i in range(n_windows):
+            start = i * stride
+            end = start + window_size
+            all_X.append(source[:, start:end])
+            all_y.append(target[:, start:end])
+            all_subject_ids.append(subj_idx)
+
+    if not all_X:
+        raise RuntimeError("No valid windows loaded from DANDI data")
+
+    X = np.stack(all_X, axis=0)
+    y = np.stack(all_y, axis=0)
+    subject_ids = np.array(all_subject_ids)
+
+    print(f"  Loaded: {source_region} {X.shape} -> {target_region} {y.shape}")
+    print(f"  Subjects: {len(idx_to_subject)} unique, {len(X)} windows")
+
+    return X, y, subject_ids, idx_to_subject
+
+
+def load_dataset_data(
+    dataset: str,
+    pcx1_window_size: int = 5000,
+    pcx1_stride_ratio: float = 0.5,
+    dandi_source_region: str = "amygdala",
+    dandi_target_region: str = "hippocampus",
+    dandi_window_size: int = 5000,
+    dandi_stride_ratio: float = 0.5,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load data for any supported dataset.
+
+    Args:
+        dataset: Dataset name (olfactory, pfc, pcx1, dandi)
+        pcx1_window_size: Window size for pcx1
+        pcx1_stride_ratio: Stride ratio for pcx1
+        dandi_source_region: Source region for dandi
+        dandi_target_region: Target region for dandi
+        dandi_window_size: Window size for dandi
+        dandi_stride_ratio: Stride ratio for dandi
+
+    Returns:
+        X, y, session_ids, idx_to_session
+    """
+    if dataset == "olfactory":
+        return load_raw_olfactory_data()
+    elif dataset == "pfc":
+        return load_raw_pfc_data()
+    elif dataset == "pcx1":
+        return load_raw_pcx1_data(pcx1_window_size, pcx1_stride_ratio)
+    elif dataset == "dandi":
+        return load_raw_dandi_data(
+            dandi_source_region, dandi_target_region,
+            dandi_window_size, dandi_stride_ratio
+        )
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}. Supported: olfactory, pfc, pcx1, dandi")
+
+
 # =============================================================================
 # Normalization (per-channel, computed on training data only)
 # =============================================================================
@@ -567,27 +768,43 @@ def run_single_fold(
 
 def run_wiener_evaluation(
     output_dir: Path,
+    dataset: str = "olfactory",
     seed: int = 42,
     n_seeds: int = 1,
     folds_to_run: Optional[List[int]] = None,
     verbose: bool = True,
     dry_run: bool = False,
+    # Dataset-specific options
+    pcx1_window_size: int = 5000,
+    pcx1_stride_ratio: float = 0.5,
+    dandi_source_region: str = "amygdala",
+    dandi_target_region: str = "hippocampus",
+    dandi_window_size: int = 5000,
+    dandi_stride_ratio: float = 0.5,
 ) -> WienerResult:
     """Run complete Wiener filter evaluation with 3-fold CV.
 
     Args:
         output_dir: Directory to save results
+        dataset: Dataset to evaluate (olfactory, pfc, pcx1, dandi)
         seed: Base random seed
         n_seeds: Number of seeds per fold
         folds_to_run: Optional list of specific fold indices to run
         verbose: Print progress
         dry_run: If True, skip actual computation
+        pcx1_window_size: Window size for pcx1 dataset
+        pcx1_stride_ratio: Stride ratio for pcx1 dataset
+        dandi_source_region: Source region for dandi dataset
+        dandi_target_region: Target region for dandi dataset
+        dandi_window_size: Window size for dandi dataset
+        dandi_stride_ratio: Stride ratio for dandi dataset
 
     Returns:
         WienerResult with all fold results
     """
     print("\n" + "#"*70)
     print("# WIENER FILTER BASELINE EVALUATION")
+    print(f"# Dataset: {dataset}")
     print("# 3-Fold Cross-Validation")
     print("#"*70)
 
@@ -595,7 +812,15 @@ def run_wiener_evaluation(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load data
-    X, y, session_ids, idx_to_session = load_raw_olfactory_data()
+    X, y, session_ids, idx_to_session = load_dataset_data(
+        dataset=dataset,
+        pcx1_window_size=pcx1_window_size,
+        pcx1_stride_ratio=pcx1_stride_ratio,
+        dandi_source_region=dandi_source_region,
+        dandi_target_region=dandi_target_region,
+        dandi_window_size=dandi_window_size,
+        dandi_stride_ratio=dandi_stride_ratio,
+    )
 
     # Get session names in order
     all_sessions = sorted(idx_to_session.values())
@@ -677,6 +902,13 @@ def main():
     )
 
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="olfactory",
+        choices=["olfactory", "pfc", "pcx1", "dandi"],
+        help="Dataset to evaluate",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=PROJECT_ROOT / "artifacts" / "phase_three" / "wiener_baseline",
@@ -718,17 +950,64 @@ def main():
         help="Print what would be run without executing",
     )
 
+    # PCx1-specific arguments
+    parser.add_argument(
+        "--pcx1-window-size",
+        type=int,
+        default=5000,
+        help="Window size for PCx1 dataset",
+    )
+    parser.add_argument(
+        "--pcx1-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride ratio for PCx1 dataset",
+    )
+
+    # DANDI-specific arguments
+    parser.add_argument(
+        "--dandi-source-region",
+        type=str,
+        default="amygdala",
+        help="Source region for DANDI dataset",
+    )
+    parser.add_argument(
+        "--dandi-target-region",
+        type=str,
+        default="hippocampus",
+        help="Target region for DANDI dataset",
+    )
+    parser.add_argument(
+        "--dandi-window-size",
+        type=int,
+        default=5000,
+        help="Window size for DANDI dataset",
+    )
+    parser.add_argument(
+        "--dandi-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride ratio for DANDI dataset",
+    )
+
     args = parser.parse_args()
 
     verbose = not args.quiet
 
     result = run_wiener_evaluation(
         output_dir=args.output_dir,
+        dataset=args.dataset,
         seed=args.seed,
         n_seeds=args.n_seeds,
         folds_to_run=args.folds,
         verbose=verbose,
         dry_run=args.dry_run,
+        pcx1_window_size=args.pcx1_window_size,
+        pcx1_stride_ratio=args.pcx1_stride_ratio,
+        dandi_source_region=args.dandi_source_region,
+        dandi_target_region=args.dandi_target_region,
+        dandi_window_size=args.dandi_window_size,
+        dandi_stride_ratio=args.dandi_stride_ratio,
     )
 
     # Exit with appropriate code

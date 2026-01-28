@@ -75,7 +75,7 @@ class GatedConfig:
     """Configuration for GatedTranslator training."""
 
     # Dataset
-    dataset: str = "olfactory"  # olfactory, pfc, dandi
+    dataset: str = "olfactory"  # olfactory, pfc, pcx1, dandi
     output_dir: Path = field(default_factory=lambda: Path("artifacts/phase3_gated"))
 
     # Training
@@ -124,6 +124,10 @@ class GatedConfig:
     dandi_target_region: str = "hippocampus"
     dandi_window_size: int = 5000
     dandi_stride_ratio: float = 0.5
+
+    # PCx1-specific
+    pcx1_window_size: int = 5000
+    pcx1_stride_ratio: float = 0.5
 
     def __post_init__(self):
         if isinstance(self.output_dir, str):
@@ -283,6 +287,11 @@ def run_single_fold(
             "--dandi-target-region", config.dandi_target_region,
             "--dandi-window-size", str(config.dandi_window_size),
             "--dandi-stride-ratio", str(config.dandi_stride_ratio),
+        ])
+    elif config.dataset == "pcx1":
+        cmd.extend([
+            "--pcx1-window-size", str(config.pcx1_window_size),
+            "--pcx1-stride-ratio", str(config.pcx1_stride_ratio),
         ])
 
     # Model architecture arguments
@@ -466,7 +475,7 @@ def parse_args():
 
     # Dataset
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "dandi"])
+                        choices=["olfactory", "pfc", "pcx1", "dandi"])
     parser.add_argument("--output-dir", type=str, default="artifacts/phase3_gated")
 
     # Training
@@ -507,6 +516,10 @@ def parse_args():
     parser.add_argument("--dandi-target-region", type=str, default="hippocampus")
     parser.add_argument("--dandi-window-size", type=int, default=5000)
     parser.add_argument("--dandi-stride-ratio", type=float, default=0.5)
+
+    # PCx1-specific
+    parser.add_argument("--pcx1-window-size", type=int, default=5000)
+    parser.add_argument("--pcx1-stride-ratio", type=float, default=0.5)
 
     # Execution
     parser.add_argument("--verbose", action="store_true", default=True)
@@ -549,6 +562,8 @@ def main():
         dandi_target_region=args.dandi_target_region,
         dandi_window_size=args.dandi_window_size,
         dandi_stride_ratio=args.dandi_stride_ratio,
+        pcx1_window_size=args.pcx1_window_size,
+        pcx1_stride_ratio=args.pcx1_stride_ratio,
         verbose=args.verbose and not args.quiet,
     )
 
