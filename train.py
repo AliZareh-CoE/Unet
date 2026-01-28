@@ -3634,10 +3634,30 @@ def main():
         if is_primary():
             print(f"Available sessions: {all_sessions}")
 
+        # Check for explicit session holdout (used by LOSO)
+        loso_test_sessions = None
+        if args.test_sessions:
+            loso_test_sessions = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+            if is_primary():
+                print(f"[LOSO MODE] PCx1 session holdout:")
+                print(f"  Held-out test sessions: {loso_test_sessions}")
+
         if args.pcx1_train_sessions and args.pcx1_val_sessions:
             # Use explicitly specified sessions
             train_sessions = args.pcx1_train_sessions
             val_sessions = args.pcx1_val_sessions
+        elif loso_test_sessions:
+            # LOSO mode: exclude test sessions, split rest for train/val
+            available_sessions = [s for s in all_sessions if s not in loso_test_sessions]
+            # 70/30 train/val split of remaining sessions
+            n_val = max(1, len(available_sessions) // 4)  # ~25% for val
+            np.random.seed(config["seed"])
+            shuffled = np.random.permutation(available_sessions).tolist()
+            val_sessions = shuffled[:n_val]
+            train_sessions = shuffled[n_val:]
+            if is_primary():
+                print(f"  Train sessions ({len(train_sessions)}): {train_sessions}")
+                print(f"  Val sessions ({len(val_sessions)}): {val_sessions}")
         else:
             # Random split: use pcx1_n_val for validation, rest for training
             train_sessions, val_sessions, _ = get_pcx1_session_splits(
@@ -3707,7 +3727,7 @@ def main():
         loaders = create_pcx1_dataloaders(
             train_sessions=train_sessions,
             val_sessions=val_sessions,
-            test_sessions=None,
+            test_sessions=loso_test_sessions,  # Pass test sessions for LOSO evaluation
             window_size=window_size,
             stride=train_stride,
             val_stride=val_stride,
@@ -3723,9 +3743,12 @@ def main():
         data = {
             "train_loader": loaders["train"],
             "val_loader": loaders["val"],
+            "test_loader": loaders.get("test"),  # For LOSO test evaluation
             "val_sessions_loaders": loaders.get("val_sessions"),  # For per-session eval
+            "test_sessions_loaders": loaders.get("test_sessions"),  # For LOSO per-session test eval
             "train_sessions": train_sessions,
             "val_sessions": val_sessions,
+            "test_sessions": loso_test_sessions,
             "n_odors": 1,  # No odor conditioning for continuous data
             "vocab": {"none": 0},
         }
