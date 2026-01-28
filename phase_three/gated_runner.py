@@ -80,14 +80,14 @@ class GatedConfig:
 
     # Training
     epochs: int = 50
-    batch_size: int = 32
+    batch_size: int = 64  # Optimized: 64
     learning_rate: float = 1e-4
     seed: int = 42
     n_seeds: int = 1
 
     # Model architecture (LOSO-optimized defaults)
     arch: str = "condunet"
-    base_channels: int = 64
+    base_channels: int = 256  # Optimized: 256
     n_downsample: int = 2
     attention_type: str = "none"
     cond_mode: str = "cross_attn_gated"
@@ -480,13 +480,13 @@ def parse_args():
 
     # Training
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)  # Optimized
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-seeds", type=int, default=1)
 
     # Model architecture
-    parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument("--base-channels", type=int, default=256)  # Optimized
     parser.add_argument("--n-downsample", type=int, default=2)
     parser.add_argument("--attention-type", type=str, default="none")
     parser.add_argument("--cond-mode", type=str, default="cross_attn_gated")

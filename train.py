@@ -168,7 +168,7 @@ LOGS_DIR = OUTPUT_DIR / "logs"
 # Default hyperparameters
 DEFAULT_CONFIG = {
     # Training
-    "batch_size": 8,
+    "batch_size": 64,  # Optimized (was 8)
     "num_epochs": 80,
     "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
@@ -186,10 +186,10 @@ DEFAULT_CONFIG = {
     "cycle_lambda": 1.0,
 
     # Model
-    "base_channels": 128,
+    "base_channels": 256,  # Optimized (was 128)
     "dropout": 0.0,
     "use_attention": True,
-    "attention_type": "cross_freq_v2",
+    "attention_type": "none",  # Optimized (was cross_freq_v2)
     "cond_mode": "cross_attn_gated",
     "n_downsample": 2,
 
