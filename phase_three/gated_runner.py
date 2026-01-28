@@ -273,9 +273,9 @@ def run_training(
     if config.get("test_sessions"):
         cmd.extend(["--test-sessions"] + config["test_sessions"])
 
-    # Environment
+    # Environment - pass through without modifying CUDA_VISIBLE_DEVICES
+    # torchrun will handle GPU distribution
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
     # Run training
     try:
