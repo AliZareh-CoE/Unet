@@ -221,6 +221,20 @@ def get_all_sessions(
         }
         return subjects, metadata
 
+    elif dataset == "pcx1":
+        from data import list_pcx1_sessions
+
+        sessions = list_pcx1_sessions()
+
+        metadata = {
+            "session_type": ds_config.session_type,
+            "description": ds_config.description,
+            "source_region": ds_config.source_region,
+            "target_region": ds_config.target_region,
+            "n_sessions": len(sessions),
+        }
+        return sessions, metadata
+
     else:
         available = ", ".join(DATASET_CONFIGS.keys())
         raise ValueError(
@@ -452,7 +466,11 @@ def run_single_fold(
 
     # Build train.py command
     if config.use_fsdp:
-        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        # Use explicit nproc if provided, otherwise auto-detect
+        if config.nproc is not None:
+            nproc = config.nproc
+        else:
+            nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
         # Use unique port per fold to avoid "address already in use" errors
         # when running sequential folds with FSDP
         master_port = 29500 + fold_idx
@@ -462,6 +480,7 @@ def run_single_fold(
             f"--master_port={master_port}",
             str(PROJECT_ROOT / "train.py"),
         ]
+        print(f"Launching with torchrun: {nproc} GPUs, port {master_port}")
     else:
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
@@ -498,6 +517,12 @@ def run_single_fold(
             "--dandi-stride-ratio", str(config.dandi_stride_ratio),
         ])
         # For DANDI, the --val-sessions will be treated as subject IDs
+    elif config.dataset == "pcx1":
+        # PCx1-specific: window settings for continuous data
+        cmd.extend([
+            "--pcx1-window-size", str(config.pcx1_window_size),
+            "--pcx1-stride-ratio", str(config.pcx1_stride_ratio),
+        ])
 
     elif config.dataset == "pfc_hpc":
         # PFC-specific: resampling and sliding window options
@@ -954,7 +979,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc_hpc", "dandi_movie"],
+        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -966,20 +991,20 @@ def parse_args() -> argparse.Namespace:
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=80, help="Training epochs per fold (no early stopping)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size (optimized: 64)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # Model architecture
+    # Model architecture (defaults from optimized LOSOConfig)
     parser.add_argument("--arch", type=str, default="condunet", help="Model architecture")
-    parser.add_argument("--base-channels", type=int, default=128, help="Base channel count")
+    parser.add_argument("--base-channels", type=int, default=256, help="Base channel count (optimized: 256)")
     parser.add_argument("--n-downsample", type=int, default=2, help="Downsample layers")
     parser.add_argument(
         "--attention-type",
         type=str,
-        default="cross_freq_v2",
+        default="none",
         choices=["none", "basic", "cross_freq_v2"],
-        help="Attention type",
+        help="Attention type (optimized: none)",
     )
     parser.add_argument(
         "--cond-mode",
@@ -1016,6 +1041,7 @@ def parse_args() -> argparse.Namespace:
     # FSDP
     parser.add_argument("--fsdp", action="store_true", help="Enable FSDP")
     parser.add_argument("--fsdp-strategy", type=str, default="grad_op", help="FSDP strategy")
+    parser.add_argument("--nproc", type=int, default=None, help="Number of GPUs for distributed training (default: auto-detect)")
 
     # Execution control
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
@@ -1056,6 +1082,24 @@ def parse_args() -> argparse.Namespace:
     )
     dandi_group.add_argument(
         "--dandi-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+
+    # PCx1 dataset options (continuous OB->PCx)
+    pcx1_group = parser.add_argument_group(
+        "PCx1 Dataset",
+        "Options for continuous OB to PCx translation (1kHz LFP)"
+    )
+    pcx1_group.add_argument(
+        "--pcx1-window-size",
+        type=int,
+        default=5000,
+        help="Window size in samples (at 1kHz)",
+    )
+    pcx1_group.add_argument(
+        "--pcx1-stride-ratio",
         type=float,
         default=0.5,
         help="Stride as fraction of window size (0.5 = 50%% overlap)",
@@ -1130,6 +1174,7 @@ def main():
         # FSDP
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
+        nproc=args.nproc,
         # Execution
         resume=not args.no_resume,
         verbose=not args.quiet,
@@ -1139,6 +1184,9 @@ def main():
         dandi_target_region=args.dandi_target_region,
         dandi_window_size=args.dandi_window_size,
         dandi_stride_ratio=args.dandi_stride_ratio,
+        # PCx1-specific
+        pcx1_window_size=args.pcx1_window_size,
+        pcx1_stride_ratio=args.pcx1_stride_ratio,
         # PFC-specific
         pfc_resample_to_1khz=args.pfc_resample,
         pfc_sliding_window=args.pfc_sliding_window,

@@ -3153,12 +3153,16 @@ def create_pcx1_dataloaders(
     separate_val_sessions: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
+    loso_mode: bool = False,
+    loso_val_ratio: float = 0.3,
+    seed: int = 42,
+    distributed: bool = False,  # Use DistributedSampler for multi-GPU training
 ) -> Dict[str, Any]:
     """Create DataLoaders for PCx1 continuous data with session-based splits.
 
     Args:
         train_sessions: List of session names for training
-        val_sessions: List of session names for validation
+        val_sessions: List of session names for validation (ignored if loso_mode=True)
         test_sessions: List of session names for testing (optional)
         window_size: Window size in samples (5000 = 5 seconds)
         stride: Stride between windows for training (default: window_size // 2)
@@ -3170,6 +3174,9 @@ def create_pcx1_dataloaders(
         separate_val_sessions: If True, also create per-session val loaders
         persistent_workers: Keep workers alive between epochs (faster)
         prefetch_factor: Number of batches to prefetch per worker
+        loso_mode: If True, combine all train_sessions and do 70/30 data split (not session split)
+        loso_val_ratio: Fraction of data for validation in LOSO mode (default 0.3 = 30%)
+        seed: Random seed for LOSO data split
 
     Returns:
         Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
@@ -3182,19 +3189,6 @@ def create_pcx1_dataloaders(
 
     # persistent_workers requires num_workers > 0
     use_persistent = persistent_workers and num_workers > 0
-    # Load sessions
-    _print_primary("Loading training sessions...")
-    train_data = [load_pcx1_session(s, path) for s in train_sessions]
-    _print_primary("Loading validation sessions...")
-    val_data = [load_pcx1_session(s, path) for s in val_sessions]
-
-    # Create datasets (val can use larger stride for faster eval)
-    train_dataset = MultiSessionContinuousDataset(
-        train_data, window_size, stride, zscore_per_window
-    )
-    val_dataset = MultiSessionContinuousDataset(
-        val_data, window_size, val_stride, zscore_per_window
-    )
 
     # Common DataLoader kwargs for speed
     loader_kwargs = dict(
@@ -3204,40 +3198,135 @@ def create_pcx1_dataloaders(
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
-    dataloaders = {
-        'train': DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            **loader_kwargs,
-        ),
-        'val': DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            **loader_kwargs,
-        ),
-    }
+    if loso_mode:
+        # LOSO MODE: Split raw samples TEMPORALLY first, then create windows
+        # This prevents data leakage from overlapping windows
+        _print_primary(f"Loading {len(train_sessions)} training sessions for LOSO...")
+        all_train_data = [load_pcx1_session(s, path) for s in train_sessions]
 
-    # Create per-session validation loaders for separate evaluation
-    if separate_val_sessions:
-        val_sessions_loaders = {}
-        for sess_data in val_data:
-            sess_name = sess_data['session']
-            sess_dataset = ContinuousLFPDataset(
-                ob=sess_data['ob'],
-                pcx=sess_data['pcx'],
-                window_size=window_size,
-                stride=val_stride,  # Use val_stride for faster eval
-                zscore_per_window=zscore_per_window,
-            )
-            val_sessions_loaders[sess_name] = DataLoader(
-                sess_dataset,
+        # Split each session's raw samples temporally (70% train, 30% val)
+        # This ensures NO overlap between train and val windows
+        train_portions = []
+        val_portions = []
+        total_train_samples = 0
+        total_val_samples = 0
+
+        for sess_data in all_train_data:
+            n_samples = sess_data['ob'].shape[1]
+            split_point = int(n_samples * (1.0 - loso_val_ratio))
+
+            # First 70% for training
+            train_portions.append({
+                'session': sess_data['session'],
+                'ob': sess_data['ob'][:, :split_point],
+                'pcx': sess_data['pcx'][:, :split_point],
+            })
+            total_train_samples += split_point
+
+            # Last 30% for validation
+            val_portions.append({
+                'session': sess_data['session'],
+                'ob': sess_data['ob'][:, split_point:],
+                'pcx': sess_data['pcx'][:, split_point:],
+            })
+            total_val_samples += (n_samples - split_point)
+
+        _print_primary(f"  Temporal split: {total_train_samples} train samples, {total_val_samples} val samples")
+
+        # Now create windows from each portion (no overlap between train/val)
+        train_dataset = MultiSessionContinuousDataset(
+            train_portions, window_size, stride, zscore_per_window
+        )
+        val_dataset = MultiSessionContinuousDataset(
+            val_portions, window_size, stride, zscore_per_window
+        )
+
+        _print_primary(f"  LOSO windows: {len(train_dataset)} train, {len(val_dataset)} val (NO overlap)")
+
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+
+        dataloaders = {
+            'train': DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=(train_sampler is None),  # Only shuffle if not using sampler
+                sampler=train_sampler,
+                **loader_kwargs,
+            ),
+            'val': DataLoader(
+                val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
+                sampler=val_sampler,
                 **loader_kwargs,
-            )
-        dataloaders['val_sessions'] = val_sessions_loaders
+            ),
+        }
+
+        if distributed:
+            _print_primary(f"  Using DistributedSampler for {dist.get_world_size()} GPUs")
+
+        # No per-session val loaders in LOSO mode (data is mixed)
+
+    else:
+        # STANDARD MODE: Separate session-based splits
+        _print_primary("Loading training sessions...")
+        train_data = [load_pcx1_session(s, path) for s in train_sessions]
+        _print_primary("Loading validation sessions...")
+        val_data = [load_pcx1_session(s, path) for s in val_sessions]
+
+        # Create datasets (val can use larger stride for faster eval)
+        train_dataset = MultiSessionContinuousDataset(
+            train_data, window_size, stride, zscore_per_window
+        )
+        val_dataset = MultiSessionContinuousDataset(
+            val_data, window_size, val_stride, zscore_per_window
+        )
+
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+
+        dataloaders = {
+            'train': DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
+                **loader_kwargs,
+            ),
+            'val': DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                **loader_kwargs,
+            ),
+        }
+
+        if distributed:
+            _print_primary(f"  Using DistributedSampler for {dist.get_world_size()} GPUs")
+
+        # Create per-session validation loaders for separate evaluation
+        if separate_val_sessions:
+            val_sessions_loaders = {}
+            for sess_data in val_data:
+                sess_name = sess_data['session']
+                sess_dataset = ContinuousLFPDataset(
+                    ob=sess_data['ob'],
+                    pcx=sess_data['pcx'],
+                    window_size=window_size,
+                    stride=val_stride,  # Use val_stride for faster eval
+                    zscore_per_window=zscore_per_window,
+                )
+                val_sessions_loaders[sess_name] = DataLoader(
+                    sess_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    **loader_kwargs,
+                )
+            dataloaders['val_sessions'] = val_sessions_loaders
 
     if test_sessions:
         _print_primary("Loading test sessions...")
@@ -3245,12 +3334,33 @@ def create_pcx1_dataloaders(
         test_dataset = MultiSessionContinuousDataset(
             test_data, window_size, val_stride, zscore_per_window  # Use val_stride for test too
         )
+        test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=seed) if distributed else None
         dataloaders['test'] = DataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
+            sampler=test_sampler,
             **loader_kwargs,
         )
+
+        # Create per-session test loaders for LOSO evaluation
+        test_sessions_loaders = {}
+        for sess_data in test_data:
+            sess_name = sess_data['session']
+            sess_dataset = ContinuousLFPDataset(
+                ob=sess_data['ob'],
+                pcx=sess_data['pcx'],
+                window_size=window_size,
+                stride=val_stride,
+                zscore_per_window=zscore_per_window,
+            )
+            test_sessions_loaders[sess_name] = DataLoader(
+                sess_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+        dataloaders['test_sessions'] = test_sessions_loaders
 
     return dataloaders
 
@@ -3918,14 +4028,79 @@ def prepare_dandi_data(
         _print_primary(f"\nNormalized channel counts: source={min_source_channels}, target={min_target_channels}")
 
     # Create datasets with consistent channel counts
-    train_dataset = DANDIMovieDataset(
-        train_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
-    )
-    val_dataset = DANDIMovieDataset(
-        val_data, window_size, stride, verbose=verbose,
-        n_source_channels=min_source_channels, n_target_channels=min_target_channels,
-    )
+    # Special handling for LOSO mode: when test_subjects provided but no val_subjects,
+    # create val set by TEMPORALLY splitting training data (not random window split)
+    loso_mode_no_val = (test_subjects is not None and len(test_subjects) > 0 and
+                        (val_subjects is None or len(val_subjects) == 0))
+
+    if loso_mode_no_val and len(train_data) > 0:
+        # LOSO mode: Split raw samples TEMPORALLY first, then create windows
+        # This prevents data leakage from overlapping windows
+        train_portions = []
+        val_portions = []
+        total_train_samples = 0
+        total_val_samples = 0
+
+        for subj_data in train_data:
+            n_samples = subj_data['n_samples']
+            split_point = int(n_samples * 0.7)  # 70% train, 30% val
+
+            # First 70% for training
+            train_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, :split_point],
+                'target': subj_data['target'][:, :split_point],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'sampling_rate': subj_data['sampling_rate'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': split_point,
+            })
+            total_train_samples += split_point
+
+            # Last 30% for validation
+            val_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, split_point:],
+                'target': subj_data['target'][:, split_point:],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'sampling_rate': subj_data['sampling_rate'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': n_samples - split_point,
+            })
+            total_val_samples += (n_samples - split_point)
+
+        if verbose:
+            _print_primary(f"  Temporal split: {total_train_samples} train samples, {total_val_samples} val samples")
+
+        # Now create windows from each portion (no overlap between train/val)
+        train_dataset = DANDIMovieDataset(
+            train_portions, window_size, stride, verbose=False,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+        val_dataset = DANDIMovieDataset(
+            val_portions, window_size, stride, verbose=False,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+
+        if verbose:
+            _print_primary(f"DANDIMovieDataset [LOSO]: {len(train_data)} subjects, "
+                  f"{len(train_dataset)} train + {len(val_dataset)} val windows (NO overlap), "
+                  f"window_size={window_size}, stride={stride}, "
+                  f"source_ch={min_source_channels}, target_ch={min_target_channels}")
+    else:
+        train_dataset = DANDIMovieDataset(
+            train_data, window_size, stride, verbose=verbose,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+        val_dataset = DANDIMovieDataset(
+            val_data, window_size, stride, verbose=verbose,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+
     test_dataset = DANDIMovieDataset(
         test_data, window_size, stride, verbose=verbose,
         n_source_channels=min_source_channels, n_target_channels=min_target_channels,

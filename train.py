@@ -99,6 +99,9 @@ from models import (
     TrainingMetricsRecorder,
     # Wiener filter for inference-time boosting
     WienerBoost,
+    # Gated translator for learnable communication windows
+    GatedTranslator,
+    create_gated_translator,
 )
 from data import (
     prepare_data,
@@ -165,7 +168,7 @@ LOGS_DIR = OUTPUT_DIR / "logs"
 # Default hyperparameters
 DEFAULT_CONFIG = {
     # Training
-    "batch_size": 8,
+    "batch_size": 64,  # Optimized (was 8)
     "num_epochs": 80,
     "learning_rate": 0.0002,
     "beta1": 0.7595905764360957,
@@ -183,10 +186,10 @@ DEFAULT_CONFIG = {
     "cycle_lambda": 1.0,
 
     # Model
-    "base_channels": 128,
+    "base_channels": 256,  # Optimized (was 128)
     "dropout": 0.0,
     "use_attention": True,
-    "attention_type": "cross_freq_v2",
+    "attention_type": "none",  # Optimized (was cross_freq_v2)
     "cond_mode": "cross_attn_gated",
     "n_downsample": 2,
 
@@ -1411,18 +1414,32 @@ def train_epoch(
         # For CondUNet: use cond_emb if available, otherwise odor_ids
         # For other architectures: just pass input directly
         arch = config.get("arch", "condunet")
+        use_gated = config.get("use_gated", False)
+        gate_values = None  # For gated models, stores gate tensor
 
         if arch == "condunet":
             # CondUNet with conditioning
             # Use proper session_ids from dataloader (only needed for learnable session embedding)
             session_ids = session_ids_batch if config.get("use_session_embedding", False) else None
-            if cond_emb is not None:
-                pred_raw = model(ob, cond_emb=cond_emb, session_ids=session_ids)
+            if use_gated:
+                # GatedTranslator wraps CondUNet - pass kwargs through
+                if cond_emb is not None:
+                    pred_raw, gate_components = model(ob, return_components=True, cond_emb=cond_emb, session_ids=session_ids)
+                else:
+                    pred_raw, gate_components = model(ob, return_components=True, odor=odor, session_ids=session_ids)
+                gate_values = gate_components["gate"]
             else:
-                pred_raw = model(ob, odor, session_ids=session_ids)
+                if cond_emb is not None:
+                    pred_raw = model(ob, cond_emb=cond_emb, session_ids=session_ids)
+                else:
+                    pred_raw = model(ob, odor, session_ids=session_ids)
         else:
             # Other architectures: just pass input
-            pred_raw = model(ob)
+            if use_gated:
+                pred_raw, gate_components = model(ob, return_components=True)
+                gate_values = gate_components["gate"]
+            else:
+                pred_raw = model(ob)
 
         # Wiener residual learning: combine neural net + Wiener prediction
         # pred_combined = NeuralNet(x) + alpha * Wiener(x)
@@ -1440,6 +1457,16 @@ def train_epoch(
         recon_loss = config["weight_l1"] * F.l1_loss(pred_raw_c, pcx_c)
         loss = recon_loss
         loss_components["l1_fwd"] = loss_components["l1_fwd"] + recon_loss.detach()
+
+        # Gated translator sparsity loss
+        if gate_values is not None:
+            sparsity_target = config.get("gated_sparsity_target", 0.3)
+            sparsity_weight = config.get("gated_sparsity_weight", 0.01)
+            gate_mean = gate_values.mean()
+            sparsity_loss = sparsity_weight * (gate_mean - sparsity_target).pow(2)
+            loss = loss + sparsity_loss
+            loss_components["gate_sparsity"] = loss_components["gate_sparsity"] + sparsity_loss.detach()
+            loss_components["gate_mean"] = loss_components["gate_mean"] + gate_mean.detach()
 
         # Add conditioning encoder auxiliary loss if present
         if cond_loss != 0.0:
@@ -1587,16 +1614,27 @@ def train(
             "train": data["train_loader"],
             "val": data["val_loader"],
         }
+        # Add test loader if available (for LOSO)
+        if data.get("test_loader") is not None:
+            loaders["test"] = data["test_loader"]
         # Add per-session val loaders if available
         if data.get("val_sessions_loaders"):
             loaders["val_sessions"] = data["val_sessions_loaders"]
+        # Add per-session test loaders if available (for LOSO per-session eval)
+        if data.get("test_sessions_loaders"):
+            loaders["test_sessions"] = data["test_sessions_loaders"]
         if is_primary():
             dataset_name = config.get("dataset_type", "").upper()
             print(f"{dataset_name} DataLoaders: {len(loaders['train'].dataset)} train windows, "
                   f"{len(loaders['val'].dataset)} val windows")
+            if "test" in loaders:
+                print(f"  Test: {len(loaders['test'].dataset)} windows")
             if "val_sessions" in loaders:
                 for sess_name, sess_loader in loaders["val_sessions"].items():
                     print(f"  Val session {sess_name}: {len(sess_loader.dataset)} windows")
+            if "test_sessions" in loaders:
+                for sess_name, sess_loader in loaders["test_sessions"].items():
+                    print(f"  Test session {sess_name}: {len(sess_loader.dataset)} windows")
     elif config.get("dataset_type") == "pfc":
         if config.get("pfc_sliding_window", False):
             # Use sliding window dataloaders for more training samples
@@ -1683,9 +1721,9 @@ def train(
             )
 
         # Update in_channels and out_channels from actual data
-        # Get a sample batch to determine shapes (collate_fn returns tuple: source, target, label)
+        # Get a sample batch to determine shapes (collate_fn returns tuple: source, target, label, session_id)
         sample_batch = next(iter(loaders["train"]))
-        source_batch, target_batch, _ = sample_batch
+        source_batch, target_batch, *_ = sample_batch
         config["in_channels"] = source_batch.shape[1]  # [B, C, T]
         config["out_channels"] = target_batch.shape[1]
 
@@ -1933,6 +1971,36 @@ def train(
             reverse_model.set_gradient_checkpointing(True)
         if is_primary():
             print("Gradient checkpointing ENABLED (saves ~40% memory, costs ~30% more compute)")
+
+    # Wrap with GatedTranslator if requested (learnable communication windows)
+    if config.get("use_gated", False):
+        if is_primary():
+            print(f"Wrapping model with GatedTranslator:")
+            print(f"  Sparsity target: {config.get('gated_sparsity_target', 0.3)}")
+            print(f"  Sparsity weight: {config.get('gated_sparsity_weight', 0.01)}")
+
+        model = create_gated_translator(
+            translator=model,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            sparsity_weight=config.get("gated_sparsity_weight", 0.01),
+            sparsity_target=config.get("gated_sparsity_target", 0.3),
+            gate_hidden_channels=config.get("gated_gate_channels", 64),
+            baseline_hidden_channels=config.get("gated_baseline_channels", 64),
+        )
+
+        # Update parameter count
+        gated_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        config["model_n_params"] = gated_params
+        if is_primary():
+            print(f"  GatedTranslator parameters: {gated_params:,}")
+
+        # Disable reverse model for gated (not supported)
+        if reverse_model is not None:
+            if is_primary():
+                print("  Warning: Bidirectional training not supported with --gated, disabling")
+            reverse_model = None
+            config["use_bidirectional"] = False
 
     # Wrap for distributed training
     is_fsdp_wrapped = False
@@ -2651,7 +2719,8 @@ def train(
 
     # Final test evaluation (full metrics, fast_mode=False)
     # Skip if no test set (no_test_set=True means all held-out sessions are validation)
-    has_test_set = len(data.get("test_idx", [])) > 0
+    # Check both index-based (olfactory/pfc) and loader-based (pcx1) test sets
+    has_test_set = len(data.get("test_idx", [])) > 0 or data.get("test_loader") is not None
     if has_test_set:
         test_metrics = evaluate(
             model, loaders["test"], device,
@@ -2763,10 +2832,10 @@ def train(
 
     # =========================================================================
     # PER-SESSION TEST EVALUATION (for cross-session generalization analysis)
-    # Skip when using FSDP - causes hangs due to sharded model needing all ranks
+    # Skip when using FSDP or distributed - causes hangs due to barrier timeout
     # =========================================================================
     use_fsdp = config.get("fsdp", False)
-    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data and not use_fsdp:
+    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data and not use_fsdp and not is_distributed:
         split_info = data.get("split_info", {})
         test_sessions = split_info.get("test_sessions", [])
         session_ids = data.get("session_ids")
@@ -2848,11 +2917,80 @@ def train(
                 print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
 
-                # Store per-session test results for JSON output
-                results["per_session_test_results"] = per_session_results
-                results["test_avg_r2"] = avg_r2
-                results["test_avg_corr"] = avg_corr
-                results["test_avg_delta"] = avg_delta
+                # Store per-session test results in test_metrics for JSON output
+                test_metrics["per_session_test_results"] = per_session_results
+                test_metrics["test_avg_r2"] = avg_r2
+                test_metrics["test_avg_corr"] = avg_corr
+                test_metrics["test_avg_delta"] = avg_delta
+
+    # =========================================================================
+    # LOADER-BASED PER-SESSION TEST EVALUATION (for pcx1 and similar datasets)
+    # Uses test_sessions_loaders instead of index-based approach
+    # =========================================================================
+    use_fsdp = config.get("fsdp", False)
+    # Skip per-session test evaluation in distributed mode to avoid NCCL timeout
+    # (only rank 0 would evaluate while others wait at barrier)
+    if is_primary() and has_test_set and "test_sessions" in loaders and not use_fsdp and not is_distributed:
+        test_sessions_loaders = loaders["test_sessions"]
+
+        if len(test_sessions_loaders) >= 1:
+            print("\n" + "=" * 70)
+            print("PER-SESSION TEST RESULTS (LOSO)")
+            print("=" * 70)
+
+            per_session_results = []
+
+            for session_name, session_loader in test_sessions_loaders.items():
+                # Evaluate this session
+                session_metrics = evaluate(
+                    model, session_loader, device,
+                    compute_phase=False, reverse_model=None, config=config,
+                    fast_mode=True,  # Fast mode for per-session eval
+                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    cond_encoder=cond_encoder,
+                    wiener_boost=wiener_filter,
+                    wiener_alpha=config.get("wiener_alpha", 1.0),
+                )
+
+                per_session_results.append({
+                    "session": session_name,
+                    "n_trials": len(session_loader.dataset),
+                    "corr": session_metrics["corr"],
+                    "baseline_corr": session_metrics.get("baseline_corr", 0),
+                    "r2": session_metrics["r2"],
+                    "psd_err_db": session_metrics.get("psd_err_db", 0),
+                })
+
+            # Print summary table
+            if per_session_results:
+                print(f"\n{'Session':<15} {'Windows':>8} {'Corr':>8} {'Baseline':>10} {'Δ Corr':>10} {'R²':>8}")
+                print("-" * 70)
+
+                for r in per_session_results:
+                    delta = r['corr'] - r['baseline_corr']
+                    print(f"{r['session']:<15} {r['n_trials']:>8} {r['corr']:>8.4f} {r['baseline_corr']:>10.4f} {delta:>+10.4f} {r['r2']:>8.4f}")
+
+                # Compute aggregate stats
+                avg_corr = np.mean([r['corr'] for r in per_session_results])
+                avg_baseline = np.mean([r['baseline_corr'] for r in per_session_results])
+                avg_delta = avg_corr - avg_baseline
+                avg_r2 = np.mean([r['r2'] for r in per_session_results])
+                total_windows = sum(r['n_trials'] for r in per_session_results)
+
+                print("-" * 70)
+                print(f"{'AVERAGE':<15} {total_windows:>8} {avg_corr:>8.4f} {avg_baseline:>10.4f} {avg_delta:>+10.4f} {avg_r2:>8.4f}")
+                print("=" * 70)
+
+                # Machine-parseable output
+                print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
+                print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
+                print(f"RESULT_PER_SESSION_AVG_R2={avg_r2:.4f}")
+
+                # Store per-session test results in test_metrics for JSON output
+                test_metrics["per_session_test_results"] = per_session_results
+                test_metrics["test_avg_r2"] = avg_r2
+                test_metrics["test_avg_corr"] = avg_corr
+                test_metrics["test_avg_delta"] = avg_delta
 
     if is_distributed:
         dist.barrier()
@@ -3323,6 +3461,18 @@ def parse_args():
     parser.add_argument("--wiener-alpha", type=float, default=1.0,
                         help="Wiener contribution weight (default: 1.0)")
 
+    # Gated translator options (learnable communication windows)
+    parser.add_argument("--gated", action="store_true",
+                        help="Wrap model with GatedTranslator for learnable communication windows")
+    parser.add_argument("--gated-sparsity-weight", type=float, default=0.01,
+                        help="Weight for gate sparsity penalty (default: 0.01)")
+    parser.add_argument("--gated-sparsity-target", type=float, default=0.3,
+                        help="Target gate activation rate 0-1 (default: 0.3)")
+    parser.add_argument("--gated-gate-channels", type=int, default=64,
+                        help="Hidden channels for gate network (default: 64)")
+    parser.add_argument("--gated-baseline-channels", type=int, default=64,
+                        help="Hidden channels for baseline predictor (default: 64)")
+
     return parser.parse_args()
 
 
@@ -3535,6 +3685,15 @@ def main():
     config["wiener_residual"] = args.wiener_residual
     config["wiener_alpha"] = args.wiener_alpha
 
+    # =========================================================================
+    # Gated Translator (Learnable Communication Windows)
+    # =========================================================================
+    config["use_gated"] = args.gated
+    config["gated_sparsity_weight"] = args.gated_sparsity_weight
+    config["gated_sparsity_target"] = args.gated_sparsity_target
+    config["gated_gate_channels"] = args.gated_gate_channels
+    config["gated_baseline_channels"] = args.gated_baseline_channels
+
     # Print session split info
     if is_primary() and config["split_by_session"]:
         if config.get("no_test_set", False):
@@ -3556,10 +3715,29 @@ def main():
         if is_primary():
             print(f"Available sessions: {all_sessions}")
 
+        # Check for explicit session holdout (used by LOSO)
+        loso_test_sessions = None
+        if args.test_sessions:
+            loso_test_sessions = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+            if is_primary():
+                print(f"[LOSO MODE] PCx1 session holdout:")
+                print(f"  Held-out test sessions: {loso_test_sessions}")
+
+        # Determine if we're in LOSO mode (proper 70/30 data split, not session split)
+        is_loso_mode = False
         if args.pcx1_train_sessions and args.pcx1_val_sessions:
             # Use explicitly specified sessions
             train_sessions = args.pcx1_train_sessions
             val_sessions = args.pcx1_val_sessions
+        elif loso_test_sessions:
+            # LOSO mode: use ALL non-test sessions for training, do 70/30 DATA split
+            is_loso_mode = True
+            train_sessions = [s for s in all_sessions if s not in loso_test_sessions]
+            val_sessions = []  # Not used in LOSO mode - data split happens internally
+            if is_primary():
+                print(f"  LOSO mode: using all {len(train_sessions)} non-test sessions")
+                print(f"  Train sessions: {train_sessions}")
+                print(f"  Will split data 70/30 for train/val (not by session)")
         else:
             # Random split: use pcx1_n_val for validation, rest for training
             train_sessions, val_sessions, _ = get_pcx1_session_splits(
@@ -3629,7 +3807,7 @@ def main():
         loaders = create_pcx1_dataloaders(
             train_sessions=train_sessions,
             val_sessions=val_sessions,
-            test_sessions=None,
+            test_sessions=loso_test_sessions,  # Pass test sessions for LOSO evaluation
             window_size=window_size,
             stride=train_stride,
             val_stride=val_stride,
@@ -3639,15 +3817,21 @@ def main():
             separate_val_sessions=config.get("separate_val_sessions", True),
             persistent_workers=use_persistent,
             prefetch_factor=prefetch_factor,
+            loso_mode=is_loso_mode,  # Use 70/30 data split instead of session split
+            seed=config["seed"],
+            distributed=get_world_size() > 1,  # Use DistributedSampler for multi-GPU
         )
 
         # Build a minimal data dict for compatibility with rest of training loop
         data = {
             "train_loader": loaders["train"],
             "val_loader": loaders["val"],
+            "test_loader": loaders.get("test"),  # For LOSO test evaluation
             "val_sessions_loaders": loaders.get("val_sessions"),  # For per-session eval
+            "test_sessions_loaders": loaders.get("test_sessions"),  # For LOSO per-session test eval
             "train_sessions": train_sessions,
             "val_sessions": val_sessions,
+            "test_sessions": loso_test_sessions,
             "n_odors": 1,  # No odor conditioning for continuous data
             "vocab": {"none": 0},
         }
@@ -4104,11 +4288,18 @@ def main():
                         if session:
                             per_session_loss[session] = value
 
-            # Get actual test metrics (not the multi-session average)
+            # Get actual test metrics
+            # Priority: test_avg_r2 (from per-session eval) > r2 (from main eval)
             test_metrics = results.get("test_metrics", {})
-            actual_test_r2 = test_metrics.get("r2") if test_metrics else results.get("test_avg_r2")
-            actual_test_corr = test_metrics.get("corr") if test_metrics else results.get("test_avg_corr")
-            actual_test_loss = test_metrics.get("loss") if test_metrics else results.get("test_avg_delta")
+            actual_test_r2 = test_metrics.get("test_avg_r2") or test_metrics.get("r2")
+            actual_test_corr = test_metrics.get("test_avg_corr") or test_metrics.get("corr")
+            actual_test_loss = test_metrics.get("test_avg_delta") or test_metrics.get("loss")
+
+            # Extract gate_mean from last epoch if gated mode was used
+            final_gate_mean = None
+            if history:
+                final_entry = history[-1]
+                final_gate_mean = final_entry.get("gate_mean", None)
 
             output_results = {
                 "architecture": args.arch,
@@ -4125,8 +4316,8 @@ def main():
                 "per_session_r2": per_session_r2,
                 "per_session_corr": per_session_corr,
                 "per_session_loss": per_session_loss,
-                # Per-session TEST results (if available)
-                "per_session_test_results": results.get("per_session_test_results", []),
+                # Per-session TEST results (if available) - stored in test_metrics
+                "per_session_test_results": test_metrics.get("per_session_test_results", []),
                 # CRITICAL: Use actual test metrics from test_metrics dict
                 "test_avg_r2": actual_test_r2,
                 "test_avg_corr": actual_test_corr,
@@ -4135,6 +4326,8 @@ def main():
                 "epochs_trained": len(history),
                 "n_parameters": n_params,
                 "completed_successfully": True,
+                # Gated translator metrics
+                "gate_mean": final_gate_mean,
             }
             output_path = Path(args.output_results_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
