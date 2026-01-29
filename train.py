@@ -2917,11 +2917,11 @@ def train(
                 print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
 
-                # Store per-session test results for JSON output
-                results["per_session_test_results"] = per_session_results
-                results["test_avg_r2"] = avg_r2
-                results["test_avg_corr"] = avg_corr
-                results["test_avg_delta"] = avg_delta
+                # Store per-session test results in test_metrics for JSON output
+                test_metrics["per_session_test_results"] = per_session_results
+                test_metrics["test_avg_r2"] = avg_r2
+                test_metrics["test_avg_corr"] = avg_corr
+                test_metrics["test_avg_delta"] = avg_delta
 
     # =========================================================================
     # LOADER-BASED PER-SESSION TEST EVALUATION (for pcx1 and similar datasets)
@@ -2984,11 +2984,11 @@ def train(
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_R2={avg_r2:.4f}")
 
-                # Store per-session test results for JSON output
-                results["per_session_test_results"] = per_session_results
-                results["test_avg_r2"] = avg_r2
-                results["test_avg_corr"] = avg_corr
-                results["test_avg_delta"] = avg_delta
+                # Store per-session test results in test_metrics for JSON output
+                test_metrics["per_session_test_results"] = per_session_results
+                test_metrics["test_avg_r2"] = avg_r2
+                test_metrics["test_avg_corr"] = avg_corr
+                test_metrics["test_avg_delta"] = avg_delta
 
     if is_distributed:
         dist.barrier()
@@ -4285,11 +4285,12 @@ def main():
                         if session:
                             per_session_loss[session] = value
 
-            # Get actual test metrics (not the multi-session average)
+            # Get actual test metrics
+            # Priority: test_avg_r2 (from per-session eval) > r2 (from main eval)
             test_metrics = results.get("test_metrics", {})
-            actual_test_r2 = test_metrics.get("r2") if test_metrics else results.get("test_avg_r2")
-            actual_test_corr = test_metrics.get("corr") if test_metrics else results.get("test_avg_corr")
-            actual_test_loss = test_metrics.get("loss") if test_metrics else results.get("test_avg_delta")
+            actual_test_r2 = test_metrics.get("test_avg_r2") or test_metrics.get("r2")
+            actual_test_corr = test_metrics.get("test_avg_corr") or test_metrics.get("corr")
+            actual_test_loss = test_metrics.get("test_avg_delta") or test_metrics.get("loss")
 
             # Extract gate_mean from last epoch if gated mode was used
             final_gate_mean = None
@@ -4312,8 +4313,8 @@ def main():
                 "per_session_r2": per_session_r2,
                 "per_session_corr": per_session_corr,
                 "per_session_loss": per_session_loss,
-                # Per-session TEST results (if available)
-                "per_session_test_results": results.get("per_session_test_results", []),
+                # Per-session TEST results (if available) - stored in test_metrics
+                "per_session_test_results": test_metrics.get("per_session_test_results", []),
                 # CRITICAL: Use actual test metrics from test_metrics dict
                 "test_avg_r2": actual_test_r2,
                 "test_avg_corr": actual_test_corr,
