@@ -3819,6 +3819,7 @@ def main():
             prefetch_factor=prefetch_factor,
             loso_mode=is_loso_mode,  # Use 70/30 data split instead of session split
             seed=config["seed"],
+            distributed=get_world_size() > 1,  # Use DistributedSampler for multi-GPU
         )
 
         # Build a minimal data dict for compatibility with rest of training loop

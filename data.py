@@ -3156,6 +3156,7 @@ def create_pcx1_dataloaders(
     loso_mode: bool = False,
     loso_val_ratio: float = 0.3,
     seed: int = 42,
+    distributed: bool = False,  # Use DistributedSampler for multi-GPU training
 ) -> Dict[str, Any]:
     """Create DataLoaders for PCx1 continuous data with session-based splits.
 
@@ -3242,20 +3243,29 @@ def create_pcx1_dataloaders(
 
         _print_primary(f"  LOSO windows: {len(train_dataset)} train, {len(val_dataset)} val (NO overlap)")
 
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+
         dataloaders = {
             'train': DataLoader(
                 train_dataset,
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=(train_sampler is None),  # Only shuffle if not using sampler
+                sampler=train_sampler,
                 **loader_kwargs,
             ),
             'val': DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
+                sampler=val_sampler,
                 **loader_kwargs,
             ),
         }
+
+        if distributed:
+            _print_primary(f"  Using DistributedSampler for {dist.get_world_size()} GPUs")
 
         # No per-session val loaders in LOSO mode (data is mixed)
 
@@ -3274,20 +3284,29 @@ def create_pcx1_dataloaders(
             val_data, window_size, val_stride, zscore_per_window
         )
 
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=seed) if distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=seed) if distributed else None
+
         dataloaders = {
             'train': DataLoader(
                 train_dataset,
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
                 **loader_kwargs,
             ),
             'val': DataLoader(
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
+                sampler=val_sampler,
                 **loader_kwargs,
             ),
         }
+
+        if distributed:
+            _print_primary(f"  Using DistributedSampler for {dist.get_world_size()} GPUs")
 
         # Create per-session validation loaders for separate evaluation
         if separate_val_sessions:
@@ -3315,10 +3334,12 @@ def create_pcx1_dataloaders(
         test_dataset = MultiSessionContinuousDataset(
             test_data, window_size, val_stride, zscore_per_window  # Use val_stride for test too
         )
+        test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=seed) if distributed else None
         dataloaders['test'] = DataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
+            sampler=test_sampler,
             **loader_kwargs,
         )
 
