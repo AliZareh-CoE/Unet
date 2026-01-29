@@ -217,6 +217,7 @@ class LOSOConfig:
     # FSDP
     use_fsdp: bool = False
     fsdp_strategy: str = "full"
+    nproc: Optional[int] = None  # Number of GPUs (None = auto-detect)
 
     # Nested CV settings
     inner_cv_folds: int = 3  # k-fold CV for inner loop

@@ -466,7 +466,11 @@ def run_single_fold(
 
     # Build train.py command
     if config.use_fsdp:
-        nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        # Use explicit nproc if provided, otherwise auto-detect
+        if config.nproc is not None:
+            nproc = config.nproc
+        else:
+            nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
         # Use unique port per fold to avoid "address already in use" errors
         # when running sequential folds with FSDP
         master_port = 29500 + fold_idx
@@ -476,6 +480,7 @@ def run_single_fold(
             f"--master_port={master_port}",
             str(PROJECT_ROOT / "train.py"),
         ]
+        print(f"Launching with torchrun: {nproc} GPUs, port {master_port}")
     else:
         cmd = [sys.executable, str(PROJECT_ROOT / "train.py")]
 
@@ -1036,6 +1041,7 @@ def parse_args() -> argparse.Namespace:
     # FSDP
     parser.add_argument("--fsdp", action="store_true", help="Enable FSDP")
     parser.add_argument("--fsdp-strategy", type=str, default="grad_op", help="FSDP strategy")
+    parser.add_argument("--nproc", type=int, default=None, help="Number of GPUs for distributed training (default: auto-detect)")
 
     # Execution control
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
@@ -1168,6 +1174,7 @@ def main():
         # FSDP
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
+        nproc=args.nproc,
         # Execution
         resume=not args.no_resume,
         verbose=not args.quiet,
