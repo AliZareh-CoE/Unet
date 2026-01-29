@@ -1614,16 +1614,27 @@ def train(
             "train": data["train_loader"],
             "val": data["val_loader"],
         }
+        # Add test loader if available (for LOSO)
+        if data.get("test_loader") is not None:
+            loaders["test"] = data["test_loader"]
         # Add per-session val loaders if available
         if data.get("val_sessions_loaders"):
             loaders["val_sessions"] = data["val_sessions_loaders"]
+        # Add per-session test loaders if available (for LOSO per-session eval)
+        if data.get("test_sessions_loaders"):
+            loaders["test_sessions"] = data["test_sessions_loaders"]
         if is_primary():
             dataset_name = config.get("dataset_type", "").upper()
             print(f"{dataset_name} DataLoaders: {len(loaders['train'].dataset)} train windows, "
                   f"{len(loaders['val'].dataset)} val windows")
+            if "test" in loaders:
+                print(f"  Test: {len(loaders['test'].dataset)} windows")
             if "val_sessions" in loaders:
                 for sess_name, sess_loader in loaders["val_sessions"].items():
                     print(f"  Val session {sess_name}: {len(sess_loader.dataset)} windows")
+            if "test_sessions" in loaders:
+                for sess_name, sess_loader in loaders["test_sessions"].items():
+                    print(f"  Test session {sess_name}: {len(sess_loader.dataset)} windows")
     elif config.get("dataset_type") == "pfc":
         if config.get("pfc_sliding_window", False):
             # Use sliding window dataloaders for more training samples
@@ -2708,7 +2719,8 @@ def train(
 
     # Final test evaluation (full metrics, fast_mode=False)
     # Skip if no test set (no_test_set=True means all held-out sessions are validation)
-    has_test_set = len(data.get("test_idx", [])) > 0
+    # Check both index-based (olfactory/pfc) and loader-based (pcx1) test sets
+    has_test_set = len(data.get("test_idx", [])) > 0 or data.get("test_loader") is not None
     if has_test_set:
         test_metrics = evaluate(
             model, loaders["test"], device,
@@ -2904,6 +2916,73 @@ def train(
                 # Machine-parseable output
                 print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
                 print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
+
+                # Store per-session test results for JSON output
+                results["per_session_test_results"] = per_session_results
+                results["test_avg_r2"] = avg_r2
+                results["test_avg_corr"] = avg_corr
+                results["test_avg_delta"] = avg_delta
+
+    # =========================================================================
+    # LOADER-BASED PER-SESSION TEST EVALUATION (for pcx1 and similar datasets)
+    # Uses test_sessions_loaders instead of index-based approach
+    # =========================================================================
+    use_fsdp = config.get("fsdp", False)
+    if is_primary() and has_test_set and "test_sessions" in loaders and not use_fsdp:
+        test_sessions_loaders = loaders["test_sessions"]
+
+        if len(test_sessions_loaders) >= 1:
+            print("\n" + "=" * 70)
+            print("PER-SESSION TEST RESULTS (LOSO)")
+            print("=" * 70)
+
+            per_session_results = []
+
+            for session_name, session_loader in test_sessions_loaders.items():
+                # Evaluate this session
+                session_metrics = evaluate(
+                    model, session_loader, device,
+                    compute_phase=False, reverse_model=None, config=config,
+                    fast_mode=True,  # Fast mode for per-session eval
+                    sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
+                    cond_encoder=cond_encoder,
+                    wiener_boost=wiener_filter,
+                    wiener_alpha=config.get("wiener_alpha", 1.0),
+                )
+
+                per_session_results.append({
+                    "session": session_name,
+                    "n_trials": len(session_loader.dataset),
+                    "corr": session_metrics["corr"],
+                    "baseline_corr": session_metrics.get("baseline_corr", 0),
+                    "r2": session_metrics["r2"],
+                    "psd_err_db": session_metrics.get("psd_err_db", 0),
+                })
+
+            # Print summary table
+            if per_session_results:
+                print(f"\n{'Session':<15} {'Windows':>8} {'Corr':>8} {'Baseline':>10} {'Δ Corr':>10} {'R²':>8}")
+                print("-" * 70)
+
+                for r in per_session_results:
+                    delta = r['corr'] - r['baseline_corr']
+                    print(f"{r['session']:<15} {r['n_trials']:>8} {r['corr']:>8.4f} {r['baseline_corr']:>10.4f} {delta:>+10.4f} {r['r2']:>8.4f}")
+
+                # Compute aggregate stats
+                avg_corr = np.mean([r['corr'] for r in per_session_results])
+                avg_baseline = np.mean([r['baseline_corr'] for r in per_session_results])
+                avg_delta = avg_corr - avg_baseline
+                avg_r2 = np.mean([r['r2'] for r in per_session_results])
+                total_windows = sum(r['n_trials'] for r in per_session_results)
+
+                print("-" * 70)
+                print(f"{'AVERAGE':<15} {total_windows:>8} {avg_corr:>8.4f} {avg_baseline:>10.4f} {avg_delta:>+10.4f} {avg_r2:>8.4f}")
+                print("=" * 70)
+
+                # Machine-parseable output
+                print(f"\nRESULT_PER_SESSION_AVG_CORR={avg_corr:.4f}")
+                print(f"RESULT_PER_SESSION_AVG_DELTA={avg_delta:.4f}")
+                print(f"RESULT_PER_SESSION_AVG_R2={avg_r2:.4f}")
 
                 # Store per-session test results for JSON output
                 results["per_session_test_results"] = per_session_results

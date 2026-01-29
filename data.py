@@ -3252,6 +3252,25 @@ def create_pcx1_dataloaders(
             **loader_kwargs,
         )
 
+        # Create per-session test loaders for LOSO evaluation
+        test_sessions_loaders = {}
+        for sess_data in test_data:
+            sess_name = sess_data['session']
+            sess_dataset = ContinuousLFPDataset(
+                ob=sess_data['ob'],
+                pcx=sess_data['pcx'],
+                window_size=window_size,
+                stride=val_stride,
+                zscore_per_window=zscore_per_window,
+            )
+            test_sessions_loaders[sess_name] = DataLoader(
+                sess_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            )
+        dataloaders['test_sessions'] = test_sessions_loaders
+
     return dataloaders
 
 
