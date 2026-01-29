@@ -3721,22 +3721,21 @@ def main():
                 print(f"[LOSO MODE] PCx1 session holdout:")
                 print(f"  Held-out test sessions: {loso_test_sessions}")
 
+        # Determine if we're in LOSO mode (proper 70/30 data split, not session split)
+        is_loso_mode = False
         if args.pcx1_train_sessions and args.pcx1_val_sessions:
             # Use explicitly specified sessions
             train_sessions = args.pcx1_train_sessions
             val_sessions = args.pcx1_val_sessions
         elif loso_test_sessions:
-            # LOSO mode: exclude test sessions, split rest for train/val
-            available_sessions = [s for s in all_sessions if s not in loso_test_sessions]
-            # 70/30 train/val split of remaining sessions
-            n_val = max(1, len(available_sessions) // 4)  # ~25% for val
-            np.random.seed(config["seed"])
-            shuffled = np.random.permutation(available_sessions).tolist()
-            val_sessions = shuffled[:n_val]
-            train_sessions = shuffled[n_val:]
+            # LOSO mode: use ALL non-test sessions for training, do 70/30 DATA split
+            is_loso_mode = True
+            train_sessions = [s for s in all_sessions if s not in loso_test_sessions]
+            val_sessions = []  # Not used in LOSO mode - data split happens internally
             if is_primary():
-                print(f"  Train sessions ({len(train_sessions)}): {train_sessions}")
-                print(f"  Val sessions ({len(val_sessions)}): {val_sessions}")
+                print(f"  LOSO mode: using all {len(train_sessions)} non-test sessions")
+                print(f"  Train sessions: {train_sessions}")
+                print(f"  Will split data 70/30 for train/val (not by session)")
         else:
             # Random split: use pcx1_n_val for validation, rest for training
             train_sessions, val_sessions, _ = get_pcx1_session_splits(
@@ -3816,6 +3815,8 @@ def main():
             separate_val_sessions=config.get("separate_val_sessions", True),
             persistent_workers=use_persistent,
             prefetch_factor=prefetch_factor,
+            loso_mode=is_loso_mode,  # Use 70/30 data split instead of session split
+            seed=config["seed"],
         )
 
         # Build a minimal data dict for compatibility with rest of training loop

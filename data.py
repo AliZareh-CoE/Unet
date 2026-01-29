@@ -3153,12 +3153,15 @@ def create_pcx1_dataloaders(
     separate_val_sessions: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
+    loso_mode: bool = False,
+    loso_val_ratio: float = 0.3,
+    seed: int = 42,
 ) -> Dict[str, Any]:
     """Create DataLoaders for PCx1 continuous data with session-based splits.
 
     Args:
         train_sessions: List of session names for training
-        val_sessions: List of session names for validation
+        val_sessions: List of session names for validation (ignored if loso_mode=True)
         test_sessions: List of session names for testing (optional)
         window_size: Window size in samples (5000 = 5 seconds)
         stride: Stride between windows for training (default: window_size // 2)
@@ -3170,6 +3173,9 @@ def create_pcx1_dataloaders(
         separate_val_sessions: If True, also create per-session val loaders
         persistent_workers: Keep workers alive between epochs (faster)
         prefetch_factor: Number of batches to prefetch per worker
+        loso_mode: If True, combine all train_sessions and do 70/30 data split (not session split)
+        loso_val_ratio: Fraction of data for validation in LOSO mode (default 0.3 = 30%)
+        seed: Random seed for LOSO data split
 
     Returns:
         Dictionary with 'train', 'val', and optionally 'test' and 'val_sessions' DataLoaders
@@ -3182,19 +3188,6 @@ def create_pcx1_dataloaders(
 
     # persistent_workers requires num_workers > 0
     use_persistent = persistent_workers and num_workers > 0
-    # Load sessions
-    _print_primary("Loading training sessions...")
-    train_data = [load_pcx1_session(s, path) for s in train_sessions]
-    _print_primary("Loading validation sessions...")
-    val_data = [load_pcx1_session(s, path) for s in val_sessions]
-
-    # Create datasets (val can use larger stride for faster eval)
-    train_dataset = MultiSessionContinuousDataset(
-        train_data, window_size, stride, zscore_per_window
-    )
-    val_dataset = MultiSessionContinuousDataset(
-        val_data, window_size, val_stride, zscore_per_window
-    )
 
     # Common DataLoader kwargs for speed
     loader_kwargs = dict(
@@ -3204,40 +3197,96 @@ def create_pcx1_dataloaders(
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
-    dataloaders = {
-        'train': DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            **loader_kwargs,
-        ),
-        'val': DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            **loader_kwargs,
-        ),
-    }
+    if loso_mode:
+        # LOSO MODE: Load all training sessions, create windows, then split 70/30
+        _print_primary(f"Loading {len(train_sessions)} training sessions for LOSO...")
+        all_train_data = [load_pcx1_session(s, path) for s in train_sessions]
 
-    # Create per-session validation loaders for separate evaluation
-    if separate_val_sessions:
-        val_sessions_loaders = {}
-        for sess_data in val_data:
-            sess_name = sess_data['session']
-            sess_dataset = ContinuousLFPDataset(
-                ob=sess_data['ob'],
-                pcx=sess_data['pcx'],
-                window_size=window_size,
-                stride=val_stride,  # Use val_stride for faster eval
-                zscore_per_window=zscore_per_window,
-            )
-            val_sessions_loaders[sess_name] = DataLoader(
-                sess_dataset,
+        # Create combined dataset from all training sessions
+        combined_dataset = MultiSessionContinuousDataset(
+            all_train_data, window_size, stride, zscore_per_window
+        )
+
+        # Split into train/val (70/30 by default)
+        n_total = len(combined_dataset)
+        n_val = int(n_total * loso_val_ratio)
+        n_train = n_total - n_val
+
+        # Use random split with fixed seed for reproducibility
+        import torch
+        generator = torch.Generator().manual_seed(seed)
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            combined_dataset, [n_train, n_val], generator=generator
+        )
+
+        _print_primary(f"  LOSO data split: {n_train} train, {n_val} val ({loso_val_ratio*100:.0f}% val)")
+
+        dataloaders = {
+            'train': DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            ),
+            'val': DataLoader(
+                val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 **loader_kwargs,
-            )
-        dataloaders['val_sessions'] = val_sessions_loaders
+            ),
+        }
+
+        # No per-session val loaders in LOSO mode (data is mixed)
+
+    else:
+        # STANDARD MODE: Separate session-based splits
+        _print_primary("Loading training sessions...")
+        train_data = [load_pcx1_session(s, path) for s in train_sessions]
+        _print_primary("Loading validation sessions...")
+        val_data = [load_pcx1_session(s, path) for s in val_sessions]
+
+        # Create datasets (val can use larger stride for faster eval)
+        train_dataset = MultiSessionContinuousDataset(
+            train_data, window_size, stride, zscore_per_window
+        )
+        val_dataset = MultiSessionContinuousDataset(
+            val_data, window_size, val_stride, zscore_per_window
+        )
+
+        dataloaders = {
+            'train': DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                **loader_kwargs,
+            ),
+            'val': DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                **loader_kwargs,
+            ),
+        }
+
+        # Create per-session validation loaders for separate evaluation
+        if separate_val_sessions:
+            val_sessions_loaders = {}
+            for sess_data in val_data:
+                sess_name = sess_data['session']
+                sess_dataset = ContinuousLFPDataset(
+                    ob=sess_data['ob'],
+                    pcx=sess_data['pcx'],
+                    window_size=window_size,
+                    stride=val_stride,  # Use val_stride for faster eval
+                    zscore_per_window=zscore_per_window,
+                )
+                val_sessions_loaders[sess_name] = DataLoader(
+                    sess_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    **loader_kwargs,
+                )
+            dataloaders['val_sessions'] = val_sessions_loaders
 
     if test_sessions:
         _print_primary("Loading test sessions...")
