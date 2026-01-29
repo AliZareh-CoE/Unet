@@ -2832,10 +2832,10 @@ def train(
 
     # =========================================================================
     # PER-SESSION TEST EVALUATION (for cross-session generalization analysis)
-    # Skip when using FSDP - causes hangs due to sharded model needing all ranks
+    # Skip when using FSDP or distributed - causes hangs due to barrier timeout
     # =========================================================================
     use_fsdp = config.get("fsdp", False)
-    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data and not use_fsdp:
+    if is_primary() and has_test_set and "split_info" in data and "session_ids" in data and not use_fsdp and not is_distributed:
         split_info = data.get("split_info", {})
         test_sessions = split_info.get("test_sessions", [])
         session_ids = data.get("session_ids")
@@ -2928,7 +2928,9 @@ def train(
     # Uses test_sessions_loaders instead of index-based approach
     # =========================================================================
     use_fsdp = config.get("fsdp", False)
-    if is_primary() and has_test_set and "test_sessions" in loaders and not use_fsdp:
+    # Skip per-session test evaluation in distributed mode to avoid NCCL timeout
+    # (only rank 0 would evaluate while others wait at barrier)
+    if is_primary() and has_test_set and "test_sessions" in loaders and not use_fsdp and not is_distributed:
         test_sessions_loaders = loaders["test_sessions"]
 
         if len(test_sessions_loaders) >= 1:
