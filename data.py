@@ -4008,34 +4008,66 @@ def prepare_dandi_data(
 
     # Create datasets with consistent channel counts
     # Special handling for LOSO mode: when test_subjects provided but no val_subjects,
-    # create val set by randomly splitting training windows (not subjects)
+    # create val set by TEMPORALLY splitting training data (not random window split)
     loso_mode_no_val = (test_subjects is not None and len(test_subjects) > 0 and
                         (val_subjects is None or len(val_subjects) == 0))
 
     if loso_mode_no_val and len(train_data) > 0:
-        # LOSO mode: create combined train dataset, then split windows into train/val
-        combined_dataset = DANDIMovieDataset(
-            train_data, window_size, stride, verbose=False,
+        # LOSO mode: Split raw samples TEMPORALLY first, then create windows
+        # This prevents data leakage from overlapping windows
+        train_portions = []
+        val_portions = []
+        total_train_samples = 0
+        total_val_samples = 0
+
+        for subj_data in train_data:
+            n_samples = subj_data['n_samples']
+            split_point = int(n_samples * 0.7)  # 70% train, 30% val
+
+            # First 70% for training
+            train_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, :split_point],
+                'target': subj_data['target'][:, :split_point],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'sampling_rate': subj_data['sampling_rate'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': split_point,
+            })
+            total_train_samples += split_point
+
+            # Last 30% for validation
+            val_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, split_point:],
+                'target': subj_data['target'][:, split_point:],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'sampling_rate': subj_data['sampling_rate'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': n_samples - split_point,
+            })
+            total_val_samples += (n_samples - split_point)
+
+        if verbose:
+            _print_primary(f"  Temporal split: {total_train_samples} train samples, {total_val_samples} val samples")
+
+        # Now create windows from each portion (no overlap between train/val)
+        train_dataset = DANDIMovieDataset(
+            train_portions, window_size, stride, verbose=False,
+            n_source_channels=min_source_channels, n_target_channels=min_target_channels,
+        )
+        val_dataset = DANDIMovieDataset(
+            val_portions, window_size, stride, verbose=False,
             n_source_channels=min_source_channels, n_target_channels=min_target_channels,
         )
 
-        # Random 70/30 split of windows
-        n_total = len(combined_dataset)
-        n_train = int(0.7 * n_total)
-        n_val = n_total - n_train
-
-        rng = np.random.default_rng(seed)
-        indices = rng.permutation(n_total)
-        train_indices = indices[:n_train].tolist()
-        val_indices = indices[n_train:].tolist()
-
-        # Create subset datasets
-        train_dataset = torch.utils.data.Subset(combined_dataset, train_indices)
-        val_dataset = torch.utils.data.Subset(combined_dataset, val_indices)
-
         if verbose:
             _print_primary(f"DANDIMovieDataset [LOSO]: {len(train_data)} subjects, "
-                  f"{n_train} train + {n_val} val windows (70/30 split), "
+                  f"{len(train_dataset)} train + {len(val_dataset)} val windows (NO overlap), "
                   f"window_size={window_size}, stride={stride}, "
                   f"source_ch={min_source_channels}, target_ch={min_target_channels}")
     else:
