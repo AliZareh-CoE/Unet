@@ -3198,28 +3198,49 @@ def create_pcx1_dataloaders(
     )
 
     if loso_mode:
-        # LOSO MODE: Load all training sessions, create windows, then split 70/30
+        # LOSO MODE: Split raw samples TEMPORALLY first, then create windows
+        # This prevents data leakage from overlapping windows
         _print_primary(f"Loading {len(train_sessions)} training sessions for LOSO...")
         all_train_data = [load_pcx1_session(s, path) for s in train_sessions]
 
-        # Create combined dataset from all training sessions
-        combined_dataset = MultiSessionContinuousDataset(
-            all_train_data, window_size, stride, zscore_per_window
+        # Split each session's raw samples temporally (70% train, 30% val)
+        # This ensures NO overlap between train and val windows
+        train_portions = []
+        val_portions = []
+        total_train_samples = 0
+        total_val_samples = 0
+
+        for sess_data in all_train_data:
+            n_samples = sess_data['ob'].shape[1]
+            split_point = int(n_samples * (1.0 - loso_val_ratio))
+
+            # First 70% for training
+            train_portions.append({
+                'session': sess_data['session'],
+                'ob': sess_data['ob'][:, :split_point],
+                'pcx': sess_data['pcx'][:, :split_point],
+            })
+            total_train_samples += split_point
+
+            # Last 30% for validation
+            val_portions.append({
+                'session': sess_data['session'],
+                'ob': sess_data['ob'][:, split_point:],
+                'pcx': sess_data['pcx'][:, split_point:],
+            })
+            total_val_samples += (n_samples - split_point)
+
+        _print_primary(f"  Temporal split: {total_train_samples} train samples, {total_val_samples} val samples")
+
+        # Now create windows from each portion (no overlap between train/val)
+        train_dataset = MultiSessionContinuousDataset(
+            train_portions, window_size, stride, zscore_per_window
+        )
+        val_dataset = MultiSessionContinuousDataset(
+            val_portions, window_size, stride, zscore_per_window
         )
 
-        # Split into train/val (70/30 by default)
-        n_total = len(combined_dataset)
-        n_val = int(n_total * loso_val_ratio)
-        n_train = n_total - n_val
-
-        # Use random split with fixed seed for reproducibility
-        import torch
-        generator = torch.Generator().manual_seed(seed)
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            combined_dataset, [n_train, n_val], generator=generator
-        )
-
-        _print_primary(f"  LOSO data split: {n_train} train, {n_val} val ({loso_val_ratio*100:.0f}% val)")
+        _print_primary(f"  LOSO windows: {len(train_dataset)} train, {len(val_dataset)} val (NO overlap)")
 
         dataloaders = {
             'train': DataLoader(
