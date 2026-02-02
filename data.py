@@ -76,6 +76,7 @@ class DatasetType(Enum):
     OLFACTORY = "olfactory"      # OB/PCx dataset
     PFC_HPC = "pfc_hpc"          # PFC/Hippocampus (CA1) dataset
     DANDI_MOVIE = "dandi_movie"  # DANDI 000623: Human iEEG movie watching
+    COGITATE = "cogitate"        # COGITATE EXP1: Human SEEG visual cognition
 
 
 # =============================================================================
@@ -171,6 +172,29 @@ DANDI_SUBJECT_IDS = [f"sub-CS{i}" for i in range(41, 63) if i not in [43, 44, 48
 DANDI_TRAIN_SPLIT_PATH = _DANDI_DATA_DIR / "train_indices.npy"
 DANDI_VAL_SPLIT_PATH = _DANDI_DATA_DIR / "val_indices.npy"
 DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
+
+
+# =============================================================================
+# Constants - COGITATE Dataset (Human SEEG)
+# =============================================================================
+# COGITATE EXP1: Visual cognition task with SEEG depth electrodes
+# Task: Duration/visual cognitive task with faces, objects, letters, false-fonts
+# 38 subjects across 3 sites (CE, CF, CG)
+
+_COGITATE_DATA_DIR = _DATA_DIR / "COGITATEDataset_1024hz"
+COGITATE_SAMPLING_RATE_HZ = 1024
+COGITATE_N_SUBJECTS = 38
+
+# Available brain regions (mapped from Desikan atlas)
+COGITATE_BRAIN_REGIONS = [
+    "temporal", "frontal", "hippocampus", "amygdala",
+    "parietal", "insula", "occipital", "cingulate",
+    "fusiform", "entorhinal", "parahippocampal"
+]
+
+# Default region pairs for neural translation
+COGITATE_DEFAULT_SOURCE = "temporal"
+COGITATE_DEFAULT_TARGET = "frontal"
 
 
 # =============================================================================
@@ -4206,5 +4230,534 @@ def create_dandi_dataloaders(
     _print_primary(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
     _print_primary(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
     _print_primary(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
+
+    return dataloaders
+
+
+# =============================================================================
+# COGITATE Dataset (Human SEEG - Visual Cognition)
+# =============================================================================
+
+def list_cogitate_subjects(data_dir: Path = _COGITATE_DATA_DIR) -> List[str]:
+    """List available COGITATE subjects in the preprocessed data directory.
+
+    Args:
+        data_dir: Path to preprocessed COGITATE data
+
+    Returns:
+        List of subject IDs (e.g., ['sub-CE103', 'sub-CE106', ...])
+    """
+    if not data_dir.exists():
+        return []
+
+    subjects = []
+    for d in sorted(data_dir.iterdir()):
+        if d.is_dir() and d.name.startswith("sub-"):
+            # Verify it has the required files
+            if (d / "continuous.npy").exists() and (d / "region_mapping.json").exists():
+                subjects.append(d.name)
+
+    return subjects
+
+
+def load_cogitate_subject(
+    subject_id: str,
+    data_dir: Path = _COGITATE_DATA_DIR,
+    source_regions: List[str] = None,
+    target_regions: List[str] = None,
+    n_source_channels: Optional[int] = None,
+    n_target_channels: Optional[int] = None,
+    channel_strategy: str = "first",
+    zscore: bool = True,
+    mode: str = "region-to-region",
+) -> Optional[Dict[str, Any]]:
+    """Load and preprocess data for a single COGITATE subject.
+
+    Args:
+        subject_id: Subject ID (e.g., "sub-CE103")
+        data_dir: Path to preprocessed COGITATE data
+        source_regions: List of source region names (default: ["temporal"])
+        target_regions: List of target region names (default: ["frontal"])
+        n_source_channels: Number of source channels to select (None = all available)
+        n_target_channels: Number of target channels to select (None = all available)
+        channel_strategy: How to select channels - "first", "last", "even", "random"
+        zscore: Whether to z-score normalize the data
+        mode: "region-to-region" or "within-region" (for channel interpolation)
+
+    Returns:
+        Dictionary containing preprocessed data, or None if subject doesn't meet requirements
+    """
+    if source_regions is None:
+        source_regions = [COGITATE_DEFAULT_SOURCE]
+    if target_regions is None:
+        target_regions = [COGITATE_DEFAULT_TARGET]
+
+    subject_dir = data_dir / subject_id
+    if not subject_dir.exists():
+        return None
+
+    # Load continuous data and region mapping
+    continuous = np.load(subject_dir / "continuous.npy")
+
+    with open(subject_dir / "region_mapping.json", "r") as f:
+        region_mapping = json.load(f)
+
+    # Get indices for source regions
+    source_indices = []
+    for region in source_regions:
+        if region in region_mapping:
+            source_indices.extend(region_mapping[region]["indices"])
+
+    # Get indices for target regions
+    if mode == "within-region":
+        # For within-region, target comes from same pool as source
+        target_indices = source_indices.copy()
+    else:
+        target_indices = []
+        for region in target_regions:
+            if region in region_mapping:
+                target_indices.extend(region_mapping[region]["indices"])
+
+    # Check if we have enough channels
+    if len(source_indices) == 0 or len(target_indices) == 0:
+        return None
+
+    # Select channels based on strategy
+    def select_channels(indices, n_channels, strategy, exclude=None):
+        if exclude:
+            indices = [i for i in indices if i not in exclude]
+        if n_channels is None or n_channels >= len(indices):
+            return indices
+        if strategy == "first":
+            return indices[:n_channels]
+        elif strategy == "last":
+            return indices[-n_channels:]
+        elif strategy == "even":
+            step = len(indices) / n_channels
+            return [indices[int(i * step)] for i in range(n_channels)]
+        elif strategy == "random":
+            return list(np.random.choice(indices, n_channels, replace=False))
+        return indices[:n_channels]
+
+    # Select source channels
+    selected_source = select_channels(source_indices, n_source_channels, channel_strategy)
+
+    # Select target channels (excluding source if within-region)
+    if mode == "within-region":
+        selected_target = select_channels(
+            target_indices, n_target_channels, channel_strategy, exclude=selected_source
+        )
+    else:
+        selected_target = select_channels(target_indices, n_target_channels, channel_strategy)
+
+    # Check we have enough channels
+    if n_source_channels and len(selected_source) < n_source_channels:
+        return None
+    if n_target_channels and len(selected_target) < n_target_channels:
+        return None
+
+    # Extract data
+    source_data = continuous[selected_source, :]
+    target_data = continuous[selected_target, :]
+
+    # Z-score normalization per channel
+    if zscore:
+        source_data = (source_data - source_data.mean(axis=1, keepdims=True)) / (
+            source_data.std(axis=1, keepdims=True) + 1e-8
+        )
+        target_data = (target_data - target_data.mean(axis=1, keepdims=True)) / (
+            target_data.std(axis=1, keepdims=True) + 1e-8
+        )
+
+    return {
+        "subject_id": subject_id,
+        "source": source_data.astype(np.float32),
+        "target": target_data.astype(np.float32),
+        "source_regions": source_regions,
+        "target_regions": target_regions,
+        "source_indices": selected_source,
+        "target_indices": selected_target,
+        "sampling_rate": COGITATE_SAMPLING_RATE_HZ,
+        "n_source_channels": len(selected_source),
+        "n_target_channels": len(selected_target),
+        "n_samples": continuous.shape[1],
+        "mode": mode,
+    }
+
+
+class COGITATEDataset(Dataset):
+    """PyTorch Dataset for COGITATE human SEEG data.
+
+    Provides sliding window segments for neural signal translation between
+    brain regions during visual cognition task.
+
+    Args:
+        subjects_data: List of subject data dicts from load_cogitate_subject()
+        window_size: Size of each window in samples (default: 5120 = 5s at 1024Hz)
+        stride: Stride between windows (default: 2560 = 2.5s)
+        zscore_per_window: Whether to z-score each window independently
+        verbose: Whether to print info messages
+    """
+
+    def __init__(
+        self,
+        subjects_data: List[Dict[str, Any]],
+        window_size: int = 5120,  # 5s at 1024 Hz
+        stride: int = 2560,  # 2.5s
+        zscore_per_window: bool = False,
+        verbose: bool = True,
+    ):
+        self.window_size = window_size
+        self.stride = stride
+        self.zscore_per_window = zscore_per_window
+
+        # Determine channel counts (should be uniform after load_cogitate_subject)
+        if subjects_data:
+            self.n_source_channels = subjects_data[0]["n_source_channels"]
+            self.n_target_channels = subjects_data[0]["n_target_channels"]
+        else:
+            self.n_source_channels = 0
+            self.n_target_channels = 0
+
+        # Build index of all windows across subjects
+        self.windows = []  # List of (subject_idx, start_sample)
+
+        for subj_idx, subj_data in enumerate(subjects_data):
+            n_samples = subj_data["n_samples"]
+            n_windows = max(0, (n_samples - window_size) // stride + 1)
+
+            for w in range(n_windows):
+                start = w * stride
+                self.windows.append((subj_idx, start))
+
+        self.subjects_data = subjects_data
+
+        if verbose and _is_primary_rank():
+            _print_primary(
+                f"COGITATEDataset: {len(subjects_data)} subjects, "
+                f"{len(self.windows)} windows, "
+                f"window_size={window_size}, stride={stride}, "
+                f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}"
+            )
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        subj_idx, start = self.windows[idx]
+        subj_data = self.subjects_data[subj_idx]
+
+        end = start + self.window_size
+
+        source = subj_data["source"][:, start:end].copy()
+        target = subj_data["target"][:, start:end].copy()
+
+        # Optional per-window normalization
+        if self.zscore_per_window:
+            source = (source - source.mean(axis=1, keepdims=True)) / (
+                source.std(axis=1, keepdims=True) + 1e-8
+            )
+            target = (target - target.mean(axis=1, keepdims=True)) / (
+                target.std(axis=1, keepdims=True) + 1e-8
+            )
+
+        return {
+            "source": torch.from_numpy(source).float(),
+            "target": torch.from_numpy(target).float(),
+            "subject_idx": torch.tensor(subj_idx),
+            "start_sample": torch.tensor(start),
+        }
+
+
+def prepare_cogitate_data(
+    data_dir: Path = _COGITATE_DATA_DIR,
+    source_regions: List[str] = None,
+    target_regions: List[str] = None,
+    n_source_channels: Optional[int] = None,
+    n_target_channels: Optional[int] = None,
+    channel_strategy: str = "first",
+    mode: str = "region-to-region",
+    window_size: int = 5120,
+    stride: int = 2560,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+    verbose: bool = True,
+    # Explicit subject holdout for LOSO cross-validation
+    val_subjects: Optional[List[str]] = None,
+    test_subjects: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Complete data preparation pipeline for COGITATE dataset.
+
+    Args:
+        data_dir: Directory containing preprocessed COGITATE data
+        source_regions: List of source region names (default: ["temporal"])
+        target_regions: List of target region names (default: ["frontal"])
+        n_source_channels: Number of source channels (None = use all available)
+        n_target_channels: Number of target channels (None = use all available)
+        channel_strategy: "first", "last", "even", or "random"
+        mode: "region-to-region" or "within-region"
+        window_size: Window size in samples
+        stride: Stride between windows
+        train_ratio: Fraction of subjects for training
+        val_ratio: Fraction of subjects for validation
+        test_ratio: Fraction of subjects for testing
+        seed: Random seed
+        zscore: Whether to z-score normalize
+        verbose: Whether to print progress
+        val_subjects: Explicit validation subjects (for LOSO)
+        test_subjects: Explicit test subjects (for LOSO)
+
+    Returns:
+        Dictionary containing train/val/test datasets and metadata
+    """
+    if source_regions is None:
+        source_regions = [COGITATE_DEFAULT_SOURCE]
+    if target_regions is None:
+        target_regions = [COGITATE_DEFAULT_TARGET]
+
+    data_dir = Path(data_dir)
+
+    if verbose:
+        _print_primary(f"Preparing COGITATE dataset...")
+        _print_primary(f"  Source regions: {source_regions}")
+        _print_primary(f"  Target regions: {target_regions}")
+        _print_primary(f"  Mode: {mode}")
+
+    # Get all available subjects
+    all_subjects = list_cogitate_subjects(data_dir)
+
+    if verbose:
+        _print_primary(f"  Found {len(all_subjects)} subjects")
+
+    # Load all subjects and filter by channel requirements
+    subjects_data = []
+    for subj_id in all_subjects:
+        data = load_cogitate_subject(
+            subject_id=subj_id,
+            data_dir=data_dir,
+            source_regions=source_regions,
+            target_regions=target_regions,
+            n_source_channels=n_source_channels,
+            n_target_channels=n_target_channels,
+            channel_strategy=channel_strategy,
+            zscore=zscore,
+            mode=mode,
+        )
+        if data is not None:
+            subjects_data.append(data)
+
+    if verbose:
+        _print_primary(f"  Loaded {len(subjects_data)} subjects with sufficient channels")
+
+    if len(subjects_data) == 0:
+        raise ValueError(
+            f"No subjects have sufficient channels for the configuration. "
+            f"Try reducing n_source_channels or n_target_channels."
+        )
+
+    # Create subject ID to data mapping
+    subject_id_to_data = {d["subject_id"]: d for d in subjects_data}
+    available_subjects = list(subject_id_to_data.keys())
+
+    # Split subjects
+    np.random.seed(seed)
+
+    if val_subjects is not None or test_subjects is not None:
+        # LOSO mode: explicit subject assignment
+        val_subjects = val_subjects or []
+        test_subjects = test_subjects or []
+
+        # Validate specified subjects exist
+        for s in val_subjects + test_subjects:
+            if s not in available_subjects:
+                _print_primary(f"  WARNING: Subject {s} not available, skipping")
+
+        val_subjects = [s for s in val_subjects if s in available_subjects]
+        test_subjects = [s for s in test_subjects if s in available_subjects]
+        train_subjects = [
+            s for s in available_subjects if s not in val_subjects and s not in test_subjects
+        ]
+    else:
+        # Random split by subject
+        n_subjects = len(available_subjects)
+        indices = np.random.permutation(n_subjects)
+
+        n_train = int(n_subjects * train_ratio)
+        n_val = int(n_subjects * val_ratio)
+
+        train_indices = indices[:n_train]
+        val_indices = indices[n_train : n_train + n_val]
+        test_indices = indices[n_train + n_val :]
+
+        train_subjects = [available_subjects[i] for i in train_indices]
+        val_subjects = [available_subjects[i] for i in val_indices]
+        test_subjects = [available_subjects[i] for i in test_indices]
+
+    if verbose:
+        _print_primary(f"  Train subjects: {len(train_subjects)}")
+        _print_primary(f"  Val subjects: {len(val_subjects)}")
+        _print_primary(f"  Test subjects: {len(test_subjects)}")
+
+    # Create datasets
+    train_data = [subject_id_to_data[s] for s in train_subjects]
+    val_data = [subject_id_to_data[s] for s in val_subjects]
+    test_data = [subject_id_to_data[s] for s in test_subjects]
+
+    train_dataset = COGITATEDataset(
+        train_data, window_size=window_size, stride=stride, verbose=verbose
+    )
+    val_dataset = COGITATEDataset(
+        val_data, window_size=window_size, stride=stride, verbose=False
+    )
+    test_dataset = COGITATEDataset(
+        test_data, window_size=window_size, stride=stride, verbose=False
+    )
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "train_subjects": train_subjects,
+        "val_subjects": val_subjects,
+        "test_subjects": test_subjects,
+        "source_regions": source_regions,
+        "target_regions": target_regions,
+        "n_source_channels": train_dataset.n_source_channels,
+        "n_target_channels": train_dataset.n_target_channels,
+        "sampling_rate": COGITATE_SAMPLING_RATE_HZ,
+        "mode": mode,
+    }
+
+
+def create_cogitate_dataloaders(
+    data_dir: Path = _COGITATE_DATA_DIR,
+    source_regions: List[str] = None,
+    target_regions: List[str] = None,
+    n_source_channels: Optional[int] = None,
+    n_target_channels: Optional[int] = None,
+    channel_strategy: str = "first",
+    mode: str = "region-to-region",
+    window_size: int = 5120,
+    stride: int = 2560,
+    batch_size: int = 32,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    verbose: bool = True,
+    distributed: bool = False,
+    val_subjects: Optional[List[str]] = None,
+    test_subjects: Optional[List[str]] = None,
+) -> Dict[str, DataLoader]:
+    """Create DataLoaders for COGITATE dataset.
+
+    Args:
+        data_dir: Directory containing preprocessed COGITATE data
+        source_regions: Source region(s) for translation
+        target_regions: Target region(s) for translation
+        n_source_channels: Number of source channels to use
+        n_target_channels: Number of target channels to use
+        channel_strategy: Channel selection strategy
+        mode: "region-to-region" or "within-region"
+        window_size: Window size in samples (5120 = 5s at 1024Hz)
+        stride: Stride between windows
+        batch_size: Batch size for DataLoaders
+        train_ratio: Training set ratio
+        val_ratio: Validation set ratio
+        test_ratio: Test set ratio
+        seed: Random seed
+        zscore: Whether to z-score normalize
+        num_workers: Number of DataLoader workers
+        pin_memory: Whether to pin memory for GPU transfer
+        verbose: Whether to print progress
+        distributed: Whether to use DistributedSampler for multi-GPU
+        val_subjects: Explicit validation subjects (for LOSO)
+        test_subjects: Explicit test subjects (for LOSO)
+
+    Returns:
+        Dictionary with 'train', 'val', 'test' DataLoaders
+    """
+    # Prepare datasets
+    data = prepare_cogitate_data(
+        data_dir=data_dir,
+        source_regions=source_regions,
+        target_regions=target_regions,
+        n_source_channels=n_source_channels,
+        n_target_channels=n_target_channels,
+        channel_strategy=channel_strategy,
+        mode=mode,
+        window_size=window_size,
+        stride=stride,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+        zscore=zscore,
+        verbose=verbose,
+        val_subjects=val_subjects,
+        test_subjects=test_subjects,
+    )
+
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Create samplers for distributed training
+    if distributed and dist.is_available() and dist.is_initialized():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        test_sampler = DistributedSampler(test_dataset, shuffle=False)
+    else:
+        train_sampler = None
+        val_sampler = None
+        test_sampler = None
+
+    # Common DataLoader kwargs
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": num_workers > 0,
+    }
+
+    dataloaders = {
+        "train": DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            drop_last=True,
+            **loader_kwargs,
+        ),
+        "val": DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=test_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        ),
+    }
+
+    if verbose:
+        _print_primary(f"\nCOGITATE DataLoaders created:")
+        _print_primary(f"  Source: {data['source_regions']} ({data['n_source_channels']} ch)")
+        _print_primary(f"  Target: {data['target_regions']} ({data['n_target_channels']} ch)")
+        _print_primary(f"  Train: {len(train_dataset)} windows, {len(dataloaders['train'])} batches")
+        _print_primary(f"  Val: {len(val_dataset)} windows, {len(dataloaders['val'])} batches")
+        _print_primary(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
 
     return dataloaders
