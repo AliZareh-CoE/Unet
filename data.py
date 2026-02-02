@@ -4565,6 +4565,9 @@ def prepare_cogitate_data(
     # Split subjects
     np.random.seed(seed)
 
+    # Track if we need window-level train/val split (LOSO mode)
+    loso_window_split = False
+
     if val_subjects is not None or test_subjects is not None:
         # LOSO mode: explicit subject assignment
         explicit_val = val_subjects is not None and len(val_subjects) > 0
@@ -4583,12 +4586,10 @@ def prepare_cogitate_data(
         ]
 
         # If no explicit val_subjects but we have test_subjects,
-        # do 70/30 split of remaining subjects for train/val
-        if not explicit_val and len(test_subjects) > 0 and len(train_subjects) > 1:
-            n_val = max(1, int(len(train_subjects) * 0.3))
-            np.random.shuffle(train_subjects)
-            val_subjects = train_subjects[:n_val]
-            train_subjects = train_subjects[n_val:]
+        # we'll do 70/30 WINDOW-level split from pooled remaining subjects
+        if not explicit_val and len(test_subjects) > 0:
+            loso_window_split = True
+            # train_subjects contains all non-test subjects for pooling
     else:
         # Random split by subject
         n_subjects = len(available_subjects)
@@ -4606,24 +4607,59 @@ def prepare_cogitate_data(
         test_subjects = [available_subjects[i] for i in test_indices]
 
     if verbose:
-        _print_primary(f"  Train subjects: {len(train_subjects)}")
-        _print_primary(f"  Val subjects: {len(val_subjects)}")
-        _print_primary(f"  Test subjects: {len(test_subjects)}")
+        if loso_window_split:
+            _print_primary(f"  LOSO mode: {len(train_subjects)} subjects for train/val (window-level 70/30 split)")
+            _print_primary(f"  Test subjects: {len(test_subjects)} (held out)")
+        else:
+            _print_primary(f"  Train subjects: {len(train_subjects)}")
+            _print_primary(f"  Val subjects: {len(val_subjects)}")
+            _print_primary(f"  Test subjects: {len(test_subjects)}")
 
     # Create datasets
-    train_data = [subject_id_to_data[s] for s in train_subjects]
-    val_data = [subject_id_to_data[s] for s in val_subjects]
     test_data = [subject_id_to_data[s] for s in test_subjects]
-
-    train_dataset = COGITATEDataset(
-        train_data, window_size=window_size, stride=stride, verbose=verbose
-    )
-    val_dataset = COGITATEDataset(
-        val_data, window_size=window_size, stride=stride, verbose=False
-    )
     test_dataset = COGITATEDataset(
         test_data, window_size=window_size, stride=stride, verbose=False
     )
+
+    if loso_window_split:
+        # LOSO mode: pool all non-test subjects, then split windows 70/30
+        from torch.utils.data import Subset
+
+        pooled_data = [subject_id_to_data[s] for s in train_subjects]
+        pooled_dataset = COGITATEDataset(
+            pooled_data, window_size=window_size, stride=stride, verbose=verbose
+        )
+
+        # Random 70/30 split at window level
+        n_windows = len(pooled_dataset)
+        indices = np.random.permutation(n_windows)
+        n_train = int(n_windows * 0.7)
+
+        train_indices = indices[:n_train].tolist()
+        val_indices = indices[n_train:].tolist()
+
+        train_dataset = Subset(pooled_dataset, train_indices)
+        val_dataset = Subset(pooled_dataset, val_indices)
+
+        # Store channel info from pooled dataset
+        train_dataset.n_source_channels = pooled_dataset.n_source_channels
+        train_dataset.n_target_channels = pooled_dataset.n_target_channels
+        val_dataset.n_source_channels = pooled_dataset.n_source_channels
+        val_dataset.n_target_channels = pooled_dataset.n_target_channels
+
+        if verbose:
+            _print_primary(f"  Window split: {len(train_indices)} train, {len(val_indices)} val")
+    else:
+        # Standard subject-level split
+        train_data = [subject_id_to_data[s] for s in train_subjects]
+        val_data = [subject_id_to_data[s] for s in val_subjects]
+
+        train_dataset = COGITATEDataset(
+            train_data, window_size=window_size, stride=stride, verbose=verbose
+        )
+        val_dataset = COGITATEDataset(
+            val_data, window_size=window_size, stride=stride, verbose=False
+        )
 
     return {
         "train_dataset": train_dataset,
