@@ -93,8 +93,21 @@ def analyze_configuration(
     target_region: str,
     min_rate: float = 512.0,
     min_channels: int = MIN_CHANNELS_THRESHOLD,
+    channel_strategy: str = 'min',  # 'min', 'median', 'percentile_25'
 ) -> Dict:
-    """Analyze a single source→target configuration."""
+    """Analyze a single source→target configuration.
+
+    Args:
+        subjects: List of subject data dicts
+        source_region: Source region name
+        target_region: Target region name
+        min_rate: Minimum sampling rate to include
+        min_channels: Minimum channels per region to include subject
+        channel_strategy: How to determine uniform channel count:
+            - 'min': Use minimum (include all subjects, fewer channels)
+            - 'median': Use median (include ~50% subjects, more channels)
+            - 'percentile_25': Use 25th percentile (include ~75% subjects)
+    """
 
     # Filter subjects that have BOTH regions with minimum channels
     qualifying = []
@@ -129,23 +142,57 @@ def analyze_configuration(
             'viable': False,
         }
 
-    # Find minimum channels across all qualifying subjects
-    min_source = min(s['source_channels'] for s in qualifying)
-    min_target = min(s['target_channels'] for s in qualifying)
+    # Get channel counts
+    src_channels = [s['source_channels'] for s in qualifying]
+    tgt_channels = [s['target_channels'] for s in qualifying]
+
+    # Compute statistics
+    stats = {
+        'min_source': min(src_channels),
+        'min_target': min(tgt_channels),
+        'max_source': max(src_channels),
+        'max_target': max(tgt_channels),
+        'median_source': int(np.median(src_channels)),
+        'median_target': int(np.median(tgt_channels)),
+        'p25_source': int(np.percentile(src_channels, 25)),
+        'p25_target': int(np.percentile(tgt_channels, 25)),
+    }
+
+    # Determine uniform channel count based on strategy
+    if channel_strategy == 'min':
+        uniform_src = stats['min_source']
+        uniform_tgt = stats['min_target']
+        final_subjects = qualifying  # All qualify
+    elif channel_strategy == 'median':
+        uniform_src = stats['median_source']
+        uniform_tgt = stats['median_target']
+        # Filter to subjects meeting median threshold
+        final_subjects = [s for s in qualifying
+                         if s['source_channels'] >= uniform_src and s['target_channels'] >= uniform_tgt]
+    elif channel_strategy == 'percentile_25':
+        uniform_src = stats['p25_source']
+        uniform_tgt = stats['p25_target']
+        final_subjects = [s for s in qualifying
+                         if s['source_channels'] >= uniform_src and s['target_channels'] >= uniform_tgt]
+    else:
+        raise ValueError(f"Unknown strategy: {channel_strategy}")
 
     # Get unique sampling rates
-    rates = set(s['sampling_rate'] for s in qualifying)
+    rates = set(s['sampling_rate'] for s in final_subjects) if final_subjects else set()
 
     return {
         'source': source_region,
         'target': target_region,
-        'n_subjects': len(qualifying),
-        'subjects': qualifying,
-        'uniform_source_ch': min_source,
-        'uniform_target_ch': min_target,
-        'sampling_rates': sorted(rates),
-        'viable': len(qualifying) >= 10,  # Need at least 10 for LOSO
-        'total_duration_hours': sum(s['n_samples'] / s['sampling_rate'] / 3600 for s in qualifying),
+        'n_subjects': len(final_subjects),
+        'n_subjects_initial': len(qualifying),  # Before strategy filtering
+        'subjects': final_subjects,
+        'uniform_source_ch': uniform_src,
+        'uniform_target_ch': uniform_tgt,
+        'stats': stats,  # All statistics for reference
+        'strategy': channel_strategy,
+        'sampling_rates': sorted(rates) if rates else [],
+        'viable': len(final_subjects) >= 10,  # Need at least 10 for LOSO
+        'total_duration_hours': sum(s['n_samples'] / s['sampling_rate'] / 3600 for s in final_subjects) if final_subjects else 0,
     }
 
 
@@ -162,7 +209,18 @@ def print_configuration_analysis(config: Dict, rationale: str):
             print(f"  Subjects: {[s['subject_id'] for s in config['subjects']]}")
         return
 
-    print(f"  ✅ VIABLE CONFIGURATION")
+    print(f"  ✅ VIABLE CONFIGURATION (strategy: {config.get('strategy', 'min')})")
+
+    # Show channel statistics
+    stats = config.get('stats', {})
+    if stats:
+        print(f"\n  Channel Statistics:")
+        print(f"  {'':>20} {'Source':>12} {'Target':>12}")
+        print(f"  {'-'*46}")
+        print(f"  {'Min':>20} {stats.get('min_source', 0):>12} {stats.get('min_target', 0):>12}")
+        print(f"  {'25th Percentile':>20} {stats.get('p25_source', 0):>12} {stats.get('p25_target', 0):>12}")
+        print(f"  {'Median':>20} {stats.get('median_source', 0):>12} {stats.get('median_target', 0):>12}")
+        print(f"  {'Max':>20} {stats.get('max_source', 0):>12} {stats.get('max_target', 0):>12}")
     print(f"  ")
     print(f"  Qualifying subjects: {config['n_subjects']}")
     print(f"  Total duration: {config['total_duration_hours']:.1f} hours")
@@ -256,6 +314,9 @@ def main():
                         help="Minimum channels per region (default: 2)")
     parser.add_argument("--min-rate", type=float, default=512,
                         help="Minimum sampling rate in Hz (default: 512)")
+    parser.add_argument("--strategy", type=str, default="all",
+                        choices=["min", "median", "percentile_25", "all"],
+                        help="Channel count strategy: min (all subjects), median (~50%%), percentile_25 (~75%%), all (compare all)")
     parser.add_argument("--save-configs", action="store_true",
                         help="Save configuration JSONs")
     args = parser.parse_args()
@@ -268,75 +329,105 @@ def main():
     print(f"Dataset: {dataset_dir}")
     print(f"Min channels per region: {args.min_channels}")
     print(f"Min sampling rate: {args.min_rate} Hz")
+    print(f"Strategy: {args.strategy}")
 
     # Load all subject data
     print("\nLoading subject data...")
     subjects = load_subject_data(dataset_dir)
     print(f"Found {len(subjects)} subjects")
 
-    # Analyze each configuration
-    configs = []
-    for source, target, rationale in TRANSLATION_PAIRS:
-        config = analyze_configuration(
-            subjects, source, target,
-            min_rate=args.min_rate,
-            min_channels=args.min_channels
-        )
-        config['rationale'] = rationale
-        configs.append(config)
+    # Strategies to analyze
+    if args.strategy == "all":
+        strategies = ["min", "percentile_25", "median"]
+    else:
+        strategies = [args.strategy]
 
-        print_configuration_analysis(config, rationale)
+    # Analyze each configuration with each strategy
+    all_configs = {}
 
-        # Show threshold analysis
-        if config['n_subjects'] < 20:
-            analyze_with_thresholds(subjects, source, target)
+    for strategy in strategies:
+        print(f"\n\n{'#'*70}")
+        print(f"# STRATEGY: {strategy.upper()}")
+        print(f"# {'(Include all subjects, use minimum channels)' if strategy == 'min' else ''}")
+        print(f"# {'(Include ~75% subjects, use 25th percentile channels)' if strategy == 'percentile_25' else ''}")
+        print(f"# {'(Include ~50% subjects, use median channels)' if strategy == 'median' else ''}")
+        print(f"{'#'*70}")
 
-    # Summary
+        configs = []
+        for source, target, rationale in TRANSLATION_PAIRS:
+            config = analyze_configuration(
+                subjects, source, target,
+                min_rate=args.min_rate,
+                min_channels=args.min_channels,
+                channel_strategy=strategy,
+            )
+            config['rationale'] = rationale
+            configs.append(config)
+
+            print_configuration_analysis(config, rationale)
+
+        all_configs[strategy] = configs
+
+    # Summary comparison table
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("STRATEGY COMPARISON TABLE")
     print("=" * 70)
 
-    viable_configs = [c for c in configs if c['viable']]
+    # Header
+    print(f"\n{'Pair':<25} {'Strategy':<15} {'Subjects':>10} {'Src Ch':>8} {'Tgt Ch':>8} {'Viable'}")
+    print("-" * 80)
 
-    print(f"\nViable configurations: {len(viable_configs)}/3")
+    for source, target, rationale in TRANSLATION_PAIRS:
+        pair_name = f"{source} → {target}"
+        for strategy in strategies:
+            for c in all_configs[strategy]:
+                if c['source'] == source and c['target'] == target:
+                    status = "✅" if c['viable'] else "❌"
+                    print(f"{pair_name:<25} {strategy:<15} {c['n_subjects']:>10} "
+                          f"{c['uniform_source_ch']:>8} {c['uniform_target_ch']:>8} {status}")
+                    pair_name = ""  # Only show pair name once
 
-    for c in configs:
-        status = "✅" if c['viable'] else "❌"
-        print(f"  {status} {c['source']} → {c['target']}: "
-              f"{c['n_subjects']} subjects, {c['uniform_source_ch']}→{c['uniform_target_ch']} channels")
+    # Find best config across all strategies
+    all_viable = []
+    for strategy, configs in all_configs.items():
+        for c in configs:
+            if c['viable']:
+                all_viable.append(c)
 
-    # Generate commands
-    if viable_configs:
+    if all_viable:
         print("\n" + "=" * 70)
-        print("PREPROCESSING COMMANDS")
+        print("RECOMMENDED CONFIGURATIONS")
         print("=" * 70)
 
-        for c in viable_configs:
-            suffix = f"{c['source'][:4]}_{c['target'][:4]}"
-            cmd = generate_preprocessing_command(c, suffix)
-            print(cmd)
+        # Best by subject count
+        best_subjects = max(all_viable, key=lambda x: x['n_subjects'])
+        # Best by channel count (product of src and tgt)
+        best_channels = max(all_viable, key=lambda x: x['uniform_source_ch'] * x['uniform_target_ch'])
 
-            if args.save_configs:
-                config_path = dataset_dir / f"config_{suffix}.json"
-                save_configuration(c, config_path)
-
-    # Final recommendation
-    if viable_configs:
-        best = max(viable_configs, key=lambda x: x['n_subjects'])
-        print("\n" + "=" * 70)
-        print("RECOMMENDED CONFIGURATION")
-        print("=" * 70)
         print(f"""
-┌─────────────────────────────────────────────────────────────────────┐
-│  BEST OPTION: {best['source']} → {best['target']:<38} │
-│                                                                     │
-│  Subjects:     {best['n_subjects']:<50} │
-│  Source:       {best['uniform_source_ch']} {best['source']} channels{' '*(36-len(best['source']))} │
-│  Target:       {best['uniform_target_ch']} {best['target']} channels{' '*(36-len(best['target']))} │
-│  Duration:     {best['total_duration_hours']:.1f} hours{' '*43} │
-│  Rationale:    {best['rationale']:<50} │
-└─────────────────────────────────────────────────────────────────────┘
+  MOST SUBJECTS:
+    {best_subjects['source']} → {best_subjects['target']} (strategy: {best_subjects['strategy']})
+    {best_subjects['n_subjects']} subjects, {best_subjects['uniform_source_ch']}→{best_subjects['uniform_target_ch']} channels
+
+  MOST CHANNELS:
+    {best_channels['source']} → {best_channels['target']} (strategy: {best_channels['strategy']})
+    {best_channels['n_subjects']} subjects, {best_channels['uniform_source_ch']}→{best_channels['uniform_target_ch']} channels
 """)
+
+        # Generate commands for viable configs with best strategy
+        print("=" * 70)
+        print("PREPROCESSING COMMANDS (for min strategy - most subjects)")
+        print("=" * 70)
+
+        for c in all_configs.get('min', []):
+            if c['viable']:
+                suffix = f"{c['source'][:4]}_{c['target'][:4]}"
+                cmd = generate_preprocessing_command(c, suffix)
+                print(cmd)
+
+                if args.save_configs:
+                    config_path = dataset_dir / f"config_{suffix}.json"
+                    save_configuration(c, config_path)
 
 
 if __name__ == "__main__":
