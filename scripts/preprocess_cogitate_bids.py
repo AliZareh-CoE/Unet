@@ -324,7 +324,7 @@ def preprocess_subject(
     bids_root: Path,
     subject_id: str,
     output_dir: Path,
-    target_sfreq: float = 1000.0,
+    target_sfreq: Optional[float] = None,
     l_freq: Optional[float] = 0.5,
     h_freq: Optional[float] = 200.0,
     notch_freqs: Optional[List[float]] = None,
@@ -335,7 +335,7 @@ def preprocess_subject(
         bids_root: Path to BIDS root
         subject_id: Subject ID
         output_dir: Output directory for processed data
-        target_sfreq: Target sampling frequency (Hz)
+        target_sfreq: Target sampling frequency (Hz), None to keep original
         l_freq: High-pass filter frequency (Hz), None to skip
         h_freq: Low-pass filter frequency (Hz), None to skip
         notch_freqs: List of notch filter frequencies (e.g., [60, 120])
@@ -346,8 +346,9 @@ def preprocess_subject(
     # Load subject data
     data = load_bids_subject(bids_root, subject_id)
     raw = data['raw']
+    original_sfreq = raw.info['sfreq']
 
-    print(f"  Original: {raw.info['sfreq']} Hz, {raw.n_times} samples, {len(raw.ch_names)} channels")
+    print(f"  Original: {original_sfreq} Hz, {raw.n_times} samples, {len(raw.ch_names)} channels")
 
     # Get good SEEG channels only
     channels_df = data['channels']
@@ -367,20 +368,25 @@ def preprocess_subject(
     raw.pick_channels(good_channels)
     print(f"  After channel selection: {len(raw.ch_names)} good SEEG channels")
 
-    # Apply filters
+    # Apply filters (only if specified)
     if l_freq is not None or h_freq is not None:
         raw.filter(l_freq=l_freq, h_freq=h_freq, verbose=False)
         print(f"  Filtered: {l_freq or 0}-{h_freq or 'inf'} Hz")
+    else:
+        print(f"  No filtering applied")
 
-    # Apply notch filter for line noise
+    # Apply notch filter for line noise (only if specified)
     if notch_freqs:
         raw.notch_filter(notch_freqs, verbose=False)
         print(f"  Notch filtered: {notch_freqs} Hz")
 
-    # Resample if needed
-    if raw.info['sfreq'] != target_sfreq:
+    # Resample only if target_sfreq is specified AND different from original
+    if target_sfreq is not None and raw.info['sfreq'] != target_sfreq:
         raw.resample(target_sfreq, verbose=False)
         print(f"  Resampled: {target_sfreq} Hz, {raw.n_times} samples")
+    else:
+        target_sfreq = original_sfreq
+        print(f"  No resampling (keeping {original_sfreq} Hz)")
 
     # Get data as numpy array (channels x time)
     signal_data = raw.get_data()  # Shape: (n_channels, n_samples)
@@ -603,8 +609,8 @@ def main():
     parser.add_argument(
         "--target-sfreq",
         type=float,
-        default=1000.0,
-        help="Target sampling frequency in Hz",
+        default=None,
+        help="Target sampling frequency in Hz (default: keep original)",
     )
 
     parser.add_argument(
@@ -638,6 +644,12 @@ def main():
     )
 
     parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Keep completely raw data (no filtering, no resampling)",
+    )
+
+    parser.add_argument(
         "--no-filter",
         action="store_true",
         help="Skip all filtering (use raw data)",
@@ -645,16 +657,25 @@ def main():
 
     args = parser.parse_args()
 
-    # Handle filter arguments
-    l_freq = None if args.no_filter or args.l_freq == 0 else args.l_freq
-    h_freq = None if args.no_filter or args.h_freq == 0 else args.h_freq
-    notch_freqs = None if args.no_filter else args.notch
+    # Handle --raw flag (no filtering, no resampling)
+    if args.raw:
+        l_freq = None
+        h_freq = None
+        notch_freqs = None
+        target_sfreq = None  # Keep original
+        print("RAW MODE: No filtering, no resampling - keeping original data")
+    else:
+        # Handle filter arguments
+        l_freq = None if args.no_filter or args.l_freq == 0 else args.l_freq
+        h_freq = None if args.no_filter or args.h_freq == 0 else args.h_freq
+        notch_freqs = None if args.no_filter else args.notch
+        target_sfreq = args.target_sfreq
 
     # Run preprocessing
     result = preprocess_all_subjects(
         bids_root=Path(args.bids_root),
         output_dir=Path(args.output_dir),
-        target_sfreq=args.target_sfreq,
+        target_sfreq=target_sfreq,
         l_freq=l_freq,
         h_freq=h_freq,
         notch_freqs=notch_freqs,
