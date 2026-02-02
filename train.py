@@ -1730,6 +1730,79 @@ def train(
         if is_primary():
             print(f"DANDI DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
             print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
+
+    elif config.get("dataset_type") == "cogitate":
+        # COGITATE uses pre-created datasets from prepare_cogitate_data
+        from torch.utils.data import DataLoader
+        from torch.utils.data.distributed import DistributedSampler
+
+        cogitate_datasets = config.get("_cogitate_datasets", {})
+        train_dataset = cogitate_datasets.get("train_dataset")
+        val_dataset = cogitate_datasets.get("val_dataset")
+        test_dataset = cogitate_datasets.get("test_dataset")
+
+        batch_size = config.get("batch_size", 16)
+
+        # Custom collate function to convert COGITATE dict format to tuple
+        def cogitate_collate_fn(batch):
+            """Convert COGITATE batch dict to (source, target, label, session_id) tuple."""
+            sources = torch.stack([item["source"] for item in batch])
+            targets = torch.stack([item["target"] for item in batch])
+            # COGITATE has no conditioning labels, use subject_idx as session
+            labels = torch.zeros(len(batch), dtype=torch.long)
+            session_ids = torch.stack([item["subject_idx"] for item in batch])
+            return sources, targets, labels, session_ids
+
+        # Create samplers for distributed training
+        train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
+
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "collate_fn": cogitate_collate_fn,
+        }
+
+        loaders = {
+            "train": DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
+                drop_last=True,
+                **loader_kwargs,
+            ),
+            "val": DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            ),
+        }
+
+        if test_dataset is not None and len(test_dataset) > 0:
+            test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if is_distributed else None
+            loaders["test"] = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=test_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            )
+
+        # Update in_channels and out_channels from actual data
+        sample_batch = next(iter(loaders["train"]))
+        source_batch, target_batch, *_ = sample_batch
+        config["in_channels"] = source_batch.shape[1]  # [B, C, T]
+        config["out_channels"] = target_batch.shape[1]
+
+        if is_primary():
+            print(f"COGITATE DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
+            print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
+
     else:
         loaders = create_dataloaders(
             data,
@@ -3241,6 +3314,20 @@ def parse_args():
     parser.add_argument("--dandi-data-dir", type=str, default=None,
                         help="Directory containing DANDI NWB files (default: $UNET_DATA_DIR/movie)")
 
+    # COGITATE dataset options (human SEEG)
+    parser.add_argument("--cogitate-source-region", type=str, default="temporal",
+                        help="Source brain region for COGITATE (default: temporal)")
+    parser.add_argument("--cogitate-target-region", type=str, default="frontal",
+                        help="Target brain region for COGITATE (default: frontal)")
+    parser.add_argument("--cogitate-source-channels", type=int, default=23,
+                        help="Number of source channels for COGITATE (default: 23)")
+    parser.add_argument("--cogitate-target-channels", type=int, default=17,
+                        help="Number of target channels for COGITATE (default: 17)")
+    parser.add_argument("--cogitate-window-size", type=int, default=5120,
+                        help="Window size in samples for COGITATE (default: 5120 = 5s at 1024Hz)")
+    parser.add_argument("--cogitate-stride-ratio", type=float, default=0.5,
+                        help="Stride as ratio of window size for COGITATE (default: 0.5)")
+
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Quiet mode: minimal output, no progress bars")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs (default: from config)")
@@ -3981,6 +4068,82 @@ def main():
             print(f"  Val windows: {len(dandi_data['val_dataset'])}")
             print(f"  Test windows: {len(dandi_data['test_dataset'])}")
             print(f"  Source channels: {dandi_data['n_source_channels']}, Target channels: {dandi_data['n_target_channels']}")
+
+    elif args.dataset == "cogitate":
+        # COGITATE human SEEG dataset (visual cognition task)
+        from data import prepare_cogitate_data, _COGITATE_DATA_DIR, COGITATE_SAMPLING_RATE_HZ
+
+        # Calculate stride
+        window_size = args.cogitate_window_size
+        train_stride = int(window_size * args.cogitate_stride_ratio)
+        val_stride = int(window_size * args.val_stride_multiplier)
+
+        # Check for explicit subject holdout (used by LOSO)
+        loso_val_subjects = None
+        loso_test_subjects = None
+        if args.val_sessions:
+            loso_val_subjects = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
+        if is_primary():
+            print(f"\nLoading COGITATE dataset...")
+            print(f"  Data directory: {_COGITATE_DATA_DIR}")
+            print(f"  Source region: {args.cogitate_source_region}")
+            print(f"  Target region: {args.cogitate_target_region}")
+            print(f"  Source channels: {args.cogitate_source_channels}, Target channels: {args.cogitate_target_channels}")
+            print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            if loso_val_subjects:
+                print(f"  [LOSO MODE] Held-out validation subjects: {loso_val_subjects}")
+            if loso_test_subjects:
+                print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
+
+        # Prepare COGITATE data
+        cogitate_data = prepare_cogitate_data(
+            data_dir=_COGITATE_DATA_DIR,
+            source_regions=[args.cogitate_source_region],
+            target_regions=[args.cogitate_target_region],
+            n_source_channels=args.cogitate_source_channels,
+            n_target_channels=args.cogitate_target_channels,
+            window_size=window_size,
+            stride=train_stride,
+            seed=config["seed"],
+            verbose=is_primary(),
+            val_subjects=loso_val_subjects,
+            test_subjects=loso_test_subjects,
+        )
+
+        # Create a minimal data dict for compatibility with training loop
+        data = {
+            "train_idx": list(range(len(cogitate_data["train_dataset"]))),
+            "val_idx": list(range(len(cogitate_data["val_dataset"]))),
+            "test_idx": list(range(len(cogitate_data["test_dataset"]))),
+            "n_odors": 1,  # No conditioning labels
+            "vocab": {"cogitate": 0},  # Placeholder
+        }
+
+        # Store COGITATE-specific config
+        config["dataset_type"] = "cogitate"
+        config["cogitate_sliding_window"] = True
+        config["cogitate_window_size"] = window_size
+        config["cogitate_stride"] = train_stride
+        config["cogitate_val_stride"] = val_stride
+        config["cogitate_source_region"] = args.cogitate_source_region
+        config["cogitate_target_region"] = args.cogitate_target_region
+        config["sampling_rate"] = COGITATE_SAMPLING_RATE_HZ
+
+        # Channel counts
+        config["in_channels"] = cogitate_data["n_source_channels"]
+        config["out_channels"] = cogitate_data["n_target_channels"]
+        config["split_by_session"] = True  # Subject-based splits
+
+        # Store the prepared datasets for later use
+        config["_cogitate_datasets"] = cogitate_data
+
+        if is_primary():
+            print(f"  Train windows: {len(cogitate_data['train_dataset'])}")
+            print(f"  Val windows: {len(cogitate_data['val_dataset'])}")
+            print(f"  Test windows: {len(cogitate_data['test_dataset'])}")
 
     else:
         # Olfactory dataset (default)

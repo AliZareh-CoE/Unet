@@ -235,6 +235,36 @@ def get_all_sessions(
         }
         return sessions, metadata
 
+    elif dataset.startswith("cogitate"):
+        from data import list_cogitate_subjects, _COGITATE_DATA_DIR
+
+        if not _COGITATE_DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"COGITATE data directory not found: {_COGITATE_DATA_DIR}\n"
+                f"Please preprocess COGITATE data first with:\n"
+                f"  python scripts/preprocess_cogitate_bids.py /data/COG_ECOG_EXP1_BIDS "
+                f"--output-dir {_COGITATE_DATA_DIR} --target-sfreq 1024 --no-filter"
+            )
+
+        # Discover subjects from preprocessed data
+        subjects = list_cogitate_subjects(_COGITATE_DATA_DIR)
+        if not subjects:
+            raise FileNotFoundError(
+                f"No preprocessed subjects found in: {_COGITATE_DATA_DIR}"
+            )
+
+        metadata = {
+            "session_type": ds_config.session_type,  # "subject"
+            "description": ds_config.description,
+            "source_region": ds_config.source_region,
+            "target_region": ds_config.target_region,
+            "n_subjects": len(subjects),
+            "in_channels": ds_config.in_channels,
+            "out_channels": ds_config.out_channels,
+            "note": "LOSO holds out entire subjects (Leave-One-Subject-Out)",
+        }
+        return subjects, metadata
+
     else:
         available = ", ".join(DATASET_CONFIGS.keys())
         raise ValueError(
@@ -534,6 +564,17 @@ def run_single_fold(
                 "--pfc-window-size", str(config.pfc_window_size),
                 "--pfc-stride-ratio", str(config.pfc_stride_ratio),
             ])
+
+    elif config.dataset.startswith("cogitate"):
+        # COGITATE-specific: source/target regions and window settings
+        cmd.extend([
+            "--cogitate-source-region", ds_config.source_region,
+            "--cogitate-target-region", ds_config.target_region,
+            "--cogitate-source-channels", str(ds_config.in_channels),
+            "--cogitate-target-channels", str(ds_config.out_channels),
+            "--cogitate-window-size", str(config.cogitate_window_size),
+            "--cogitate-stride-ratio", str(config.cogitate_stride_ratio),
+        ])
 
     # LOSO test session holdout with random train/val split
     # CRITICAL: This prevents data leakage in LOSO cross-validation
@@ -979,7 +1020,8 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1"],
+        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1",
+                 "cogitate_temp_front", "cogitate_temp_front_min", "cogitate_temp_hipp"],
         help="Dataset to use",
     )
     parser.add_argument(

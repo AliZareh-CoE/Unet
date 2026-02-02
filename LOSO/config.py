@@ -136,6 +136,49 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         default_stride_ratio=0.5,
         train_py_dataset_name="pcx1",
     ),
+    # COGITATE configurations (human SEEG)
+    "cogitate_temp_front": DatasetConfig(
+        name="cogitate_temp_front",
+        description="Human SEEG temporal to frontal translation (COGITATE)",
+        session_type="subject",
+        in_channels=23,
+        out_channels=17,
+        sampling_rate=1024,
+        source_region="temporal",
+        target_region="frontal",
+        uses_sliding_window=True,
+        default_window_size=5120,  # 5s at 1024Hz
+        default_stride_ratio=0.5,
+        train_py_dataset_name="cogitate",
+    ),
+    "cogitate_temp_front_min": DatasetConfig(
+        name="cogitate_temp_front_min",
+        description="Human SEEG temporal to frontal (minimal channels, max subjects)",
+        session_type="subject",
+        in_channels=7,
+        out_channels=3,
+        sampling_rate=1024,
+        source_region="temporal",
+        target_region="frontal",
+        uses_sliding_window=True,
+        default_window_size=5120,
+        default_stride_ratio=0.5,
+        train_py_dataset_name="cogitate",
+    ),
+    "cogitate_temp_hipp": DatasetConfig(
+        name="cogitate_temp_hipp",
+        description="Human SEEG temporal to hippocampus (perception to memory)",
+        session_type="subject",
+        in_channels=23,
+        out_channels=4,
+        sampling_rate=1024,
+        source_region="temporal",
+        target_region="hippocampus",
+        uses_sliding_window=True,
+        default_window_size=5120,
+        default_stride_ratio=0.5,
+        train_py_dataset_name="cogitate",
+    ),
 }
 
 
@@ -249,6 +292,10 @@ class LOSOConfig:
     pfc_sliding_window: bool = False
     pfc_window_size: int = 2500
     pfc_stride_ratio: float = 0.5
+
+    # COGITATE dataset options (human SEEG)
+    cogitate_window_size: int = 5120  # 5s at 1024 Hz
+    cogitate_stride_ratio: float = 0.5
 
     def __post_init__(self):
         if isinstance(self.output_dir, str):
