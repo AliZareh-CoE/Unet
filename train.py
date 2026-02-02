@@ -3263,10 +3263,11 @@ def parse_args():
 
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "pcx1", "dandi"],
+                        choices=["olfactory", "pfc", "pcx1", "dandi", "cogitate"],
                         help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
-                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), or "
-                             "'dandi' (DANDI 000623 human iEEG movie watching)")
+                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), "
+                             "'dandi' (DANDI 000623 human iEEG), or "
+                             "'cogitate' (COGITATE human SEEG)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
