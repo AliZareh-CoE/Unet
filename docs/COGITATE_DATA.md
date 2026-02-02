@@ -154,11 +154,58 @@ Strategic analysis of region coverage and sampling rates.
 python scripts/analyze_cogitate_coverage.py /data/COGITATEDataset
 ```
 
+### `scripts/build_cogitate_dataset.py`
+Builds final training datasets with uniform dimensions. Supports three modes:
+
+**Region-to-Region (many-to-many):**
+```bash
+python scripts/build_cogitate_dataset.py /data/COGITATEDataset_1024hz \
+    --source temporal --target frontal \
+    --source-channels 23 --target-channels 17 \
+    --output /data/COGITATE_temp_front
+```
+
+**Multi-Region Source (many-to-one):**
+```bash
+python scripts/build_cogitate_dataset.py /data/COGITATEDataset_1024hz \
+    --source temporal parietal --target hippocampus \
+    --source-channels 30 --target-channels 7 \
+    --output /data/COGITATE_multi_hipp
+```
+
+**Within-Region Interpolation:**
+```bash
+python scripts/build_cogitate_dataset.py /data/COGITATEDataset_1024hz \
+    --source temporal --target temporal \
+    --mode within-region \
+    --source-channels 20 --target-channels 10 \
+    --output /data/COGITATE_temp_interp
+```
+
 ---
 
-## 6. Next Steps
+## 6. Training Modes
 
-### Step 1: Preprocess with Uniform Sampling Rate
+### Mode 1: Region-to-Region Translation
+Translate neural signals between different brain regions.
+- **Use case**: Predict frontal activity from temporal activity
+- **Example**: Perception (temporal) → Executive control (frontal)
+
+### Mode 2: Many-to-One Translation
+Combine multiple source regions to predict a single target region.
+- **Use case**: Integrate information from multiple areas
+- **Example**: Temporal + Parietal → Hippocampus (memory encoding)
+
+### Mode 3: Within-Region Interpolation
+Learn to interpolate missing channels within a region.
+- **Use case**: Reconstruct failed/missing electrodes
+- **Example**: Use 20 temporal channels to reconstruct 10 others
+
+---
+
+## 7. Quick Start Commands
+
+### Step 1: Preprocess (already done)
 
 ```bash
 python scripts/preprocess_cogitate_bids.py /data/COG_ECOG_EXP1_BIDS \
@@ -167,32 +214,35 @@ python scripts/preprocess_cogitate_bids.py /data/COG_ECOG_EXP1_BIDS \
     --no-filter
 ```
 
-### Step 2: Verify Configuration
+### Step 2: Build Training Dataset
 
+**Recommended - Temporal → Frontal (20 subjects):**
 ```bash
-python scripts/create_cogitate_configs.py /data/COGITATEDataset_1024hz --strategy all
+python scripts/build_cogitate_dataset.py /data/COGITATEDataset_1024hz \
+    --source temporal --target frontal \
+    --source-channels 23 --target-channels 17 \
+    --output /data/COGITATE_temp_front_p25
 ```
 
-### Step 3: Create Final Dataset
-
-A new script is needed to:
-1. Extract source/target region channels per subject
-2. Apply uniform channel selection (first N channels or by signal quality)
-3. Segment continuous data into training windows
-4. Create train/val splits compatible with existing DataLoaders
-
-### Step 4: Training
-
-Once the dataset is prepared with uniform dimensions:
+**Alternative - More subjects, fewer channels (32 subjects):**
 ```bash
-python LOSO/runner.py --dataset COGITATEDataset_temp_front \
+python scripts/build_cogitate_dataset.py /data/COGITATEDataset_1024hz \
+    --source temporal --target frontal \
+    --source-channels 7 --target-channels 3 \
+    --output /data/COGITATE_temp_front_min
+```
+
+### Step 3: Training
+
+```bash
+python LOSO/runner.py --dataset COGITATE_temp_front_p25 \
     --source-channels 23 --target-channels 17 \
     --batch-size 32 --epochs 100
 ```
 
 ---
 
-## 7. Key Differences from Existing Datasets
+## 8. Key Differences from Existing Datasets
 
 | Aspect | PCX1 (OB→PCx) | COGITATE |
 |--------|---------------|----------|
@@ -205,7 +255,7 @@ python LOSO/runner.py --dataset COGITATEDataset_temp_front \
 
 ---
 
-## 8. Technical Notes
+## 9. Technical Notes
 
 ### Nyquist Considerations
 - Original 1024 Hz → Nyquist: 512 Hz
