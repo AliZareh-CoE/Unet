@@ -236,7 +236,7 @@ def get_all_sessions(
         return sessions, metadata
 
     elif dataset.startswith("cogitate"):
-        from data import list_cogitate_subjects, _COGITATE_DATA_DIR
+        from data import list_cogitate_subjects, load_cogitate_subject, _COGITATE_DATA_DIR
 
         if not _COGITATE_DATA_DIR.exists():
             raise FileNotFoundError(
@@ -247,23 +247,49 @@ def get_all_sessions(
             )
 
         # Discover subjects from preprocessed data
-        subjects = list_cogitate_subjects(_COGITATE_DATA_DIR)
-        if not subjects:
+        all_subjects = list_cogitate_subjects(_COGITATE_DATA_DIR)
+        if not all_subjects:
             raise FileNotFoundError(
                 f"No preprocessed subjects found in: {_COGITATE_DATA_DIR}"
             )
+
+        # Filter subjects by channel requirements
+        # Only include subjects that have enough channels for the configured translation
+        viable_subjects = []
+        for subj_id in all_subjects:
+            data = load_cogitate_subject(
+                subject_id=subj_id,
+                data_dir=_COGITATE_DATA_DIR,
+                source_regions=[ds_config.source_region],
+                target_regions=[ds_config.target_region],
+                n_source_channels=ds_config.in_channels,
+                n_target_channels=ds_config.out_channels,
+                zscore=False,  # Don't need to z-score for checking
+            )
+            if data is not None:
+                viable_subjects.append(subj_id)
+
+        if not viable_subjects:
+            raise ValueError(
+                f"No subjects have enough channels for {ds_config.source_region}→{ds_config.target_region} "
+                f"({ds_config.in_channels}→{ds_config.out_channels} channels). "
+                f"Try reducing channel requirements or use a different configuration."
+            )
+
+        print(f"  Filtered to {len(viable_subjects)}/{len(all_subjects)} subjects with sufficient channels")
 
         metadata = {
             "session_type": ds_config.session_type,  # "subject"
             "description": ds_config.description,
             "source_region": ds_config.source_region,
             "target_region": ds_config.target_region,
-            "n_subjects": len(subjects),
+            "n_subjects": len(viable_subjects),
+            "n_total_subjects": len(all_subjects),
             "in_channels": ds_config.in_channels,
             "out_channels": ds_config.out_channels,
             "note": "LOSO holds out entire subjects (Leave-One-Subject-Out)",
         }
-        return subjects, metadata
+        return viable_subjects, metadata
 
     else:
         available = ", ".join(DATASET_CONFIGS.keys())

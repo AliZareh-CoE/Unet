@@ -4567,6 +4567,7 @@ def prepare_cogitate_data(
 
     if val_subjects is not None or test_subjects is not None:
         # LOSO mode: explicit subject assignment
+        explicit_val = val_subjects is not None and len(val_subjects) > 0
         val_subjects = val_subjects or []
         test_subjects = test_subjects or []
 
@@ -4580,6 +4581,14 @@ def prepare_cogitate_data(
         train_subjects = [
             s for s in available_subjects if s not in val_subjects and s not in test_subjects
         ]
+
+        # If no explicit val_subjects but we have test_subjects,
+        # do 70/30 split of remaining subjects for train/val
+        if not explicit_val and len(test_subjects) > 0 and len(train_subjects) > 1:
+            n_val = max(1, int(len(train_subjects) * 0.3))
+            np.random.shuffle(train_subjects)
+            val_subjects = train_subjects[:n_val]
+            train_subjects = train_subjects[n_val:]
     else:
         # Random split by subject
         n_subjects = len(available_subjects)
