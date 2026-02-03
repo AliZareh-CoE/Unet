@@ -3328,6 +3328,8 @@ def parse_args():
                         help="Window size in samples for COGITATE (default: 5120 = 5s at 1024Hz)")
     parser.add_argument("--cogitate-stride-ratio", type=float, default=0.5,
                         help="Stride as ratio of window size for COGITATE (default: 0.5)")
+    parser.add_argument("--cogitate-cached-data", type=str, default=None,
+                        help="Path to pre-cached memory-mapped data (fast loading)")
 
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Quiet mode: minimal output, no progress bars")
@@ -4087,9 +4089,15 @@ def main():
         if args.test_sessions:
             loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
 
+        # Check if using cached memory-mapped data (fast loading)
+        use_cached = args.cogitate_cached_data is not None
+
         if is_primary():
             print(f"\nLoading COGITATE dataset...")
-            print(f"  Data directory: {_COGITATE_DATA_DIR}")
+            if use_cached:
+                print(f"  [CACHED MODE] Using memory-mapped data from: {args.cogitate_cached_data}")
+            else:
+                print(f"  Data directory: {_COGITATE_DATA_DIR}")
             print(f"  Source region: {args.cogitate_source_region}")
             print(f"  Target region: {args.cogitate_target_region}")
             print(f"  Source channels: {args.cogitate_source_channels}, Target channels: {args.cogitate_target_channels}")
@@ -4099,20 +4107,32 @@ def main():
             if loso_test_subjects:
                 print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
 
-        # Prepare COGITATE data
-        cogitate_data = prepare_cogitate_data(
-            data_dir=_COGITATE_DATA_DIR,
-            source_regions=[args.cogitate_source_region],
-            target_regions=[args.cogitate_target_region],
-            n_source_channels=args.cogitate_source_channels,
-            n_target_channels=args.cogitate_target_channels,
-            window_size=window_size,
-            stride=train_stride,
-            seed=config["seed"],
-            verbose=is_primary(),
-            val_subjects=loso_val_subjects,
-            test_subjects=loso_test_subjects,
-        )
+        # Prepare COGITATE data - use cached or dynamic loading
+        if use_cached:
+            from data import load_cached_cogitate_data
+            from pathlib import Path
+            cogitate_data = load_cached_cogitate_data(
+                cache_dir=Path(args.cogitate_cached_data),
+                test_subjects=loso_test_subjects or [],
+                val_ratio=0.3,
+                seed=config["seed"],
+                zscore_per_window=False,  # Data is already z-scored in cache
+                verbose=is_primary(),
+            )
+        else:
+            cogitate_data = prepare_cogitate_data(
+                data_dir=_COGITATE_DATA_DIR,
+                source_regions=[args.cogitate_source_region],
+                target_regions=[args.cogitate_target_region],
+                n_source_channels=args.cogitate_source_channels,
+                n_target_channels=args.cogitate_target_channels,
+                window_size=window_size,
+                stride=train_stride,
+                seed=config["seed"],
+                verbose=is_primary(),
+                val_subjects=loso_val_subjects,
+                test_subjects=loso_test_subjects,
+            )
 
         # Create a minimal data dict for compatibility with training loop
         data = {

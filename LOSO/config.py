@@ -296,6 +296,7 @@ class LOSOConfig:
     # COGITATE dataset options (human SEEG)
     cogitate_window_size: int = 5120  # 5s at 1024 Hz
     cogitate_stride_ratio: float = 0.5
+    cogitate_cached_data: Optional[str] = None  # Path to pre-cached memory-mapped data
 
     def __post_init__(self):
         if isinstance(self.output_dir, str):

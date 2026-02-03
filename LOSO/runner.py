@@ -601,6 +601,9 @@ def run_single_fold(
             "--cogitate-window-size", str(config.cogitate_window_size),
             "--cogitate-stride-ratio", str(config.cogitate_stride_ratio),
         ])
+        # Optional: use pre-cached memory-mapped data for fast loading
+        if config.cogitate_cached_data:
+            cmd.extend(["--cogitate-cached-data", config.cogitate_cached_data])
 
     # LOSO test session holdout with random train/val split
     # CRITICAL: This prevents data leakage in LOSO cross-validation
@@ -1201,6 +1204,31 @@ def parse_args() -> argparse.Namespace:
         help="Stride as fraction of window size",
     )
 
+    # COGITATE dataset options (human SEEG)
+    cogitate_group = parser.add_argument_group(
+        "COGITATE Dataset",
+        "Options for COGITATE human SEEG dataset"
+    )
+    cogitate_group.add_argument(
+        "--cogitate-cached-data",
+        type=str,
+        default=None,
+        help="Path to pre-cached memory-mapped data (from cache_cogitate_dataset.py). "
+             "Enables FAST data loading via memory mapping.",
+    )
+    cogitate_group.add_argument(
+        "--cogitate-window-size",
+        type=int,
+        default=5120,
+        help="Window size in samples (at 1024Hz). Default: 5120 = 5s",
+    )
+    cogitate_group.add_argument(
+        "--cogitate-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+
     return parser.parse_args()
 
 
@@ -1260,6 +1288,10 @@ def main():
         pfc_sliding_window=args.pfc_sliding_window,
         pfc_window_size=args.pfc_window_size,
         pfc_stride_ratio=args.pfc_stride_ratio,
+        # COGITATE-specific
+        cogitate_window_size=args.cogitate_window_size,
+        cogitate_stride_ratio=args.cogitate_stride_ratio,
+        cogitate_cached_data=args.cogitate_cached_data,
     )
 
     # Run LOSO

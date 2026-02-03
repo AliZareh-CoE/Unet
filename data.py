@@ -4806,3 +4806,205 @@ def create_cogitate_dataloaders(
         _print_primary(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
 
     return dataloaders
+
+
+# =============================================================================
+# Cached COGITATE Dataset (Memory-Mapped for Fast Loading)
+# =============================================================================
+
+
+class CachedCOGITATEDataset(Dataset):
+    """Memory-mapped COGITATE dataset for fast data loading.
+
+    Uses pre-cached numpy memory-mapped arrays created by cache_cogitate_dataset.py.
+    This eliminates data loading overhead by:
+    - Memory mapping: Direct disk-to-memory access without copying
+    - No worker memory duplication: All workers share the same mmap
+    - OS-level caching: Automatic prefetching by the OS
+
+    Args:
+        cache_dir: Directory containing cached .npy and metadata.json files
+        subject_indices: Optional list of subject indices to include (for LOSO)
+        zscore_per_window: Whether to z-score each window (data may already be z-scored)
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        subject_indices: Optional[List[int]] = None,
+        zscore_per_window: bool = False,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.zscore_per_window = zscore_per_window
+
+        # Load metadata
+        with open(self.cache_dir / "metadata.json") as f:
+            self.metadata = json.load(f)
+
+        self.n_source_channels = self.metadata["n_source_channels"]
+        self.n_target_channels = self.metadata["n_target_channels"]
+        self.window_size = self.metadata["window_size"]
+        self.total_windows = self.metadata["total_windows"]
+        self.subjects = self.metadata["subjects"]
+        self.subject_windows = self.metadata["subject_windows"]
+
+        # Memory-map the arrays (read-only mode)
+        self.source_mmap = np.load(
+            self.cache_dir / "source_windows.npy", mmap_mode="r"
+        )
+        self.target_mmap = np.load(
+            self.cache_dir / "target_windows.npy", mmap_mode="r"
+        )
+
+        # Build window index based on subject filter
+        if subject_indices is not None:
+            # Only include windows from specified subjects
+            self.window_indices = []
+            for subj_idx in subject_indices:
+                sw = self.subject_windows[subj_idx]
+                self.window_indices.extend(
+                    range(sw["window_start_idx"], sw["window_end_idx"])
+                )
+        else:
+            # Include all windows
+            self.window_indices = list(range(self.total_windows))
+
+    def __len__(self) -> int:
+        return len(self.window_indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # Map local index to global window index
+        global_idx = self.window_indices[idx]
+
+        # Direct memory-mapped access (no copy unless needed for modifications)
+        source = self.source_mmap[global_idx]
+        target = self.target_mmap[global_idx]
+
+        # Copy only if we need to modify (z-score)
+        if self.zscore_per_window:
+            source = source.copy()
+            target = target.copy()
+            source = (source - source.mean(axis=1, keepdims=True)) / (
+                source.std(axis=1, keepdims=True) + 1e-8
+            )
+            target = (target - target.mean(axis=1, keepdims=True)) / (
+                target.std(axis=1, keepdims=True) + 1e-8
+            )
+
+        # Find which subject this window belongs to
+        subj_idx = 0
+        for i, sw in enumerate(self.subject_windows):
+            if sw["window_start_idx"] <= global_idx < sw["window_end_idx"]:
+                subj_idx = i
+                break
+
+        return {
+            "source": torch.from_numpy(np.ascontiguousarray(source)).float(),
+            "target": torch.from_numpy(np.ascontiguousarray(target)).float(),
+            "subject_idx": torch.tensor(subj_idx),
+            "window_idx": torch.tensor(global_idx),
+        }
+
+    def get_subject_indices(self, subject_id: str) -> List[int]:
+        """Get local indices for windows belonging to a subject."""
+        for sw in self.subject_windows:
+            if sw["subject_id"] == subject_id:
+                global_start = sw["window_start_idx"]
+                global_end = sw["window_end_idx"]
+                return [
+                    i for i, gi in enumerate(self.window_indices)
+                    if global_start <= gi < global_end
+                ]
+        return []
+
+
+def load_cached_cogitate_data(
+    cache_dir: Path,
+    test_subjects: List[str],
+    val_ratio: float = 0.3,
+    seed: int = 42,
+    zscore_per_window: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Load cached COGITATE dataset with LOSO split.
+
+    Args:
+        cache_dir: Directory containing cached dataset
+        test_subjects: Subjects to hold out for testing (LOSO)
+        val_ratio: Fraction of train windows to use for validation
+        seed: Random seed for train/val split
+        zscore_per_window: Whether to z-score per window
+        verbose: Whether to print info
+
+    Returns:
+        Dictionary with train, val, test datasets and metadata
+    """
+    cache_dir = Path(cache_dir)
+
+    # Load metadata to get subject list
+    with open(cache_dir / "metadata.json") as f:
+        metadata = json.load(f)
+
+    all_subjects = metadata["subjects"]
+    subject_to_idx = {s: i for i, s in enumerate(all_subjects)}
+
+    # Determine train/val subjects (all except test)
+    train_val_subjects = [s for s in all_subjects if s not in test_subjects]
+
+    # Get subject indices
+    test_subject_indices = [subject_to_idx[s] for s in test_subjects if s in subject_to_idx]
+    train_val_indices = [subject_to_idx[s] for s in train_val_subjects]
+
+    if verbose:
+        print(f"COGITATE Cached LOSO:")
+        print(f"  Test subjects: {test_subjects}")
+        print(f"  Train/Val subjects: {len(train_val_subjects)}")
+
+    # Create full dataset for train/val pool
+    full_dataset = CachedCOGITATEDataset(
+        cache_dir,
+        subject_indices=train_val_indices,
+        zscore_per_window=zscore_per_window,
+    )
+
+    # Split train/val at window level (70/30)
+    np.random.seed(seed)
+    n_windows = len(full_dataset)
+    indices = np.random.permutation(n_windows)
+    n_train = int(n_windows * (1 - val_ratio))
+
+    train_indices = indices[:n_train].tolist()
+    val_indices = indices[n_train:].tolist()
+
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+
+    # Create test dataset
+    test_dataset = CachedCOGITATEDataset(
+        cache_dir,
+        subject_indices=test_subject_indices,
+        zscore_per_window=zscore_per_window,
+    )
+
+    # Attach channel info to subsets
+    train_dataset.n_source_channels = full_dataset.n_source_channels
+    train_dataset.n_target_channels = full_dataset.n_target_channels
+    val_dataset.n_source_channels = full_dataset.n_source_channels
+    val_dataset.n_target_channels = full_dataset.n_target_channels
+
+    if verbose:
+        print(f"  Train windows: {len(train_dataset)}")
+        print(f"  Val windows: {len(val_dataset)}")
+        print(f"  Test windows: {len(test_dataset)}")
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "train_subjects": train_val_subjects,
+        "test_subjects": test_subjects,
+        "n_source_channels": metadata["n_source_channels"],
+        "n_target_channels": metadata["n_target_channels"],
+        "window_size": metadata["window_size"],
+        "metadata": metadata,
+    }
