@@ -648,9 +648,9 @@ def save_checkpoint(
                 "cond_mode": config.get("cond_mode", "unknown") if config else "unknown",
             }
 
-            # Save full config for validation
+            # Save full config for validation (exclude internal keys like _cogitate_datasets)
             if config is not None:
-                checkpoint["config"] = config
+                checkpoint["config"] = {k: v for k, v in config.items() if not k.startswith("_")}
 
             # Save split info for validation to use same sessions
             if data is not None:

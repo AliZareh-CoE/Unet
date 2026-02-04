@@ -4876,14 +4876,12 @@ class CachedCOGITATEDataset(Dataset):
         # Map local index to global window index
         global_idx = self.window_indices[idx]
 
-        # Direct memory-mapped access (no copy unless needed for modifications)
-        source = self.source_mmap[global_idx]
-        target = self.target_mmap[global_idx]
+        # Always copy from mmap (read-only) to get writable arrays for PyTorch
+        source = self.source_mmap[global_idx].copy()
+        target = self.target_mmap[global_idx].copy()
 
-        # Copy only if we need to modify (z-score)
+        # Optional z-score normalization
         if self.zscore_per_window:
-            source = source.copy()
-            target = target.copy()
             source = (source - source.mean(axis=1, keepdims=True)) / (
                 source.std(axis=1, keepdims=True) + 1e-8
             )
@@ -4899,8 +4897,8 @@ class CachedCOGITATEDataset(Dataset):
                 break
 
         return {
-            "source": torch.from_numpy(np.ascontiguousarray(source)).float(),
-            "target": torch.from_numpy(np.ascontiguousarray(target)).float(),
+            "source": torch.from_numpy(source).float(),
+            "target": torch.from_numpy(target).float(),
             "subject_idx": torch.tensor(subj_idx),
             "window_idx": torch.tensor(global_idx),
         }
