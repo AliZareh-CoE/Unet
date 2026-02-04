@@ -98,7 +98,7 @@ class Phase1Config:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Validate dataset
-        valid_datasets = {"olfactory", "pfc", "dandi"}
+        valid_datasets = {"olfactory", "pfc", "dandi", "cogitate"}
         if self.dataset not in valid_datasets:
             raise ValueError(f"Invalid dataset: {self.dataset}. Must be one of {valid_datasets}")
 
@@ -183,6 +183,26 @@ class PFCDataConfig:
     @property
     def signal_path(self) -> Path:
         return self.data_dir / self.signal_file
+
+
+@dataclass
+class COGITATEDataConfig:
+    """Configuration specific to the COGITATE human SEEG dataset."""
+
+    data_dir: Path = field(default_factory=lambda: Path("/data/COGITATEDataset_1024hz"))
+
+    # Data dimensions (for temporal→frontal translation)
+    source_channels: int = 23     # Source: temporal lobe
+    target_channels: int = 17     # Target: frontal lobe
+    sample_rate: float = 1024.0   # Hz
+
+    # Default regions for translation
+    source_region: str = "temporal"
+    target_region: str = "frontal"
+
+    # Window settings
+    window_size: int = 5120       # 5s at 1024Hz
+    stride: int = 2560            # 50% overlap
 
 
 # =============================================================================

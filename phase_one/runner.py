@@ -1010,6 +1010,121 @@ def load_raw_dandi_data(
     return X, y, subject_ids, idx_to_subject
 
 
+def load_raw_cogitate_data(
+    window_size: int = 5120,
+    stride: int = 2560,
+    source_region: str = "temporal",
+    target_region: str = "frontal",
+    n_source_channels: int = 23,
+    n_target_channels: int = 17,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) COGITATE data with subject info for LOSO.
+
+    For COGITATE, "sessions" are subjects (subject-based LOSO).
+
+    Args:
+        window_size: Window size in samples (default: 5120 = 5s at 1024Hz)
+        stride: Stride between windows (default: 2560 = 2.5s)
+        source_region: Source brain region (default: temporal)
+        target_region: Target brain region (default: frontal)
+        n_source_channels: Number of source channels required
+        n_target_channels: Number of target channels required
+
+    Returns:
+        X: Raw input signals [N, C, T]
+        y: Raw target signals [N, C, T]
+        subject_ids: Subject ID per window [N]
+        idx_to_subject: Map from subject int ID to subject name
+    """
+    from data import (
+        list_cogitate_subjects,
+        load_cogitate_subject,
+        _COGITATE_DATA_DIR,
+    )
+
+    print("Loading raw COGITATE data for LOSO (no pre-normalization)...")
+    print(f"  Window size: {window_size}, stride: {stride}")
+    print(f"  Regions: {source_region} -> {target_region}")
+    print(f"  Channels: {n_source_channels} source, {n_target_channels} target")
+
+    # Get available subjects
+    all_subject_ids = list_cogitate_subjects(_COGITATE_DATA_DIR)
+    print(f"  Found {len(all_subject_ids)} total subjects")
+
+    # Load all subjects that have sufficient channels
+    subjects_data = []
+    valid_subject_ids = []
+
+    for subj_id in all_subject_ids:
+        try:
+            subj_data = load_cogitate_subject(
+                subject_id=subj_id,
+                data_dir=_COGITATE_DATA_DIR,
+                source_regions=[source_region],
+                target_regions=[target_region],
+                n_source_channels=n_source_channels,
+                n_target_channels=n_target_channels,
+                zscore=False,  # No pre-normalization for LOSO
+            )
+
+            if subj_data is None:
+                print(f"    Skipping {subj_id}: insufficient channels")
+                continue
+
+            subjects_data.append(subj_data)
+            valid_subject_ids.append(subj_id)
+            n_src = subj_data["source"].shape[0]
+            n_tgt = subj_data["target"].shape[0]
+            print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, {subj_data['n_samples']} samples")
+
+        except Exception as e:
+            print(f"    Warning: Could not load {subj_id}: {e}")
+
+    if not subjects_data:
+        raise RuntimeError("No valid COGITATE subjects found!")
+
+    print(f"  Valid subjects: {len(valid_subject_ids)}/{len(all_subject_ids)}")
+
+    # Create subject ID mapping
+    subject_to_idx = {subj_id: idx for idx, subj_id in enumerate(valid_subject_ids)}
+    idx_to_subject = {idx: subj_id for subj_id, idx in subject_to_idx.items()}
+
+    # Create sliding windows for all subjects
+    all_X = []
+    all_y = []
+    all_subject_ids_per_window = []
+
+    for subj_data in subjects_data:
+        subj_id = subj_data["subject_id"]
+        subj_idx = subject_to_idx[subj_id]
+        source = subj_data["source"][:n_source_channels]  # [C, T_total]
+        target = subj_data["target"][:n_target_channels]  # [C, T_total]
+        n_samples = subj_data["n_samples"]
+
+        n_windows = (n_samples - window_size) // stride + 1
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+
+            X_window = source[:, start:end]  # [C, T]
+            y_window = target[:, start:end]  # [C, T]
+
+            all_X.append(X_window)
+            all_y.append(y_window)
+            all_subject_ids_per_window.append(subj_idx)
+
+    # Stack into arrays
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    subject_ids = np.array(all_subject_ids_per_window, dtype=np.int32)
+
+    print(f"  Loaded: {source_region} {X.shape} -> {target_region} {y.shape}")
+    print(f"  Subjects: {len(idx_to_subject)} unique, {len(X)} total windows")
+
+    return X, y, subject_ids, idx_to_subject
+
+
 def run_loso_evaluation(
     config: "Phase1Config",
     dataset: str = "pfc",
@@ -1046,6 +1161,11 @@ def run_loso_evaluation(
     elif dataset == "dandi":
         # For DANDI, "sessions" are subjects (subject-based LOSO)
         X_raw, y_raw, session_ids, idx_to_session = load_raw_dandi_data()
+    elif dataset == "cogitate":
+        # For COGITATE, "sessions" are subjects (subject-based LOSO)
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_cogitate_data()
+        # Update sample rate for COGITATE (1024 Hz)
+        config.sample_rate = 1024.0
     else:
         raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
 
@@ -2606,7 +2726,7 @@ Examples:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc", "dandi"],
+        choices=["olfactory", "pfc", "dandi", "cogitate"],
         help="Dataset to evaluate on (default: olfactory)",
     )
     parser.add_argument(
