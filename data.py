@@ -4939,6 +4939,8 @@ def load_cached_cogitate_data(
     Returns:
         Dictionary with train, val, test datasets and metadata
     """
+    from torch.utils.data import Subset
+
     cache_dir = Path(cache_dir)
 
     # Load metadata to get subject list
