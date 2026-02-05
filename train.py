@@ -126,6 +126,12 @@ from data import (
     DANDI_SAMPLING_RATE_HZ,
     DANDI_BRAIN_REGIONS,
     _DANDI_DATA_DIR,
+    # Miller ECoG Library
+    prepare_ecog_data,
+    list_ecog_subjects,
+    ECOG_SAMPLING_RATE_HZ,
+    ECOG_BRAIN_LOBES,
+    _ECOG_DATA_DIR,
 )
 
 # Phase 2 architecture imports (for --arch flag)
@@ -1730,6 +1736,69 @@ def train(
         if is_primary():
             print(f"DANDI DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
             print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
+    elif config.get("dataset_type") == "ecog":
+        # ECoG uses pre-created datasets from prepare_ecog_data
+        from torch.utils.data import DataLoader
+        from torch.utils.data.distributed import DistributedSampler
+
+        ecog_datasets = config.get("_ecog_datasets", {})
+        train_dataset = ecog_datasets.get("train_dataset")
+        val_dataset = ecog_datasets.get("val_dataset")
+        test_dataset = ecog_datasets.get("test_dataset")
+
+        batch_size = config.get("batch_size", 16)
+
+        # Collate function to convert ECoG dict format to (source, target, label, session_id)
+        def ecog_collate_fn(batch):
+            """Convert ECoG batch dict to (source, target, label, session_id) tuple."""
+            sources = torch.stack([item["source"] for item in batch])
+            targets = torch.stack([item["target"] for item in batch])
+            labels = torch.zeros(len(batch), dtype=torch.long)
+            session_ids = torch.stack([item["subject_idx"] for item in batch])
+            return sources, targets, labels, session_ids
+
+        train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
+
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "collate_fn": ecog_collate_fn,
+        }
+
+        loaders = {
+            "train": DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=(train_sampler is None),
+                sampler=train_sampler,
+                drop_last=True,
+                **loader_kwargs,
+            ),
+            "val": DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=val_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            ),
+        }
+
+        if test_dataset is not None and len(test_dataset) > 0:
+            test_sampler = DistributedSampler(test_dataset, shuffle=False, seed=42) if is_distributed else None
+            loaders["test"] = DataLoader(
+                test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=test_sampler,
+                drop_last=False,
+                **loader_kwargs,
+            )
+
+        if is_primary():
+            print(f"ECoG DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
+            print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
     else:
         loaders = create_dataloaders(
             data,
@@ -3190,10 +3259,11 @@ def parse_args():
 
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "pcx1", "dandi"],
+                        choices=["olfactory", "pfc", "pcx1", "dandi", "ecog"],
                         help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
-                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), or "
-                             "'dandi' (DANDI 000623 human iEEG movie watching)")
+                             "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), "
+                             "'dandi' (DANDI 000623 human iEEG movie watching), or "
+                             "'ecog' (Miller ECoG Library inter-region cortical)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
@@ -3240,6 +3310,24 @@ def parse_args():
                         help="Stride as ratio of window size for DANDI (0.5 = 50%% overlap)")
     parser.add_argument("--dandi-data-dir", type=str, default=None,
                         help="Directory containing DANDI NWB files (default: $UNET_DATA_DIR/movie)")
+
+    # Miller ECoG Library dataset options
+    parser.add_argument("--ecog-experiment", type=str, default="fingerflex",
+                        choices=["fingerflex", "faceshouses", "motor_imagery",
+                                 "joystick_track", "memory_nback"],
+                        help="ECoG Library experiment (default: fingerflex)")
+    parser.add_argument("--ecog-source-region", type=str, default="frontal",
+                        choices=["frontal", "temporal", "parietal"],
+                        help="Source brain lobe for ECoG translation (default: frontal)")
+    parser.add_argument("--ecog-target-region", type=str, default="temporal",
+                        choices=["frontal", "temporal", "parietal"],
+                        help="Target brain lobe for ECoG translation (default: temporal)")
+    parser.add_argument("--ecog-window-size", type=int, default=5000,
+                        help="Window size in samples for ECoG (default: 5000 = 5s at 1kHz)")
+    parser.add_argument("--ecog-stride-ratio", type=float, default=None,
+                        help="Stride as ratio of window size for ECoG (0.5 = 50%% overlap)")
+    parser.add_argument("--ecog-data-dir", type=str, default=None,
+                        help="Directory containing ECoG .npz files (default: $UNET_DATA_DIR/ecog)")
 
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Quiet mode: minimal output, no progress bars")
@@ -3560,6 +3648,12 @@ def main():
             # Wiener residual learning
             wiener_residual=args.wiener_residual,
             wiener_alpha=args.wiener_alpha,
+            # ECoG-specific
+            ecog_experiment=getattr(args, 'ecog_experiment', 'fingerflex'),
+            ecog_source_region=getattr(args, 'ecog_source_region', 'frontal'),
+            ecog_target_region=getattr(args, 'ecog_target_region', 'temporal'),
+            ecog_window_size=getattr(args, 'ecog_window_size', 5000),
+            ecog_stride_ratio=getattr(args, 'ecog_stride_ratio', None) or 0.5,
         )
 
         print("=" * 60)
@@ -3981,6 +4075,87 @@ def main():
             print(f"  Val windows: {len(dandi_data['val_dataset'])}")
             print(f"  Test windows: {len(dandi_data['test_dataset'])}")
             print(f"  Source channels: {dandi_data['n_source_channels']}, Target channels: {dandi_data['n_target_channels']}")
+
+    elif args.dataset == "ecog":
+        # Miller ECoG Library - inter-region cortical translation
+        window_size = args.ecog_window_size
+        if args.ecog_stride_ratio is not None:
+            train_stride = int(window_size * args.ecog_stride_ratio)
+        else:
+            train_stride = window_size // 2  # 50% overlap default
+
+        val_stride = int(window_size * args.val_stride_multiplier)
+
+        ecog_data_dir = Path(args.ecog_data_dir) if args.ecog_data_dir else _ECOG_DATA_DIR
+
+        # Check for explicit subject holdout (used by LOSO)
+        loso_val_subjects = None
+        loso_test_subjects = None
+        if args.val_sessions:
+            loso_val_subjects = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
+        if is_primary():
+            print(f"\nLoading Miller ECoG Library dataset...")
+            print(f"  Data directory: {ecog_data_dir}")
+            print(f"  Experiment: {args.ecog_experiment}")
+            print(f"  Source region: {args.ecog_source_region}")
+            print(f"  Target region: {args.ecog_target_region}")
+            print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            if loso_val_subjects:
+                print(f"  [LOSO MODE] Held-out validation subjects: {loso_val_subjects}")
+            if loso_test_subjects:
+                print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
+
+        ecog_data = prepare_ecog_data(
+            data_dir=ecog_data_dir,
+            experiment=args.ecog_experiment,
+            source_region=args.ecog_source_region,
+            target_region=args.ecog_target_region,
+            window_size=window_size,
+            stride=train_stride,
+            seed=config["seed"],
+            verbose=is_primary(),
+            val_subjects=loso_val_subjects,
+            test_subjects=loso_test_subjects,
+        )
+
+        # Create minimal data dict for compatibility with training loop
+        data = {
+            "train_idx": list(range(len(ecog_data["train_dataset"]))),
+            "val_idx": list(range(len(ecog_data["val_dataset"]))),
+            "test_idx": list(range(len(ecog_data["test_dataset"]))),
+            "n_odors": 1,  # No conditioning labels for ECoG
+            "vocab": {"ecog": 0},  # Placeholder
+        }
+
+        # Store ECoG-specific config
+        config["dataset_type"] = "ecog"
+        config["ecog_sliding_window"] = True
+        config["ecog_window_size"] = window_size
+        config["ecog_stride"] = train_stride
+        config["ecog_val_stride"] = val_stride
+        config["ecog_experiment"] = args.ecog_experiment
+        config["ecog_source_region"] = args.ecog_source_region
+        config["ecog_target_region"] = args.ecog_target_region
+        config["ecog_data_dir"] = str(ecog_data_dir)
+        config["sampling_rate"] = ECOG_SAMPLING_RATE_HZ
+
+        # Channel counts from prepared data
+        config["in_channels"] = ecog_data["n_source_channels"]
+        config["out_channels"] = ecog_data["n_target_channels"]
+        config["split_by_session"] = True  # Subject-based splits
+
+        # Store the prepared datasets for later use
+        config["_ecog_datasets"] = ecog_data
+
+        if is_primary():
+            print(f"  Train windows: {len(ecog_data['train_dataset'])}")
+            print(f"  Val windows: {len(ecog_data['val_dataset'])}")
+            print(f"  Test windows: {len(ecog_data['test_dataset'])}")
+            print(f"  Source channels: {ecog_data['n_source_channels']}, "
+                  f"Target channels: {ecog_data['n_target_channels']}")
 
     else:
         # Olfactory dataset (default)

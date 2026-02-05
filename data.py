@@ -76,6 +76,7 @@ class DatasetType(Enum):
     OLFACTORY = "olfactory"      # OB/PCx dataset
     PFC_HPC = "pfc_hpc"          # PFC/Hippocampus (CA1) dataset
     DANDI_MOVIE = "dandi_movie"  # DANDI 000623: Human iEEG movie watching
+    ECOG = "ecog"                # Miller ECoG Library: inter-region cortical translation
 
 
 # =============================================================================
@@ -171,6 +172,31 @@ DANDI_SUBJECT_IDS = [f"sub-CS{i}" for i in range(41, 63) if i not in [43, 44, 48
 DANDI_TRAIN_SPLIT_PATH = _DANDI_DATA_DIR / "train_indices.npy"
 DANDI_VAL_SPLIT_PATH = _DANDI_DATA_DIR / "val_indices.npy"
 DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
+
+
+# =============================================================================
+# Constants - Miller ECoG Library (Human Subdural ECoG)
+# =============================================================================
+# Reference: Miller, K.J. (2019). A library of human electrocorticographic
+# data and analyses. Nature Human Behaviour, 3(11), 1225-1235.
+# DOI: 10.1038/s41562-019-0678-3
+# Repository: https://purl.stanford.edu/zk881ps0522
+# Preprocessed data via Neuromatch Academy (OSF)
+
+_ECOG_DATA_DIR = _DATA_DIR / "ecog"
+ECOG_SAMPLING_RATE_HZ = 1000  # All recordings at 1kHz
+
+# Available experiments with OSF download URLs
+ECOG_EXPERIMENTS = {
+    "fingerflex": "https://osf.io/5m47z/download",
+    "faceshouses": "https://osf.io/argh7/download",
+    "motor_imagery": "https://osf.io/ksqv8/download",
+    "joystick_track": "https://osf.io/6jncm/download",
+    "memory_nback": "https://osf.io/xfc7e/download",
+}
+
+# Brain lobes for region-based source/target pairing
+ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal"]
 
 
 # =============================================================================
@@ -4208,3 +4234,458 @@ def create_dandi_dataloaders(
     _print_primary(f"  Test: {len(test_dataset)} windows, {len(dataloaders['test'])} batches")
 
     return dataloaders
+
+
+# =============================================================================
+# Miller ECoG Library - Dataset and Loading Functions
+# =============================================================================
+# Inter-region cortical translation using subdural ECoG recordings.
+# Electrodes are grouped by brain lobe (frontal, temporal, parietal, etc.)
+# and paired as source -> target for neural signal translation.
+#
+# Each "subject" in the ECoG dataset is a unique patient with electrodes
+# across multiple brain regions. LOSO holds out entire subjects.
+
+
+def list_ecog_subjects(
+    data_dir: Optional[Path] = None,
+    experiment: str = "fingerflex",
+) -> List[str]:
+    """List available subjects for an ECoG experiment.
+
+    Args:
+        data_dir: Directory containing .npz files (default: _ECOG_DATA_DIR)
+        experiment: Experiment name (default: fingerflex)
+
+    Returns:
+        List of subject identifiers like ["ecog_s00", "ecog_s01", ...]
+    """
+    data_dir = data_dir or _ECOG_DATA_DIR
+    filepath = data_dir / f"{experiment}.npz"
+
+    if not filepath.exists():
+        raise FileNotFoundError(
+            f"ECoG data file not found: {filepath}\n"
+            f"Run: python scripts/download_ecog.py --experiments {experiment}"
+        )
+
+    alldat = np.load(filepath, allow_pickle=True)["dat"]
+    return [f"ecog_s{i:02d}" for i in range(len(alldat))]
+
+
+def _get_ecog_region_channels(
+    dat: dict,
+    source_region: str,
+    target_region: str,
+) -> Tuple[List[int], List[int]]:
+    """Get channel indices for source and target brain regions.
+
+    Electrodes are grouped by their anatomical lobe annotation.
+
+    Args:
+        dat: Single block data dict from the .npz file
+        source_region: Source lobe name (e.g., "frontal")
+        target_region: Target lobe name (e.g., "temporal")
+
+    Returns:
+        Tuple of (source_channel_indices, target_channel_indices)
+    """
+    if "lobe" not in dat:
+        raise ValueError("No anatomical lobe annotations in this dataset")
+
+    V = np.float32(dat["V"])
+    n_channels = V.shape[1]
+    lobes = [str(l).strip().lower() for l in dat["lobe"]]
+
+    source_chs = [i for i, l in enumerate(lobes) if l == source_region.lower() and i < n_channels]
+    target_chs = [i for i, l in enumerate(lobes) if l == target_region.lower() and i < n_channels]
+
+    return source_chs, target_chs
+
+
+def load_ecog_subject(
+    subject_idx: int,
+    data_dir: Optional[Path] = None,
+    experiment: str = "fingerflex",
+    source_region: str = "frontal",
+    target_region: str = "temporal",
+    block_idx: int = 0,
+    zscore: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Load a single subject's ECoG data for inter-region translation.
+
+    Groups electrodes by brain lobe and creates source/target pairs.
+
+    Args:
+        subject_idx: Subject index within the experiment
+        data_dir: Directory containing .npz files
+        experiment: Experiment name
+        source_region: Source brain lobe
+        target_region: Target brain lobe
+        block_idx: Block index within subject (usually 0)
+        zscore: Whether to z-score normalize the data
+
+    Returns:
+        Dict with keys: source, target, subject_id, n_source_channels,
+        n_target_channels, n_samples, metadata. Returns None if subject
+        doesn't have enough channels in both regions.
+    """
+    data_dir = data_dir or _ECOG_DATA_DIR
+    filepath = data_dir / f"{experiment}.npz"
+
+    if not filepath.exists():
+        raise FileNotFoundError(
+            f"ECoG data file not found: {filepath}\n"
+            f"Run: python scripts/download_ecog.py --experiments {experiment}"
+        )
+
+    alldat = np.load(filepath, allow_pickle=True)["dat"]
+
+    if subject_idx >= len(alldat):
+        return None
+
+    n_blocks = len(alldat[subject_idx])
+    if block_idx >= n_blocks:
+        return None
+
+    dat = alldat[subject_idx][block_idx]
+
+    # Get voltage data (stored as float16, convert to float32)
+    V = np.float32(dat["V"])  # (n_samples, n_channels)
+
+    # Get region channel indices
+    if "lobe" not in dat:
+        _print_primary(f"  Warning: Subject {subject_idx} has no lobe annotations, skipping")
+        return None
+
+    source_chs, target_chs = _get_ecog_region_channels(dat, source_region, target_region)
+
+    # Need at least 4 channels in each region for meaningful translation
+    min_channels = 4
+    if len(source_chs) < min_channels or len(target_chs) < min_channels:
+        _print_primary(
+            f"  Subject {subject_idx}: insufficient channels "
+            f"({source_region}={len(source_chs)}, {target_region}={len(target_chs)}), "
+            f"need >= {min_channels} each, skipping"
+        )
+        return None
+
+    # Extract source and target signals: (channels, samples)
+    source = V[:, source_chs].T.copy()  # (n_source_channels, n_samples)
+    target = V[:, target_chs].T.copy()  # (n_target_channels, n_samples)
+
+    # Z-score per channel
+    if zscore:
+        src_mean = source.mean(axis=1, keepdims=True)
+        src_std = source.std(axis=1, keepdims=True) + 1e-8
+        source = (source - src_mean) / src_std
+
+        tgt_mean = target.mean(axis=1, keepdims=True)
+        tgt_std = target.std(axis=1, keepdims=True) + 1e-8
+        target = (target - tgt_mean) / tgt_std
+
+    subject_id = f"ecog_s{subject_idx:02d}"
+
+    # Collect metadata
+    metadata = {
+        "experiment": experiment,
+        "subject_idx": subject_idx,
+        "block_idx": block_idx,
+        "source_region": source_region,
+        "target_region": target_region,
+        "source_channels": source_chs,
+        "target_channels": target_chs,
+        "srate": int(dat.get("srate", ECOG_SAMPLING_RATE_HZ)),
+    }
+
+    # Add anatomical info if available
+    for key in ["gyrus", "Brodmann_Area", "hemisphere"]:
+        if key in dat:
+            metadata[key] = [str(x) for x in dat[key]]
+
+    return {
+        "source": source,
+        "target": target,
+        "subject_id": subject_id,
+        "n_source_channels": len(source_chs),
+        "n_target_channels": len(target_chs),
+        "n_samples": V.shape[0],
+        "metadata": metadata,
+    }
+
+
+class ECoGDataset(Dataset):
+    """PyTorch Dataset for Miller ECoG Library inter-region translation.
+
+    Provides sliding window segments from ECoG recordings for neural signal
+    translation between brain regions (e.g., frontal -> temporal cortex).
+
+    Args:
+        subjects_data: List of subject data dicts from load_ecog_subject()
+        window_size: Size of each window in samples (default: 5000 = 5s at 1kHz)
+        stride: Stride between windows (default: 2500 = 2.5s)
+        zscore_per_window: Whether to z-score each window independently
+        verbose: Whether to print info messages
+        n_source_channels: Fixed number of source channels (None = use min)
+        n_target_channels: Fixed number of target channels (None = use min)
+    """
+
+    def __init__(
+        self,
+        subjects_data: List[Dict[str, Any]],
+        window_size: int = 5000,
+        stride: int = 2500,
+        zscore_per_window: bool = False,
+        verbose: bool = True,
+        n_source_channels: Optional[int] = None,
+        n_target_channels: Optional[int] = None,
+    ):
+        self.window_size = window_size
+        self.stride = stride
+        self.zscore_per_window = zscore_per_window
+
+        # Determine channel counts - use minimum across subjects for consistent shapes
+        if n_source_channels is None:
+            self.n_source_channels = min(s["n_source_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_source_channels = n_source_channels
+
+        if n_target_channels is None:
+            self.n_target_channels = min(s["n_target_channels"] for s in subjects_data) if subjects_data else 0
+        else:
+            self.n_target_channels = n_target_channels
+
+        # Build index of all windows across subjects
+        self.windows = []  # List of (subject_idx, start_sample)
+
+        for subj_idx, subj_data in enumerate(subjects_data):
+            n_samples = subj_data["n_samples"]
+            n_windows = max(0, (n_samples - window_size) // stride + 1)
+
+            for w in range(n_windows):
+                start = w * stride
+                self.windows.append((subj_idx, start))
+
+        self.subjects_data = subjects_data
+
+        if verbose:
+            _print_primary(
+                f"ECoGDataset: {len(subjects_data)} subjects, "
+                f"{len(self.windows)} windows, "
+                f"window_size={window_size}, stride={stride}, "
+                f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}"
+            )
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        subj_idx, start = self.windows[idx]
+        subj_data = self.subjects_data[subj_idx]
+
+        end = start + self.window_size
+
+        # Extract window and truncate to normalized channel counts
+        source = subj_data["source"][:self.n_source_channels, start:end].copy()
+        target = subj_data["target"][:self.n_target_channels, start:end].copy()
+
+        # Optional per-window normalization
+        if self.zscore_per_window:
+            source = (source - source.mean(axis=1, keepdims=True)) / (
+                source.std(axis=1, keepdims=True) + 1e-8
+            )
+            target = (target - target.mean(axis=1, keepdims=True)) / (
+                target.std(axis=1, keepdims=True) + 1e-8
+            )
+
+        return {
+            "source": torch.from_numpy(source).float(),
+            "target": torch.from_numpy(target).float(),
+            "subject_idx": torch.tensor(subj_idx),
+            "start_sample": torch.tensor(start),
+        }
+
+
+def prepare_ecog_data(
+    data_dir: Optional[Path] = None,
+    experiment: str = "fingerflex",
+    source_region: str = "frontal",
+    target_region: str = "temporal",
+    window_size: int = 5000,
+    stride: int = 2500,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+    verbose: bool = True,
+    min_channels: int = 4,
+    val_subjects: Optional[List[str]] = None,
+    test_subjects: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Complete data preparation pipeline for Miller ECoG Library.
+
+    Loads ECoG data, groups electrodes by brain lobe, and creates
+    train/val/test datasets for inter-region neural signal translation.
+
+    Args:
+        data_dir: Directory containing .npz files
+        experiment: Experiment name (fingerflex, faceshouses, etc.)
+        source_region: Source brain lobe for translation
+        target_region: Target brain lobe for translation
+        window_size: Window size in samples
+        stride: Stride between windows
+        train_ratio: Fraction of subjects for training
+        val_ratio: Fraction of subjects for validation
+        seed: Random seed
+        zscore: Whether to z-score normalize
+        verbose: Whether to print progress
+        min_channels: Minimum channels required per region
+        val_subjects: Explicit subjects for validation (LOSO mode)
+        test_subjects: Explicit subjects for testing (LOSO mode)
+
+    Returns:
+        Dictionary with train/val/test datasets and metadata
+    """
+    data_dir = data_dir or _ECOG_DATA_DIR
+
+    if verbose:
+        _print_primary(f"Preparing ECoG Library dataset...")
+        _print_primary(f"  Experiment: {experiment}")
+        _print_primary(f"  Data directory: {data_dir}")
+        _print_primary(f"  Source region: {source_region}")
+        _print_primary(f"  Target region: {target_region}")
+
+    # Load all subjects
+    filepath = data_dir / f"{experiment}.npz"
+    if not filepath.exists():
+        raise FileNotFoundError(
+            f"ECoG data file not found: {filepath}\n"
+            f"Run: python scripts/download_ecog.py --experiments {experiment}"
+        )
+
+    alldat = np.load(filepath, allow_pickle=True)["dat"]
+    all_subject_ids = [f"ecog_s{i:02d}" for i in range(len(alldat))]
+
+    # Load each subject's data
+    subjects_data = []
+    valid_subject_ids = []
+
+    for subj_idx in range(len(alldat)):
+        subj_data = load_ecog_subject(
+            subject_idx=subj_idx,
+            data_dir=data_dir,
+            experiment=experiment,
+            source_region=source_region,
+            target_region=target_region,
+            zscore=zscore,
+        )
+        if subj_data is not None:
+            subjects_data.append(subj_data)
+            valid_subject_ids.append(subj_data["subject_id"])
+
+    if verbose:
+        _print_primary(f"  Valid subjects: {len(valid_subject_ids)}/{len(all_subject_ids)}")
+        _print_primary(f"  Subject IDs: {valid_subject_ids}")
+
+    if len(valid_subject_ids) < 3:
+        raise ValueError(
+            f"Need at least 3 valid subjects for train/val/test split, "
+            f"but only {len(valid_subject_ids)} subjects have >= {min_channels} "
+            f"channels in both {source_region} and {target_region}. "
+            f"Try different region pairs or a different experiment."
+        )
+
+    # Determine train/val/test split
+    if val_subjects is not None or test_subjects is not None:
+        # Explicit subject holdout (LOSO mode)
+        val_subjects = val_subjects or []
+        test_subjects = test_subjects or []
+
+        # Validate subjects exist
+        for subj in val_subjects + test_subjects:
+            if subj not in valid_subject_ids:
+                raise ValueError(
+                    f"Subject '{subj}' not found in valid subjects. "
+                    f"Available: {valid_subject_ids}"
+                )
+
+        holdout = set(val_subjects) | set(test_subjects)
+        train_subject_ids = [s for s in valid_subject_ids if s not in holdout]
+        val_subject_ids = val_subjects
+        test_subject_ids = test_subjects
+
+        if verbose:
+            _print_primary(f"  [LOSO MODE] Explicit subject holdout:")
+            _print_primary(f"    Train: {train_subject_ids}")
+            _print_primary(f"    Val: {val_subject_ids}")
+            _print_primary(f"    Test: {test_subject_ids}")
+    else:
+        # Random split
+        rng = np.random.default_rng(seed)
+        indices = list(range(len(valid_subject_ids)))
+        rng.shuffle(indices)
+
+        n_train = max(1, int(len(indices) * train_ratio))
+        n_val = max(1, int(len(indices) * val_ratio))
+
+        train_subject_ids = [valid_subject_ids[i] for i in indices[:n_train]]
+        val_subject_ids = [valid_subject_ids[i] for i in indices[n_train:n_train + n_val]]
+        test_subject_ids = [valid_subject_ids[i] for i in indices[n_train + n_val:]]
+
+        # Ensure test set has at least one subject
+        if not test_subject_ids and len(val_subject_ids) > 1:
+            test_subject_ids = [val_subject_ids.pop()]
+
+        if verbose:
+            _print_primary(f"  Random split:")
+            _print_primary(f"    Train ({len(train_subject_ids)}): {train_subject_ids}")
+            _print_primary(f"    Val ({len(val_subject_ids)}): {val_subject_ids}")
+            _print_primary(f"    Test ({len(test_subject_ids)}): {test_subject_ids}")
+
+    # Build subject data lists for each split
+    subj_id_to_data = {s["subject_id"]: s for s in subjects_data}
+    train_data = [subj_id_to_data[sid] for sid in train_subject_ids]
+    val_data = [subj_id_to_data[sid] for sid in val_subject_ids]
+    test_data = [subj_id_to_data[sid] for sid in test_subject_ids]
+
+    # Determine normalized channel counts across ALL subjects
+    all_n_src = [s["n_source_channels"] for s in subjects_data]
+    all_n_tgt = [s["n_target_channels"] for s in subjects_data]
+    n_source_channels = min(all_n_src)
+    n_target_channels = min(all_n_tgt)
+
+    if verbose:
+        _print_primary(f"  Normalized channels: source={n_source_channels}, target={n_target_channels}")
+
+    # Create datasets
+    train_dataset = ECoGDataset(
+        train_data, window_size=window_size, stride=stride,
+        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+        verbose=verbose,
+    )
+    val_dataset = ECoGDataset(
+        val_data, window_size=window_size, stride=window_size,  # No overlap for val
+        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+        verbose=verbose,
+    )
+    test_dataset = ECoGDataset(
+        test_data, window_size=window_size, stride=window_size,  # No overlap for test
+        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+        verbose=verbose,
+    )
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "n_source_channels": n_source_channels,
+        "n_target_channels": n_target_channels,
+        "all_subjects": valid_subject_ids,
+        "train_subjects": train_subject_ids,
+        "val_subjects": val_subject_ids,
+        "test_subjects": test_subject_ids,
+        "experiment": experiment,
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": ECOG_SAMPLING_RATE_HZ,
+    }
