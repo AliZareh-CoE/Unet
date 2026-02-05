@@ -4780,16 +4780,80 @@ def prepare_ecog_data(
         _print_primary(f"  Normalized channels: source={n_source_channels}, target={n_target_channels}")
 
     # Create datasets
-    train_dataset = ECoGDataset(
-        train_data, window_size=window_size, stride=stride,
-        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-        verbose=verbose,
-    )
-    val_dataset = ECoGDataset(
-        val_data, window_size=window_size, stride=window_size,
-        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-        verbose=verbose,
-    )
+    # Special handling for LOSO mode: when test_subjects provided but no val_subjects,
+    # create val set by TEMPORALLY splitting training data (not random window split)
+    loso_mode_no_val = (test_subjects is not None and len(test_subjects) > 0 and
+                        (val_subjects is None or len(val_subjects) == 0))
+
+    if loso_mode_no_val and len(train_data) > 0:
+        # LOSO mode: Split raw samples TEMPORALLY first, then create windows
+        # This prevents data leakage from overlapping windows
+        train_portions = []
+        val_portions = []
+        total_train_samples = 0
+        total_val_samples = 0
+
+        for subj_data in train_data:
+            n_samples = subj_data['n_samples']
+            split_point = int(n_samples * 0.7)  # 70% train, 30% val
+
+            train_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, :split_point],
+                'target': subj_data['target'][:, :split_point],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': split_point,
+                'metadata': subj_data['metadata'],
+            })
+            total_train_samples += split_point
+
+            val_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, split_point:],
+                'target': subj_data['target'][:, split_point:],
+                'source_region': subj_data['source_region'],
+                'target_region': subj_data['target_region'],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': n_samples - split_point,
+                'metadata': subj_data['metadata'],
+            })
+            total_val_samples += (n_samples - split_point)
+
+        if verbose:
+            _print_primary(f"  Temporal split: {total_train_samples} train samples, {total_val_samples} val samples")
+
+        train_dataset = ECoGDataset(
+            train_portions, window_size=window_size, stride=stride,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+        val_dataset = ECoGDataset(
+            val_portions, window_size=window_size, stride=window_size,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+
+        if verbose:
+            _print_primary(f"ECoGDataset [LOSO]: {len(train_data)} subjects, "
+                  f"{len(train_dataset)} train + {len(val_dataset)} val windows (NO overlap), "
+                  f"window_size={window_size}, stride={stride}, "
+                  f"source_ch={n_source_channels}, target_ch={n_target_channels}")
+    else:
+        train_dataset = ECoGDataset(
+            train_data, window_size=window_size, stride=stride,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+        val_dataset = ECoGDataset(
+            val_data, window_size=window_size, stride=window_size,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+
     test_dataset = ECoGDataset(
         test_data, window_size=window_size, stride=window_size,
         n_source_channels=n_source_channels, n_target_channels=n_target_channels,
