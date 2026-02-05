@@ -51,7 +51,7 @@ class Phase1Config:
     """Configuration for Phase 1 classical baselines study.
 
     Attributes:
-        dataset: Dataset name ('olfactory', 'pfc', 'dandi')
+        dataset: Dataset name ('olfactory', 'pfc', 'dandi', 'pcx1')
         n_folds: Number of cross-validation folds
         seed: Random seed for reproducibility
         n_bootstrap: Number of bootstrap samples for CI
@@ -98,7 +98,7 @@ class Phase1Config:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Validate dataset
-        valid_datasets = {"olfactory", "pfc", "dandi"}
+        valid_datasets = {"olfactory", "pfc", "dandi", "pcx1"}
         if self.dataset not in valid_datasets:
             raise ValueError(f"Invalid dataset: {self.dataset}. Must be one of {valid_datasets}")
 

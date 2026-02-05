@@ -4,7 +4,8 @@ Phase 1 Runner: Classical Baselines Evaluation
 ===============================================
 
 Main execution script for Phase 1 of the Nature Methods study.
-Evaluates 7 classical signal processing baselines on the olfactory dataset.
+Evaluates 7 classical signal processing baselines on neural datasets.
+Supports: olfactory, pfc, dandi, and pcx1 datasets.
 
 3-Fold × 3-Seed Strategy:
 - 3-fold session-based cross-validation (9 sessions → 3 groups of 3)
@@ -830,6 +831,103 @@ def load_dandi_data() -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Opti
     return X, y, train_idx, val_idx, test_idx, None
 
 
+def load_pcx1_data(
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+    n_val_sessions: int = 3,
+    seed: int = 42,
+) -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load PCx1 continuous dataset (OB -> PCx translation) with session-based splits.
+
+    PCx1 is a continuous 1kHz LFP dataset. This function:
+    1. Loads all sessions
+    2. Creates sliding windows from continuous data
+    3. Performs session-based train/val split (cross-subject evaluation)
+    4. Tracks which windows belong to which session for per-session metrics
+
+    Args:
+        window_size: Window size in samples (5000 = 5 seconds at 1kHz)
+        stride_ratio: Stride as fraction of window size (0.5 = 50% overlap)
+        n_val_sessions: Number of sessions to hold out for validation
+        seed: Random seed for session split
+
+    Returns:
+        X: Input signals (OB) [N, C, T]
+        y: Target signals (PCx) [N, C, T]
+        train_idx: Training window indices
+        val_idx: Validation window indices
+        test_idx: Test indices (empty for cross-subject mode)
+        val_idx_per_session: Dict mapping session name -> validation window indices
+    """
+    from data import list_pcx1_sessions, load_pcx1_session
+
+    print(f"Loading PCx1 continuous dataset (cross-subject: {n_val_sessions} held-out sessions)...")
+
+    # Get all sessions and create random split
+    all_sessions = list_pcx1_sessions()
+    rng = np.random.default_rng(seed)
+    rng.shuffle(all_sessions)
+
+    # Split sessions
+    val_sessions = all_sessions[:n_val_sessions]
+    train_sessions = all_sessions[n_val_sessions:]
+
+    print(f"  Train sessions: {train_sessions}")
+    print(f"  Val sessions: {val_sessions}")
+
+    stride = int(window_size * stride_ratio)
+
+    # Load and window all sessions
+    all_X = []
+    all_y = []
+    window_to_session = []  # Track which session each window belongs to
+
+    for sess_name in all_sessions:
+        sess_data = load_pcx1_session(sess_name)
+        ob = sess_data['ob']   # [C, T_total]
+        pcx = sess_data['pcx'] # [C, T_total]
+
+        n_samples = ob.shape[1]
+        n_windows = max(0, (n_samples - window_size) // stride + 1)
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+            all_X.append(ob[:, start:end])
+            all_y.append(pcx[:, start:end])
+            window_to_session.append(sess_name)
+
+    # Stack into arrays
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    window_to_session = np.array(window_to_session)
+
+    # Create train/val indices based on session membership
+    train_mask = np.isin(window_to_session, train_sessions)
+    val_mask = np.isin(window_to_session, val_sessions)
+
+    train_idx = np.where(train_mask)[0]
+    val_idx = np.where(val_mask)[0]
+    test_idx = np.array([], dtype=np.int64)  # No separate test set for cross-subject
+
+    # Build per-session val indices for per-session metrics
+    val_idx_per_session = {}
+    val_idx_set = set(val_idx)
+    for sess_name in val_sessions:
+        sess_mask = window_to_session == sess_name
+        sess_indices = np.where(sess_mask)[0]
+        sess_val_idx = np.array([i for i in sess_indices if i in val_idx_set])
+        if len(sess_val_idx) > 0:
+            val_idx_per_session[sess_name] = sess_val_idx
+
+    print(f"  Loaded: OB {X.shape} -> PCx {y.shape}")
+    print(f"  Train: {len(train_idx)} windows, Val: {len(val_idx)} windows, Test: {len(test_idx)}")
+    for sess_name, sess_idx in val_idx_per_session.items():
+        print(f"    Val session {sess_name}: {len(sess_idx)} windows")
+
+    return X, y, train_idx, val_idx, test_idx, val_idx_per_session
+
+
 # =============================================================================
 # LOSO (Leave-One-Session-Out) Functions
 # =============================================================================
@@ -1010,6 +1108,62 @@ def load_raw_dandi_data(
     return X, y, subject_ids, idx_to_subject
 
 
+def load_raw_pcx1_data(
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) PCx1 continuous data with session info for LOSO.
+
+    Creates sliding windows from continuous recordings and tracks session membership.
+
+    Args:
+        window_size: Window size in samples (5000 = 5 seconds at 1kHz)
+        stride_ratio: Stride as fraction of window size (0.5 = 50% overlap)
+
+    Returns:
+        X: Raw input signals (OB) [N, C, T]
+        y: Raw target signals (PCx) [N, C, T]
+        session_ids: Session ID per window [N]
+        idx_to_session: Map from session int ID to session name
+    """
+    from data import list_pcx1_sessions, load_pcx1_session
+
+    print("Loading raw PCx1 continuous data for LOSO (no pre-normalization)...")
+
+    sessions = list_pcx1_sessions()
+    stride = int(window_size * stride_ratio)
+
+    all_X = []
+    all_y = []
+    all_session_ids = []
+    session_to_idx = {s: i for i, s in enumerate(sessions)}
+    idx_to_session = {i: s for i, s in enumerate(sessions)}
+
+    for sess_idx, sess_name in enumerate(sessions):
+        sess_data = load_pcx1_session(sess_name)
+        ob = sess_data['ob']   # [C, T_total]
+        pcx = sess_data['pcx'] # [C, T_total]
+
+        n_samples = ob.shape[1]
+        n_windows = max(0, (n_samples - window_size) // stride + 1)
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+            all_X.append(ob[:, start:end])
+            all_y.append(pcx[:, start:end])
+            all_session_ids.append(sess_idx)
+
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    session_ids = np.array(all_session_ids, dtype=np.int32)
+
+    print(f"  Loaded: OB {X.shape} -> PCx {y.shape}")
+    print(f"  Sessions: {len(idx_to_session)} unique, {len(X)} windows")
+
+    return X, y, session_ids, idx_to_session
+
+
 def run_loso_evaluation(
     config: "Phase1Config",
     dataset: str = "pfc",
@@ -1024,7 +1178,7 @@ def run_loso_evaluation(
 
     Args:
         config: Phase1 configuration
-        dataset: Dataset name ('pfc', 'olfactory')
+        dataset: Dataset name ('pfc', 'olfactory', 'dandi', 'pcx1')
 
     Returns:
         Phase1Result with aggregated metrics
@@ -1046,6 +1200,9 @@ def run_loso_evaluation(
     elif dataset == "dandi":
         # For DANDI, "sessions" are subjects (subject-based LOSO)
         X_raw, y_raw, session_ids, idx_to_session = load_raw_dandi_data()
+    elif dataset == "pcx1":
+        # PCx1 continuous dataset - creates sliding windows, session-based LOSO
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_pcx1_data()
     else:
         raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
 
@@ -2606,7 +2763,7 @@ Examples:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc", "dandi"],
+        choices=["olfactory", "pfc", "dandi", "pcx1"],
         help="Dataset to evaluate on (default: olfactory)",
     )
     parser.add_argument(
@@ -2844,6 +3001,8 @@ Examples:
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pfc_data()
             elif config.dataset == "dandi":
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_dandi_data()
+            elif config.dataset == "pcx1":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pcx1_data(seed=config.seed)
             else:  # olfactory (default)
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
 
