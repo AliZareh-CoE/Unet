@@ -183,7 +183,7 @@ DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
 # Repository: https://purl.stanford.edu/zk881ps0522
 # Preprocessed data via Neuromatch Academy (OSF)
 
-_ECOG_DATA_DIR = _DATA_DIR / "ecog"
+_ECOG_DATA_DIR = _DATA_DIR / "ECoG"
 ECOG_SAMPLING_RATE_HZ = 1000  # All recordings at 1kHz
 
 # Available experiments with OSF download URLs
@@ -196,7 +196,9 @@ ECOG_EXPERIMENTS = {
 }
 
 # Brain lobes for region-based source/target pairing
-ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal"]
+# Raw lobe annotations in the data are e.g. "Frontal Lobe", "Temporal Lobe" etc.
+# We normalize to lowercase single-word keys.
+ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
 
 
 # =============================================================================
@@ -4243,22 +4245,120 @@ def create_dandi_dataloaders(
 # Electrodes are grouped by brain lobe (frontal, temporal, parietal, etc.)
 # and paired as source -> target for neural signal translation.
 #
-# Each "subject" in the ECoG dataset is a unique patient with electrodes
-# across multiple brain regions. LOSO holds out entire subjects.
+# Data format (OSF/Neuromatch preprocessed NPZ files):
+#   alldat = np.load('exp.npz', allow_pickle=True)['dat']
+#   alldat.shape = (n_subjects, n_blocks)  — 2D object array
+#   alldat[subj][block] -> dict with keys:
+#     'V': float16 (n_samples, n_channels) — voltage data
+#     'srate': int or [[int]] — sampling rate (format varies!)
+#     'lobe': list of str — e.g. "Frontal Lobe", "Temporal Lobe"
+#     'gyrus', 'Brodmann_Area', 'hemisphere', 'locs': anatomical info
+#     (experiment-specific keys: 'dg', 'stim_id', 't_on', 't_off', etc.)
+#
+# IMPORTANT: Some experiments (fingerflex, joystick_track) store different
+# patients as "blocks" of a single "subject" row. We detect this by checking
+# if channel counts vary across blocks (different electrode grids = different
+# patients). These blocks are unpacked into separate subjects automatically.
+
+
+def _parse_ecog_lobe(raw_lobe: str) -> str:
+    """Normalize a raw lobe annotation to a canonical lowercase name.
+
+    The data contains strings like "Frontal Lobe", "Temporal Lobe",
+    "Limbic Lobe", "Sub-lobar", "Anterior Lobe", etc.
+
+    Returns:
+        Canonical lobe name: frontal, temporal, parietal, occipital,
+        limbic, sub-lobar, or the lowercased input if unrecognized.
+    """
+    s = raw_lobe.strip().lower()
+    for known in ("frontal", "temporal", "parietal", "occipital", "limbic"):
+        if known in s:
+            return known
+    if "sub-lobar" in s or "sub lobar" in s:
+        return "sub-lobar"
+    # "Anterior Lobe" (cerebellum) and other rare cases
+    return s
+
+
+def _parse_ecog_srate(dat: dict) -> int:
+    """Extract sampling rate from a block dict, handling format variations.
+
+    The srate field can be: int, float, np.int64, np.ndarray([[1000]]),
+    or missing entirely.
+    """
+    sr = dat.get("srate", ECOG_SAMPLING_RATE_HZ)
+    if isinstance(sr, np.ndarray):
+        return int(sr.flat[0])
+    return int(sr)
+
+
+def _enumerate_ecog_recordings(
+    alldat: np.ndarray,
+) -> List[Tuple[int, int, str]]:
+    """Enumerate all individual recordings (patient x block) in an experiment.
+
+    Some experiments pack multiple patients as blocks of 1 "subject" row
+    (detectable when channel counts differ across blocks). This function
+    returns a flat list of (subject_row, block_col, recording_id) where
+    recording_id is unique per patient.
+
+    Returns:
+        List of (row_idx, col_idx, recording_id) tuples
+    """
+    n_subj, n_blocks = alldat.shape
+    recordings = []
+
+    for si in range(n_subj):
+        # Check if blocks within this subject have varying channel counts
+        # (indicating they are actually different patients)
+        block_channels = []
+        for bi in range(n_blocks):
+            dat = alldat[si][bi]
+            if dat is not None and "V" in dat:
+                block_channels.append(np.float32(dat["V"]).shape[1])
+
+        blocks_are_patients = (
+            len(set(block_channels)) > 1 and n_subj == 1
+        )
+
+        for bi in range(n_blocks):
+            dat = alldat[si][bi]
+            if dat is None:
+                continue
+            if "V" not in dat:
+                continue
+
+            if blocks_are_patients:
+                rec_id = f"ecog_s{si:02d}_b{bi:02d}"
+            elif n_subj > 1:
+                rec_id = f"ecog_s{si:02d}"
+            else:
+                rec_id = f"ecog_s{si:02d}_b{bi:02d}"
+
+            recordings.append((si, bi, rec_id))
+
+    return recordings
 
 
 def list_ecog_subjects(
     data_dir: Optional[Path] = None,
     experiment: str = "fingerflex",
 ) -> List[str]:
-    """List available subjects for an ECoG experiment.
+    """List available subject/recording identifiers for an ECoG experiment.
+
+    For multi-subject experiments (faceshouses, motor_imagery, memory_nback),
+    returns one ID per subject using block 0.
+    For single-subject experiments where blocks are different patients
+    (fingerflex, joystick_track), returns one ID per block.
 
     Args:
         data_dir: Directory containing .npz files (default: _ECOG_DATA_DIR)
-        experiment: Experiment name (default: fingerflex)
+        experiment: Experiment name
 
     Returns:
-        List of subject identifiers like ["ecog_s00", "ecog_s01", ...]
+        List of recording identifiers like ["ecog_s00", "ecog_s01", ...] or
+        ["ecog_s00_b00", "ecog_s00_b01", ...] for block-as-patient experiments.
     """
     data_dir = data_dir or _ECOG_DATA_DIR
     filepath = data_dir / f"{experiment}.npz"
@@ -4270,7 +4370,21 @@ def list_ecog_subjects(
         )
 
     alldat = np.load(filepath, allow_pickle=True)["dat"]
-    return [f"ecog_s{i:02d}" for i in range(len(alldat))]
+    recordings = _enumerate_ecog_recordings(alldat)
+
+    # For multi-subject experiments, deduplicate to one entry per subject row
+    # (use first block only). For block-as-patient, each block is unique.
+    n_subj = alldat.shape[0]
+    if n_subj > 1:
+        seen = set()
+        unique = []
+        for si, bi, rec_id in recordings:
+            if si not in seen:
+                seen.add(si)
+                unique.append(rec_id)
+        return unique
+    else:
+        return [rec_id for _, _, rec_id in recordings]
 
 
 def _get_ecog_region_channels(
@@ -4281,90 +4395,91 @@ def _get_ecog_region_channels(
     """Get channel indices for source and target brain regions.
 
     Electrodes are grouped by their anatomical lobe annotation.
+    Raw lobe strings (e.g. "Frontal Lobe") are normalized via _parse_ecog_lobe.
 
     Args:
         dat: Single block data dict from the .npz file
-        source_region: Source lobe name (e.g., "frontal")
-        target_region: Target lobe name (e.g., "temporal")
+        source_region: Canonical lobe name (e.g., "frontal")
+        target_region: Canonical lobe name (e.g., "temporal")
 
     Returns:
         Tuple of (source_channel_indices, target_channel_indices)
     """
     if "lobe" not in dat:
-        raise ValueError("No anatomical lobe annotations in this dataset")
+        return [], []
 
     V = np.float32(dat["V"])
     n_channels = V.shape[1]
-    lobes = [str(l).strip().lower() for l in dat["lobe"]]
+    lobes = [_parse_ecog_lobe(str(l)) for l in dat["lobe"]]
 
-    source_chs = [i for i, l in enumerate(lobes) if l == source_region.lower() and i < n_channels]
-    target_chs = [i for i, l in enumerate(lobes) if l == target_region.lower() and i < n_channels]
+    src = source_region.lower()
+    tgt = target_region.lower()
+
+    source_chs = [i for i, l in enumerate(lobes) if l == src and i < n_channels]
+    target_chs = [i for i, l in enumerate(lobes) if l == tgt and i < n_channels]
 
     return source_chs, target_chs
 
 
 def load_ecog_subject(
-    subject_idx: int,
+    subject_idx: int = 0,
+    block_idx: int = 0,
     data_dir: Optional[Path] = None,
     experiment: str = "fingerflex",
     source_region: str = "frontal",
     target_region: str = "temporal",
-    block_idx: int = 0,
     zscore: bool = True,
+    min_channels: int = 4,
+    _alldat: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Load a single subject's ECoG data for inter-region translation.
+    """Load a single recording's ECoG data for inter-region translation.
 
     Groups electrodes by brain lobe and creates source/target pairs.
 
     Args:
-        subject_idx: Subject index within the experiment
+        subject_idx: Subject row index in the NPZ array
+        block_idx: Block column index in the NPZ array
         data_dir: Directory containing .npz files
         experiment: Experiment name
-        source_region: Source brain lobe
-        target_region: Target brain lobe
-        block_idx: Block index within subject (usually 0)
+        source_region: Source brain lobe (canonical name)
+        target_region: Target brain lobe (canonical name)
         zscore: Whether to z-score normalize the data
+        min_channels: Minimum channels required per region
+        _alldat: Pre-loaded alldat array (avoids re-reading the file)
 
     Returns:
         Dict with keys: source, target, subject_id, n_source_channels,
-        n_target_channels, n_samples, metadata. Returns None if subject
-        doesn't have enough channels in both regions.
+        n_target_channels, n_samples, metadata. Returns None if the
+        recording doesn't have enough channels in both regions.
     """
-    data_dir = data_dir or _ECOG_DATA_DIR
-    filepath = data_dir / f"{experiment}.npz"
+    if _alldat is None:
+        data_dir = data_dir or _ECOG_DATA_DIR
+        filepath = data_dir / f"{experiment}.npz"
+        if not filepath.exists():
+            raise FileNotFoundError(
+                f"ECoG data file not found: {filepath}\n"
+                f"Run: python scripts/download_ecog.py --experiments {experiment}"
+            )
+        _alldat = np.load(filepath, allow_pickle=True)["dat"]
 
-    if not filepath.exists():
-        raise FileNotFoundError(
-            f"ECoG data file not found: {filepath}\n"
-            f"Run: python scripts/download_ecog.py --experiments {experiment}"
-        )
-
-    alldat = np.load(filepath, allow_pickle=True)["dat"]
-
-    if subject_idx >= len(alldat):
+    if subject_idx >= _alldat.shape[0]:
+        return None
+    if block_idx >= _alldat.shape[1]:
         return None
 
-    n_blocks = len(alldat[subject_idx])
-    if block_idx >= n_blocks:
+    dat = _alldat[subject_idx][block_idx]
+    if dat is None or "V" not in dat:
         return None
-
-    dat = alldat[subject_idx][block_idx]
 
     # Get voltage data (stored as float16, convert to float32)
     V = np.float32(dat["V"])  # (n_samples, n_channels)
 
     # Get region channel indices
-    if "lobe" not in dat:
-        _print_primary(f"  Warning: Subject {subject_idx} has no lobe annotations, skipping")
-        return None
-
     source_chs, target_chs = _get_ecog_region_channels(dat, source_region, target_region)
 
-    # Need at least 4 channels in each region for meaningful translation
-    min_channels = 4
     if len(source_chs) < min_channels or len(target_chs) < min_channels:
         _print_primary(
-            f"  Subject {subject_idx}: insufficient channels "
+            f"  S{subject_idx} B{block_idx}: insufficient channels "
             f"({source_region}={len(source_chs)}, {target_region}={len(target_chs)}), "
             f"need >= {min_channels} each, skipping"
         )
@@ -4384,24 +4499,19 @@ def load_ecog_subject(
         tgt_std = target.std(axis=1, keepdims=True) + 1e-8
         target = (target - tgt_mean) / tgt_std
 
-    subject_id = f"ecog_s{subject_idx:02d}"
+    subject_id = f"ecog_s{subject_idx:02d}" if _alldat.shape[0] > 1 else f"ecog_s{subject_idx:02d}_b{block_idx:02d}"
+    srate = _parse_ecog_srate(dat)
 
-    # Collect metadata
     metadata = {
         "experiment": experiment,
         "subject_idx": subject_idx,
         "block_idx": block_idx,
         "source_region": source_region,
         "target_region": target_region,
-        "source_channels": source_chs,
-        "target_channels": target_chs,
-        "srate": int(dat.get("srate", ECOG_SAMPLING_RATE_HZ)),
+        "n_source_channels_raw": len(source_chs),
+        "n_target_channels_raw": len(target_chs),
+        "srate": srate,
     }
-
-    # Add anatomical info if available
-    for key in ["gyrus", "Brodmann_Area", "hemisphere"]:
-        if key in dat:
-            metadata[key] = [str(x) for x in dat[key]]
 
     return {
         "source": source,
@@ -4470,7 +4580,7 @@ class ECoGDataset(Dataset):
 
         if verbose:
             _print_primary(
-                f"ECoGDataset: {len(subjects_data)} subjects, "
+                f"ECoGDataset: {len(subjects_data)} recordings, "
                 f"{len(self.windows)} windows, "
                 f"window_size={window_size}, stride={stride}, "
                 f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}"
@@ -4527,6 +4637,13 @@ def prepare_ecog_data(
     Loads ECoG data, groups electrodes by brain lobe, and creates
     train/val/test datasets for inter-region neural signal translation.
 
+    Handles the two data layout patterns in the NPZ files:
+    - Multi-subject: alldat.shape = (N, B) where N > 1 subjects, B blocks each.
+      Each subject uses block 0 (longest/primary recording).
+    - Single-subject with block-as-patient: alldat.shape = (1, B) where blocks
+      have different channel counts (= different patients). Each block becomes
+      a separate "subject" for LOSO.
+
     Args:
         data_dir: Directory containing .npz files
         experiment: Experiment name (fingerflex, faceshouses, etc.)
@@ -4555,7 +4672,7 @@ def prepare_ecog_data(
         _print_primary(f"  Source region: {source_region}")
         _print_primary(f"  Target region: {target_region}")
 
-    # Load all subjects
+    # Load NPZ file once
     filepath = data_dir / f"{experiment}.npz"
     if not filepath.exists():
         raise FileNotFoundError(
@@ -4564,33 +4681,40 @@ def prepare_ecog_data(
         )
 
     alldat = np.load(filepath, allow_pickle=True)["dat"]
-    all_subject_ids = [f"ecog_s{i:02d}" for i in range(len(alldat))]
+    recordings = _enumerate_ecog_recordings(alldat)
 
-    # Load each subject's data
+    if verbose:
+        _print_primary(f"  NPZ shape: {alldat.shape} ({len(recordings)} recordings)")
+
+    # Load each recording
     subjects_data = []
     valid_subject_ids = []
 
-    for subj_idx in range(len(alldat)):
+    for si, bi, rec_id in recordings:
         subj_data = load_ecog_subject(
-            subject_idx=subj_idx,
-            data_dir=data_dir,
+            subject_idx=si,
+            block_idx=bi,
             experiment=experiment,
             source_region=source_region,
             target_region=target_region,
             zscore=zscore,
+            min_channels=min_channels,
+            _alldat=alldat,
         )
         if subj_data is not None:
+            # Override subject_id with the recording_id from enumeration
+            subj_data["subject_id"] = rec_id
             subjects_data.append(subj_data)
-            valid_subject_ids.append(subj_data["subject_id"])
+            valid_subject_ids.append(rec_id)
 
     if verbose:
-        _print_primary(f"  Valid subjects: {len(valid_subject_ids)}/{len(all_subject_ids)}")
-        _print_primary(f"  Subject IDs: {valid_subject_ids}")
+        _print_primary(f"  Valid recordings: {len(valid_subject_ids)}/{len(recordings)}")
+        _print_primary(f"  IDs: {valid_subject_ids}")
 
     if len(valid_subject_ids) < 3:
         raise ValueError(
-            f"Need at least 3 valid subjects for train/val/test split, "
-            f"but only {len(valid_subject_ids)} subjects have >= {min_channels} "
+            f"Need at least 3 valid recordings for train/val/test split, "
+            f"but only {len(valid_subject_ids)} have >= {min_channels} "
             f"channels in both {source_region} and {target_region}. "
             f"Try different region pairs or a different experiment."
         )
@@ -4601,11 +4725,10 @@ def prepare_ecog_data(
         val_subjects = val_subjects or []
         test_subjects = test_subjects or []
 
-        # Validate subjects exist
         for subj in val_subjects + test_subjects:
             if subj not in valid_subject_ids:
                 raise ValueError(
-                    f"Subject '{subj}' not found in valid subjects. "
+                    f"Subject '{subj}' not found in valid recordings. "
                     f"Available: {valid_subject_ids}"
                 )
 
@@ -4632,7 +4755,6 @@ def prepare_ecog_data(
         val_subject_ids = [valid_subject_ids[i] for i in indices[n_train:n_train + n_val]]
         test_subject_ids = [valid_subject_ids[i] for i in indices[n_train + n_val:]]
 
-        # Ensure test set has at least one subject
         if not test_subject_ids and len(val_subject_ids) > 1:
             test_subject_ids = [val_subject_ids.pop()]
 
@@ -4648,7 +4770,7 @@ def prepare_ecog_data(
     val_data = [subj_id_to_data[sid] for sid in val_subject_ids]
     test_data = [subj_id_to_data[sid] for sid in test_subject_ids]
 
-    # Determine normalized channel counts across ALL subjects
+    # Determine normalized channel counts across ALL valid recordings
     all_n_src = [s["n_source_channels"] for s in subjects_data]
     all_n_tgt = [s["n_target_channels"] for s in subjects_data]
     n_source_channels = min(all_n_src)
@@ -4664,12 +4786,12 @@ def prepare_ecog_data(
         verbose=verbose,
     )
     val_dataset = ECoGDataset(
-        val_data, window_size=window_size, stride=window_size,  # No overlap for val
+        val_data, window_size=window_size, stride=window_size,
         n_source_channels=n_source_channels, n_target_channels=n_target_channels,
         verbose=verbose,
     )
     test_dataset = ECoGDataset(
-        test_data, window_size=window_size, stride=window_size,  # No overlap for test
+        test_data, window_size=window_size, stride=window_size,
         n_source_channels=n_source_channels, n_target_channels=n_target_channels,
         verbose=verbose,
     )

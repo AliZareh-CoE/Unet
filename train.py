@@ -3327,7 +3327,7 @@ def parse_args():
     parser.add_argument("--ecog-stride-ratio", type=float, default=None,
                         help="Stride as ratio of window size for ECoG (0.5 = 50%% overlap)")
     parser.add_argument("--ecog-data-dir", type=str, default=None,
-                        help="Directory containing ECoG .npz files (default: $UNET_DATA_DIR/ecog)")
+                        help="Directory containing ECoG .npz files (default: $UNET_DATA_DIR/ECoG)")
 
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Quiet mode: minimal output, no progress bars")

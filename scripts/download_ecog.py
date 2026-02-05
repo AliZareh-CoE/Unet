@@ -20,7 +20,7 @@ Usage:
     python scripts/download_ecog.py --explore
 
     # Specify output directory
-    python scripts/download_ecog.py --output-dir /data/ecog
+    python scripts/download_ecog.py --output-dir /data/ECoG
 """
 
 from __future__ import annotations
@@ -40,28 +40,32 @@ ECOG_EXPERIMENTS = {
     "fingerflex": {
         "url": "https://osf.io/5m47z/download",
         "description": "Cued individual finger flexion with dataglove",
-        "n_subjects": 9,
+        "n_subjects": 1,  # 1 subject row, 3 blocks (different patients packed as blocks)
+        "n_blocks": 3,
         "task_type": "motor",
         "has_behavioral": True,
     },
     "faceshouses": {
         "url": "https://osf.io/argh7/download",
         "description": "Face vs. house visual perception (400ms stimuli)",
-        "n_subjects": 7,
+        "n_subjects": 7,  # 7 subjects, 2 blocks each (session 1: basic, session 2: noise)
+        "n_blocks": 2,
         "task_type": "visual",
         "has_behavioral": False,
     },
     "motor_imagery": {
         "url": "https://osf.io/ksqv8/download",
         "description": "Motor execution, motor imagery, and imagery feedback",
-        "n_subjects": 1,
+        "n_subjects": 7,  # 7 subjects, 2 blocks each (execution, imagery)
+        "n_blocks": 2,
         "task_type": "motor",
         "has_behavioral": False,
     },
     "joystick_track": {
         "url": "https://osf.io/6jncm/download",
         "description": "2D joystick tracking of moving target",
-        "n_subjects": 4,
+        "n_subjects": 1,  # 1 subject row, 4 blocks (different patients packed as blocks)
+        "n_blocks": 4,
         "task_type": "motor",
         "has_behavioral": True,
     },
@@ -162,27 +166,41 @@ def explore_experiment(name: str, filepath: Path) -> Dict:
             if "V" in dat:
                 V = np.float32(dat["V"])
                 n_samples, n_channels = V.shape
-                srate = dat.get("srate", 1000)
+                # srate can be int, float, or nested ndarray like [[1000]]
+                srate_raw = dat.get("srate", 1000)
+                if isinstance(srate_raw, np.ndarray):
+                    srate = int(srate_raw.flat[0])
+                else:
+                    srate = int(srate_raw)
                 duration_s = n_samples / srate
 
                 block_info.update({
                     "n_samples": n_samples,
                     "n_channels": n_channels,
-                    "srate": int(srate),
+                    "srate": srate,
                     "duration_s": float(duration_s),
                 })
 
                 print(f"    Block {block_idx}: {n_channels} channels, "
                       f"{n_samples} samples ({duration_s:.1f}s), "
-                      f"srate={int(srate)}Hz")
+                      f"srate={srate}Hz")
                 print(f"      Keys: {list(dat.keys())}")
 
-            # Anatomical info
+            # Anatomical info - parse lobe names to canonical form
             if "lobe" in dat:
                 lobes = dat["lobe"]
-                unique_lobes = list(set(str(l) for l in lobes if str(l).strip()))
-                block_info["lobes"] = unique_lobes
-                print(f"      Lobes: {unique_lobes}")
+                # Count channels per lobe (normalized)
+                lobe_counts = {}
+                for l in lobes:
+                    lname = str(l).strip().lower()
+                    for known in ("frontal", "temporal", "parietal", "occipital", "limbic"):
+                        if known in lname:
+                            lname = known
+                            break
+                    lobe_counts[lname] = lobe_counts.get(lname, 0) + 1
+                block_info["lobe_counts"] = lobe_counts
+                lobes_str = ", ".join(f"{k}: {v}ch" for k, v in sorted(lobe_counts.items()))
+                print(f"      Lobes: {lobes_str}")
 
             if "gyrus" in dat:
                 gyri = dat["gyrus"]
@@ -313,7 +331,7 @@ Examples:
         "--output-dir",
         type=str,
         default=None,
-        help="Output directory (default: $UNET_DATA_DIR/ecog or /data/ecog)",
+        help="Output directory (default: $UNET_DATA_DIR/ECoG or /data/ECoG)",
     )
     parser.add_argument(
         "--experiments",
@@ -355,7 +373,7 @@ Examples:
         output_dir = Path(args.output_dir)
     else:
         data_dir = Path(os.environ.get("UNET_DATA_DIR", "/data"))
-        output_dir = data_dir / "ecog"
+        output_dir = data_dir / "ECoG"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"ECoG data directory: {output_dir}")
