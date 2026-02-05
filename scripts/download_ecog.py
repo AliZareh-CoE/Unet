@@ -213,7 +213,17 @@ def explore_experiment(name: str, filepath: Path) -> Dict:
 
             if "Brodmann_Area" in dat:
                 bas = dat["Brodmann_Area"]
-                unique_bas = sorted(set(int(b) for b in bas if not np.isnan(float(b))))
+                unique_bas = set()
+                for b in bas:
+                    try:
+                        val = float(b)
+                        if not np.isnan(val):
+                            unique_bas.add(int(val))
+                    except (ValueError, TypeError):
+                        # String like "Brodmann area 8" - keep as-is
+                        if b and str(b).strip():
+                            unique_bas.add(str(b).strip())
+                unique_bas = sorted(unique_bas, key=str)
                 block_info["brodmann_areas"] = unique_bas
                 print(f"      Brodmann Areas: {unique_bas}")
 
