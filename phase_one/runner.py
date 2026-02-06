@@ -1274,7 +1274,8 @@ def load_raw_ecog_data(
 
     for row, col, rec_id in recordings:
         subj_data = load_ecog_subject(
-            rec_id,
+            row,
+            block_idx=col,
             data_dir=_ECOG_DATA_DIR,
             experiment=experiment,
             source_region=source_region,
