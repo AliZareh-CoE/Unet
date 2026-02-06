@@ -184,7 +184,7 @@ DANDI_TEST_SPLIT_PATH = _DANDI_DATA_DIR / "test_indices.npy"
 # Preprocessed data via Neuromatch Academy (OSF)
 
 _ECOG_DATA_DIR = _DATA_DIR / "ECoG"
-ECOG_SAMPLING_RATE_HZ = 1000  # All recordings at 1kHz
+ECOG_SAMPLING_RATE_HZ = 1000  # All recordings at 1kHz (verified from actual data, fallback only)
 
 # Available experiments with OSF download URLs
 ECOG_EXPERIMENTS = {
@@ -4869,5 +4869,5 @@ def prepare_ecog_data(
         "experiment": experiment,
         "source_region": source_region,
         "target_region": target_region,
-        "sampling_rate": ECOG_SAMPLING_RATE_HZ,
+        "sampling_rate": _parse_ecog_srate(alldat[0, 0]) if alldat.size > 0 else ECOG_SAMPLING_RATE_HZ,
     }
