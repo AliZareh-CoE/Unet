@@ -138,6 +138,7 @@ def analyze_ecog_recording(
     window_size: int = 5000,
     stride: int = 2500,
     min_channels: int = 4,
+    verbose: bool = True,
 ) -> Optional[Dict]:
     """Analyze baseline inter-region relationship for one ECoG recording.
 
@@ -151,6 +152,7 @@ def analyze_ecog_recording(
         window_size: Window size in samples
         stride: Stride between windows
         min_channels: Minimum channels per region
+        verbose: Whether to print per-recording details
 
     Returns:
         Dict of results, or None if recording has insufficient channels.
@@ -175,26 +177,33 @@ def analyze_ecog_recording(
 
     # Use min channels for consistent comparison
     n_ch = min(len(source_chs), len(target_chs))
-    source = V[:, source_chs[:n_ch]].T  # (C, T)
-    target = V[:, target_chs[:n_ch]].T  # (C, T)
+    source = V[:, source_chs[:n_ch]].T.astype(np.float64)  # (C, T) - float64 to avoid overflow
+    target = V[:, target_chs[:n_ch]].T.astype(np.float64)  # (C, T)
+
+    # Clean inf/nan values
+    source = np.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
+    target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
 
     srate = _parse_ecog_srate(dat)
     subject_id = f"s{subject_idx:02d}_b{block_idx:02d}"
 
-    print(f"\nAnalyzing ECoG {experiment} {subject_id}: "
-          f"{source_region}({len(source_chs)}ch) -> {target_region}({len(target_chs)}ch)")
-    print(f"  Using {n_ch} matched channels, {V.shape[0]} samples ({V.shape[0]/srate:.1f}s), srate={srate}Hz")
-    print(f"  Source range: [{source.min():.2f}, {source.max():.2f}], std={source.std():.2f}")
-    print(f"  Target range: [{target.min():.2f}, {target.max():.2f}], std={target.std():.2f}")
+    if verbose:
+        print(f"\nAnalyzing ECoG {experiment} {subject_id}: "
+              f"{source_region}({len(source_chs)}ch) -> {target_region}({len(target_chs)}ch)")
+        print(f"  Using {n_ch} matched channels, {V.shape[0]} samples ({V.shape[0]/srate:.1f}s), srate={srate}Hz")
+        print(f"  Source range: [{source.min():.2f}, {source.max():.2f}], std={source.std():.2f}")
+        print(f"  Target range: [{target.min():.2f}, {target.max():.2f}], std={target.std():.2f}")
 
     n_samples = source.shape[1]
     n_windows = (n_samples - window_size) // stride + 1
 
     if n_windows < 1:
-        print(f"  Too short for windowed analysis (need >= {window_size} samples)")
+        if verbose:
+            print(f"  Too short for windowed analysis (need >= {window_size} samples)")
         return None
 
-    print(f"  Windows: {n_windows} (size={window_size}, stride={stride})")
+    if verbose:
+        print(f"  Windows: {n_windows} (size={window_size}, stride={stride})")
 
     window_corrs = []
     window_r2s = []
@@ -228,11 +237,20 @@ def analyze_ecog_recording(
         band_powers[f"source_{band_name}_rel"] = float(np.sum(src_psd[mask]) / total_src)
         band_powers[f"target_{band_name}_rel"] = float(np.sum(tgt_psd[mask]) / total_tgt)
 
-    # SNR estimation
-    src_noise = np.var(np.diff(source, axis=1))
-    tgt_noise = np.var(np.diff(target, axis=1))
-    src_snr = float(np.var(source) / (src_noise + 1e-10))
-    tgt_snr = float(np.var(target) / (tgt_noise + 1e-10))
+    # SNR estimation (use per-channel to avoid cross-channel variance inflation)
+    src_snrs = []
+    tgt_snrs = []
+    for c in range(n_ch):
+        s_var = np.var(source[c])
+        s_noise = np.var(np.diff(source[c]))
+        if s_noise > 1e-10 and np.isfinite(s_var) and np.isfinite(s_noise):
+            src_snrs.append(s_var / s_noise)
+        t_var = np.var(target[c])
+        t_noise = np.var(np.diff(target[c]))
+        if t_noise > 1e-10 and np.isfinite(t_var) and np.isfinite(t_noise):
+            tgt_snrs.append(t_var / t_noise)
+    src_snr = float(np.mean(src_snrs)) if src_snrs else 0.0
+    tgt_snr = float(np.mean(tgt_snrs)) if tgt_snrs else 0.0
 
     results = {
         "subject_id": subject_id,
@@ -259,9 +277,10 @@ def analyze_ecog_recording(
         **band_powers,
     }
 
-    print(f"  Baseline correlation: r={results['corr_mean']:.3f} +/- {results['corr_std']:.3f}")
-    print(f"  Baseline R2: {results['r2_mean']:.3f} +/- {results['r2_std']:.3f}")
-    print(f"  SNR: source={src_snr:.2f}, target={tgt_snr:.2f}")
+    if verbose:
+        print(f"  Baseline correlation: r={results['corr_mean']:.3f} +/- {results['corr_std']:.3f}")
+        print(f"  Baseline R2: {results['r2_mean']:.3f} +/- {results['r2_std']:.3f}")
+        print(f"  SNR: source={src_snr:.2f}, target={tgt_snr:.2f}")
 
     return results
 
@@ -374,7 +393,7 @@ If model r < baseline r: Something is wrong
         for row, col, rec_id in recordings:
             r = analyze_ecog_recording(
                 row, col, alldat, experiment, src, tgt,
-                window_size, stride,
+                window_size, stride, verbose=False,
             )
             if r is not None:
                 pair_results.append(r)
