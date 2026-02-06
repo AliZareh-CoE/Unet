@@ -293,18 +293,12 @@ def run_ecog_analysis(
     stride: int = 2500,
 ):
     """Run baseline analysis for the ECoG dataset."""
+    import json
     from data import (
         _ECOG_DATA_DIR,
         _enumerate_ecog_recordings,
-        ECOG_EXPERIMENTS,
+        ECOG_BRAIN_LOBES,
     )
-
-    print("=" * 70)
-    print(f"BASELINE ANALYSIS: ECoG {experiment} ({source_region} -> {target_region})")
-    print("=" * 70)
-    print("\nThis shows what correlation exists between brain regions")
-    print("WITHOUT any model - just raw signal comparison.")
-    print("Your model needs to BEAT these numbers to be useful.\n")
 
     npz_path = _ECOG_DATA_DIR / f"{experiment}.npz"
     if not npz_path.exists():
@@ -313,103 +307,86 @@ def run_ecog_analysis(
 
     alldat = np.load(npz_path, allow_pickle=True)["dat"]
     recordings = _enumerate_ecog_recordings(alldat)
-    print(f"Found {len(recordings)} recordings in {experiment}")
+    print(f"ECoG {experiment}: {len(recordings)} recordings, analyzing {source_region} -> {target_region}...")
 
+    # Primary pair analysis
     all_results = []
     for row, col, rec_id in recordings:
         try:
             results = analyze_ecog_recording(
                 row, col, alldat, experiment,
                 source_region, target_region,
-                window_size, stride,
+                window_size, stride, verbose=False,
             )
             if results is not None:
                 all_results.append(results)
         except Exception as e:
-            print(f"  ERROR on {rec_id}: {e}")
+            pass  # Skip failures silently
 
     if not all_results:
-        print("\nNo valid recordings found! Try different region pairs.")
+        print("No valid recordings found! Try different region pairs.")
         return
-
-    # Summary table
-    print("\n" + "=" * 70)
-    print(f"SUMMARY: Baseline {source_region} -> {target_region} (no model)")
-    print("=" * 70)
-    print(f"\n{'Subject':<12} {'Src Ch':<8} {'Tgt Ch':<8} {'Corr (r)':<16} {'R2':<16} {'Windows':<8} {'SNR(s/t)'}")
-    print("-" * 90)
-
-    for r in all_results:
-        print(f"{r['subject_id']:<12} {r['n_source_channels']:<8} {r['n_target_channels']:<8} "
-              f"{r['corr_mean']:.3f} +/- {r['corr_std']:.3f}   "
-              f"{r['r2_mean']:.3f} +/- {r['r2_std']:.3f}   "
-              f"{r['n_windows']:<8} {r['source_snr']:.1f}/{r['target_snr']:.1f}")
 
     all_corrs = [r["corr_mean"] for r in all_results]
     all_r2s = [r["r2_mean"] for r in all_results]
 
-    print("-" * 90)
-    print(f"{'OVERALL':<12} {'':8} {'':8} "
-          f"{np.mean(all_corrs):.3f} +/- {np.std(all_corrs):.3f}   "
-          f"{np.mean(all_r2s):.3f} +/- {np.std(all_r2s):.3f}")
+    # All region pairs comparison
+    all_pairs_summary = {}
+    all_pairs_data = {}
 
-    # Spectral summary
-    print(f"\n{'Band':<10} {'Source Power':<14} {'Target Power':<14}")
-    print("-" * 38)
-    for band in ["delta", "theta", "alpha", "beta", "gamma"]:
-        src_vals = [r[f"source_{band}_rel"] for r in all_results]
-        tgt_vals = [r[f"target_{band}_rel"] for r in all_results]
-        print(f"{band:<10} {np.mean(src_vals):.4f}         {np.mean(tgt_vals):.4f}")
+    all_pairs_summary[f"{source_region} -> {target_region}"] = {
+        "corr": float(np.mean(all_corrs)),
+        "r2": float(np.mean(all_r2s)),
+        "n_valid": len(all_results),
+    }
+    all_pairs_data[f"{source_region}_{target_region}"] = all_results
 
-    print("\n" + "=" * 70)
-    print("INTERPRETATION")
-    print("=" * 70)
-    print(f"""
-Baseline correlation (raw {source_region} vs {target_region}): r = {np.mean(all_corrs):.3f}
-Baseline R2: {np.mean(all_r2s):.3f}
-
-If model r > baseline r: Model is learning useful transformations
-If model r ~ baseline r: Model might just be passing through signal
-If model r < baseline r: Something is wrong
-""")
-
-    # Also test other region pairs for comparison
-    from data import ECOG_BRAIN_LOBES
-    other_pairs = []
     for src in ECOG_BRAIN_LOBES:
         for tgt in ECOG_BRAIN_LOBES:
-            if src != tgt and (src, tgt) != (source_region, target_region):
-                other_pairs.append((src, tgt))
+            if src == tgt or (src, tgt) == (source_region, target_region):
+                continue
+            pair_results = []
+            for row, col, rec_id in recordings:
+                r = analyze_ecog_recording(
+                    row, col, alldat, experiment, src, tgt,
+                    window_size, stride, verbose=False,
+                )
+                if r is not None:
+                    pair_results.append(r)
+            if pair_results:
+                pair_corrs = [r["corr_mean"] for r in pair_results]
+                pair_r2s = [r["corr_mean"] for r in pair_results]
+                all_pairs_summary[f"{src} -> {tgt}"] = {
+                    "corr": float(np.mean(pair_corrs)),
+                    "r2": float(np.mean([r["r2_mean"] for r in pair_results])),
+                    "n_valid": len(pair_results),
+                }
+                all_pairs_data[f"{src}_{tgt}"] = pair_results
 
-    print("=" * 70)
-    print("QUICK COMPARISON: Other region pairs")
-    print("=" * 70)
-    print(f"\n{'Pair':<30} {'Corr (r)':<12} {'R2':<12} {'N_valid'}")
-    print("-" * 65)
-    print(f"{source_region} -> {target_region:<20} {np.mean(all_corrs):.3f}        {np.mean(all_r2s):.3f}        {len(all_results)}")
+    # Print compact summary
+    print(f"\nBaseline {source_region} -> {target_region}: r={np.mean(all_corrs):.3f}, R2={np.mean(all_r2s):.3f} ({len(all_results)} recordings)")
 
-    for src, tgt in other_pairs:
-        pair_results = []
-        for row, col, rec_id in recordings:
-            r = analyze_ecog_recording(
-                row, col, alldat, experiment, src, tgt,
-                window_size, stride, verbose=False,
-            )
-            if r is not None:
-                pair_results.append(r)
-        if pair_results:
-            pair_corrs = [r["corr_mean"] for r in pair_results]
-            pair_r2s = [r["r2_mean"] for r in pair_results]
-            print(f"{src} -> {tgt:<20} {np.mean(pair_corrs):.3f}        {np.mean(pair_r2s):.3f}        {len(pair_results)}")
+    print(f"\n{'Pair':<30} {'Corr':<8} {'R2':<8} {'N'}")
+    print("-" * 50)
+    for pair, s in sorted(all_pairs_summary.items(), key=lambda x: x[1]["corr"], reverse=True):
+        marker = " <--" if pair == f"{source_region} -> {target_region}" else ""
+        print(f"{pair:<30} {s['corr']:.3f}    {s['r2']:.3f}    {s['n_valid']}{marker}")
 
-    # Save results
-    import json
+    # Save everything to JSON
     output_dir = Path("results/baseline")
     output_dir.mkdir(parents=True, exist_ok=True)
+
     output_file = output_dir / f"ecog_{experiment}_{source_region}_{target_region}.json"
+    save_data = {
+        "experiment": experiment,
+        "primary_pair": f"{source_region} -> {target_region}",
+        "summary": all_pairs_summary,
+        "primary_results": all_results,
+        "all_pairs_results": {k: v for k, v in all_pairs_data.items()},
+    }
     with open(output_file, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nResults saved to {output_file}")
+        json.dump(save_data, f, indent=2)
+    print(f"\nSaved to {output_file}")
 
 
 def run_pcx1_analysis():
