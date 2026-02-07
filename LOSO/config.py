@@ -136,6 +136,20 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         default_stride_ratio=0.5,
         train_py_dataset_name="pcx1",
     ),
+    "ecog": DatasetConfig(
+        name="ecog",
+        description="Miller ECoG Library: inter-region cortical translation",
+        session_type="subject",  # LOSO holds out entire subjects
+        in_channels=0,  # Variable - detected at runtime
+        out_channels=0,  # Variable - detected at runtime
+        sampling_rate=1000,
+        source_region="frontal",  # Default, can be changed
+        target_region="temporal",  # Default, can be changed
+        uses_sliding_window=True,
+        default_window_size=5000,
+        default_stride_ratio=0.5,
+        train_py_dataset_name="ecog",
+    ),
 }
 
 
@@ -250,6 +264,13 @@ class LOSOConfig:
     pfc_window_size: int = 2500
     pfc_stride_ratio: float = 0.5
 
+    # Miller ECoG Library dataset options
+    ecog_experiment: str = "fingerflex"
+    ecog_source_region: str = "frontal"
+    ecog_target_region: str = "temporal"
+    ecog_window_size: int = 5000
+    ecog_stride_ratio: float = 0.5
+
     def __post_init__(self):
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
@@ -276,6 +297,11 @@ class LOSOConfig:
         elif self.dataset == "pcx1":
             ds_config.default_window_size = self.pcx1_window_size
             ds_config.default_stride_ratio = self.pcx1_stride_ratio
+        elif self.dataset == "ecog":
+            ds_config.source_region = self.ecog_source_region
+            ds_config.target_region = self.ecog_target_region
+            ds_config.default_window_size = self.ecog_window_size
+            ds_config.default_stride_ratio = self.ecog_stride_ratio
 
         return ds_config
 
@@ -470,6 +496,11 @@ class LOSOResult:
         if self.config.dataset == "dandi_movie":
             print(f"\nNote: Leave-One-Subject-Out CV (each fold holds out one human subject)")
             print(f"      Source: {self.config.dandi_source_region}, Target: {self.config.dandi_target_region}")
+        elif self.config.dataset == "ecog":
+            print(f"\nNote: Leave-One-Subject-Out CV on Miller ECoG Library")
+            print(f"      Experiment: {self.config.ecog_experiment}")
+            print(f"      Source: {self.config.ecog_source_region} cortex, "
+                  f"Target: {self.config.ecog_target_region} cortex")
 
     def _print_per_session_summary(self) -> None:
         """Print per-session correlation summary across all folds."""

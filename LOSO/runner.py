@@ -235,6 +235,52 @@ def get_all_sessions(
         }
         return sessions, metadata
 
+    elif dataset == "ecog":
+        from data import list_ecog_subjects, _ECOG_DATA_DIR
+
+        # Get experiment and region from config
+        experiment = "fingerflex"
+        source_region = ds_config.source_region
+        target_region = ds_config.target_region
+        if config is not None:
+            experiment = config.ecog_experiment
+            source_region = config.ecog_source_region
+            target_region = config.ecog_target_region
+
+        if not _ECOG_DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"ECoG data directory not found: {_ECOG_DATA_DIR}\n"
+                f"Run: python scripts/download_ecog.py --experiments {experiment}"
+            )
+
+        # Get all subjects and filter to those with valid regions
+        all_subjects = list_ecog_subjects(data_dir=_ECOG_DATA_DIR, experiment=experiment)
+
+        # Filter subjects that have enough channels in both regions
+        from data import load_ecog_subject
+        valid_subjects = []
+        for subj_idx, subj_id in enumerate(all_subjects):
+            subj_data = load_ecog_subject(
+                subject_idx=subj_idx,
+                data_dir=_ECOG_DATA_DIR,
+                experiment=experiment,
+                source_region=source_region,
+                target_region=target_region,
+            )
+            if subj_data is not None:
+                valid_subjects.append(subj_id)
+
+        metadata = {
+            "session_type": ds_config.session_type,  # "subject"
+            "description": ds_config.description,
+            "source_region": source_region,
+            "target_region": target_region,
+            "experiment": experiment,
+            "n_subjects": len(valid_subjects),
+            "note": "LOSO holds out entire subjects (Leave-One-Subject-Out)",
+        }
+        return valid_subjects, metadata
+
     else:
         available = ", ".join(DATASET_CONFIGS.keys())
         raise ValueError(
@@ -268,7 +314,15 @@ def validate_sessions(
         )
 
     # Dataset-specific validations
-    if dataset == "dandi_movie":
+    if dataset == "ecog":
+        # Validate ECoG source/target regions
+        if config.ecog_source_region == config.ecog_target_region:
+            raise ValueError(
+                f"Source and target regions must be different. "
+                f"Both are set to '{config.ecog_source_region}'."
+            )
+
+    elif dataset == "dandi_movie":
         # Validate DANDI source/target regions
         valid_regions = ["amygdala", "hippocampus", "medial_frontal_cortex"]
 
@@ -534,6 +588,17 @@ def run_single_fold(
                 "--pfc-window-size", str(config.pfc_window_size),
                 "--pfc-stride-ratio", str(config.pfc_stride_ratio),
             ])
+
+    elif config.dataset == "ecog":
+        # ECoG-specific: experiment, regions, and window settings
+        cmd.extend([
+            "--ecog-experiment", config.ecog_experiment,
+            "--ecog-source-region", config.ecog_source_region,
+            "--ecog-target-region", config.ecog_target_region,
+            "--ecog-window-size", str(config.ecog_window_size),
+            "--ecog-stride-ratio", str(config.ecog_stride_ratio),
+        ])
+        # For ECoG, the --test-sessions will be treated as subject IDs
 
     # LOSO test session holdout with random train/val split
     # CRITICAL: This prevents data leakage in LOSO cross-validation
@@ -979,7 +1044,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1"],
+        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1", "ecog"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -1133,6 +1198,46 @@ def parse_args() -> argparse.Namespace:
         help="Stride as fraction of window size",
     )
 
+    # Miller ECoG Library dataset options
+    ecog_group = parser.add_argument_group(
+        "Miller ECoG Library",
+        "Options for Miller ECoG Library inter-region cortical translation"
+    )
+    ecog_group.add_argument(
+        "--ecog-experiment",
+        type=str,
+        default="fingerflex",
+        choices=["fingerflex", "faceshouses", "motor_imagery",
+                 "joystick_track", "memory_nback"],
+        help="ECoG Library experiment",
+    )
+    ecog_group.add_argument(
+        "--ecog-source-region",
+        type=str,
+        default="frontal",
+        choices=["frontal", "temporal", "parietal"],
+        help="Source brain lobe for translation",
+    )
+    ecog_group.add_argument(
+        "--ecog-target-region",
+        type=str,
+        default="temporal",
+        choices=["frontal", "temporal", "parietal"],
+        help="Target brain lobe for translation",
+    )
+    ecog_group.add_argument(
+        "--ecog-window-size",
+        type=int,
+        default=5000,
+        help="Window size in samples (at 1kHz)",
+    )
+    ecog_group.add_argument(
+        "--ecog-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+
     return parser.parse_args()
 
 
@@ -1192,6 +1297,12 @@ def main():
         pfc_sliding_window=args.pfc_sliding_window,
         pfc_window_size=args.pfc_window_size,
         pfc_stride_ratio=args.pfc_stride_ratio,
+        # ECoG-specific
+        ecog_experiment=args.ecog_experiment,
+        ecog_source_region=args.ecog_source_region,
+        ecog_target_region=args.ecog_target_region,
+        ecog_window_size=args.ecog_window_size,
+        ecog_stride_ratio=args.ecog_stride_ratio,
     )
 
     # Run LOSO

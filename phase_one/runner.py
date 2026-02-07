@@ -928,6 +928,65 @@ def load_pcx1_data(
     return X, y, train_idx, val_idx, test_idx, val_idx_per_session
 
 
+def load_ecog_data(
+    experiment: str = "motor_imagery",
+    source_region: str = "frontal",
+    target_region: str = "parietal",
+    window_size: int = 5000,
+    stride: int = 2500,
+) -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load Miller ECoG Library dataset for inter-region cortical translation.
+
+    Returns:
+        X: Input signals (source region) [N, C, T]
+        y: Target signals (target region) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices
+        val_idx_per_session: None (no session grouping in standard eval)
+    """
+    from data import prepare_ecog_data
+
+    print(f"Loading ECoG dataset ({experiment}: {source_region} -> {target_region})...")
+    data = prepare_ecog_data(
+        experiment=experiment,
+        source_region=source_region,
+        target_region=target_region,
+        window_size=window_size,
+        stride=stride,
+    )
+
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Convert datasets to arrays
+    def dataset_to_arrays(dataset):
+        sources, targets = [], []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            sources.append(item["source"].numpy())
+            targets.append(item["target"].numpy())
+        return np.stack(sources), np.stack(targets)
+
+    X_train, y_train = dataset_to_arrays(train_dataset)
+    X_val, y_val = dataset_to_arrays(val_dataset)
+    X_test, y_test = dataset_to_arrays(test_dataset) if len(test_dataset) > 0 else (np.array([]), np.array([]))
+
+    # Combine into full arrays
+    X = np.concatenate([X_train, X_val] + ([X_test] if len(X_test) > 0 else []))
+    y = np.concatenate([y_train, y_val] + ([y_test] if len(y_test) > 0 else []))
+
+    train_idx = np.arange(len(X_train))
+    val_idx = np.arange(len(X_train), len(X_train) + len(X_val))
+    test_idx = np.arange(len(X_train) + len(X_val), len(X)) if len(X_test) > 0 else np.array([])
+
+    print(f"  Loaded: Source {X.shape} -> Target {y.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    return X, y, train_idx, val_idx, test_idx, None
+
+
 # =============================================================================
 # LOSO (Leave-One-Session-Out) Functions
 # =============================================================================
@@ -1164,6 +1223,119 @@ def load_raw_pcx1_data(
     return X, y, session_ids, idx_to_session
 
 
+def load_raw_ecog_data(
+    experiment: str = "motor_imagery",
+    source_region: str = "frontal",
+    target_region: str = "parietal",
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+    min_channels: int = 4,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) ECoG data with subject info for LOSO.
+
+    For ECoG, "sessions" are subjects (subject-based LOSO).
+
+    Args:
+        experiment: ECoG experiment name
+        source_region: Source brain lobe
+        target_region: Target brain lobe
+        window_size: Window size in samples
+        stride_ratio: Stride as fraction of window size
+        min_channels: Minimum channels required per region
+
+    Returns:
+        X: Raw input signals (source region) [N, C, T]
+        y: Raw target signals (target region) [N, C, T]
+        subject_ids: Subject ID per window [N]
+        idx_to_subject: Map from subject int ID to subject name
+    """
+    from data import (
+        _ECOG_DATA_DIR,
+        _enumerate_ecog_recordings,
+        load_ecog_subject,
+        list_ecog_subjects,
+    )
+
+    print(f"Loading raw ECoG data for LOSO ({experiment}: {source_region} -> {target_region})...")
+    stride = int(window_size * stride_ratio)
+    print(f"  Window size: {window_size}, stride: {stride}")
+
+    # Load the NPZ file once
+    npz_path = _ECOG_DATA_DIR / f"{experiment}.npz"
+    alldat = np.load(npz_path, allow_pickle=True)["dat"]
+
+    # Enumerate all recordings
+    recordings = _enumerate_ecog_recordings(alldat)
+    print(f"  Found {len(recordings)} recordings in {experiment}")
+
+    # Load all recordings without z-scoring
+    subjects_data = []
+    valid_subject_ids = []
+
+    for row, col, rec_id in recordings:
+        subj_data = load_ecog_subject(
+            row,
+            block_idx=col,
+            data_dir=_ECOG_DATA_DIR,
+            experiment=experiment,
+            source_region=source_region,
+            target_region=target_region,
+            zscore=False,  # No pre-normalization for LOSO
+            min_channels=min_channels,
+            _alldat=alldat,
+        )
+        if subj_data is not None:
+            subjects_data.append(subj_data)
+            if subj_data["subject_id"] not in valid_subject_ids:
+                valid_subject_ids.append(subj_data["subject_id"])
+            n_src = subj_data["n_source_channels"]
+            n_tgt = subj_data["n_target_channels"]
+            print(f"    Loaded {subj_data['subject_id']}: source={n_src}ch, target={n_tgt}ch, {subj_data['n_samples']} samples")
+
+    if not subjects_data:
+        raise RuntimeError(f"No valid ECoG recordings found for {experiment} {source_region}->{target_region}!")
+
+    # Determine channel counts (use minimum across subjects for consistent shapes)
+    n_source_ch = min(s["n_source_channels"] for s in subjects_data)
+    n_target_ch = min(s["n_target_channels"] for s in subjects_data)
+    print(f"  Using {n_source_ch} source channels, {n_target_ch} target channels")
+
+    # Create subject ID mapping
+    subject_to_idx = {subj_id: idx for idx, subj_id in enumerate(valid_subject_ids)}
+    idx_to_subject = {idx: subj_id for subj_id, idx in subject_to_idx.items()}
+
+    # Create sliding windows for all subjects
+    all_X = []
+    all_y = []
+    all_subject_ids_per_window = []
+
+    for subj_data in subjects_data:
+        subj_id = subj_data["subject_id"]
+        subj_idx = subject_to_idx[subj_id]
+        source = subj_data["source"][:n_source_ch]  # [C, T_total]
+        target = subj_data["target"][:n_target_ch]  # [C, T_total]
+        n_samples = subj_data["n_samples"]
+
+        n_windows = (n_samples - window_size) // stride + 1
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+            all_X.append(source[:, start:end])
+            all_y.append(target[:, start:end])
+            all_subject_ids_per_window.append(subj_idx)
+
+    # Stack into arrays
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    subject_ids = np.array(all_subject_ids_per_window, dtype=np.int32)
+
+    print(f"  Loaded: {source_region} {X.shape} -> {target_region} {y.shape}")
+    print(f"  Subjects: {len(idx_to_subject)} unique, {len(X)} total windows")
+
+    return X, y, subject_ids, idx_to_subject
+
+
 def run_loso_evaluation(
     config: "Phase1Config",
     dataset: str = "pfc",
@@ -1203,6 +1375,9 @@ def run_loso_evaluation(
     elif dataset == "pcx1":
         # PCx1 continuous dataset - creates sliding windows, session-based LOSO
         X_raw, y_raw, session_ids, idx_to_session = load_raw_pcx1_data()
+    elif dataset == "ecog":
+        # ECoG dataset - subject-based LOSO
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_ecog_data()
     else:
         raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
 
@@ -2763,7 +2938,7 @@ Examples:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc", "dandi", "pcx1"],
+        choices=["olfactory", "pfc", "dandi", "pcx1", "ecog"],
         help="Dataset to evaluate on (default: olfactory)",
     )
     parser.add_argument(
@@ -3003,6 +3178,8 @@ Examples:
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_dandi_data()
             elif config.dataset == "pcx1":
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pcx1_data(seed=config.seed)
+            elif config.dataset == "ecog":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_ecog_data()
             else:  # olfactory (default)
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
 
