@@ -1742,8 +1742,8 @@ def train(
         if is_primary():
             print(f"DANDI DataLoaders: {len(train_dataset)} train, {len(val_dataset)} val windows")
             print(f"  Source channels: {config['in_channels']}, Target channels: {config['out_channels']}")
-    elif config.get("dataset_type") == "ecog":
-        # ECoG uses pre-created datasets from prepare_ecog_data
+    elif config.get("dataset_type") in ("ecog", "boran"):
+        # ECoG/Boran uses pre-created datasets from prepare_ecog_data/prepare_boran_data
         from torch.utils.data import DataLoader
         from torch.utils.data.distributed import DistributedSampler
 
