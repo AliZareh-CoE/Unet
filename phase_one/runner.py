@@ -3199,11 +3199,20 @@ Examples:
 
     # Create configuration
     baselines = FAST_BASELINES if args.fast else BASELINE_METHODS
+    # Build output directory: results/phase1/<dataset>/ (with direction for multi-region datasets)
+    base_output = Path(args.output)
+    if args.dataset == "boran":
+        dataset_subdir = f"boran/{args.boran_source_region}_to_{args.boran_target_region}"
+    elif args.dataset == "ecog":
+        dataset_subdir = "ecog"
+    else:
+        dataset_subdir = args.dataset
+
     config = Phase1Config(
         dataset=args.dataset,
         n_folds=args.folds,
         seed=args.seed,
-        output_dir=Path(args.output),
+        output_dir=base_output / dataset_subdir,
         baselines=baselines,
         boran_source_region=args.boran_source_region,
         boran_target_region=args.boran_target_region,
