@@ -132,6 +132,12 @@ from data import (
     ECOG_SAMPLING_RATE_HZ,
     ECOG_BRAIN_LOBES,
     _ECOG_DATA_DIR,
+    # Boran MTL Working Memory
+    prepare_boran_data,
+    list_boran_subjects,
+    BORAN_SAMPLING_RATE_HZ,
+    BORAN_MTL_REGIONS,
+    _BORAN_DATA_DIR,
 )
 
 # Phase 2 architecture imports (for --arch flag)
@@ -3259,11 +3265,12 @@ def parse_args():
 
     # Dataset selection
     parser.add_argument("--dataset", type=str, default="olfactory",
-                        choices=["olfactory", "pfc", "pcx1", "dandi", "ecog"],
+                        choices=["olfactory", "pfc", "pcx1", "dandi", "ecog", "boran"],
                         help="Dataset to train on: 'olfactory' (OB→PCx trial-based), "
                              "'pfc' (PFC→CA1), 'pcx1' (continuous 1kHz LFP), "
-                             "'dandi' (DANDI 000623 human iEEG movie watching), or "
-                             "'ecog' (Miller ECoG Library inter-region cortical)")
+                             "'dandi' (DANDI 000623 human iEEG movie watching), "
+                             "'ecog' (Miller ECoG Library inter-region cortical), or "
+                             "'boran' (Boran MTL depth electrode inter-region)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
 
@@ -3328,6 +3335,24 @@ def parse_args():
                         help="Stride as ratio of window size for ECoG (0.5 = 50%% overlap)")
     parser.add_argument("--ecog-data-dir", type=str, default=None,
                         help="Directory containing ECoG .npz files (default: $UNET_DATA_DIR/ECoG)")
+
+    # Boran MTL Working Memory dataset options
+    parser.add_argument("--boran-source-region", type=str, default="hippocampus",
+                        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+                        help="Source MTL region for Boran translation (default: hippocampus)")
+    parser.add_argument("--boran-target-region", type=str, default="entorhinal_cortex",
+                        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+                        help="Target MTL region for Boran translation (default: entorhinal_cortex)")
+    parser.add_argument("--boran-window-size", type=int, default=10000,
+                        help="Window size in samples for Boran (default: 10000 = 5s at 2kHz)")
+    parser.add_argument("--boran-stride-ratio", type=float, default=None,
+                        help="Stride as ratio of window size for Boran (0.5 = 50%% overlap)")
+    parser.add_argument("--boran-data-dir", type=str, default=None,
+                        help="Directory containing Boran H5 files (default: $UNET_DATA_DIR/boran_mtl_wm)")
+    parser.add_argument("--boran-min-channels", type=int, default=4,
+                        help="Minimum channels per region for Boran (default: 4)")
+    parser.add_argument("--boran-exclude-soz", action="store_true",
+                        help="Exclude Seizure Onset Zone probes from Boran data")
 
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Quiet mode: minimal output, no progress bars")
@@ -4156,6 +4181,88 @@ def main():
             print(f"  Test windows: {len(ecog_data['test_dataset'])}")
             print(f"  Source channels: {ecog_data['n_source_channels']}, "
                   f"Target channels: {ecog_data['n_target_channels']}")
+
+    elif args.dataset == "boran":
+        # Boran MTL Working Memory - inter-region depth electrode translation
+        window_size = args.boran_window_size
+        if args.boran_stride_ratio is not None:
+            train_stride = int(window_size * args.boran_stride_ratio)
+        else:
+            train_stride = window_size // 2  # 50% overlap default
+
+        val_stride = int(window_size * args.val_stride_multiplier)
+
+        boran_data_dir = Path(args.boran_data_dir) if args.boran_data_dir else _BORAN_DATA_DIR
+
+        # Check for explicit subject holdout (used by LOSO)
+        loso_val_subjects = None
+        loso_test_subjects = None
+        if args.val_sessions:
+            loso_val_subjects = args.val_sessions if isinstance(args.val_sessions, list) else [args.val_sessions]
+        if args.test_sessions:
+            loso_test_subjects = args.test_sessions if isinstance(args.test_sessions, list) else [args.test_sessions]
+
+        if is_primary():
+            print(f"\nLoading Boran MTL Working Memory dataset...")
+            print(f"  Data directory: {boran_data_dir}")
+            print(f"  Source region: {args.boran_source_region}")
+            print(f"  Target region: {args.boran_target_region}")
+            print(f"  Window size: {window_size}, stride: {train_stride}, val_stride: {val_stride}")
+            print(f"  Min channels/region: {args.boran_min_channels}")
+            print(f"  Exclude SOZ: {args.boran_exclude_soz}")
+            if loso_val_subjects:
+                print(f"  [LOSO MODE] Held-out validation subjects: {loso_val_subjects}")
+            if loso_test_subjects:
+                print(f"  [LOSO MODE] Held-out test subjects: {loso_test_subjects}")
+
+        boran_data = prepare_boran_data(
+            data_dir=boran_data_dir,
+            source_region=args.boran_source_region,
+            target_region=args.boran_target_region,
+            window_size=window_size,
+            stride=train_stride,
+            seed=config["seed"],
+            verbose=is_primary(),
+            min_channels=args.boran_min_channels,
+            exclude_soz=args.boran_exclude_soz,
+            val_subjects=loso_val_subjects,
+            test_subjects=loso_test_subjects,
+        )
+
+        # Create minimal data dict for compatibility with training loop
+        data = {
+            "train_idx": list(range(len(boran_data["train_dataset"]))),
+            "val_idx": list(range(len(boran_data["val_dataset"]))),
+            "test_idx": list(range(len(boran_data["test_dataset"]))),
+            "n_odors": 1,  # No conditioning labels for Boran
+            "vocab": {"boran": 0},  # Placeholder
+        }
+
+        # Store Boran-specific config
+        config["dataset_type"] = "boran"
+        config["boran_sliding_window"] = True
+        config["boran_window_size"] = window_size
+        config["boran_stride"] = train_stride
+        config["boran_val_stride"] = val_stride
+        config["boran_source_region"] = args.boran_source_region
+        config["boran_target_region"] = args.boran_target_region
+        config["boran_data_dir"] = str(boran_data_dir)
+        config["sampling_rate"] = BORAN_SAMPLING_RATE_HZ
+
+        # Channel counts from prepared data
+        config["in_channels"] = boran_data["n_source_channels"]
+        config["out_channels"] = boran_data["n_target_channels"]
+        config["split_by_session"] = True  # Subject-based splits
+
+        # Store the prepared datasets for later use (same key pattern as ECoG)
+        config["_ecog_datasets"] = boran_data
+
+        if is_primary():
+            print(f"  Train windows: {len(boran_data['train_dataset'])}")
+            print(f"  Val windows: {len(boran_data['val_dataset'])}")
+            print(f"  Test windows: {len(boran_data['test_dataset'])}")
+            print(f"  Source channels: {boran_data['n_source_channels']}, "
+                  f"Target channels: {boran_data['n_target_channels']}")
 
     else:
         # Olfactory dataset (default)
