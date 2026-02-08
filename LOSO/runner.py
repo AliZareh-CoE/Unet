@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import pickle
+import socket
 import subprocess
 import sys
 import time
@@ -47,6 +48,31 @@ from LOSO.config import (
     DATASET_CONFIGS,
     get_dataset_config,
 )
+
+
+# =============================================================================
+# Port management for distributed training
+# =============================================================================
+
+def _find_free_port(start: int = 29500, max_tries: int = 100) -> int:
+    """Find a free TCP port starting from `start`.
+
+    Tries sequential ports until one is available, avoiding EADDRINUSE errors
+    when launching torchrun for sequential LOSO folds.
+    """
+    for offset in range(max_tries):
+        port = start + offset
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("", port))
+                return port
+        except OSError:
+            continue
+    # Fallback: let the OS pick
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 # =============================================================================
@@ -575,9 +601,9 @@ def run_single_fold(
             nproc = config.nproc
         else:
             nproc = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        # Use unique port per fold to avoid "address already in use" errors
-        # when running sequential folds with FSDP
-        master_port = 29500 + fold_idx
+        # Find a free port to avoid "address already in use" errors
+        # when running sequential folds/seeds with FSDP
+        master_port = _find_free_port(29500 + fold_idx * 10 + seed_idx)
         cmd = [
             "torchrun",
             f"--nproc_per_node={nproc}",
@@ -773,11 +799,18 @@ def run_single_fold(
                 env=env,
             )
     except subprocess.CalledProcessError as e:
+        # Brief delay to let torchrun child processes and sockets clean up
+        if config.use_fsdp:
+            time.sleep(5)
         print(f"ERROR: train.py failed for fold {fold_idx} (test={test_session})")
         print(f"  Return code: {e.returncode}")
         if hasattr(e, 'stderr') and e.stderr:
             print(f"  stderr: {e.stderr[:1000]}...")
         return None
+
+    # Brief delay to let torchrun child processes and sockets clean up
+    if config.use_fsdp:
+        time.sleep(5)
 
     elapsed = time.time() - start_time
 

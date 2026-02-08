@@ -5016,8 +5016,10 @@ def load_boran_subject(
         return None
 
     # Extract source and target signals
-    source = ieeg[source_chs, :].astype(np.float32)
-    target = ieeg[target_chs, :].astype(np.float32)
+    # np.ascontiguousarray ensures contiguous memory layout after fancy indexing,
+    # which dramatically speeds up per-window slicing in __getitem__
+    source = np.ascontiguousarray(ieeg[source_chs, :], dtype=np.float32)
+    target = np.ascontiguousarray(ieeg[target_chs, :], dtype=np.float32)
 
     # Z-score per channel
     if zscore:
