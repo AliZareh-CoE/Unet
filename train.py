@@ -957,18 +957,17 @@ def evaluate(
                 if psd_diagnostics_collected is None:
                     psd_diagnostics_collected = psd_diagnostics_torch(pred_f32, pcx_f32, fs=sampling_rate)
 
-            # Baseline metrics: Compare raw source vs target
-            # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
-            # This gives a meaningful "how similar are these brain regions" baseline
+            # Baseline metrics: Compare raw source vs target (per-channel)
+            # Always use per-channel comparison to match how model is evaluated.
+            # When channel counts differ, truncate to min channels.
+            # NOTE: Previous mean-signal comparison inflated baseline correlation
+            # because averaging across channels denoises the signal.
             if not fast_mode:
-                if ob_f32.shape[1] == pcx_f32.shape[1]:
-                    # Same channel count: direct comparison
-                    ob_baseline = ob_f32
-                    pcx_baseline = pcx_f32
-                else:
-                    # Different channel counts: compare mean signals (reduces to [B, 1, T])
-                    ob_baseline = ob_f32.mean(dim=1, keepdim=True)
-                    pcx_baseline = pcx_f32.mean(dim=1, keepdim=True)
+                n_ch_src = ob_f32.shape[1]
+                n_ch_tgt = pcx_f32.shape[1]
+                n_ch_min = min(n_ch_src, n_ch_tgt)
+                ob_baseline = ob_f32[:, :n_ch_min, :]
+                pcx_baseline = pcx_f32[:, :n_ch_min, :]
 
                 baseline_corr_list.append(pearson_batch(ob_baseline, pcx_baseline).item())
                 baseline_r2_list.append(explained_variance_torch(ob_baseline, pcx_baseline).item())
@@ -2822,12 +2821,10 @@ def train(
         print("FINAL TEST RESULTS")
         print("="*60)
 
-        # Determine if we're using mean-signal baseline (different channel counts)
+        # Baseline: Natural difference between source and target (context for comparison)
         in_ch = config.get("in_channels", 32)
         out_ch = config.get("out_channels", 32)
-        baseline_note = "" if in_ch == out_ch else " (mean-signal comparison)"
-
-        # Baseline: Natural difference between source and target (context for comparison)
+        baseline_note = "" if in_ch == out_ch else f" (per-channel, truncated to min({in_ch},{out_ch})={min(in_ch,out_ch)}ch)"
         print(f"Baseline (Raw Source vs Target - natural difference){baseline_note}:")
         base_corr = test_metrics.get('baseline_corr', 0)
         base_r2 = test_metrics.get('baseline_r2', 0)
