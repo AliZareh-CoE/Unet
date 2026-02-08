@@ -131,6 +131,63 @@ def decode_bytes(val):
     return str(val)
 
 
+def extract_first_string(val):
+    """Extract the first string/bytes value from a metadata field.
+
+    NIX metadata properties are stored as HDF5 compound datasets. When read
+    with h5py, they come back as numpy void scalars (np.void) with fields like
+    (b'AHL,AL,ECL,...', 0., b'', b'', b'', b'').
+
+    The actual content is always in the first field. This function robustly
+    extracts it regardless of the numpy type.
+    """
+    # numpy void (structured scalar from compound dataset)
+    if isinstance(val, np.void):
+        try:
+            first = val[0]
+            if isinstance(first, (bytes, np.bytes_)):
+                return first.decode("utf-8", errors="replace")
+            return str(first)
+        except (IndexError, TypeError):
+            pass
+
+    # Regular tuple/list
+    if isinstance(val, (tuple, list)):
+        if len(val) > 0:
+            first = val[0]
+            if isinstance(first, (bytes, np.bytes_)):
+                return first.decode("utf-8", errors="replace")
+            return str(first)
+
+    # numpy array
+    if isinstance(val, np.ndarray):
+        if val.dtype.names:
+            # Structured array — get first field of first element
+            try:
+                first = val.flat[0][0]
+                if isinstance(first, (bytes, np.bytes_)):
+                    return first.decode("utf-8", errors="replace")
+                return str(first)
+            except (IndexError, TypeError):
+                pass
+        elif val.size >= 1:
+            first = val.flat[0]
+            if isinstance(first, (bytes, np.bytes_)):
+                return first.decode("utf-8", errors="replace")
+            return str(first)
+
+    # Plain bytes
+    if isinstance(val, (bytes, np.bytes_)):
+        return val.decode("utf-8", errors="replace")
+
+    # Plain string
+    if isinstance(val, str):
+        return val
+
+    # Fallback
+    return str(val)
+
+
 # ---------------------------------------------------------------------------
 #  NIX H5 metadata extraction (no signal data loaded)
 # ---------------------------------------------------------------------------
@@ -470,20 +527,14 @@ def parse_depth_electrodes_metadata(meta_dict):
 
     The metadata contains entries like:
       'metadata/Subject/properties/Depth electrodes':
-          (b'AHL,AL,ECL,LR,PHL,PHR', 0., b'', ...)
+          np.void(b'AHL,AL,ECL,LR,PHL,PHR', 0., b'', ...)
 
+    The actual content string is always in the first field of the compound type.
     Returns a list of probe abbreviations, e.g. ['AHL', 'AL', 'ECL', 'LR', 'PHL', 'PHR'].
     """
     for key, val in meta_dict.items():
         if "depth electrode" in key.lower():
-            # Value might be a tuple like (b'AHL,AL,...', 0., b'', ...)
-            raw = val
-            if isinstance(raw, (tuple, list, np.ndarray)):
-                # Take first element
-                raw = raw[0] if len(raw) > 0 else raw
-            if isinstance(raw, (bytes, np.bytes_)):
-                raw = raw.decode("utf-8", errors="replace")
-            raw = str(raw).strip()
+            raw = extract_first_string(val).strip()
             if raw:
                 probes = [p.strip().upper() for p in raw.split(",") if p.strip()]
                 return probes
@@ -712,15 +763,9 @@ def main():
         if meta:
             print(f"    Metadata:")
             for k, v in sorted(meta.items()):
-                # Clean up tuple display
-                if isinstance(v, (tuple, list, np.ndarray)):
-                    first = v[0] if len(v) > 0 else v
-                    if isinstance(first, (bytes, np.bytes_)):
-                        first = first.decode("utf-8", errors="replace")
-                    # Skip printing the zeros/empty fields in the tuple
-                    v = first
                 short_key = k.split("/")[-1] if "/" in k else k
-                print(f"      {short_key}: {v}")
+                clean_v = extract_first_string(v)
+                print(f"      {short_key}: {clean_v}")
 
     # =========================================================================
     #  DEPTH ELECTRODE PROBE MAPPING (from first session of each subject)
@@ -893,12 +938,7 @@ def main():
 
         for key, val in meta.items():
             if "seizure onset" in key.lower() or "soz" in key.lower():
-                raw = val
-                if isinstance(raw, (tuple, list, np.ndarray)):
-                    raw = raw[0] if len(raw) > 0 else raw
-                if isinstance(raw, (bytes, np.bytes_)):
-                    raw = raw.decode("utf-8", errors="replace")
-                raw = str(raw).strip()
+                raw = extract_first_string(val).strip()
                 if raw:
                     soz_probes = [p.strip().upper() for p in raw.split(",") if p.strip()]
 
