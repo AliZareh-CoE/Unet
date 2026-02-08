@@ -3343,12 +3343,12 @@ def parse_args():
     parser.add_argument("--boran-target-region", type=str, default="entorhinal_cortex",
                         choices=["hippocampus", "entorhinal_cortex", "amygdala"],
                         help="Target MTL region for Boran translation (default: entorhinal_cortex)")
-    parser.add_argument("--boran-window-size", type=int, default=10000,
-                        help="Window size in samples for Boran (default: 10000 = 5s at 2kHz)")
+    parser.add_argument("--boran-window-size", type=int, default=5000,
+                        help="Window size in samples for Boran (default: 5000 = 5s at 1kHz)")
     parser.add_argument("--boran-stride-ratio", type=float, default=None,
                         help="Stride as ratio of window size for Boran (0.5 = 50%% overlap)")
     parser.add_argument("--boran-data-dir", type=str, default=None,
-                        help="Directory containing Boran H5 files (default: $UNET_DATA_DIR/boran_mtl_wm)")
+                        help="Directory containing preprocessed Boran NPZ files (default: $UNET_DATA_DIR/boran_mtl_wm/processed_1khz)")
     parser.add_argument("--boran-min-channels", type=int, default=4,
                         help="Minimum channels per region for Boran (default: 4)")
     parser.add_argument("--boran-exclude-soz", action="store_true",

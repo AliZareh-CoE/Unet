@@ -210,8 +210,8 @@ ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
 # Depth electrodes: 8 contacts per probe
 # Regions: hippocampus (AH/PH probes), entorhinal_cortex (EC probes), amygdala (A probes)
 
-_BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm" / "data_nix"
-BORAN_SAMPLING_RATE_HZ = 2000
+_BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm" / "processed_1khz"
+BORAN_SAMPLING_RATE_HZ = 1000  # Preprocessed: downsampled from 2kHz to 1kHz
 
 # Canonical MTL regions for inter-region translation
 BORAN_MTL_REGIONS = ["hippocampus", "entorhinal_cortex", "amygdala"]
@@ -4906,72 +4906,17 @@ def prepare_ecog_data(
 # =============================================================================
 # Boran MTL Working Memory Dataset
 # =============================================================================
-# Data format: NIX/HDF5 files, one per session per subject
-# File naming: Data_Subject_XX_Session_YY.h5
-# Each file contains iEEG trials as data_arrays: shape (n_channels, 16000)
-# Electrode regions from metadata "Depth electrodes" field
-# 8 contacts per probe, probes distributed across MTL regions
+# Preprocessed format: one NPZ per subject (downsampled from 2kHz to 1kHz)
+# Created by: python scripts/preprocess_boran.py
+# NPZ keys: ieeg (n_channels, total_samples), probes, probe_n_contacts,
+#            soz_probes, n_sessions, n_trials, sampling_rate (1000)
+# Probe-to-region mapping assigns channels to hippocampus/entorhinal_cortex/amygdala
 
 import re as _re
 
 
-def _boran_extract_first_string(val) -> str:
-    """Extract the first string/bytes from a NIX metadata compound field.
-
-    NIX metadata properties come back as numpy.void (compound dtype), NOT
-    Python tuples. The actual content is always in the first field.
-    """
-    # numpy void (structured scalar from compound dataset)
-    if isinstance(val, np.void):
-        try:
-            first = val[0]
-            if isinstance(first, (bytes, np.bytes_)):
-                return first.decode("utf-8", errors="replace")
-            return str(first)
-        except (IndexError, TypeError):
-            pass
-
-    if isinstance(val, (tuple, list)):
-        if len(val) > 0:
-            first = val[0]
-            if isinstance(first, (bytes, np.bytes_)):
-                return first.decode("utf-8", errors="replace")
-            return str(first)
-
-    if isinstance(val, np.ndarray):
-        if val.dtype.names:
-            try:
-                first = val.flat[0][0]
-                if isinstance(first, (bytes, np.bytes_)):
-                    return first.decode("utf-8", errors="replace")
-                return str(first)
-            except (IndexError, TypeError):
-                pass
-        elif val.size >= 1:
-            first = val.flat[0]
-            if isinstance(first, (bytes, np.bytes_)):
-                return first.decode("utf-8", errors="replace")
-            return str(first)
-
-    if isinstance(val, (bytes, np.bytes_)):
-        return val.decode("utf-8", errors="replace")
-    if isinstance(val, str):
-        return val
-    return str(val)
-
-
-def _boran_decode_bytes(val) -> str:
-    """Decode bytes to string."""
-    if isinstance(val, (bytes, np.bytes_)):
-        return val.decode("utf-8", errors="replace")
-    return str(val)
-
-
 def _boran_parse_probe_region(prefix: str) -> str:
-    """Parse a probe abbreviation to canonical region name.
-
-    Uses longest-prefix-first matching to avoid 'A' swallowing 'AH'/'AL'/'AR'.
-    """
+    """Parse a probe abbreviation to canonical region name."""
     prefix = prefix.upper().strip()
     if prefix in BORAN_PROBE_REGION_MAP:
         return BORAN_PROBE_REGION_MAP[prefix]
@@ -4981,131 +4926,21 @@ def _boran_parse_probe_region(prefix: str) -> str:
     return "unknown"
 
 
-def _boran_get_depth_probes(f) -> List[str]:
-    """Extract depth electrode probe list from NIX metadata.
-
-    Parses the "Depth electrodes" metadata field (e.g., "AHL,AL,ECL,LR,PHL,PHR")
-    and returns a list of probe abbreviations.
-    """
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("h5py required for Boran MTL dataset. pip install h5py")
-
-    probes = []
-    if "metadata" not in f:
-        return probes
-
-    def _scan(group, depth=0):
-        if depth > 6:
-            return
-        try:
-            for key in group.keys():
-                item = group[key]
-                if isinstance(item, type(f.create_group) if False else object):
-                    pass
-                k_lower = key.lower()
-                if "depth electrode" in k_lower:
-                    if hasattr(item, 'shape'):  # h5py.Dataset
-                        try:
-                            val = item[()]
-                            raw = _boran_extract_first_string(val).strip()
-                            if raw:
-                                probes.extend(
-                                    p.strip().upper()
-                                    for p in raw.split(",")
-                                    if p.strip()
-                                )
-                                return
-                        except Exception:
-                            pass
-                try:
-                    # Recurse into groups
-                    if hasattr(item, 'keys'):
-                        _scan(item, depth + 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    _scan(f["metadata"])
-    return probes
-
-
-def _boran_get_soz_probes(f) -> List[str]:
-    """Extract Seizure Onset Zone probe names from metadata."""
-    soz_probes = []
-    if "metadata" not in f:
-        return soz_probes
-
-    def _scan(group, depth=0):
-        if depth > 6:
-            return
-        try:
-            for key in group.keys():
-                item = group[key]
-                k_lower = key.lower()
-                if "seizure onset" in k_lower or "soz" in k_lower:
-                    if hasattr(item, 'shape'):  # h5py.Dataset
-                        try:
-                            val = item[()]
-                            raw = _boran_extract_first_string(val).strip()
-                            if raw:
-                                soz_probes.extend(
-                                    p.strip().upper()
-                                    for p in raw.split(",")
-                                    if p.strip()
-                                )
-                                return
-                        except Exception:
-                            pass
-                try:
-                    if hasattr(item, 'keys'):
-                        _scan(item, depth + 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    _scan(f["metadata"])
-    return soz_probes
-
-
-def _boran_assign_channels_to_probes(
-    probes: List[str], n_channels: int
-) -> Dict[str, int]:
-    """Distribute iEEG channels across probes (8 contacts each typically)."""
-    if not probes or n_channels == 0:
-        return {}
-    n_probes = len(probes)
-    base = n_channels // n_probes
-    remainder = n_channels % n_probes
-    return {
-        probe: base + (1 if i < remainder else 0)
-        for i, probe in enumerate(probes)
-    }
-
-
 def _boran_get_region_channels(
     probes: List[str],
-    probe_channels: Dict[str, int],
+    probe_n_contacts: np.ndarray,
     region: str,
     soz_probes: Optional[List[str]] = None,
 ) -> Tuple[List[int], List[str]]:
-    """Get channel indices for a given canonical region.
-
-    Channels are assigned sequentially to probes (8 contacts each).
-    Returns (channel_indices, probe_names_used).
-    """
+    """Get channel indices for a given canonical region from preprocessed probe info."""
     indices = []
     used_probes = []
     ch_offset = 0
 
-    for probe in probes:
-        n_contacts = probe_channels.get(probe, 0)
+    for i, probe in enumerate(probes):
+        n_contacts = int(probe_n_contacts[i])
         probe_region = _boran_parse_probe_region(probe)
 
-        # Skip SOZ probes if requested
         if soz_probes and probe in soz_probes:
             ch_offset += n_contacts
             continue
@@ -5119,84 +4954,6 @@ def _boran_get_region_channels(
     return indices, used_probes
 
 
-def _boran_load_trials_from_h5(
-    h5_path: Path,
-    channel_indices: List[int],
-) -> Optional[np.ndarray]:
-    """Load iEEG trial data for specific channels from a single H5 file.
-
-    Returns array of shape (n_trials, n_channels, n_timepoints) or None.
-    """
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("h5py required for Boran MTL dataset. pip install h5py")
-
-    trials = []
-    try:
-        with h5py.File(h5_path, "r") as f:
-            if "data" not in f:
-                return None
-
-            data_grp = f["data"]
-
-            # Find data_arrays in NIX blocks
-            for block_key in data_grp.keys():
-                block = data_grp[block_key]
-                if not hasattr(block, 'keys'):
-                    continue
-
-                da_group = None
-                if "data_arrays" in block:
-                    da_group = block["data_arrays"]
-                elif block_key == "data_arrays":
-                    da_group = block
-
-                if da_group is None:
-                    continue
-
-                for da_key in da_group.keys():
-                    da = da_group[da_key]
-                    da_name = ""
-                    try:
-                        if hasattr(da, 'attrs') and "name" in da.attrs:
-                            da_name = _boran_decode_bytes(da.attrs["name"])
-                        elif hasattr(da, 'keys') and "name" in da:
-                            d = da["name"]
-                            if hasattr(d, 'shape'):
-                                da_name = _boran_decode_bytes(d[()])
-                    except Exception:
-                        da_name = da_key
-
-                    name_lower = da_name.lower()
-
-                    # We want iEEG trials only
-                    if "ieeg" in name_lower and "trial" in name_lower:
-                        try:
-                            if hasattr(da, 'keys') and "data" in da:
-                                arr = da["data"][()]  # (n_channels, n_timepoints)
-                            elif hasattr(da, 'shape'):
-                                arr = da[()]
-                            else:
-                                continue
-
-                            if arr.ndim == 2 and len(channel_indices) > 0:
-                                # Select only the requested channels
-                                valid_idx = [i for i in channel_indices if i < arr.shape[0]]
-                                if len(valid_idx) > 0:
-                                    trials.append(arr[valid_idx, :].copy())
-                        except Exception:
-                            continue
-
-    except Exception:
-        return None
-
-    if not trials:
-        return None
-
-    return np.stack(trials, axis=0)  # (n_trials, n_channels, n_timepoints)
-
-
 def load_boran_subject(
     subject_id: str,
     data_dir: Optional[Path] = None,
@@ -5206,14 +4963,14 @@ def load_boran_subject(
     min_channels: int = 4,
     exclude_soz: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Load all sessions for a single Boran MTL subject.
+    """Load preprocessed Boran MTL subject data from NPZ.
 
-    Reads H5/NIX files for the subject, extracts source/target channels by
-    region, concatenates trials, and z-scores.
+    Reads preprocessed NPZ file (downsampled to 1kHz), extracts source/target
+    channels by region, and z-scores.
 
     Args:
         subject_id: Subject identifier (e.g., "S01", "S02")
-        data_dir: Directory containing H5 files
+        data_dir: Directory containing preprocessed NPZ files
         source_region: Source MTL region (hippocampus, entorhinal_cortex, amygdala)
         target_region: Target MTL region
         zscore: Whether to z-score normalize per channel
@@ -5225,72 +4982,29 @@ def load_boran_subject(
         n_target_channels, n_samples, metadata. Returns None if subject
         doesn't have enough channels in both regions.
     """
-    try:
-        import h5py
-    except ImportError:
-        raise ImportError("h5py required for Boran MTL dataset. pip install h5py")
-
     data_dir = data_dir or _BORAN_DATA_DIR
+    npz_path = data_dir / f"{subject_id}.npz"
 
-    # Find all H5 files for this subject
-    subj_num = int(_re.search(r"\d+", subject_id).group())
-    pattern = f"*Subject*{subj_num:02d}*Session*.h5"
-    h5_files = sorted(data_dir.glob(pattern))
-    if not h5_files:
-        # Try without zero-padding
-        pattern = f"*Subject*{subj_num}*Session*.h5"
-        h5_files = sorted(data_dir.glob(pattern))
-
-    if not h5_files:
-        _print_primary(f"  {subject_id}: no H5 files found matching {pattern}")
+    if not npz_path.exists():
+        _print_primary(f"  {subject_id}: NPZ file not found: {npz_path}")
         return None
 
-    # Get electrode layout from the first session
-    with h5py.File(h5_files[0], "r") as f:
-        probes = _boran_get_depth_probes(f)
-        soz_probes = _boran_get_soz_probes(f) if exclude_soz else []
-
-        # Get total iEEG channel count from trial shape
-        n_ieeg_channels = 0
-        if "data" in f:
-            for block_key in f["data"].keys():
-                block = f["data"][block_key]
-                if hasattr(block, 'keys') and "data_arrays" in block:
-                    for da_key in block["data_arrays"].keys():
-                        da = block["data_arrays"][da_key]
-                        da_name = ""
-                        try:
-                            if hasattr(da, 'attrs') and "name" in da.attrs:
-                                da_name = _boran_decode_bytes(da.attrs["name"])
-                            elif hasattr(da, 'keys') and "name" in da:
-                                da_name = _boran_decode_bytes(da["name"][()])
-                        except Exception:
-                            pass
-                        if "ieeg" in da_name.lower() and "trial" in da_name.lower():
-                            try:
-                                if hasattr(da, 'keys') and "data" in da:
-                                    n_ieeg_channels = da["data"].shape[0]
-                                elif hasattr(da, 'shape'):
-                                    n_ieeg_channels = da.shape[0]
-                            except Exception:
-                                pass
-                            if n_ieeg_channels > 0:
-                                break
-                if n_ieeg_channels > 0:
-                    break
-
-    if not probes or n_ieeg_channels == 0:
-        _print_primary(f"  {subject_id}: no probes or channels found")
-        return None
-
-    probe_channels = _boran_assign_channels_to_probes(probes, n_ieeg_channels)
+    # Load preprocessed data
+    npz = np.load(npz_path, allow_pickle=False)
+    ieeg = npz["ieeg"]  # (n_channels, total_samples) at 1kHz
+    probes = list(npz["probes"])
+    probe_n_contacts = npz["probe_n_contacts"]
+    soz_probes_arr = npz["soz_probes"]
+    soz_probes = list(soz_probes_arr) if len(soz_probes_arr) > 0 else []
+    n_sessions = int(npz["n_sessions"])
+    n_trials = int(npz["n_trials"])
 
     # Get channel indices for source and target regions
     source_chs, source_probes = _boran_get_region_channels(
-        probes, probe_channels, source_region, soz_probes if exclude_soz else None
+        probes, probe_n_contacts, source_region, soz_probes if exclude_soz else None
     )
     target_chs, target_probes = _boran_get_region_channels(
-        probes, probe_channels, target_region, soz_probes if exclude_soz else None
+        probes, probe_n_contacts, target_region, soz_probes if exclude_soz else None
     )
 
     if len(source_chs) < min_channels or len(target_chs) < min_channels:
@@ -5301,45 +5015,9 @@ def load_boran_subject(
         )
         return None
 
-    # Load trials from all sessions for this subject
-    all_source_trials = []
-    all_target_trials = []
-    total_trials = 0
-
-    for h5_path in h5_files:
-        src_trials = _boran_load_trials_from_h5(h5_path, source_chs)
-        tgt_trials = _boran_load_trials_from_h5(h5_path, target_chs)
-
-        if src_trials is not None and tgt_trials is not None:
-            # Ensure matching trial counts
-            n = min(src_trials.shape[0], tgt_trials.shape[0])
-            all_source_trials.append(src_trials[:n])
-            all_target_trials.append(tgt_trials[:n])
-            total_trials += n
-
-    if total_trials == 0:
-        _print_primary(f"  {subject_id}: no valid trials loaded")
-        return None
-
-    # Concatenate all trials into continuous data
-    # Shape: (n_channels, total_samples) — trials concatenated along time
-    source_cat = np.concatenate(
-        [t.reshape(t.shape[1], -1) if t.ndim == 3 else t
-         for t in all_source_trials], axis=-1
-    )
-    target_cat = np.concatenate(
-        [t.reshape(t.shape[1], -1) if t.ndim == 3 else t
-         for t in all_target_trials], axis=-1
-    )
-
-    # Ensure shape is (n_channels, n_samples)
-    if source_cat.ndim == 3:
-        # (n_trials, n_channels, n_timepoints) -> (n_channels, n_trials * n_timepoints)
-        source_cat = source_cat.transpose(1, 0, 2).reshape(source_cat.shape[1], -1)
-        target_cat = target_cat.transpose(1, 0, 2).reshape(target_cat.shape[1], -1)
-
-    source = source_cat.astype(np.float32)
-    target = target_cat.astype(np.float32)
+    # Extract source and target signals
+    source = ieeg[source_chs, :].astype(np.float32)
+    target = ieeg[target_chs, :].astype(np.float32)
 
     # Z-score per channel
     if zscore:
@@ -5359,8 +5037,8 @@ def load_boran_subject(
         "target_region": target_region,
         "source_probes": source_probes,
         "target_probes": target_probes,
-        "n_sessions": len(h5_files),
-        "n_trials": total_trials,
+        "n_sessions": n_sessions,
+        "n_trials": n_trials,
         "soz_excluded": exclude_soz,
         "soz_probes": soz_probes,
         "srate": BORAN_SAMPLING_RATE_HZ,
@@ -5382,10 +5060,10 @@ def list_boran_subjects(
 ) -> List[str]:
     """List available subject IDs in the Boran MTL dataset.
 
-    Discovers subjects by scanning H5 filenames for Subject_XX patterns.
+    Discovers subjects by scanning for preprocessed NPZ files (S01.npz, S02.npz, ...).
 
     Args:
-        data_dir: Directory containing H5 files (default: _BORAN_DATA_DIR)
+        data_dir: Directory containing preprocessed NPZ files (default: _BORAN_DATA_DIR)
 
     Returns:
         Sorted list of subject IDs like ["S01", "S02", ...]
@@ -5395,15 +5073,11 @@ def list_boran_subjects(
     if not data_dir.exists():
         raise FileNotFoundError(
             f"Boran MTL data directory not found: {data_dir}\n"
-            f"Download from: https://gin.g-node.org/USZ_NCH/Human_MTL_units_scalp_EEG_and_ும_iEEG_verbal_WM"
+            f"Run: python scripts/preprocess_boran.py"
         )
 
-    h5_files = sorted(data_dir.glob("*.h5"))
-    subjects = set()
-    for f in h5_files:
-        m = _re.search(r"Subject[_\s]*(\d+)", f.stem, _re.IGNORECASE)
-        if m:
-            subjects.add(f"S{int(m.group(1)):02d}")
+    npz_files = sorted(data_dir.glob("S*.npz"))
+    subjects = [f.stem for f in npz_files]
 
     return sorted(subjects)
 
@@ -5416,74 +5090,31 @@ def validate_boran_subject(
     min_channels: int = 4,
     exclude_soz: bool = False,
 ) -> bool:
-    """Check if a Boran subject has enough channels without loading trial data.
+    """Check if a Boran subject has enough channels without loading signal data.
 
-    Lightweight validation that only reads metadata (depth probes, first trial
-    shape) to determine channel counts. Much faster than load_boran_subject().
+    Reads only probe metadata from NPZ to determine channel counts.
 
     Returns:
         True if subject has >= min_channels in both source and target regions.
     """
-    try:
-        import h5py
-    except ImportError:
-        return False
-
     data_dir = data_dir or _BORAN_DATA_DIR
+    npz_path = data_dir / f"{subject_id}.npz"
 
-    # Find H5 files for this subject
-    subj_num = int(_re.search(r"\d+", subject_id).group())
-    pattern = f"*Subject*{subj_num:02d}*Session*.h5"
-    h5_files = sorted(data_dir.glob(pattern))
-    if not h5_files:
-        pattern = f"*Subject*{subj_num}*Session*.h5"
-        h5_files = sorted(data_dir.glob(pattern))
-    if not h5_files:
+    if not npz_path.exists():
         return False
 
     try:
-        with h5py.File(h5_files[0], "r") as f:
-            probes = _boran_get_depth_probes(f)
-            soz_probes = _boran_get_soz_probes(f) if exclude_soz else []
+        npz = np.load(npz_path, allow_pickle=False)
+        probes = list(npz["probes"])
+        probe_n_contacts = npz["probe_n_contacts"]
+        soz_probes_arr = npz["soz_probes"]
+        soz_probes = list(soz_probes_arr) if len(soz_probes_arr) > 0 else []
 
-            # Get total iEEG channel count from first trial shape (no data loading)
-            n_ieeg_channels = 0
-            if "data" in f:
-                for block_key in f["data"].keys():
-                    block = f["data"][block_key]
-                    if hasattr(block, 'keys') and "data_arrays" in block:
-                        for da_key in block["data_arrays"].keys():
-                            da = block["data_arrays"][da_key]
-                            da_name = ""
-                            try:
-                                if hasattr(da, 'attrs') and "name" in da.attrs:
-                                    da_name = _boran_decode_bytes(da.attrs["name"])
-                                elif hasattr(da, 'keys') and "name" in da:
-                                    da_name = _boran_decode_bytes(da["name"][()])
-                            except Exception:
-                                pass
-                            if "ieeg" in da_name.lower() and "trial" in da_name.lower():
-                                try:
-                                    if hasattr(da, 'keys') and "data" in da:
-                                        n_ieeg_channels = da["data"].shape[0]
-                                    elif hasattr(da, 'shape'):
-                                        n_ieeg_channels = da.shape[0]
-                                except Exception:
-                                    pass
-                                if n_ieeg_channels > 0:
-                                    break
-                    if n_ieeg_channels > 0:
-                        break
-
-        if not probes or n_ieeg_channels == 0:
-            return False
-
-        probe_channels = _boran_assign_channels_to_probes(probes, n_ieeg_channels)
         source_chs, _ = _boran_get_region_channels(
-            probes, probe_channels, source_region, soz_probes if exclude_soz else None
+            probes, probe_n_contacts, source_region, soz_probes if exclude_soz else None
         )
         target_chs, _ = _boran_get_region_channels(
-            probes, probe_channels, target_region, soz_probes if exclude_soz else None
+            probes, probe_n_contacts, target_region, soz_probes if exclude_soz else None
         )
 
         return len(source_chs) >= min_channels and len(target_chs) >= min_channels

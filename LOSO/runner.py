@@ -1323,8 +1323,8 @@ def parse_args() -> argparse.Namespace:
     boran_group.add_argument(
         "--boran-window-size",
         type=int,
-        default=10000,
-        help="Window size in samples (at 2kHz)",
+        default=5000,
+        help="Window size in samples (at 1kHz, preprocessed)",
     )
     boran_group.add_argument(
         "--boran-stride-ratio",

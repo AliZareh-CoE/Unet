@@ -156,11 +156,11 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         session_type="subject",  # LOSO holds out entire subjects
         in_channels=0,  # Variable - detected at runtime
         out_channels=0,  # Variable - detected at runtime
-        sampling_rate=2000,
+        sampling_rate=1000,  # Preprocessed: downsampled from 2kHz to 1kHz
         source_region="hippocampus",  # Default, can be changed
         target_region="entorhinal_cortex",  # Default, can be changed
         uses_sliding_window=True,
-        default_window_size=10000,  # 5s at 2kHz
+        default_window_size=5000,  # 5s at 1kHz (preprocessed)
         default_stride_ratio=0.5,
         train_py_dataset_name="boran",
     ),
@@ -288,7 +288,7 @@ class LOSOConfig:
     # Boran MTL Working Memory dataset options
     boran_source_region: str = "hippocampus"
     boran_target_region: str = "entorhinal_cortex"
-    boran_window_size: int = 10000  # 5s at 2kHz
+    boran_window_size: int = 5000  # 5s at 1kHz (preprocessed)
     boran_stride_ratio: float = 0.5
     boran_min_channels: int = 4
     boran_exclude_soz: bool = False
