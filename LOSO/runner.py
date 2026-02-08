@@ -866,6 +866,83 @@ def run_single_fold(
         return None
 
 
+def _load_fold_result_from_json(
+    results_file: Path,
+    fold_idx: int,
+    test_session: str,
+    all_sessions: List[str],
+    config: 'LOSOConfig',
+) -> Optional['LOSOFoldResult']:
+    """Load a LOSOFoldResult from an existing results JSON file.
+
+    Used to skip re-running folds whose results already exist on disk.
+
+    Args:
+        results_file: Path to the fold results JSON
+        fold_idx: Fold index
+        test_session: Name of the held-out test session
+        all_sessions: All session names
+        config: LOSO configuration
+
+    Returns:
+        LOSOFoldResult or None if file doesn't exist or can't be parsed
+    """
+    if not results_file.exists():
+        return None
+
+    try:
+        with open(results_file, 'r') as f:
+            results = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  WARNING: Could not read {results_file}: {e}")
+        return None
+
+    train_sessions = [s for s in all_sessions if s != test_session]
+    ds_config = config.get_dataset_config()
+
+    test_r2 = results.get("test_avg_r2")
+    test_corr = results.get("test_avg_corr")
+    test_loss = results.get("test_avg_delta")
+
+    if test_r2 is None:
+        test_r2 = 0.0
+    if test_corr is None:
+        test_corr = 0.0
+    if test_loss is None:
+        test_loss = float('inf')
+
+    per_session_test = results.get("per_session_test_results", [])
+    per_session_r2 = {}
+    per_session_corr = {}
+    per_session_loss = {}
+    for session_result in per_session_test:
+        session_name = session_result.get("session", "")
+        if session_name:
+            per_session_r2[session_name] = session_result.get("r2", 0.0)
+            per_session_corr[session_name] = session_result.get("corr", 0.0)
+            per_session_loss[session_name] = session_result.get("delta", 0.0)
+
+    return LOSOFoldResult(
+        fold_idx=fold_idx,
+        test_session=test_session,
+        train_sessions=train_sessions,
+        val_r2=test_r2,
+        val_corr=test_corr,
+        val_loss=test_loss,
+        train_loss=results.get("final_train_loss", 0.0),
+        per_session_r2=per_session_r2,
+        per_session_corr=per_session_corr,
+        per_session_loss=per_session_loss,
+        epochs_trained=results.get("epochs_trained", config.epochs),
+        total_time=results.get("total_time", 0.0),
+        config=config.to_dict(),
+        dataset=config.dataset,
+        session_type=ds_config.session_type,
+        n_train_samples=results.get("n_train_samples", 0),
+        n_val_samples=results.get("n_val_samples", 0),
+    )
+
+
 def _aggregate_seed_results(
     seed_results: List[LOSOFoldResult],
     fold_idx: int,
@@ -1018,6 +1095,16 @@ def run_loso(
             output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_seed{seed_idx}_results.json"
 
             print(f"\n--- Fold {fold_idx}, Seed {seed_idx + 1}/{config.n_seeds} ---")
+
+            # Skip if result file already exists on disk (allows resuming without checkpoint)
+            existing_result = _load_fold_result_from_json(
+                output_results_file, fold_idx, test_session, all_sessions, config,
+            )
+            if existing_result is not None:
+                print(f"  SKIPPING: Result file already exists: {output_results_file.name}")
+                print(f"  (loaded: Corr={existing_result.val_corr:.4f}, R²={existing_result.val_r2:.4f})")
+                seed_results.append(existing_result)
+                continue
 
             result = run_single_fold(
                 fold_idx=fold_idx,
