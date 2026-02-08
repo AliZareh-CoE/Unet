@@ -210,7 +210,7 @@ ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
 # Depth electrodes: 8 contacts per probe
 # Regions: hippocampus (AH/PH probes), entorhinal_cortex (EC probes), amygdala (A probes)
 
-_BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm"
+_BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm" / "data_nix"
 BORAN_SAMPLING_RATE_HZ = 2000
 
 # Canonical MTL regions for inter-region translation
