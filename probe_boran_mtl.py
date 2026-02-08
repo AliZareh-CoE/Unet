@@ -46,13 +46,18 @@ except ImportError:
 #  Region parsing
 # ---------------------------------------------------------------------------
 # Map electrode name prefixes to canonical region names
+# Prefix matching is done longest-first to avoid 'A' swallowing 'AH', 'AL', etc.
 REGION_MAP = {
     "AH":  "hippocampus",      # Anterior Hippocampus
     "PH":  "hippocampus",      # Posterior Hippocampus
     "EC":  "entorhinal_cortex",
-    "A":   "amygdala",
+    "AL":  "amygdala",         # Amygdala Left (match before generic 'A')
+    "AR":  "amygdala",         # Amygdala Right
+    "A":   "amygdala",         # Amygdala (generic, if no L/R suffix)
     "TB":  "temporal_basal",   # sometimes present
     "PHC": "parahippocampal",  # sometimes present
+    "DR":  "other",            # e.g. DRR in S05 — possibly a non-MTL probe
+    "LR":  "other",            # e.g. LR in S01 — possibly a non-MTL probe
 }
 
 # More specific sub-region mapping (for detailed analysis)
@@ -67,11 +72,16 @@ SUBREGION_MAP = {
     "AR":  "amygdala_R",
     "TBL": "temporal_basal_L",
     "TBR": "temporal_basal_R",
+    "DRR": "other_DRR",
+    "LR":  "other_LR",
 }
 
 
 def parse_electrode_region(name):
-    """Parse an electrode name like 'uAHL_5' or 'AHL_5' into region info.
+    """Parse an electrode/probe name like 'uAHL_5', 'AHL', 'ECR' into region info.
+
+    Handles both individual electrode names (with contact number) and bare
+    probe abbreviations from the metadata "Depth electrodes" field.
 
     Returns (canonical_region, subregion, hemisphere, contact_num, raw_prefix).
     """
@@ -80,7 +90,7 @@ def parse_electrode_region(name):
     if clean.startswith("u"):
         clean = clean[1:]
 
-    # Try to match pattern: PREFIX_NUMBER or PREFIX NUMBER
+    # Try to match pattern: PREFIX or PREFIX_NUMBER
     m = re.match(r"([A-Za-z]+)[_\s]*(\d+)?", clean)
     if not m:
         return ("unknown", "unknown", "?", None, clean)
@@ -95,15 +105,19 @@ def parse_electrode_region(name):
     elif prefix.endswith("R"):
         hemisphere = "R"
 
-    # Sub-region (full prefix with hemisphere)
+    # Sub-region: try exact match first
     subregion = SUBREGION_MAP.get(prefix, f"unknown_{prefix}")
 
-    # Canonical region (strip hemisphere suffix)
+    # Canonical region: match longest prefix first to avoid 'A' swallowing 'AH'/'AL'/'AR'
+    # Also try exact match first (e.g. 'AL' -> amygdala, not 'A' -> amygdala)
     region = "unknown"
-    for pfx in sorted(REGION_MAP.keys(), key=len, reverse=True):
-        if prefix.startswith(pfx):
-            region = REGION_MAP[pfx]
-            break
+    if prefix in REGION_MAP:
+        region = REGION_MAP[prefix]
+    else:
+        for pfx in sorted(REGION_MAP.keys(), key=len, reverse=True):
+            if prefix.startswith(pfx):
+                region = REGION_MAP[pfx]
+                break
 
     return (region, subregion, hemisphere, contact, prefix)
 
@@ -451,6 +465,52 @@ def count_trials(f):
     return n_scalp_trials, n_ieeg_trials, scalp_shape, ieeg_shape, sampling_rate
 
 
+def parse_depth_electrodes_metadata(meta_dict):
+    """Extract depth electrode probe list from metadata.
+
+    The metadata contains entries like:
+      'metadata/Subject/properties/Depth electrodes':
+          (b'AHL,AL,ECL,LR,PHL,PHR', 0., b'', ...)
+
+    Returns a list of probe abbreviations, e.g. ['AHL', 'AL', 'ECL', 'LR', 'PHL', 'PHR'].
+    """
+    for key, val in meta_dict.items():
+        if "depth electrode" in key.lower():
+            # Value might be a tuple like (b'AHL,AL,...', 0., b'', ...)
+            raw = val
+            if isinstance(raw, (tuple, list, np.ndarray)):
+                # Take first element
+                raw = raw[0] if len(raw) > 0 else raw
+            if isinstance(raw, (bytes, np.bytes_)):
+                raw = raw.decode("utf-8", errors="replace")
+            raw = str(raw).strip()
+            if raw:
+                probes = [p.strip().upper() for p in raw.split(",") if p.strip()]
+                return probes
+    return []
+
+
+def assign_channels_to_probes(probes, n_channels):
+    """Distribute iEEG channels across depth electrode probes.
+
+    Boran dataset uses 8 contacts per probe typically.
+    Returns dict: {probe_abbreviation: n_contacts}.
+    """
+    if not probes or n_channels == 0:
+        return {}
+
+    n_probes = len(probes)
+    base_contacts = n_channels // n_probes
+    remainder = n_channels % n_probes
+
+    assignment = {}
+    for i, probe in enumerate(probes):
+        # Distribute remainder to first probes
+        assignment[probe] = base_contacts + (1 if i < remainder else 0)
+
+    return assignment
+
+
 def probe_single_file(h5_path):
     """Probe a single H5 file for electrode and trial metadata.
 
@@ -465,6 +525,8 @@ def probe_single_file(h5_path):
         "subject_meta": {},
         "electrodes": [],
         "multitag_electrodes": set(),
+        "depth_probes": [],       # e.g. ['AHL', 'AL', 'ECL', ...]
+        "probe_channels": {},     # e.g. {'AHL': 8, 'AL': 8, ...}
         "n_scalp_trials": 0,
         "n_ieeg_trials": 0,
         "scalp_shape": None,
@@ -486,13 +548,13 @@ def probe_single_file(h5_path):
             # Subject metadata
             result["subject_meta"] = extract_subject_metadata(f)
 
-            # Electrodes from sources
+            # Electrodes from sources (for counting total iEEG channels)
             result["electrodes"] = extract_electrode_names_from_sources(f)
 
-            # Electrodes from multitag names
+            # Electrodes from multitag names (spike sorting)
             result["multitag_electrodes"] = extract_electrode_names_from_multitags(f)
 
-            # Trial counts
+            # Trial counts and signal shapes
             (result["n_scalp_trials"], result["n_ieeg_trials"],
              result["scalp_shape"], result["ieeg_shape"],
              result["sampling_rate"]) = count_trials(f)
@@ -501,22 +563,26 @@ def probe_single_file(h5_path):
         result["error"] = str(e)
         return result
 
-    # Parse regions from electrode labels
-    all_electrode_names = set()
+    # --- KEY FIX: Parse region labels from "Depth electrodes" metadata ---
+    result["depth_probes"] = parse_depth_electrodes_metadata(result["subject_meta"])
 
-    # From sources
-    for elec in result["electrodes"]:
-        label = elec.get("label", "") or elec.get("h5_name", "")
-        if label:
-            all_electrode_names.add(label)
+    # Get total iEEG channel count from data shape or source count
+    n_ieeg_channels = 0
+    if result["ieeg_shape"]:
+        n_ieeg_channels = result["ieeg_shape"][0]  # shape is (channels, timepoints)
+    elif result["electrodes"]:
+        n_ieeg_channels = len(result["electrodes"])
 
-    # From multitag names
-    all_electrode_names.update(result["multitag_electrodes"])
+    # Distribute channels across probes
+    if result["depth_probes"] and n_ieeg_channels > 0:
+        result["probe_channels"] = assign_channels_to_probes(
+            result["depth_probes"], n_ieeg_channels)
 
-    for name in all_electrode_names:
-        region, subregion, hemi, contact, prefix = parse_electrode_region(name)
-        result["region_counts"][region] += 1
-        result["subregion_counts"][subregion] += 1
+        # Map probes to regions
+        for probe, n_contacts in result["probe_channels"].items():
+            region, subregion, hemi, _, _ = parse_electrode_region(probe)
+            result["region_counts"][region] += n_contacts
+            result["subregion_counts"][subregion] += n_contacts
 
     # Force garbage collection after closing file
     gc.collect()
@@ -575,12 +641,13 @@ def main():
         subj = result["subject"] or f"unknown_{i}"
         subjects[subj].append(result)
 
-        n_elec = len(result["electrodes"]) + len(result["multitag_electrodes"])
+        n_ch = result["ieeg_shape"][0] if result["ieeg_shape"] else 0
+        probes_str = ",".join(result["depth_probes"]) if result["depth_probes"] else "?"
+        region_str = {k: v for k, v in result["region_counts"].items() if k != "unknown"}
         print(f" OK  (subj={subj}, sess={result['session']}, "
-              f"elec={n_elec}, "
-              f"scalp_trials={result['n_scalp_trials']}, "
-              f"ieeg_trials={result['n_ieeg_trials']}, "
-              f"regions={dict(result['region_counts'])})")
+              f"ieeg_ch={n_ch}, probes=[{probes_str}], "
+              f"trials={result['n_ieeg_trials']}, "
+              f"regions={region_str or dict(result['region_counts'])})")
 
     # =========================================================================
     #  PER-SUBJECT SUMMARY
@@ -635,38 +702,58 @@ def main():
             for subr in sorted(merged_subregions.keys()):
                 print(f"      {subr:25s}  {merged_subregions[subr]:3d} channels")
 
-        # Print subject metadata from first session
+        # Print depth electrode probes
+        probes = sessions[0].get("depth_probes", [])
+        if probes:
+            print(f"    Depth probes: {', '.join(probes)}")
+
+        # Print key subject metadata
         meta = sessions[0].get("subject_meta", {})
         if meta:
             print(f"    Metadata:")
             for k, v in sorted(meta.items()):
-                print(f"      {k}: {v}")
+                # Clean up tuple display
+                if isinstance(v, (tuple, list, np.ndarray)):
+                    first = v[0] if len(v) > 0 else v
+                    if isinstance(first, (bytes, np.bytes_)):
+                        first = first.decode("utf-8", errors="replace")
+                    # Skip printing the zeros/empty fields in the tuple
+                    v = first
+                short_key = k.split("/")[-1] if "/" in k else k
+                print(f"      {short_key}: {v}")
 
     # =========================================================================
-    #  ELECTRODE LABEL DETAILS (from first session of each subject)
+    #  DEPTH ELECTRODE PROBE MAPPING (from first session of each subject)
     # =========================================================================
     print(f"\n\n{'=' * 90}")
-    print(f"  ELECTRODE LABELS PER SUBJECT")
+    print(f"  DEPTH ELECTRODE PROBE → REGION MAPPING")
     print(f"{'=' * 90}")
 
     for subj in sorted(subjects.keys()):
         sess = subjects[subj][0]  # first session
-        print(f"\n  {subj}:")
+        n_ch = sess["ieeg_shape"][0] if sess["ieeg_shape"] else len(sess["electrodes"])
+        probes = sess["depth_probes"]
+        probe_ch = sess["probe_channels"]
 
-        # From sources
-        if sess["electrodes"]:
-            print(f"    From sources ({len(sess['electrodes'])} entries):")
-            for elec in sess["electrodes"][:50]:
-                label = elec.get("label", "") or elec.get("h5_name", "")
-                region, subregion, hemi, contact, prefix = parse_electrode_region(label)
-                print(f"      {label:30s}  -> {region:20s} ({subregion}, {hemi})")
+        print(f"\n  {subj}: {n_ch} total iEEG channels, {len(probes)} probes")
+        print(f"    Depth electrodes field: {','.join(probes)}")
 
-        # From multitags
+        if probe_ch:
+            ch_per = n_ch / len(probes) if probes else 0
+            print(f"    Contacts per probe: ~{ch_per:.1f}")
+            print(f"    {'Probe':<8s} {'Contacts':>10s}  {'Region':<22s} {'Sub-region':<25s} {'Hemi'}")
+            print(f"    {'─'*8} {'─'*10}  {'─'*22} {'─'*25} {'─'*4}")
+            for probe in probes:
+                nc = probe_ch.get(probe, 0)
+                region, subregion, hemi, _, _ = parse_electrode_region(probe)
+                print(f"    {probe:<8s} {nc:>10d}  {region:<22s} {subregion:<25s} {hemi}")
+
+        # Also show multitag electrode names if found (spike-sorted units)
         if sess["multitag_electrodes"]:
-            print(f"    From multitags ({len(sess['multitag_electrodes'])} entries):")
+            print(f"    Spike-sorted units from multitags ({len(sess['multitag_electrodes'])}):")
             for name in sorted(sess["multitag_electrodes"]):
                 region, subregion, hemi, contact, prefix = parse_electrode_region(name)
-                print(f"      {name:30s}  -> {region:20s} ({subregion}, {hemi})")
+                print(f"      {name:20s}  -> {region} ({subregion})")
 
     # =========================================================================
     #  REGION-TO-REGION VIABILITY TABLE
@@ -677,6 +764,13 @@ def main():
     # Canonical regions of interest
     REGIONS_OF_INTEREST = ["hippocampus", "entorhinal_cortex", "amygdala"]
 
+    # Collect all regions found (including 'other')
+    all_found_regions = set()
+    for rc in subject_region_counts.values():
+        all_found_regions.update(rc.keys())
+    extra_regions = sorted(all_found_regions - set(REGIONS_OF_INTEREST) - {"unknown"})
+    display_regions = REGIONS_OF_INTEREST + extra_regions
+
     print(f"\n\n{'=' * 90}")
     print(f"  REGION-TO-REGION VIABILITY")
     print(f"  Min channels/region: {MIN_CHANNELS}  |  Min subjects for LOSO: {MIN_SUBJECTS}")
@@ -685,23 +779,25 @@ def main():
     # Build table: subject x region -> channel count
     print(f"\n  Channel count matrix (subjects x regions):")
     print(f"  {'Subject':>10s}", end="")
-    for r in REGIONS_OF_INTEREST:
-        print(f"  {r:>20s}", end="")
-    print(f"  {'sessions':>10s}")
+    for r in display_regions:
+        rname = r[:18]
+        print(f"  {rname:>18s}", end="")
+    print(f"  {'total':>8s}  {'sessions':>8s}")
     print(f"  {'─'*10}", end="")
-    for _ in REGIONS_OF_INTEREST:
-        print(f"  {'─'*20}", end="")
-    print(f"  {'─'*10}")
+    for _ in display_regions:
+        print(f"  {'─'*18}", end="")
+    print(f"  {'─'*8}  {'─'*8}")
 
     for subj in sorted(subject_region_counts.keys()):
         rc = subject_region_counts[subj]
         n_sess = len(subjects[subj])
+        total_ch = sum(rc.values())
         print(f"  {subj:>10s}", end="")
-        for r in REGIONS_OF_INTEREST:
+        for r in display_regions:
             cnt = rc.get(r, 0)
             mark = " ✓" if cnt >= MIN_CHANNELS else " ✗" if cnt == 0 else " ~"
-            print(f"  {cnt:>17d}{mark}", end="")
-        print(f"  {n_sess:>10d}")
+            print(f"  {cnt:>15d}{mark:>2s}", end="")
+        print(f"  {total_ch:>8d}  {n_sess:>8d}")
 
     # Test all region pairs
     print(f"\n  Region pair viability (>= {MIN_SUBJECTS} subjects with >= {MIN_CHANNELS} channels each):")
@@ -780,6 +876,77 @@ def main():
             print(f"    ... ({len(files)-5} more)")
 
     # =========================================================================
+    #  SOZ ANALYSIS — exclude seizure onset zone electrodes
+    # =========================================================================
+    print(f"\n\n{'=' * 90}")
+    print(f"  SEIZURE ONSET ZONE (SOZ) ANALYSIS")
+    print(f"  SOZ electrodes may have pathological activity — consider excluding")
+    print(f"{'=' * 90}")
+
+    subject_soz = {}  # subject -> list of SOZ probe abbreviations
+    subject_region_counts_no_soz = {}  # subject -> {region: channels} excluding SOZ probes
+
+    for subj in sorted(subjects.keys()):
+        sess = subjects[subj][0]
+        meta = sess.get("subject_meta", {})
+        soz_probes = []
+
+        for key, val in meta.items():
+            if "seizure onset" in key.lower() or "soz" in key.lower():
+                raw = val
+                if isinstance(raw, (tuple, list, np.ndarray)):
+                    raw = raw[0] if len(raw) > 0 else raw
+                if isinstance(raw, (bytes, np.bytes_)):
+                    raw = raw.decode("utf-8", errors="replace")
+                raw = str(raw).strip()
+                if raw:
+                    soz_probes = [p.strip().upper() for p in raw.split(",") if p.strip()]
+
+        subject_soz[subj] = soz_probes
+
+        # Compute region counts excluding SOZ probes
+        probe_ch = sess.get("probe_channels", {})
+        region_counts_clean = defaultdict(int)
+        for probe, n_contacts in probe_ch.items():
+            if probe not in soz_probes:
+                region, _, _, _, _ = parse_electrode_region(probe)
+                region_counts_clean[region] += n_contacts
+        subject_region_counts_no_soz[subj] = dict(region_counts_clean)
+
+        probes_all = sess.get("depth_probes", [])
+        clean_probes = [p for p in probes_all if p not in soz_probes]
+        n_ch_clean = sum(probe_ch.get(p, 0) for p in clean_probes)
+        n_ch_total = sum(probe_ch.values())
+
+        soz_str = ", ".join(soz_probes) if soz_probes else "(none)"
+        print(f"  {subj}: SOZ = [{soz_str}]  "
+              f"channels: {n_ch_total} total -> {n_ch_clean} after SOZ exclusion  "
+              f"probes: {len(probes_all)} -> {len(clean_probes)}")
+
+    # Viability table excluding SOZ
+    print(f"\n  Region pair viability EXCLUDING SOZ probes:")
+    viable_runs_no_soz = []
+    for src in REGIONS_OF_INTEREST:
+        for tgt in REGIONS_OF_INTEREST:
+            if src == tgt:
+                continue
+            valid_subjects = []
+            for subj, rc in subject_region_counts_no_soz.items():
+                src_ch = rc.get(src, 0)
+                tgt_ch = rc.get(tgt, 0)
+                if src_ch >= MIN_CHANNELS and tgt_ch >= MIN_CHANNELS:
+                    valid_subjects.append((subj, src_ch, tgt_ch))
+            n_valid = len(valid_subjects)
+            mark = "✓" if n_valid >= MIN_SUBJECTS else "✗"
+            subj_str = ", ".join(f"{s[0]}({s[1]}/{s[2]}ch)" for s in valid_subjects)
+            print(f"  {mark} {src:>20s} -> {tgt:<20s}  {n_valid} subjects  [{subj_str}]")
+            if n_valid >= MIN_SUBJECTS:
+                viable_runs_no_soz.append({
+                    "source": src, "target": tgt,
+                    "n_subjects": n_valid, "subjects": valid_subjects,
+                })
+
+    # =========================================================================
     #  OVERALL VERDICT
     # =========================================================================
     all_regions_found = set()
@@ -789,20 +956,29 @@ def main():
     print(f"\n\n{'=' * 90}")
     print(f"  OVERALL VERDICT")
     print(f"{'=' * 90}")
-    print(f"  Subjects:             {len(subjects)}")
-    print(f"  Total sessions/files: {len(all_results)}")
-    print(f"  Regions found:        {sorted(all_regions_found)}")
-    print(f"  Viable LOSO runs:     {len(viable_runs)}")
+    print(f"  Subjects:              {len(subjects)}")
+    print(f"  Total sessions/files:  {len(all_results)}")
+    total_trials = sum(sum(s["n_ieeg_trials"] for s in sessions)
+                       for sessions in subjects.values())
+    print(f"  Total iEEG trials:     {total_trials}")
+    print(f"  Sampling rate:         2000 Hz (all files)")
+    print(f"  Regions found:         {sorted(all_regions_found)}")
+    print(f"  Viable LOSO runs:      {len(viable_runs)} (all probes)")
+    print(f"  Viable LOSO runs:      {len(viable_runs_no_soz)} (excluding SOZ)")
 
-    if viable_runs:
+    best_runs = viable_runs if viable_runs else viable_runs_no_soz
+    if best_runs:
         print(f"\n  DATASET IS VIABLE for inter-region neural translation!")
-        print(f"  Best region pairs:")
+        print(f"  Best region pairs (including SOZ):")
         for run in sorted(viable_runs, key=lambda x: -x["n_subjects"]):
             print(f"    {run['source']} -> {run['target']}: {run['n_subjects']} subjects")
+        if viable_runs_no_soz:
+            print(f"  Best region pairs (excluding SOZ):")
+            for run in sorted(viable_runs_no_soz, key=lambda x: -x["n_subjects"]):
+                print(f"    {run['source']} -> {run['target']}: {run['n_subjects']} subjects")
     else:
-        print(f"\n  DATASET MAY NOT BE VIABLE — check electrode labels above")
+        print(f"\n  DATASET MAY NOT BE VIABLE — check probe mapping above")
         print(f"  If regions show as 'unknown', the naming convention may differ")
-        print(f"  from expected (AHL, PHR, ECL, AL, etc.)")
 
     print()
 
