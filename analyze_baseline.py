@@ -7,14 +7,18 @@ raw source vs target signals to understand:
 2. How much does this vary across sessions/subjects?
 3. What does the model need to beat?
 
-Supports: olfactory, pfc, dandi, pcx1, ecog
+Computes ALL directed region pairs for each dataset and reports
+per-session results separately.
+
+Supports: olfactory, pfc, dandi, pcx1, ecog, boran
 """
 
 import argparse
 import json
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from itertools import permutations
 import sys
 
 # Add parent to path for imports
@@ -135,38 +139,93 @@ def analyze_continuous_pair(
     }
 
 
-def print_summary(dataset_name: str, pair_name: str, results: List[Dict]):
-    """Print a compact summary table and save JSON."""
+# =============================================================================
+# Output Helpers
+# =============================================================================
+
+def print_pair_header(pair_name: str):
+    """Print a separator for a region pair."""
+    print(f"\n{'─' * 70}")
+    print(f"  {pair_name}")
+    print(f"{'─' * 70}")
+
+
+def print_session_table(results: List[Dict]):
+    """Print per-session results as a table."""
     if not results:
-        print("No valid results.")
+        print("  No valid sessions.")
         return
 
     all_corrs = [r["corr_mean"] for r in results]
     all_r2s = [r["r2_mean"] for r in results]
 
-    print(f"\n{'Label':<16} {'Src Ch':<8} {'Tgt Ch':<8} {'Corr':<16} {'R2':<16} {'SNR(s/t)':<14} {'Win'}")
-    print("-" * 95)
+    print(f"  {'Session':<16} {'Src Ch':<8} {'Tgt Ch':<8} {'Corr':<16} {'R2':<16} {'SNR(s/t)':<14} {'Win'}")
+    print(f"  {'-' * 90}")
     for r in results:
-        print(f"{r['label']:<16} {r['n_source_channels']:<8} {r['n_target_channels']:<8} "
+        print(f"  {r['label']:<16} {r['n_source_channels']:<8} {r['n_target_channels']:<8} "
               f"{r['corr_mean']:.3f} +/- {r['corr_std']:.3f}   "
               f"{r['r2_mean']:.3f} +/- {r['r2_std']:.3f}   "
               f"{r['source_snr']:.1f}/{r['target_snr']:.1f}       {r['n_windows']}")
-    print("-" * 95)
-    print(f"{'OVERALL':<16} {'':8} {'':8} "
+    print(f"  {'-' * 90}")
+    print(f"  {'MEAN':<16} {'':8} {'':8} "
           f"{np.mean(all_corrs):.3f} +/- {np.std(all_corrs):.3f}   "
           f"{np.mean(all_r2s):.3f} +/- {np.std(all_r2s):.3f}")
 
-    # Save JSON
+
+def print_cross_pair_summary(all_pair_results: Dict[str, List[Dict]]):
+    """Print a compact cross-pair comparison table."""
+    print(f"\n{'=' * 70}")
+    print("  CROSS-PAIR SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  {'Pair':<35} {'Corr':<12} {'R2':<12} {'N sessions'}")
+    print(f"  {'-' * 65}")
+
+    summaries = []
+    for pair_name, results in all_pair_results.items():
+        if results:
+            corrs = [r["corr_mean"] for r in results]
+            r2s = [r["r2_mean"] for r in results]
+            summaries.append({
+                "pair": pair_name,
+                "corr": float(np.mean(corrs)),
+                "corr_std": float(np.std(corrs)),
+                "r2": float(np.mean(r2s)),
+                "r2_std": float(np.std(r2s)),
+                "n": len(results),
+            })
+
+    # Sort by correlation descending
+    summaries.sort(key=lambda x: x["corr"], reverse=True)
+    for s in summaries:
+        print(f"  {s['pair']:<35} {s['corr']:.3f}+/-{s['corr_std']:.3f}  "
+              f"{s['r2']:.3f}+/-{s['r2_std']:.3f}  {s['n']}")
+
+
+def save_all_results(dataset_name: str, all_pair_results: Dict[str, List[Dict]]):
+    """Save comprehensive JSON with per-session detail for every pair."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = OUTPUT_DIR / f"{dataset_name}.json"
+
+    pairs_data = {}
+    for pair_name, results in all_pair_results.items():
+        if results:
+            corrs = [r["corr_mean"] for r in results]
+            r2s = [r["r2_mean"] for r in results]
+            pairs_data[pair_name] = {
+                "n_sessions": len(results),
+                "overall_corr": float(np.mean(corrs)),
+                "overall_corr_std": float(np.std(corrs)),
+                "overall_r2": float(np.mean(r2s)),
+                "overall_r2_std": float(np.std(r2s)),
+                "per_session": results,
+            }
+
     save_data = {
         "dataset": dataset_name,
-        "pair": pair_name,
-        "n_sessions": len(results),
-        "overall_corr": float(np.mean(all_corrs)),
-        "overall_r2": float(np.mean(all_r2s)),
-        "per_session": results,
+        "n_pairs": len(pairs_data),
+        "pairs": pairs_data,
     }
+
     with open(output_file, "w") as f:
         json.dump(save_data, f, indent=2)
     print(f"\nSaved to {output_file}")
@@ -177,74 +236,100 @@ def print_summary(dataset_name: str, pair_name: str, results: List[Dict]):
 # =============================================================================
 
 def run_olfactory_analysis(window_size: int, stride: int):
-    """Run baseline analysis for the olfactory dataset (OB -> PCx)."""
+    """Run baseline analysis for olfactory dataset: OB <-> PCx (both directions)."""
     from data import load_signals, load_session_ids, extract_window, DATA_PATH, ODOR_CSV_PATH
 
-    print("Olfactory dataset: OB -> PCx")
-    signals = load_signals(DATA_PATH)  # [N, 2, C, T_full]
-    windowed = extract_window(signals)  # [N, 2, C, T_window]
+    print("Olfactory dataset: OB <-> PCx (bidirectional)")
+    signals = load_signals(DATA_PATH)
+    windowed = extract_window(signals)
     ob_all = windowed[:, 0]   # [N, C, T]
     pcx_all = windowed[:, 1]  # [N, C, T]
 
     session_ids, session_to_idx, idx_to_session = load_session_ids(ODOR_CSV_PATH, len(signals))
     unique_sessions = sorted(set(session_ids.tolist()))
-
     print(f"  {len(unique_sessions)} sessions, {len(signals)} trials")
 
-    results = []
-    for sess_int in unique_sessions:
-        sess_name = idx_to_session[sess_int]
-        mask = session_ids == sess_int
-        ob_sess = ob_all[mask]   # [N_sess, C, T]
-        pcx_sess = pcx_all[mask] # [N_sess, C, T]
+    all_pair_results = {}
 
-        # Concatenate trials along time for continuous analysis
-        ob_cat = ob_sess.reshape(ob_sess.shape[1], -1)    # [C, N*T]
-        pcx_cat = pcx_sess.reshape(pcx_sess.shape[1], -1)  # [C, N*T]
+    for src_name, tgt_name, src_all, tgt_all in [
+        ("OB", "PCx", ob_all, pcx_all),
+        ("PCx", "OB", pcx_all, ob_all),
+    ]:
+        pair_name = f"{src_name} -> {tgt_name}"
+        print_pair_header(pair_name)
 
-        r = analyze_continuous_pair(ob_cat, pcx_cat, sess_name,
-                                    srate=1000.0, window_size=window_size, stride=stride)
-        if r:
-            results.append(r)
+        results = []
+        for sess_int in unique_sessions:
+            sess_name = idx_to_session[sess_int]
+            mask = session_ids == sess_int
+            src_sess = src_all[mask]
+            tgt_sess = tgt_all[mask]
 
-    print_summary("olfactory", "OB -> PCx", results)
+            src_cat = src_sess.reshape(src_sess.shape[1], -1)
+            tgt_cat = tgt_sess.reshape(tgt_sess.shape[1], -1)
+
+            r = analyze_continuous_pair(src_cat, tgt_cat, sess_name,
+                                        srate=1000.0, window_size=window_size, stride=stride)
+            if r:
+                results.append(r)
+
+        print_session_table(results)
+        all_pair_results[pair_name] = results
+
+    print_cross_pair_summary(all_pair_results)
+    save_all_results("olfactory", all_pair_results)
 
 
 def run_pfc_analysis(window_size: int, stride: int):
-    """Run baseline analysis for the PFC dataset (PFC -> CA1)."""
+    """Run baseline analysis for PFC dataset: PFC <-> CA1 (both directions)."""
     from data import load_pfc_signals, load_pfc_session_ids, PFC_DATA_PATH, PFC_META_PATH
 
-    print("PFC dataset: PFC -> CA1")
-    pfc_all, ca1_all = load_pfc_signals(PFC_DATA_PATH)  # [N, C, T] each
+    print("PFC dataset: PFC <-> CA1 (bidirectional)")
+    pfc_all, ca1_all = load_pfc_signals(PFC_DATA_PATH)
 
     session_ids, session_to_idx, idx_to_session = load_pfc_session_ids(PFC_META_PATH, len(pfc_all))
     unique_sessions = sorted(set(session_ids.tolist()))
-
     print(f"  {len(unique_sessions)} sessions, {len(pfc_all)} trials")
 
-    results = []
-    for sess_int in unique_sessions:
-        sess_name = idx_to_session[sess_int]
-        mask = session_ids == sess_int
-        pfc_sess = pfc_all[mask]  # [N_sess, C, T]
-        ca1_sess = ca1_all[mask]  # [N_sess, C, T]
+    all_pair_results = {}
 
-        pfc_cat = pfc_sess.reshape(pfc_sess.shape[1], -1)  # [C, N*T]
-        ca1_cat = ca1_sess.reshape(ca1_sess.shape[1], -1)  # [C, N*T]
+    for src_name, tgt_name, src_all, tgt_all in [
+        ("PFC", "CA1", pfc_all, ca1_all),
+        ("CA1", "PFC", ca1_all, pfc_all),
+    ]:
+        pair_name = f"{src_name} -> {tgt_name}"
+        print_pair_header(pair_name)
 
-        r = analyze_continuous_pair(pfc_cat, ca1_cat, sess_name,
-                                    srate=1250.0, window_size=window_size, stride=stride)
-        if r:
-            results.append(r)
+        results = []
+        for sess_int in unique_sessions:
+            sess_name = idx_to_session[sess_int]
+            mask = session_ids == sess_int
+            src_sess = src_all[mask]
+            tgt_sess = tgt_all[mask]
 
-    print_summary("pfc", "PFC -> CA1", results)
+            src_cat = src_sess.reshape(src_sess.shape[1], -1)
+            tgt_cat = tgt_sess.reshape(tgt_sess.shape[1], -1)
+
+            r = analyze_continuous_pair(src_cat, tgt_cat, sess_name,
+                                        srate=1250.0, window_size=window_size, stride=stride)
+            if r:
+                results.append(r)
+
+        print_session_table(results)
+        all_pair_results[pair_name] = results
+
+    print_cross_pair_summary(all_pair_results)
+    save_all_results("pfc", all_pair_results)
 
 
 def run_dandi_analysis(window_size: int, stride: int):
-    """Run baseline analysis for the DANDI dataset (amygdala -> hippocampus)."""
-    from data import DANDI_RAW_PATH, list_dandi_nwb_files, load_dandi_subject
+    """Run baseline analysis for DANDI dataset: all 6 directed pairs across 3 regions."""
+    from data import (
+        DANDI_RAW_PATH, DANDI_BRAIN_REGIONS,
+        list_dandi_nwb_files, load_dandi_subject,
+    )
 
-    print("DANDI dataset: amygdala -> hippocampus")
+    print("DANDI dataset: all region pairs (amygdala, hippocampus, medial_frontal_cortex)")
     nwb_files = list_dandi_nwb_files(DANDI_RAW_PATH)
 
     subject_ids = []
@@ -256,57 +341,80 @@ def run_dandi_analysis(window_size: int, stride: int):
     subject_ids = sorted(subject_ids)
     print(f"  {len(subject_ids)} subjects")
 
-    results = []
-    for subj_id in subject_ids:
-        try:
-            data = load_dandi_subject(subj_id, DANDI_RAW_PATH,
-                                      source_region="amygdala",
-                                      target_region="hippocampus",
-                                      zscore=False)
-            if data["n_source_channels"] < 4 or data["n_target_channels"] < 4:
-                continue
-            r = analyze_continuous_pair(data["source"], data["target"], subj_id,
-                                        srate=1000.0, window_size=window_size, stride=stride)
-            if r:
-                results.append(r)
-        except Exception as e:
-            print(f"  Skipping {subj_id}: {e}")
+    all_pair_results = {}
 
-    print_summary("dandi", "amygdala -> hippocampus", results)
+    for src_region, tgt_region in permutations(DANDI_BRAIN_REGIONS, 2):
+        pair_name = f"{src_region} -> {tgt_region}"
+        print_pair_header(pair_name)
+
+        results = []
+        for subj_id in subject_ids:
+            try:
+                data = load_dandi_subject(subj_id, DANDI_RAW_PATH,
+                                          source_region=src_region,
+                                          target_region=tgt_region,
+                                          zscore=False)
+                if data is None:
+                    continue
+                if data["n_source_channels"] < 4 or data["n_target_channels"] < 4:
+                    continue
+                r = analyze_continuous_pair(data["source"], data["target"], subj_id,
+                                            srate=1000.0, window_size=window_size, stride=stride)
+                if r:
+                    results.append(r)
+            except Exception as e:
+                print(f"    Skipping {subj_id}: {e}")
+
+        print_session_table(results)
+        all_pair_results[pair_name] = results
+
+    print_cross_pair_summary(all_pair_results)
+    save_all_results("dandi", all_pair_results)
 
 
 def run_pcx1_analysis(window_size: int, stride: int):
-    """Run baseline analysis for the PCx1 dataset (OB -> PCx)."""
+    """Run baseline analysis for PCx1 dataset: OB <-> PCx (both directions)."""
     from data import list_pcx1_sessions, load_pcx1_session
 
-    print("PCx1 dataset: OB -> PCx (continuous)")
+    print("PCx1 dataset: OB <-> PCx (bidirectional, continuous)")
     sessions = list_pcx1_sessions()
     print(f"  {len(sessions)} sessions")
 
-    results = []
-    for session in sessions:
-        try:
-            data = load_pcx1_session(session)
-            ob = data["ob"]    # [C, T]
-            pcx = data["pcx"]  # [C, T]
-            r = analyze_continuous_pair(ob, pcx, session,
-                                        srate=1000.0, window_size=window_size, stride=stride)
-            if r:
-                results.append(r)
-        except Exception as e:
-            print(f"  Skipping {session}: {e}")
+    all_pair_results = {}
 
-    print_summary("pcx1", "OB -> PCx", results)
+    for src_key, tgt_key, src_name, tgt_name in [
+        ("ob", "pcx", "OB", "PCx"),
+        ("pcx", "ob", "PCx", "OB"),
+    ]:
+        pair_name = f"{src_name} -> {tgt_name}"
+        print_pair_header(pair_name)
+
+        results = []
+        for session in sessions:
+            try:
+                data = load_pcx1_session(session)
+                source = data[src_key]
+                target = data[tgt_key]
+                r = analyze_continuous_pair(source, target, session,
+                                            srate=1000.0, window_size=window_size, stride=stride)
+                if r:
+                    results.append(r)
+            except Exception as e:
+                print(f"    Skipping {session}: {e}")
+
+        print_session_table(results)
+        all_pair_results[pair_name] = results
+
+    print_cross_pair_summary(all_pair_results)
+    save_all_results("pcx1", all_pair_results)
 
 
 def run_ecog_analysis(
     experiment: str = "motor_imagery",
-    source_region: str = "frontal",
-    target_region: str = "parietal",
     window_size: int = 5000,
     stride: int = 2500,
 ):
-    """Run baseline analysis for the ECoG dataset."""
+    """Run baseline analysis for ECoG dataset: all directed pairs across 5 brain lobes."""
     from data import (
         _ECOG_DATA_DIR,
         _enumerate_ecog_recordings,
@@ -315,7 +423,8 @@ def run_ecog_analysis(
         ECOG_BRAIN_LOBES,
     )
 
-    print(f"ECoG dataset ({experiment}): {source_region} -> {target_region}")
+    print(f"ECoG dataset ({experiment}): all region pairs")
+    print(f"  Regions: {', '.join(ECOG_BRAIN_LOBES)}")
 
     npz_path = _ECOG_DATA_DIR / f"{experiment}.npz"
     if not npz_path.exists():
@@ -326,8 +435,13 @@ def run_ecog_analysis(
     recordings = _enumerate_ecog_recordings(alldat)
     print(f"  {len(recordings)} recordings")
 
-    def _analyze_pair(src_reg, tgt_reg):
-        pair_results = []
+    all_pair_results = {}
+
+    for src_region, tgt_region in permutations(ECOG_BRAIN_LOBES, 2):
+        pair_name = f"{src_region} -> {tgt_region}"
+        print_pair_header(pair_name)
+
+        results = []
         for row, col, rec_id in recordings:
             dat = alldat[row, col]
             if dat is None or not isinstance(dat, dict):
@@ -335,7 +449,7 @@ def run_ecog_analysis(
             V = dat.get("V")
             if V is None or V.size == 0:
                 continue
-            src_chs, tgt_chs = _get_ecog_region_channels(dat, src_reg, tgt_reg)
+            src_chs, tgt_chs = _get_ecog_region_channels(dat, src_region, tgt_region)
             if len(src_chs) < 4 or len(tgt_chs) < 4:
                 continue
             srate = _parse_ecog_srate(dat)
@@ -347,47 +461,59 @@ def run_ecog_analysis(
             if r:
                 r["n_source_channels"] = len(src_chs)
                 r["n_target_channels"] = len(tgt_chs)
-                pair_results.append(r)
-        return pair_results
+                results.append(r)
 
-    # Primary pair
-    primary_results = _analyze_pair(source_region, target_region)
-    if not primary_results:
-        print("No valid recordings found! Try different region pairs.")
-        return
+        print_session_table(results)
+        all_pair_results[pair_name] = results
 
-    # All pairs comparison
-    all_pairs = {}
-    for src in ECOG_BRAIN_LOBES:
-        for tgt in ECOG_BRAIN_LOBES:
-            if src == tgt:
-                continue
-            if (src, tgt) == (source_region, target_region):
-                pr = primary_results
-            else:
-                pr = _analyze_pair(src, tgt)
-            if pr:
-                corrs = [r["corr_mean"] for r in pr]
-                r2s = [r["r2_mean"] for r in pr]
-                all_pairs[f"{src} -> {tgt}"] = {
-                    "corr": float(np.mean(corrs)),
-                    "r2": float(np.mean(r2s)),
-                    "n": len(pr),
-                }
+    print_cross_pair_summary(all_pair_results)
+    save_all_results(f"ecog_{experiment}", all_pair_results)
 
-    # Print primary pair summary
-    print_summary(f"ecog_{experiment}_{source_region}_{target_region}",
-                  f"{source_region} -> {target_region}", primary_results)
 
-    # Print cross-pair comparison
-    if all_pairs:
-        primary_key = f"{source_region} -> {target_region}"
-        print(f"\nAll region pair baselines for {experiment}:")
-        print(f"{'Pair':<30} {'Corr':<8} {'R2':<8} {'N'}")
-        print("-" * 50)
-        for pair, s in sorted(all_pairs.items(), key=lambda x: x[1]["corr"], reverse=True):
-            marker = " <--" if pair == primary_key else ""
-            print(f"{pair:<30} {s['corr']:.3f}    {s['r2']:.3f}    {s['n']}{marker}")
+def run_boran_analysis(window_size: int, stride: int):
+    """Run baseline analysis for Boran MTL dataset: all 6 directed pairs across 3 regions."""
+    from data import (
+        BORAN_MTL_REGIONS, BORAN_SAMPLING_RATE_HZ,
+        list_boran_subjects, load_boran_subject,
+    )
+
+    print("Boran MTL dataset: all region pairs (hippocampus, entorhinal_cortex, amygdala)")
+    subjects = list_boran_subjects()
+    print(f"  {len(subjects)} subjects")
+
+    all_pair_results = {}
+
+    for src_region, tgt_region in permutations(BORAN_MTL_REGIONS, 2):
+        pair_name = f"{src_region} -> {tgt_region}"
+        print_pair_header(pair_name)
+
+        results = []
+        for subj_id in subjects:
+            try:
+                data = load_boran_subject(
+                    subj_id,
+                    source_region=src_region,
+                    target_region=tgt_region,
+                    zscore=False,
+                    min_channels=4,
+                )
+                if data is None:
+                    continue
+                r = analyze_continuous_pair(
+                    data["source"], data["target"], subj_id,
+                    srate=float(BORAN_SAMPLING_RATE_HZ),
+                    window_size=window_size, stride=stride,
+                )
+                if r:
+                    results.append(r)
+            except Exception as e:
+                print(f"    Skipping {subj_id}: {e}")
+
+        print_session_table(results)
+        all_pair_results[pair_name] = results
+
+    print_cross_pair_summary(all_pair_results)
+    save_all_results("boran", all_pair_results)
 
 
 # =============================================================================
@@ -396,17 +522,14 @@ def run_ecog_analysis(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze natural baseline relationship between brain regions (no model)"
+        description="Analyze natural baseline relationship between ALL brain region "
+                    "pairs (no model). Reports per-session results separately."
     )
-    parser.add_argument("--dataset", type=str, default="pcx1",
-                        choices=["olfactory", "pfc", "dandi", "pcx1", "ecog"],
+    parser.add_argument("--dataset", type=str, default="pfc",
+                        choices=["olfactory", "pfc", "dandi", "pcx1", "ecog", "boran"],
                         help="Dataset to analyze")
     parser.add_argument("--ecog-experiment", type=str, default="motor_imagery",
                         help="ECoG experiment name")
-    parser.add_argument("--ecog-source-region", type=str, default="frontal",
-                        help="ECoG source brain lobe")
-    parser.add_argument("--ecog-target-region", type=str, default="parietal",
-                        help="ECoG target brain lobe")
     parser.add_argument("--window-size", type=int, default=5000,
                         help="Window size in samples (default: 5000)")
     parser.add_argument("--stride", type=int, default=2500,
@@ -415,8 +538,8 @@ def main():
 
     print("=" * 70)
     print(f"BASELINE ANALYSIS: {args.dataset}")
+    print("  Natural inter-region relations — ALL pairs, per-session")
     print("=" * 70)
-    print("Natural inter-region correlation WITHOUT any model.\n")
 
     if args.dataset == "olfactory":
         run_olfactory_analysis(args.window_size, args.stride)
@@ -429,11 +552,11 @@ def main():
     elif args.dataset == "ecog":
         run_ecog_analysis(
             experiment=args.ecog_experiment,
-            source_region=args.ecog_source_region,
-            target_region=args.ecog_target_region,
             window_size=args.window_size,
             stride=args.stride,
         )
+    elif args.dataset == "boran":
+        run_boran_analysis(args.window_size, args.stride)
 
 
 if __name__ == "__main__":
