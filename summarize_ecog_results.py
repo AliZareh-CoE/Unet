@@ -16,6 +16,7 @@ import json
 import math
 import sys
 import argparse
+import numpy as np
 from pathlib import Path
 from collections import defaultdict
 
@@ -151,6 +152,222 @@ def fmt_p(p):
 
 
 # =============================================================================
+# Natural baseline computation from raw data
+# =============================================================================
+
+def _per_channel_normalize(x: np.ndarray) -> np.ndarray:
+    """Z-score normalize each channel independently. x: (C, T)."""
+    mean = x.mean(axis=-1, keepdims=True)
+    std = x.std(axis=-1, keepdims=True)
+    std[std < 1e-8] = 1e-8
+    return (x - mean) / std
+
+
+def _compute_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute mean Pearson correlation across channels. x, y: (C, T)."""
+    x_norm = _per_channel_normalize(x)
+    y_norm = _per_channel_normalize(y)
+    n_ch = min(x_norm.shape[0], y_norm.shape[0])
+    corrs = []
+    for c in range(n_ch):
+        corr = np.corrcoef(x_norm[c], y_norm[c])[0, 1]
+        if not np.isnan(corr):
+            corrs.append(corr)
+    return float(np.mean(corrs)) if corrs else 0.0
+
+
+def _compute_r2(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute mean R2 across channels. x, y: (C, T)."""
+    x_norm = _per_channel_normalize(x)
+    y_norm = _per_channel_normalize(y)
+    n_ch = min(x_norm.shape[0], y_norm.shape[0])
+    r2s = []
+    for c in range(n_ch):
+        ss_res = np.sum((y_norm[c] - x_norm[c]) ** 2)
+        ss_tot = np.sum((y_norm[c] - y_norm[c].mean()) ** 2)
+        if ss_tot > 1e-8:
+            r2s.append(1 - ss_res / ss_tot)
+    return float(np.mean(r2s)) if r2s else 0.0
+
+
+def _compute_windowed_baseline(
+    source: np.ndarray,
+    target: np.ndarray,
+    window_size: int = 5000,
+    stride: int = 2500,
+) -> dict:
+    """Compute natural baseline metrics from raw source/target signals.
+
+    Args:
+        source: (C, T) source signals
+        target: (C, T) target signals
+        window_size: Window size in samples
+        stride: Stride between windows
+
+    Returns:
+        Dict with corr_mean, corr_std, r2_mean, r2_std, or None if too short
+    """
+    source = np.nan_to_num(source.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    target = np.nan_to_num(target.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+    n_ch = min(source.shape[0], target.shape[0])
+    n_samples = min(source.shape[1], target.shape[1])
+    source = source[:n_ch, :n_samples]
+    target = target[:n_ch, :n_samples]
+
+    n_windows = (n_samples - window_size) // stride + 1
+    if n_windows < 1:
+        return None
+
+    window_corrs = []
+    window_r2s = []
+    for i in range(n_windows):
+        start = i * stride
+        end = start + window_size
+        window_corrs.append(_compute_correlation(source[:, start:end], target[:, start:end]))
+        window_r2s.append(_compute_r2(source[:, start:end], target[:, start:end]))
+
+    return {
+        "corr_mean": float(np.mean(window_corrs)),
+        "corr_std": float(np.std(window_corrs)),
+        "r2_mean": float(np.mean(window_r2s)),
+        "r2_std": float(np.std(window_r2s)),
+        "n_windows": int(n_windows),
+        "n_channels": n_ch,
+    }
+
+
+def compute_natural_baselines(experiment_name: str) -> dict:
+    """Compute proper per-channel natural baselines from raw data.
+
+    Detects dataset type and direction from experiment_name, loads raw data
+    per subject, and returns per-subject natural correlations.
+
+    Args:
+        experiment_name: e.g. "boran_mtl/hippocampus_to_entorhinal_cortex"
+
+    Returns:
+        Dict of {subject_id: {"corr": float, "r2": float}} or empty dict on failure
+    """
+    parts = experiment_name.split("/")
+    if len(parts) < 2:
+        return {}
+
+    dataset_name = parts[0]
+    direction = parts[1]
+    dir_parts = direction.split("_to_")
+    if len(dir_parts) != 2:
+        return {}
+    source_region, target_region = dir_parts
+
+    baselines = {}
+
+    try:
+        if dataset_name.startswith("boran"):
+            from data import list_boran_subjects, load_boran_subject, BORAN_SAMPLING_RATE_HZ
+            subjects = list_boran_subjects()
+            for subj_id in subjects:
+                try:
+                    data = load_boran_subject(
+                        subj_id,
+                        source_region=source_region,
+                        target_region=target_region,
+                        zscore=False,
+                        min_channels=4,
+                    )
+                    if data is None:
+                        continue
+                    result = _compute_windowed_baseline(
+                        data["source"], data["target"],
+                        window_size=5000, stride=2500,
+                    )
+                    if result:
+                        baselines[subj_id] = {
+                            "corr": result["corr_mean"],
+                            "r2": result["r2_mean"],
+                            "corr_std": result["corr_std"],
+                            "r2_std": result["r2_std"],
+                        }
+                except Exception as e:
+                    print(f"  Warning: baseline for {subj_id}: {e}")
+
+        elif dataset_name.startswith("ecog") or dataset_name in (
+            "motor_imagery", "memory", "fix_cross",
+        ):
+            from data import (
+                _ECOG_DATA_DIR, _enumerate_ecog_recordings,
+                _get_ecog_region_channels, _parse_ecog_srate,
+            )
+            # Try to find the experiment NPZ
+            ecog_experiment = dataset_name.replace("ecog_", "") if dataset_name.startswith("ecog_") else dataset_name
+            npz_path = _ECOG_DATA_DIR / f"{ecog_experiment}.npz"
+            if npz_path.exists():
+                alldat = np.load(npz_path, allow_pickle=True)["dat"]
+                recordings = _enumerate_ecog_recordings(alldat)
+                for row, col, rec_id in recordings:
+                    dat = alldat[row, col]
+                    if dat is None or not isinstance(dat, dict):
+                        continue
+                    V = dat.get("V")
+                    if V is None or V.size == 0:
+                        continue
+                    try:
+                        src_chs, tgt_chs = _get_ecog_region_channels(dat, source_region, target_region)
+                    except Exception:
+                        continue
+                    if len(src_chs) < 4 or len(tgt_chs) < 4:
+                        continue
+                    srate = _parse_ecog_srate(dat)
+                    source = V[:, src_chs].T.astype(np.float64)
+                    target = V[:, tgt_chs].T.astype(np.float64)
+                    label = f"s{row:02d}_b{col:02d}"
+                    result = _compute_windowed_baseline(
+                        source, target,
+                        window_size=int(5 * srate), stride=int(2.5 * srate),
+                    )
+                    if result:
+                        baselines[label] = {
+                            "corr": result["corr_mean"],
+                            "r2": result["r2_mean"],
+                            "corr_std": result["corr_std"],
+                            "r2_std": result["r2_std"],
+                        }
+
+        elif dataset_name.startswith("dandi"):
+            from data import list_dandi_subjects, load_dandi_subject
+            subjects = list_dandi_subjects()
+            for subj_id in subjects:
+                try:
+                    data = load_dandi_subject(subj_id, source_region, target_region)
+                    if data is None:
+                        continue
+                    result = _compute_windowed_baseline(
+                        data["source"], data["target"],
+                        window_size=5000, stride=2500,
+                    )
+                    if result:
+                        baselines[subj_id] = {
+                            "corr": result["corr_mean"],
+                            "r2": result["r2_mean"],
+                            "corr_std": result["corr_std"],
+                            "r2_std": result["r2_std"],
+                        }
+                except Exception as e:
+                    print(f"  Warning: baseline for {subj_id}: {e}")
+
+    except ImportError as e:
+        print(f"  Warning: Cannot compute natural baselines for {dataset_name}: {e}")
+        return {}
+    except Exception as e:
+        print(f"  Warning: Failed computing natural baselines: {e}")
+        return {}
+
+    if baselines:
+        print(f"  Computed {len(baselines)} natural baselines from raw data ({dataset_name}: {source_region} -> {target_region})")
+    return baselines
+
+
+# =============================================================================
 # Core parsing
 # =============================================================================
 
@@ -263,13 +480,26 @@ def pm(mean, std):
 # Experiment summarization
 # =============================================================================
 
-def summarize_experiment(experiment_name: str, run_dir: Path) -> dict:
-    """Summarize all folds for one experiment run (one source→target pair)."""
+def summarize_experiment(experiment_name: str, run_dir: Path, use_natural_baselines: bool = True) -> dict:
+    """Summarize all folds for one experiment run (one source->target pair).
+
+    Args:
+        experiment_name: e.g. "boran_mtl/hippocampus_to_entorhinal_cortex"
+        run_dir: Path to the run directory containing fold_results/
+        use_natural_baselines: If True, compute proper per-channel baselines
+            from raw data instead of using (potentially inflated) fold JSON values.
+    """
     jsons = find_fold_jsons(run_dir)
     if not jsons:
         return None
 
     folds = [parse_fold_json(j) for j in jsons]
+
+    # Compute proper natural baselines from raw data
+    # This avoids the inflated mean-signal baselines that older fold JSONs may contain
+    natural_baselines = {}
+    if use_natural_baselines:
+        natural_baselines = compute_natural_baselines(experiment_name)
 
     # Group by fold (aggregate seeds)
     by_fold = defaultdict(list)
@@ -280,6 +510,14 @@ def summarize_experiment(experiment_name: str, run_dir: Path) -> dict:
     for fold_idx in sorted(by_fold.keys()):
         seeds = by_fold[fold_idx]
         subject = seeds[0]["subject"]
+
+        # Use natural baseline from raw data if available, else fall back to fold JSON
+        if subject in natural_baselines:
+            baseline_corr = natural_baselines[subject]["corr"]
+            baseline_source = "raw_data"
+        else:
+            baseline_corr = mean_of([s["baseline_corr"] for s in seeds])
+            baseline_source = "fold_json"
 
         fold_summaries.append({
             "fold_idx": fold_idx,
@@ -293,8 +531,9 @@ def summarize_experiment(experiment_name: str, run_dir: Path) -> dict:
             "val_r2": mean_of([s["val_r2"] for s in seeds]),
             "val_corr": mean_of([s["val_corr"] for s in seeds]),
             "val_loss": mean_of([s["val_loss"] for s in seeds]),
-            # Baseline (natural correlation)
-            "baseline_corr": mean_of([s["baseline_corr"] for s in seeds]),
+            # Baseline (natural correlation) — from raw data when available
+            "baseline_corr": baseline_corr,
+            "baseline_source": baseline_source,
             # Per-seed details
             "seed_test_r2s": [s["test_r2"] for s in seeds],
             "seed_test_corrs": [s["test_corr"] for s in seeds],
@@ -311,7 +550,18 @@ def summarize_experiment(experiment_name: str, run_dir: Path) -> dict:
     all_baseline = [f["baseline_corr"] for f in fold_summaries if f["baseline_corr"] is not None]
     all_test_corrs = [f["test_corr"] for f in fold_summaries if f["test_corr"] is not None]
     all_test_r2s = [f["test_r2"] for f in fold_summaries if f["test_r2"] is not None]
-    all_test_deltas = [f["test_delta"] for f in fold_summaries if f["test_delta"] is not None]
+
+    # Recompute delta (test_corr - baseline) using the proper natural baselines
+    all_test_deltas = []
+    for f in fold_summaries:
+        if f["test_corr"] is not None and f["baseline_corr"] is not None:
+            delta = f["test_corr"] - f["baseline_corr"]
+            f["test_delta"] = delta  # Update fold-level delta too
+            all_test_deltas.append(delta)
+
+    # Track which baseline source was used
+    baseline_sources = set(f.get("baseline_source", "fold_json") for f in fold_summaries)
+    baseline_note = " (from raw data)" if "raw_data" in baseline_sources else " (from fold JSON)"
 
     return {
         "experiment": experiment_name,
@@ -319,6 +569,7 @@ def summarize_experiment(experiment_name: str, run_dir: Path) -> dict:
         "n_folds": len(fold_summaries),
         "n_total_jsons": len(folds),
         "folds": fold_summaries,
+        "baseline_note": baseline_note,
         # Aggregate across folds
         "mean_test_r2": mean_of(all_test_r2s),
         "std_test_r2": std_of(all_test_r2s),
@@ -484,10 +735,16 @@ def print_master_table(all_summaries: list):
 
 def print_baseline_table(all_summaries: list):
     """Print table of natural/baseline correlations between regions."""
+    # Determine baseline source
+    sources = set()
+    for s in all_summaries:
+        sources.add(s.get("baseline_note", " (from fold JSON)"))
+    source_note = ", ".join(sorted(sources))
+
     print("\n")
     print("=" * 110)
-    print("  NATURAL (BASELINE) CORRELATIONS — Raw Source vs Target Signal")
-    print("  (Before any model — inherent similarity between brain regions)")
+    print("  NATURAL (BASELINE) CORRELATIONS — Per-Channel Raw Source vs Target")
+    print(f"  (Before any model — inherent similarity between brain regions){source_note}")
     print("=" * 110)
 
     hdr = (f"  {'Experiment':<18} {'Direction':<22}"
@@ -863,6 +1120,8 @@ def main():
                         help="Save per-fold CSV to this path")
     parser.add_argument("--no-details", action="store_true",
                         help="Skip per-fold detail tables, only show master summary")
+    parser.add_argument("--no-recompute-baselines", action="store_true",
+                        help="Use baseline_corr from fold JSONs instead of recomputing from raw data")
     args = parser.parse_args()
 
     root = Path(args.results_dir)
@@ -884,15 +1143,19 @@ def main():
     print(f"Scanning: {root}")
     print(f"Experiments found: {[e.name for e in experiments]}")
 
+    use_natural = not args.no_recompute_baselines
+    if use_natural:
+        print("Computing natural baselines from raw data (use --no-recompute-baselines to skip)")
+
     for exp_dir in experiments:
         direction_dirs = sorted([d for d in exp_dir.iterdir() if d.is_dir()])
         for dir_dir in direction_dirs:
             if dir_dir.name == "fold_results":
                 name = exp_dir.name
-                summary = summarize_experiment(name, exp_dir)
+                summary = summarize_experiment(name, exp_dir, use_natural_baselines=use_natural)
             else:
                 name = f"{exp_dir.name}/{dir_dir.name}"
-                summary = summarize_experiment(name, dir_dir)
+                summary = summarize_experiment(name, dir_dir, use_natural_baselines=use_natural)
 
             if summary is not None:
                 all_summaries.append(summary)
