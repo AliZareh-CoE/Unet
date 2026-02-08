@@ -281,6 +281,56 @@ def get_all_sessions(
         }
         return valid_subjects, metadata
 
+    elif dataset == "boran_mtl":
+        from data import list_boran_subjects, validate_boran_subject, _BORAN_DATA_DIR
+
+        source_region = ds_config.source_region
+        target_region = ds_config.target_region
+        min_channels = 4
+        exclude_soz = False
+        if config is not None:
+            source_region = config.boran_source_region
+            target_region = config.boran_target_region
+            min_channels = config.boran_min_channels
+            exclude_soz = config.boran_exclude_soz
+
+        if not _BORAN_DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"Boran MTL data directory not found: {_BORAN_DATA_DIR}\n"
+                f"Download from: https://gin.g-node.org/USZ_NCH/Human_MTL_units_scalp_EEG_and_iEEG_verbal_WM"
+            )
+
+        # Get all subjects and filter using lightweight metadata-only check
+        all_subjects = list_boran_subjects(data_dir=_BORAN_DATA_DIR)
+        print(f"  Boran MTL: found {len(all_subjects)} subjects in {_BORAN_DATA_DIR}")
+        print(f"  Checking {source_region} -> {target_region} (min_channels={min_channels}, exclude_soz={exclude_soz})")
+
+        valid_subjects = []
+        for subj_id in all_subjects:
+            is_valid = validate_boran_subject(
+                subject_id=subj_id,
+                data_dir=_BORAN_DATA_DIR,
+                source_region=source_region,
+                target_region=target_region,
+                min_channels=min_channels,
+                exclude_soz=exclude_soz,
+            )
+            if is_valid:
+                valid_subjects.append(subj_id)
+            print(f"    {subj_id}: {'VALID' if is_valid else 'skipped'}")
+
+        metadata = {
+            "session_type": ds_config.session_type,  # "subject"
+            "description": ds_config.description,
+            "source_region": source_region,
+            "target_region": target_region,
+            "min_channels": min_channels,
+            "exclude_soz": exclude_soz,
+            "n_subjects": len(valid_subjects),
+            "note": "LOSO holds out entire subjects (Leave-One-Subject-Out)",
+        }
+        return valid_subjects, metadata
+
     else:
         available = ", ".join(DATASET_CONFIGS.keys())
         raise ValueError(
@@ -599,6 +649,19 @@ def run_single_fold(
             "--ecog-stride-ratio", str(config.ecog_stride_ratio),
         ])
         # For ECoG, the --test-sessions will be treated as subject IDs
+
+    elif config.dataset == "boran_mtl":
+        # Boran MTL-specific: regions, window settings, SOZ exclusion
+        cmd.extend([
+            "--boran-source-region", config.boran_source_region,
+            "--boran-target-region", config.boran_target_region,
+            "--boran-window-size", str(config.boran_window_size),
+            "--boran-stride-ratio", str(config.boran_stride_ratio),
+            "--boran-min-channels", str(config.boran_min_channels),
+        ])
+        if config.boran_exclude_soz:
+            cmd.append("--boran-exclude-soz")
+        # For Boran, the --test-sessions will be treated as subject IDs
 
     # LOSO test session holdout with random train/val split
     # CRITICAL: This prevents data leakage in LOSO cross-validation
@@ -1044,7 +1107,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1", "ecog"],
+        choices=["olfactory", "pfc_hpc", "dandi_movie", "pcx1", "ecog", "boran_mtl"],
         help="Dataset to use",
     )
     parser.add_argument(
@@ -1215,14 +1278,14 @@ def parse_args() -> argparse.Namespace:
         "--ecog-source-region",
         type=str,
         default="frontal",
-        choices=["frontal", "temporal", "parietal"],
+        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
         help="Source brain lobe for translation",
     )
     ecog_group.add_argument(
         "--ecog-target-region",
         type=str,
         default="temporal",
-        choices=["frontal", "temporal", "parietal"],
+        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
         help="Target brain lobe for translation",
     )
     ecog_group.add_argument(
@@ -1236,6 +1299,49 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+
+    # Boran MTL Working Memory dataset options
+    boran_group = parser.add_argument_group(
+        "Boran MTL Working Memory",
+        "Options for Boran MTL depth electrode inter-region translation"
+    )
+    boran_group.add_argument(
+        "--boran-source-region",
+        type=str,
+        default="hippocampus",
+        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+        help="Source MTL region for translation",
+    )
+    boran_group.add_argument(
+        "--boran-target-region",
+        type=str,
+        default="entorhinal_cortex",
+        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+        help="Target MTL region for translation",
+    )
+    boran_group.add_argument(
+        "--boran-window-size",
+        type=int,
+        default=5000,
+        help="Window size in samples (at 1kHz, preprocessed)",
+    )
+    boran_group.add_argument(
+        "--boran-stride-ratio",
+        type=float,
+        default=0.5,
+        help="Stride as fraction of window size (0.5 = 50%% overlap)",
+    )
+    boran_group.add_argument(
+        "--boran-min-channels",
+        type=int,
+        default=4,
+        help="Minimum channels per region",
+    )
+    boran_group.add_argument(
+        "--boran-exclude-soz",
+        action="store_true",
+        help="Exclude Seizure Onset Zone probes",
     )
 
     return parser.parse_args()
@@ -1303,6 +1409,13 @@ def main():
         ecog_target_region=args.ecog_target_region,
         ecog_window_size=args.ecog_window_size,
         ecog_stride_ratio=args.ecog_stride_ratio,
+        # Boran MTL-specific
+        boran_source_region=args.boran_source_region,
+        boran_target_region=args.boran_target_region,
+        boran_window_size=args.boran_window_size,
+        boran_stride_ratio=args.boran_stride_ratio,
+        boran_min_channels=args.boran_min_channels,
+        boran_exclude_soz=args.boran_exclude_soz,
     )
 
     # Run LOSO

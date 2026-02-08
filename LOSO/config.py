@@ -150,6 +150,20 @@ DATASET_CONFIGS: Dict[str, DatasetConfig] = {
         default_stride_ratio=0.5,
         train_py_dataset_name="ecog",
     ),
+    "boran_mtl": DatasetConfig(
+        name="boran_mtl",
+        description="Boran MTL Working Memory: inter-region depth electrode translation",
+        session_type="subject",  # LOSO holds out entire subjects
+        in_channels=0,  # Variable - detected at runtime
+        out_channels=0,  # Variable - detected at runtime
+        sampling_rate=1000,  # Preprocessed: downsampled from 2kHz to 1kHz
+        source_region="hippocampus",  # Default, can be changed
+        target_region="entorhinal_cortex",  # Default, can be changed
+        uses_sliding_window=True,
+        default_window_size=5000,  # 5s at 1kHz (preprocessed)
+        default_stride_ratio=0.5,
+        train_py_dataset_name="boran",
+    ),
 }
 
 
@@ -271,6 +285,14 @@ class LOSOConfig:
     ecog_window_size: int = 5000
     ecog_stride_ratio: float = 0.5
 
+    # Boran MTL Working Memory dataset options
+    boran_source_region: str = "hippocampus"
+    boran_target_region: str = "entorhinal_cortex"
+    boran_window_size: int = 5000  # 5s at 1kHz (preprocessed)
+    boran_stride_ratio: float = 0.5
+    boran_min_channels: int = 4
+    boran_exclude_soz: bool = False
+
     def __post_init__(self):
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
@@ -302,6 +324,11 @@ class LOSOConfig:
             ds_config.target_region = self.ecog_target_region
             ds_config.default_window_size = self.ecog_window_size
             ds_config.default_stride_ratio = self.ecog_stride_ratio
+        elif self.dataset == "boran_mtl":
+            ds_config.source_region = self.boran_source_region
+            ds_config.target_region = self.boran_target_region
+            ds_config.default_window_size = self.boran_window_size
+            ds_config.default_stride_ratio = self.boran_stride_ratio
 
         return ds_config
 
@@ -501,6 +528,12 @@ class LOSOResult:
             print(f"      Experiment: {self.config.ecog_experiment}")
             print(f"      Source: {self.config.ecog_source_region} cortex, "
                   f"Target: {self.config.ecog_target_region} cortex")
+        elif self.config.dataset == "boran_mtl":
+            print(f"\nNote: Leave-One-Subject-Out CV on Boran MTL Working Memory")
+            print(f"      Source: {self.config.boran_source_region}, "
+                  f"Target: {self.config.boran_target_region}")
+            if self.config.boran_exclude_soz:
+                print(f"      SOZ probes excluded")
 
     def _print_per_session_summary(self) -> None:
         """Print per-session correlation summary across all folds."""

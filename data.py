@@ -77,6 +77,7 @@ class DatasetType(Enum):
     PFC_HPC = "pfc_hpc"          # PFC/Hippocampus (CA1) dataset
     DANDI_MOVIE = "dandi_movie"  # DANDI 000623: Human iEEG movie watching
     ECOG = "ecog"                # Miller ECoG Library: inter-region cortical translation
+    BORAN_MTL = "boran_mtl"      # Boran et al. MTL Working Memory (depth electrodes)
 
 
 # =============================================================================
@@ -199,6 +200,35 @@ ECOG_EXPERIMENTS = {
 # Raw lobe annotations in the data are e.g. "Frontal Lobe", "Temporal Lobe" etc.
 # We normalize to lowercase single-word keys.
 ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
+
+
+# =============================================================================
+# Constants - Boran MTL Working Memory (Depth Electrodes)
+# =============================================================================
+# Boran et al., Sci Data 2020; DOI: 10.12751/g-node.d76994
+# 9 subjects, 37 sessions, ~1827 iEEG trials, 2000 Hz
+# Depth electrodes: 8 contacts per probe
+# Regions: hippocampus (AH/PH probes), entorhinal_cortex (EC probes), amygdala (A probes)
+
+_BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm" / "processed_1khz"
+BORAN_SAMPLING_RATE_HZ = 1000  # Preprocessed: downsampled from 2kHz to 1kHz
+
+# Canonical MTL regions for inter-region translation
+BORAN_MTL_REGIONS = ["hippocampus", "entorhinal_cortex", "amygdala"]
+
+# Probe prefix -> canonical region mapping (longest-first matching)
+BORAN_PROBE_REGION_MAP = {
+    "AH":  "hippocampus",       # Anterior Hippocampus
+    "PH":  "hippocampus",       # Posterior Hippocampus
+    "EC":  "entorhinal_cortex", # Entorhinal Cortex
+    "AL":  "amygdala",          # Amygdala Left
+    "AR":  "amygdala",          # Amygdala Right
+    "A":   "amygdala",          # Amygdala (generic)
+    "TB":  "other",             # Temporal basal
+    "PHC": "other",             # Parahippocampal
+    "DR":  "other",             # Non-MTL
+    "LR":  "other",             # Non-MTL
+}
 
 
 # =============================================================================
@@ -4870,4 +4900,453 @@ def prepare_ecog_data(
         "source_region": source_region,
         "target_region": target_region,
         "sampling_rate": _parse_ecog_srate(alldat[0, 0]) if alldat.size > 0 else ECOG_SAMPLING_RATE_HZ,
+    }
+
+
+# =============================================================================
+# Boran MTL Working Memory Dataset
+# =============================================================================
+# Preprocessed format: one NPZ per subject (downsampled from 2kHz to 1kHz)
+# Created by: python scripts/preprocess_boran.py
+# NPZ keys: ieeg (n_channels, total_samples), probes, probe_n_contacts,
+#            soz_probes, n_sessions, n_trials, sampling_rate (1000)
+# Probe-to-region mapping assigns channels to hippocampus/entorhinal_cortex/amygdala
+
+import re as _re
+
+
+def _boran_parse_probe_region(prefix: str) -> str:
+    """Parse a probe abbreviation to canonical region name."""
+    prefix = prefix.upper().strip()
+    if prefix in BORAN_PROBE_REGION_MAP:
+        return BORAN_PROBE_REGION_MAP[prefix]
+    for pfx in sorted(BORAN_PROBE_REGION_MAP.keys(), key=len, reverse=True):
+        if prefix.startswith(pfx):
+            return BORAN_PROBE_REGION_MAP[pfx]
+    return "unknown"
+
+
+def _boran_get_region_channels(
+    probes: List[str],
+    probe_n_contacts: np.ndarray,
+    region: str,
+    soz_probes: Optional[List[str]] = None,
+) -> Tuple[List[int], List[str]]:
+    """Get channel indices for a given canonical region from preprocessed probe info."""
+    indices = []
+    used_probes = []
+    ch_offset = 0
+
+    for i, probe in enumerate(probes):
+        n_contacts = int(probe_n_contacts[i])
+        probe_region = _boran_parse_probe_region(probe)
+
+        if soz_probes and probe in soz_probes:
+            ch_offset += n_contacts
+            continue
+
+        if probe_region == region:
+            indices.extend(range(ch_offset, ch_offset + n_contacts))
+            used_probes.append(probe)
+
+        ch_offset += n_contacts
+
+    return indices, used_probes
+
+
+def load_boran_subject(
+    subject_id: str,
+    data_dir: Optional[Path] = None,
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    zscore: bool = True,
+    min_channels: int = 4,
+    exclude_soz: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Load preprocessed Boran MTL subject data from NPZ.
+
+    Reads preprocessed NPZ file (downsampled to 1kHz), extracts source/target
+    channels by region, and z-scores.
+
+    Args:
+        subject_id: Subject identifier (e.g., "S01", "S02")
+        data_dir: Directory containing preprocessed NPZ files
+        source_region: Source MTL region (hippocampus, entorhinal_cortex, amygdala)
+        target_region: Target MTL region
+        zscore: Whether to z-score normalize per channel
+        min_channels: Minimum channels required per region
+        exclude_soz: Whether to exclude Seizure Onset Zone probes
+
+    Returns:
+        Dict with keys: source, target, subject_id, n_source_channels,
+        n_target_channels, n_samples, metadata. Returns None if subject
+        doesn't have enough channels in both regions.
+    """
+    data_dir = data_dir or _BORAN_DATA_DIR
+    npz_path = data_dir / f"{subject_id}.npz"
+
+    if not npz_path.exists():
+        _print_primary(f"  {subject_id}: NPZ file not found: {npz_path}")
+        return None
+
+    # Load preprocessed data
+    npz = np.load(npz_path, allow_pickle=False)
+    ieeg = npz["ieeg"]  # (n_channels, total_samples) at 1kHz
+    probes = list(npz["probes"])
+    probe_n_contacts = npz["probe_n_contacts"]
+    soz_probes_arr = npz["soz_probes"]
+    soz_probes = list(soz_probes_arr) if len(soz_probes_arr) > 0 else []
+    n_sessions = int(npz["n_sessions"])
+    n_trials = int(npz["n_trials"])
+
+    # Get channel indices for source and target regions
+    source_chs, source_probes = _boran_get_region_channels(
+        probes, probe_n_contacts, source_region, soz_probes if exclude_soz else None
+    )
+    target_chs, target_probes = _boran_get_region_channels(
+        probes, probe_n_contacts, target_region, soz_probes if exclude_soz else None
+    )
+
+    if len(source_chs) < min_channels or len(target_chs) < min_channels:
+        _print_primary(
+            f"  {subject_id}: insufficient channels "
+            f"({source_region}={len(source_chs)}, {target_region}={len(target_chs)}), "
+            f"need >= {min_channels} each, skipping"
+        )
+        return None
+
+    # Extract source and target signals
+    source = ieeg[source_chs, :].astype(np.float32)
+    target = ieeg[target_chs, :].astype(np.float32)
+
+    # Z-score per channel
+    if zscore:
+        src_mean = source.mean(axis=1, keepdims=True)
+        src_std = source.std(axis=1, keepdims=True) + 1e-8
+        source = (source - src_mean) / src_std
+
+        tgt_mean = target.mean(axis=1, keepdims=True)
+        tgt_std = target.std(axis=1, keepdims=True) + 1e-8
+        target = (target - tgt_mean) / tgt_std
+
+    n_samples = source.shape[1]
+
+    metadata = {
+        "subject_id": subject_id,
+        "source_region": source_region,
+        "target_region": target_region,
+        "source_probes": source_probes,
+        "target_probes": target_probes,
+        "n_sessions": n_sessions,
+        "n_trials": n_trials,
+        "soz_excluded": exclude_soz,
+        "soz_probes": soz_probes,
+        "srate": BORAN_SAMPLING_RATE_HZ,
+    }
+
+    return {
+        "source": source,
+        "target": target,
+        "subject_id": subject_id,
+        "n_source_channels": len(source_chs),
+        "n_target_channels": len(target_chs),
+        "n_samples": n_samples,
+        "metadata": metadata,
+    }
+
+
+def list_boran_subjects(
+    data_dir: Optional[Path] = None,
+) -> List[str]:
+    """List available subject IDs in the Boran MTL dataset.
+
+    Discovers subjects by scanning for preprocessed NPZ files (S01.npz, S02.npz, ...).
+
+    Args:
+        data_dir: Directory containing preprocessed NPZ files (default: _BORAN_DATA_DIR)
+
+    Returns:
+        Sorted list of subject IDs like ["S01", "S02", ...]
+    """
+    data_dir = data_dir or _BORAN_DATA_DIR
+
+    if not data_dir.exists():
+        raise FileNotFoundError(
+            f"Boran MTL data directory not found: {data_dir}\n"
+            f"Run: python scripts/preprocess_boran.py"
+        )
+
+    npz_files = sorted(data_dir.glob("S*.npz"))
+    subjects = [f.stem for f in npz_files]
+
+    return sorted(subjects)
+
+
+def validate_boran_subject(
+    subject_id: str,
+    data_dir: Optional[Path] = None,
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    min_channels: int = 4,
+    exclude_soz: bool = False,
+) -> bool:
+    """Check if a Boran subject has enough channels without loading signal data.
+
+    Reads only probe metadata from NPZ to determine channel counts.
+
+    Returns:
+        True if subject has >= min_channels in both source and target regions.
+    """
+    data_dir = data_dir or _BORAN_DATA_DIR
+    npz_path = data_dir / f"{subject_id}.npz"
+
+    if not npz_path.exists():
+        return False
+
+    try:
+        npz = np.load(npz_path, allow_pickle=False)
+        probes = list(npz["probes"])
+        probe_n_contacts = npz["probe_n_contacts"]
+        soz_probes_arr = npz["soz_probes"]
+        soz_probes = list(soz_probes_arr) if len(soz_probes_arr) > 0 else []
+
+        source_chs, _ = _boran_get_region_channels(
+            probes, probe_n_contacts, source_region, soz_probes if exclude_soz else None
+        )
+        target_chs, _ = _boran_get_region_channels(
+            probes, probe_n_contacts, target_region, soz_probes if exclude_soz else None
+        )
+
+        return len(source_chs) >= min_channels and len(target_chs) >= min_channels
+
+    except Exception:
+        return False
+
+
+def prepare_boran_data(
+    data_dir: Optional[Path] = None,
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    window_size: int = 10000,
+    stride: int = 5000,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+    zscore: bool = True,
+    verbose: bool = True,
+    min_channels: int = 4,
+    exclude_soz: bool = False,
+    val_subjects: Optional[List[str]] = None,
+    test_subjects: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Complete data preparation pipeline for Boran MTL dataset.
+
+    Loads depth electrode iEEG data, groups by MTL region, and creates
+    train/val/test datasets for inter-region neural signal translation.
+
+    Args:
+        data_dir: Directory containing H5 files
+        source_region: Source MTL region (hippocampus, entorhinal_cortex, amygdala)
+        target_region: Target MTL region
+        window_size: Window size in samples (default: 10000 = 5s at 2kHz)
+        stride: Stride between windows (default: 5000 = 2.5s)
+        train_ratio: Fraction of subjects for training (random split)
+        val_ratio: Fraction of subjects for validation (random split)
+        seed: Random seed
+        zscore: Whether to z-score normalize
+        verbose: Whether to print progress
+        min_channels: Minimum channels required per region
+        exclude_soz: Whether to exclude Seizure Onset Zone probes
+        val_subjects: Explicit subjects for validation (LOSO mode)
+        test_subjects: Explicit subjects for testing (LOSO mode)
+
+    Returns:
+        Dictionary with train/val/test datasets and metadata
+    """
+    data_dir = data_dir or _BORAN_DATA_DIR
+
+    if verbose:
+        _print_primary(f"Preparing Boran MTL dataset...")
+        _print_primary(f"  Data directory: {data_dir}")
+        _print_primary(f"  Source region: {source_region}")
+        _print_primary(f"  Target region: {target_region}")
+        _print_primary(f"  Exclude SOZ: {exclude_soz}")
+
+    # Discover subjects
+    all_subject_ids = list_boran_subjects(data_dir)
+
+    if verbose:
+        _print_primary(f"  Found {len(all_subject_ids)} subjects: {all_subject_ids}")
+
+    # Load each subject
+    subjects_data = []
+    valid_subject_ids = []
+
+    for subj_id in all_subject_ids:
+        subj_data = load_boran_subject(
+            subject_id=subj_id,
+            data_dir=data_dir,
+            source_region=source_region,
+            target_region=target_region,
+            zscore=zscore,
+            min_channels=min_channels,
+            exclude_soz=exclude_soz,
+        )
+        if subj_data is not None:
+            subjects_data.append(subj_data)
+            valid_subject_ids.append(subj_id)
+            if verbose:
+                meta = subj_data["metadata"]
+                _print_primary(
+                    f"  {subj_id}: {subj_data['n_source_channels']} src ch, "
+                    f"{subj_data['n_target_channels']} tgt ch, "
+                    f"{meta['n_sessions']} sessions, {meta['n_trials']} trials, "
+                    f"{subj_data['n_samples']} samples"
+                )
+
+    if verbose:
+        _print_primary(f"  Valid subjects: {len(valid_subject_ids)}/{len(all_subject_ids)}")
+
+    if len(valid_subject_ids) < 3:
+        raise ValueError(
+            f"Need at least 3 valid subjects for train/val/test split, "
+            f"but only {len(valid_subject_ids)} have >= {min_channels} "
+            f"channels in both {source_region} and {target_region}."
+        )
+
+    # Determine train/val/test split
+    if val_subjects is not None or test_subjects is not None:
+        # Explicit subject holdout (LOSO mode)
+        val_subjects = val_subjects or []
+        test_subjects = test_subjects or []
+
+        for subj in val_subjects + test_subjects:
+            if subj not in valid_subject_ids:
+                raise ValueError(
+                    f"Subject '{subj}' not found in valid subjects. "
+                    f"Available: {valid_subject_ids}"
+                )
+
+        holdout = set(val_subjects) | set(test_subjects)
+        train_subject_ids = [s for s in valid_subject_ids if s not in holdout]
+        val_subject_ids = val_subjects
+        test_subject_ids = test_subjects
+
+        if verbose:
+            _print_primary(f"  [LOSO MODE] Explicit subject holdout:")
+            _print_primary(f"    Train: {train_subject_ids}")
+            _print_primary(f"    Val: {val_subject_ids}")
+            _print_primary(f"    Test: {test_subject_ids}")
+    else:
+        # Random split
+        rng = np.random.default_rng(seed)
+        indices = list(range(len(valid_subject_ids)))
+        rng.shuffle(indices)
+
+        n_train = max(1, int(len(indices) * train_ratio))
+        n_val = max(1, int(len(indices) * val_ratio))
+
+        train_subject_ids = [valid_subject_ids[i] for i in indices[:n_train]]
+        val_subject_ids = [valid_subject_ids[i] for i in indices[n_train:n_train + n_val]]
+        test_subject_ids = [valid_subject_ids[i] for i in indices[n_train + n_val:]]
+
+        if not test_subject_ids and len(val_subject_ids) > 1:
+            test_subject_ids = [val_subject_ids.pop()]
+
+        if verbose:
+            _print_primary(f"  Random split:")
+            _print_primary(f"    Train ({len(train_subject_ids)}): {train_subject_ids}")
+            _print_primary(f"    Val ({len(val_subject_ids)}): {val_subject_ids}")
+            _print_primary(f"    Test ({len(test_subject_ids)}): {test_subject_ids}")
+
+    # Build subject data lists for each split
+    subj_id_to_data = {s["subject_id"]: s for s in subjects_data}
+    train_data = [subj_id_to_data[sid] for sid in train_subject_ids]
+    val_data = [subj_id_to_data[sid] for sid in val_subject_ids]
+    test_data = [subj_id_to_data[sid] for sid in test_subject_ids]
+
+    # Determine normalized channel counts across ALL valid subjects
+    all_n_src = [s["n_source_channels"] for s in subjects_data]
+    all_n_tgt = [s["n_target_channels"] for s in subjects_data]
+    n_source_channels = min(all_n_src)
+    n_target_channels = min(all_n_tgt)
+
+    if verbose:
+        _print_primary(f"  Normalized channels: source={n_source_channels}, target={n_target_channels}")
+
+    # Create datasets — reuse ECoGDataset (same sliding window pattern)
+    # LOSO mode: when test_subjects provided but no val_subjects,
+    # create val set by temporally splitting training data
+    loso_mode_no_val = (test_subjects is not None and len(test_subjects) > 0 and
+                        (val_subjects is None or len(val_subjects) == 0))
+
+    if loso_mode_no_val and len(train_data) > 0:
+        # Temporal split to prevent data leakage from overlapping windows
+        train_portions = []
+        val_portions = []
+
+        for subj_data in train_data:
+            n_samples = subj_data['n_samples']
+            split_point = int(n_samples * 0.7)
+
+            train_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, :split_point],
+                'target': subj_data['target'][:, :split_point],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': split_point,
+                'metadata': subj_data['metadata'],
+            })
+            val_portions.append({
+                'subject_id': subj_data['subject_id'],
+                'source': subj_data['source'][:, split_point:],
+                'target': subj_data['target'][:, split_point:],
+                'n_source_channels': subj_data['n_source_channels'],
+                'n_target_channels': subj_data['n_target_channels'],
+                'n_samples': n_samples - split_point,
+                'metadata': subj_data['metadata'],
+            })
+
+        train_dataset = ECoGDataset(
+            train_portions, window_size=window_size, stride=stride,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+        val_dataset = ECoGDataset(
+            val_portions, window_size=window_size, stride=window_size,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+    else:
+        train_dataset = ECoGDataset(
+            train_data, window_size=window_size, stride=stride,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+        val_dataset = ECoGDataset(
+            val_data, window_size=window_size, stride=window_size,
+            n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+            verbose=verbose,
+        )
+
+    test_dataset = ECoGDataset(
+        test_data, window_size=window_size, stride=window_size,
+        n_source_channels=n_source_channels, n_target_channels=n_target_channels,
+        verbose=verbose,
+    )
+
+    return {
+        "train_dataset": train_dataset,
+        "val_dataset": val_dataset,
+        "test_dataset": test_dataset,
+        "n_source_channels": n_source_channels,
+        "n_target_channels": n_target_channels,
+        "all_subjects": valid_subject_ids,
+        "train_subjects": train_subject_ids,
+        "val_subjects": val_subject_ids,
+        "test_subjects": test_subject_ids,
+        "source_region": source_region,
+        "target_region": target_region,
+        "sampling_rate": BORAN_SAMPLING_RATE_HZ,
     }
