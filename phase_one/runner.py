@@ -1336,6 +1336,102 @@ def load_raw_ecog_data(
     return X, y, subject_ids, idx_to_subject
 
 
+def load_raw_boran_data(
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    window_size: int = 5000,
+    stride_ratio: float = 0.5,
+    min_channels: int = 4,
+) -> Tuple[NDArray, NDArray, NDArray, Dict[int, str]]:
+    """Load raw (unnormalized) Boran MTL data with subject info for LOSO.
+
+    For Boran, "sessions" are subjects (subject-based LOSO).
+
+    Args:
+        source_region: Source MTL region (hippocampus, entorhinal_cortex, amygdala)
+        target_region: Target MTL region
+        window_size: Window size in samples (at 1kHz preprocessed)
+        stride_ratio: Stride as fraction of window size
+        min_channels: Minimum channels required per region
+
+    Returns:
+        X: Raw input signals (source region) [N, C, T]
+        y: Raw target signals (target region) [N, C, T]
+        subject_ids: Subject ID per window [N]
+        idx_to_subject: Map from subject int ID to subject name
+    """
+    from data import list_boran_subjects, load_boran_subject
+
+    print(f"Loading raw Boran MTL data for LOSO ({source_region} -> {target_region})...")
+    stride = int(window_size * stride_ratio)
+    print(f"  Window size: {window_size}, stride: {stride}")
+
+    subjects = list_boran_subjects()
+    print(f"  Found {len(subjects)} subjects")
+
+    # Load all subjects without z-scoring
+    subjects_data = []
+    valid_subject_ids = []
+
+    for subj_id in subjects:
+        subj_data = load_boran_subject(
+            subj_id,
+            source_region=source_region,
+            target_region=target_region,
+            zscore=False,  # No pre-normalization for LOSO
+            min_channels=min_channels,
+        )
+        if subj_data is not None:
+            subjects_data.append(subj_data)
+            valid_subject_ids.append(subj_id)
+            n_src = subj_data["n_source_channels"]
+            n_tgt = subj_data["n_target_channels"]
+            print(f"    Loaded {subj_id}: source={n_src}ch, target={n_tgt}ch, {subj_data['n_samples']} samples")
+
+    if not subjects_data:
+        raise RuntimeError(f"No valid Boran subjects found for {source_region}->{target_region}!")
+
+    # Determine channel counts (use minimum across subjects for consistent shapes)
+    n_source_ch = min(s["n_source_channels"] for s in subjects_data)
+    n_target_ch = min(s["n_target_channels"] for s in subjects_data)
+    print(f"  Using {n_source_ch} source channels, {n_target_ch} target channels")
+
+    # Create subject ID mapping
+    subject_to_idx = {subj_id: idx for idx, subj_id in enumerate(valid_subject_ids)}
+    idx_to_subject = {idx: subj_id for subj_id, idx in subject_to_idx.items()}
+
+    # Create sliding windows for all subjects
+    all_X = []
+    all_y = []
+    all_subject_ids_per_window = []
+
+    for subj_data in subjects_data:
+        subj_id = subj_data["subject_id"]
+        subj_idx = subject_to_idx[subj_id]
+        source = subj_data["source"][:n_source_ch]  # [C, T_total]
+        target = subj_data["target"][:n_target_ch]  # [C, T_total]
+        n_samples = subj_data["n_samples"]
+
+        n_windows = (n_samples - window_size) // stride + 1
+
+        for w in range(n_windows):
+            start = w * stride
+            end = start + window_size
+            all_X.append(source[:, start:end])
+            all_y.append(target[:, start:end])
+            all_subject_ids_per_window.append(subj_idx)
+
+    # Stack into arrays
+    X = np.stack(all_X, axis=0).astype(np.float32)  # [N, C, T]
+    y = np.stack(all_y, axis=0).astype(np.float32)  # [N, C, T]
+    subject_ids = np.array(all_subject_ids_per_window, dtype=np.int32)
+
+    print(f"  Loaded: {source_region} {X.shape} -> {target_region} {y.shape}")
+    print(f"  Subjects: {len(idx_to_subject)} unique, {len(X)} total windows")
+
+    return X, y, subject_ids, idx_to_subject
+
+
 def run_loso_evaluation(
     config: "Phase1Config",
     dataset: str = "pfc",
@@ -1378,6 +1474,12 @@ def run_loso_evaluation(
     elif dataset == "ecog":
         # ECoG dataset - subject-based LOSO
         X_raw, y_raw, session_ids, idx_to_session = load_raw_ecog_data()
+    elif dataset == "boran":
+        # Boran MTL dataset - subject-based LOSO
+        X_raw, y_raw, session_ids, idx_to_session = load_raw_boran_data(
+            source_region=config.boran_source_region,
+            target_region=config.boran_target_region,
+        )
     else:
         raise ValueError(f"LOSO not yet implemented for dataset: {dataset}")
 
@@ -2938,7 +3040,7 @@ Examples:
         "--dataset",
         type=str,
         default="olfactory",
-        choices=["olfactory", "pfc", "dandi", "pcx1", "ecog"],
+        choices=["olfactory", "pfc", "dandi", "pcx1", "ecog", "boran"],
         help="Dataset to evaluate on (default: olfactory)",
     )
     parser.add_argument(
@@ -3026,6 +3128,22 @@ Examples:
         help="Use true LOSO (Leave-One-Session-Out) evaluation with per-fold normalization",
     )
 
+    # Boran MTL dataset options
+    parser.add_argument(
+        "--boran-source-region",
+        type=str,
+        default="hippocampus",
+        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+        help="Source MTL region for Boran dataset (default: hippocampus)",
+    )
+    parser.add_argument(
+        "--boran-target-region",
+        type=str,
+        default="entorhinal_cortex",
+        choices=["hippocampus", "entorhinal_cortex", "amygdala"],
+        help="Target MTL region for Boran dataset (default: entorhinal_cortex)",
+    )
+
     args = parser.parse_args()
 
     # Handle result loading mode (figures only)
@@ -3087,6 +3205,8 @@ Examples:
         seed=args.seed,
         output_dir=Path(args.output),
         baselines=baselines,
+        boran_source_region=args.boran_source_region,
+        boran_target_region=args.boran_target_region,
     )
 
     # Handle session-CV mode (investigation mode)
