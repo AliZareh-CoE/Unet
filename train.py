@@ -3317,10 +3317,10 @@ def parse_args():
                                  "joystick_track", "memory_nback"],
                         help="ECoG Library experiment (default: fingerflex)")
     parser.add_argument("--ecog-source-region", type=str, default="frontal",
-                        choices=["frontal", "temporal", "parietal"],
+                        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
                         help="Source brain lobe for ECoG translation (default: frontal)")
     parser.add_argument("--ecog-target-region", type=str, default="temporal",
-                        choices=["frontal", "temporal", "parietal"],
+                        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
                         help="Target brain lobe for ECoG translation (default: temporal)")
     parser.add_argument("--ecog-window-size", type=int, default=5000,
                         help="Window size in samples for ECoG (default: 5000 = 5s at 1kHz)")

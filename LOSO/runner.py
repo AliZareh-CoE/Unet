@@ -1215,14 +1215,14 @@ def parse_args() -> argparse.Namespace:
         "--ecog-source-region",
         type=str,
         default="frontal",
-        choices=["frontal", "temporal", "parietal"],
+        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
         help="Source brain lobe for translation",
     )
     ecog_group.add_argument(
         "--ecog-target-region",
         type=str,
         default="temporal",
-        choices=["frontal", "temporal", "parietal"],
+        choices=["frontal", "temporal", "parietal", "occipital", "limbic"],
         help="Target brain lobe for translation",
     )
     ecog_group.add_argument(
