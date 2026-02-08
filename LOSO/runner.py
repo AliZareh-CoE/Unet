@@ -282,7 +282,7 @@ def get_all_sessions(
         return valid_subjects, metadata
 
     elif dataset == "boran_mtl":
-        from data import list_boran_subjects, load_boran_subject, _BORAN_DATA_DIR
+        from data import list_boran_subjects, validate_boran_subject, _BORAN_DATA_DIR
 
         source_region = ds_config.source_region
         target_region = ds_config.target_region
@@ -300,12 +300,14 @@ def get_all_sessions(
                 f"Download from: https://gin.g-node.org/USZ_NCH/Human_MTL_units_scalp_EEG_and_iEEG_verbal_WM"
             )
 
-        # Get all subjects and filter to those with valid regions
+        # Get all subjects and filter using lightweight metadata-only check
         all_subjects = list_boran_subjects(data_dir=_BORAN_DATA_DIR)
+        print(f"  Boran MTL: found {len(all_subjects)} subjects in {_BORAN_DATA_DIR}")
+        print(f"  Checking {source_region} -> {target_region} (min_channels={min_channels}, exclude_soz={exclude_soz})")
 
         valid_subjects = []
         for subj_id in all_subjects:
-            subj_data = load_boran_subject(
+            is_valid = validate_boran_subject(
                 subject_id=subj_id,
                 data_dir=_BORAN_DATA_DIR,
                 source_region=source_region,
@@ -313,8 +315,9 @@ def get_all_sessions(
                 min_channels=min_channels,
                 exclude_soz=exclude_soz,
             )
-            if subj_data is not None:
+            if is_valid:
                 valid_subjects.append(subj_id)
+            print(f"    {subj_id}: {'VALID' if is_valid else 'skipped'}")
 
         metadata = {
             "session_type": ds_config.session_type,  # "subject"

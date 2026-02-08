@@ -5408,6 +5408,90 @@ def list_boran_subjects(
     return sorted(subjects)
 
 
+def validate_boran_subject(
+    subject_id: str,
+    data_dir: Optional[Path] = None,
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    min_channels: int = 4,
+    exclude_soz: bool = False,
+) -> bool:
+    """Check if a Boran subject has enough channels without loading trial data.
+
+    Lightweight validation that only reads metadata (depth probes, first trial
+    shape) to determine channel counts. Much faster than load_boran_subject().
+
+    Returns:
+        True if subject has >= min_channels in both source and target regions.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return False
+
+    data_dir = data_dir or _BORAN_DATA_DIR
+
+    # Find H5 files for this subject
+    subj_num = int(_re.search(r"\d+", subject_id).group())
+    pattern = f"*Subject*{subj_num:02d}*Session*.h5"
+    h5_files = sorted(data_dir.glob(pattern))
+    if not h5_files:
+        pattern = f"*Subject*{subj_num}*Session*.h5"
+        h5_files = sorted(data_dir.glob(pattern))
+    if not h5_files:
+        return False
+
+    try:
+        with h5py.File(h5_files[0], "r") as f:
+            probes = _boran_get_depth_probes(f)
+            soz_probes = _boran_get_soz_probes(f) if exclude_soz else []
+
+            # Get total iEEG channel count from first trial shape (no data loading)
+            n_ieeg_channels = 0
+            if "data" in f:
+                for block_key in f["data"].keys():
+                    block = f["data"][block_key]
+                    if hasattr(block, 'keys') and "data_arrays" in block:
+                        for da_key in block["data_arrays"].keys():
+                            da = block["data_arrays"][da_key]
+                            da_name = ""
+                            try:
+                                if hasattr(da, 'attrs') and "name" in da.attrs:
+                                    da_name = _boran_decode_bytes(da.attrs["name"])
+                                elif hasattr(da, 'keys') and "name" in da:
+                                    da_name = _boran_decode_bytes(da["name"][()])
+                            except Exception:
+                                pass
+                            if "ieeg" in da_name.lower() and "trial" in da_name.lower():
+                                try:
+                                    if hasattr(da, 'keys') and "data" in da:
+                                        n_ieeg_channels = da["data"].shape[0]
+                                    elif hasattr(da, 'shape'):
+                                        n_ieeg_channels = da.shape[0]
+                                except Exception:
+                                    pass
+                                if n_ieeg_channels > 0:
+                                    break
+                    if n_ieeg_channels > 0:
+                        break
+
+        if not probes or n_ieeg_channels == 0:
+            return False
+
+        probe_channels = _boran_assign_channels_to_probes(probes, n_ieeg_channels)
+        source_chs, _ = _boran_get_region_channels(
+            probes, probe_channels, source_region, soz_probes if exclude_soz else None
+        )
+        target_chs, _ = _boran_get_region_channels(
+            probes, probe_channels, target_region, soz_probes if exclude_soz else None
+        )
+
+        return len(source_chs) >= min_channels and len(target_chs) >= min_channels
+
+    except Exception:
+        return False
+
+
 def prepare_boran_data(
     data_dir: Optional[Path] = None,
     source_region: str = "hippocampus",
