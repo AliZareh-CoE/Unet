@@ -1073,7 +1073,7 @@ class EnvelopeHistogramMatching(nn.Module):
         x_float = x.float()
 
         # Compute analytic signal
-        x_flat = x_float.view(B * C, T)
+        x_flat = x_float.reshape(B * C, T)
         analytic = hilbert_torch(x_flat)
         envelope = analytic.abs()  # [B*C, T]
         phase = analytic.angle()  # [B*C, T]
@@ -1114,7 +1114,7 @@ class EnvelopeHistogramMatching(nn.Module):
         corrected_signal = corrected_envelope * torch.cos(phase)
 
         # Reshape back
-        corrected_signal = corrected_signal.view(B, C, T)
+        corrected_signal = corrected_signal.reshape(B, C, T)
 
         return corrected_signal.to(original_dtype)
 
@@ -4416,7 +4416,7 @@ def hilbert_phase_torch(signal: torch.Tensor) -> torch.Tensor:
         signal = signal.unsqueeze(0)
     elif signal.ndim == 3:
         B, C, T = signal.shape
-        signal = signal.view(B * C, T)
+        signal = signal.reshape(B * C, T)
     else:  # 2D
         pass
 
@@ -4580,8 +4580,8 @@ def psd_error_db_torch(
     # Flatten batch and channel dimensions
     if pred.ndim == 3:
         B, C, T = pred.shape
-        pred = pred.view(B * C, T)
-        target = target.view(B * C, T)
+        pred = pred.reshape(B * C, T)
+        target = target.reshape(B * C, T)
     elif pred.ndim == 2:
         pass
     else:
@@ -4657,8 +4657,8 @@ def psd_diff_db_torch(
     # Flatten batch and channel dimensions
     if pred.ndim == 3:
         B, C, T = pred.shape
-        pred = pred.view(B * C, T)
-        target = target.view(B * C, T)
+        pred = pred.reshape(B * C, T)
+        target = target.reshape(B * C, T)
     elif pred.ndim == 2:
         pass
     else:
@@ -4731,8 +4731,8 @@ def psd_diagnostics_torch(
     # Flatten batch and channel dimensions
     if pred.ndim == 3:
         B, C, T = pred.shape
-        pred_flat = pred.view(B * C, T)
-        target_flat = target.view(B * C, T)
+        pred_flat = pred.reshape(B * C, T)
+        target_flat = target.reshape(B * C, T)
     elif pred.ndim == 2:
         pred_flat = pred
         target_flat = target
