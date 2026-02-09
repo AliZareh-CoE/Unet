@@ -231,6 +231,10 @@ class LOSOConfig:
     noise_channel_dropout: float = 0.05
     noise_temporal_dropout: float = 0.02
     noise_prob: float = 0.5
+    noise_time_shift: int = 0  # Max time shift in samples (0=disabled)
+    noise_amplitude_scale: float = 0.0  # Per-channel gain jitter range (0=disabled)
+    noise_freq_mask_bands: int = 0  # Max frequency bands to mask (0=disabled)
+    noise_freq_mask_width: int = 50  # Max width per freq mask in Hz
 
     # Session adaptation
     use_session_stats: bool = False
