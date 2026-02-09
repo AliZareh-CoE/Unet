@@ -4855,11 +4855,6 @@ class NoiseAugmentor(nn.Module):
         line_noise_hz: float = 0.0,  # 50/60 Hz line noise
         sample_rate: float = 1000.0,
         prob: float = 0.5,  # Probability of applying augmentation
-        # New augmentation types
-        time_shift_max: int = 0,  # Max samples to shift (0=disabled)
-        amplitude_scale_range: float = 0.0,  # Per-channel gain jitter (0=disabled), e.g. 0.2 means [0.8, 1.2]
-        freq_mask_max_bands: int = 0,  # Max number of freq bands to zero out (0=disabled)
-        freq_mask_max_width: int = 50,  # Max width of each freq mask in Hz
     ):
         super().__init__()
         self.gaussian_std = gaussian_std
@@ -4870,10 +4865,6 @@ class NoiseAugmentor(nn.Module):
         self.line_noise_hz = line_noise_hz
         self.sample_rate = sample_rate
         self.prob = prob
-        self.time_shift_max = time_shift_max
-        self.amplitude_scale_range = amplitude_scale_range
-        self.freq_mask_max_bands = freq_mask_max_bands
-        self.freq_mask_max_width = freq_mask_max_width
 
     def _generate_pink_noise(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
         """Generate 1/f (pink) noise using FFT method.
@@ -4951,33 +4942,6 @@ class NoiseAugmentor(nn.Module):
             phase = torch.rand(B, 1, 1, device=device, dtype=dtype) * 2 * np.pi
             line_noise = amp * torch.sin(2 * np.pi * self.line_noise_hz * t + phase)
             x = x + line_noise
-
-        # 6. Time shift: circular shift by random samples per batch element
-        if self.time_shift_max > 0:
-            for i in range(B):
-                shift = torch.randint(-self.time_shift_max, self.time_shift_max + 1, (1,)).item()
-                if shift != 0:
-                    x[i] = torch.roll(x[i], shifts=shift, dims=-1)
-
-        # 7. Amplitude scaling: per-channel random gain
-        if self.amplitude_scale_range > 0:
-            lo = 1.0 - self.amplitude_scale_range
-            hi = 1.0 + self.amplitude_scale_range
-            scale = torch.empty(B, C, 1, device=device, dtype=dtype).uniform_(lo, hi)
-            x = x * scale
-
-        # 8. Frequency band masking: zero out random frequency bands in FFT
-        if self.freq_mask_max_bands > 0:
-            x_fft = torch.fft.rfft(x.float(), dim=-1)
-            n_freq = x_fft.shape[-1]
-            freq_per_bin = self.sample_rate / (2.0 * n_freq)  # Hz per bin
-            max_width_bins = max(1, int(self.freq_mask_max_width / freq_per_bin))
-            n_bands = torch.randint(1, self.freq_mask_max_bands + 1, (1,)).item()
-            for _ in range(n_bands):
-                width = torch.randint(1, max_width_bins + 1, (1,)).item()
-                start = torch.randint(0, max(1, n_freq - width), (1,)).item()
-                x_fft[:, :, start:start + width] = 0
-            x = torch.fft.irfft(x_fft, n=T).to(dtype)
 
         return x
 

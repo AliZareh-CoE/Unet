@@ -2282,10 +2282,6 @@ def train(
             temporal_dropout=config.get("noise_temporal_dropout", 0.0),
             sample_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             prob=config.get("noise_prob", 0.5),
-            time_shift_max=config.get("noise_time_shift", 0),
-            amplitude_scale_range=config.get("noise_amplitude_scale", 0.0),
-            freq_mask_max_bands=config.get("noise_freq_mask_bands", 0),
-            freq_mask_max_width=config.get("noise_freq_mask_width", 50),
         ).to(device)
         noise_augmentor.train()  # Enable augmentation
         if is_primary():
@@ -3534,14 +3530,6 @@ def parse_args():
                         help="Temporal dropout probability for noise augmentation (default: 0)")
     parser.add_argument("--noise-prob", type=float, default=0.5,
                         help="Probability of applying noise augmentation (default: 0.5)")
-    parser.add_argument("--noise-time-shift", type=int, default=0,
-                        help="Max time shift in samples for augmentation (default: 0=disabled)")
-    parser.add_argument("--noise-amplitude-scale", type=float, default=0.0,
-                        help="Amplitude scaling range, e.g. 0.2 means gain in [0.8,1.2] (default: 0=disabled)")
-    parser.add_argument("--noise-freq-mask-bands", type=int, default=0,
-                        help="Max number of frequency bands to mask (default: 0=disabled)")
-    parser.add_argument("--noise-freq-mask-width", type=int, default=50,
-                        help="Max width of each frequency mask in Hz (default: 50)")
 
     # Validation plot generation
     parser.add_argument("--generate-plots", action="store_true", default=None,
@@ -3806,10 +3794,6 @@ def main():
     config["noise_channel_dropout"] = args.noise_channel_dropout
     config["noise_temporal_dropout"] = args.noise_temporal_dropout
     config["noise_prob"] = args.noise_prob
-    config["noise_time_shift"] = args.noise_time_shift
-    config["noise_amplitude_scale"] = args.noise_amplitude_scale
-    config["noise_freq_mask_bands"] = args.noise_freq_mask_bands
-    config["noise_freq_mask_width"] = args.noise_freq_mask_width
 
     # =========================================================================
     # Wiener Residual Learning

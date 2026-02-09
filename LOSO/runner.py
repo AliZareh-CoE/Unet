@@ -758,13 +758,6 @@ def run_single_fold(
         if config.noise_temporal_dropout > 0:
             cmd.extend(["--noise-temporal-dropout", str(config.noise_temporal_dropout)])
         cmd.extend(["--noise-prob", str(config.noise_prob)])
-        if config.noise_time_shift > 0:
-            cmd.extend(["--noise-time-shift", str(config.noise_time_shift)])
-        if config.noise_amplitude_scale > 0:
-            cmd.extend(["--noise-amplitude-scale", str(config.noise_amplitude_scale)])
-        if config.noise_freq_mask_bands > 0:
-            cmd.extend(["--noise-freq-mask-bands", str(config.noise_freq_mask_bands)])
-            cmd.extend(["--noise-freq-mask-width", str(config.noise_freq_mask_width)])
 
     # FSDP
     if config.use_fsdp:
@@ -1290,12 +1283,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-use-spectral", action="store_true", help="Include spectral features")
     parser.add_argument("--use-adaptive-scaling", action="store_true", help="Use adaptive scaling")
 
-    # Augmentation
-    parser.add_argument("--noise-time-shift", type=int, default=0, help="Max time shift in samples (0=disabled)")
-    parser.add_argument("--noise-amplitude-scale", type=float, default=0.0, help="Per-channel amplitude scaling range, e.g. 0.2 for [0.8,1.2] (0=disabled)")
-    parser.add_argument("--noise-freq-mask-bands", type=int, default=0, help="Max frequency bands to mask (0=disabled)")
-    parser.add_argument("--noise-freq-mask-width", type=int, default=50, help="Max width per frequency mask in Hz")
-
     # Training options
     parser.add_argument("--no-bidirectional", action="store_true", help="Disable bidirectional training")
 
@@ -1549,11 +1536,6 @@ def main():
         boran_stride_ratio=args.boran_stride_ratio,
         boran_min_channels=args.boran_min_channels,
         boran_exclude_soz=args.boran_exclude_soz,
-        # Extra augmentation
-        noise_time_shift=args.noise_time_shift,
-        noise_amplitude_scale=args.noise_amplitude_scale,
-        noise_freq_mask_bands=args.noise_freq_mask_bands,
-        noise_freq_mask_width=args.noise_freq_mask_width,
     )
 
     # Run LOSO
