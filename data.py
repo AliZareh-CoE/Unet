@@ -5268,13 +5268,17 @@ def prepare_boran_data(
     test_data = [subj_id_to_data[sid] for sid in test_subject_ids]
 
     # Determine normalized channel counts across ALL valid subjects
+    # Use same channel count for source and target to ensure fair comparison
+    # and avoid asymmetric expansion/compression problems
     all_n_src = [s["n_source_channels"] for s in subjects_data]
     all_n_tgt = [s["n_target_channels"] for s in subjects_data]
-    n_source_channels = min(all_n_src)
-    n_target_channels = min(all_n_tgt)
+    n_ch_unified = min(min(all_n_src), min(all_n_tgt))
+    n_source_channels = n_ch_unified
+    n_target_channels = n_ch_unified
 
     if verbose:
-        _print_primary(f"  Normalized channels: source={n_source_channels}, target={n_target_channels}")
+        _print_primary(f"  Channel counts per subject: source={all_n_src}, target={all_n_tgt}")
+        _print_primary(f"  Unified channel count: {n_ch_unified} (min across all subjects and both regions)")
 
     # Create datasets — reuse ECoGDataset (same sliding window pattern)
     # LOSO mode: when test_subjects provided but no val_subjects,
