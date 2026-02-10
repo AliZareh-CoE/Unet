@@ -1391,10 +1391,15 @@ def load_raw_boran_data(
     if not subjects_data:
         raise RuntimeError(f"No valid Boran subjects found for {source_region}->{target_region}!")
 
-    # Determine channel counts (use minimum across subjects for consistent shapes)
-    n_source_ch = min(s["n_source_channels"] for s in subjects_data)
-    n_target_ch = min(s["n_target_channels"] for s in subjects_data)
-    print(f"  Using {n_source_ch} source channels, {n_target_ch} target channels")
+    # Use unified channel count: min across all subjects AND both regions
+    # This ensures equal in/out channels for fair comparison
+    n_ch_unified = min(
+        min(s["n_source_channels"] for s in subjects_data),
+        min(s["n_target_channels"] for s in subjects_data),
+    )
+    n_source_ch = n_ch_unified
+    n_target_ch = n_ch_unified
+    print(f"  Unified channel count: {n_ch_unified} (min across all subjects and both regions)")
 
     # Create subject ID mapping
     subject_to_idx = {subj_id: idx for idx, subj_id in enumerate(valid_subject_ids)}

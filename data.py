@@ -211,6 +211,7 @@ ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
 # Regions: hippocampus (AH/PH probes), entorhinal_cortex (EC probes), amygdala (A probes)
 
 _BORAN_DATA_DIR = _DATA_DIR / "boran_mtl_wm" / "processed_1khz"
+_BORAN_NPY_DIR = _DATA_DIR / "boran_mtl_wm" / "processed_npy"
 BORAN_SAMPLING_RATE_HZ = 1000  # Preprocessed: downsampled from 2kHz to 1kHz
 
 # Canonical MTL regions for inter-region translation
@@ -4954,6 +4955,84 @@ def _boran_get_region_channels(
     return indices, used_probes
 
 
+def _load_boran_subject_npy(
+    subject_id: str,
+    source_region: str,
+    target_region: str,
+    zscore: bool,
+    min_channels: int,
+    npy_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    """Fast path: load pre-extracted per-region NPY files."""
+    subj_dir = npy_dir / subject_id
+    src_path = subj_dir / f"{source_region}.npy"
+    tgt_path = subj_dir / f"{target_region}.npy"
+    meta_path = subj_dir / "metadata.npz"
+
+    if not src_path.exists() or not tgt_path.exists():
+        return None  # Fall back to NPZ path
+
+    source = np.load(src_path, mmap_mode="r")  # (n_channels, n_samples)
+    target = np.load(tgt_path, mmap_mode="r")
+
+    if source.shape[0] < min_channels or target.shape[0] < min_channels:
+        _print_primary(
+            f"  {subject_id}: insufficient channels "
+            f"({source_region}={source.shape[0]}, {target_region}={target.shape[0]}), "
+            f"need >= {min_channels} each, skipping"
+        )
+        return None
+
+    # Copy to writable contiguous arrays (mmap is read-only)
+    source = np.ascontiguousarray(source, dtype=np.float32)
+    target = np.ascontiguousarray(target, dtype=np.float32)
+
+    # Z-score per channel
+    if zscore:
+        src_mean = source.mean(axis=1, keepdims=True)
+        src_std = source.std(axis=1, keepdims=True) + 1e-8
+        source = (source - src_mean) / src_std
+
+        tgt_mean = target.mean(axis=1, keepdims=True)
+        tgt_std = target.std(axis=1, keepdims=True) + 1e-8
+        target = (target - tgt_mean) / tgt_std
+
+    # Load metadata
+    n_sessions = 0
+    n_trials = 0
+    soz_probes = []
+    if meta_path.exists():
+        meta = np.load(meta_path, allow_pickle=False)
+        n_sessions = int(meta.get("n_sessions", 0))
+        n_trials = int(meta.get("n_trials", 0))
+        soz_arr = meta.get("soz_probes", np.array([], dtype="U10"))
+        soz_probes = list(soz_arr) if len(soz_arr) > 0 else []
+
+    n_samples = source.shape[1]
+    metadata = {
+        "subject_id": subject_id,
+        "source_region": source_region,
+        "target_region": target_region,
+        "source_probes": [],
+        "target_probes": [],
+        "n_sessions": n_sessions,
+        "n_trials": n_trials,
+        "soz_excluded": False,
+        "soz_probes": soz_probes,
+        "srate": BORAN_SAMPLING_RATE_HZ,
+    }
+
+    return {
+        "source": source,
+        "target": target,
+        "subject_id": subject_id,
+        "n_source_channels": source.shape[0],
+        "n_target_channels": target.shape[0],
+        "n_samples": n_samples,
+        "metadata": metadata,
+    }
+
+
 def load_boran_subject(
     subject_id: str,
     data_dir: Optional[Path] = None,
@@ -4963,10 +5042,10 @@ def load_boran_subject(
     min_channels: int = 4,
     exclude_soz: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Load preprocessed Boran MTL subject data from NPZ.
+    """Load preprocessed Boran MTL subject data.
 
-    Reads preprocessed NPZ file (downsampled to 1kHz), extracts source/target
-    channels by region, and z-scores.
+    Tries fast NPY path first (pre-extracted per-region files),
+    falls back to NPZ (full iEEG with channel extraction).
 
     Args:
         subject_id: Subject identifier (e.g., "S01", "S02")
@@ -4982,6 +5061,16 @@ def load_boran_subject(
         n_target_channels, n_samples, metadata. Returns None if subject
         doesn't have enough channels in both regions.
     """
+    # Fast path: try NPY files first (no decompression, no channel extraction)
+    if not exclude_soz:  # NPY files don't support SOZ exclusion
+        result = _load_boran_subject_npy(
+            subject_id, source_region, target_region,
+            zscore, min_channels, _BORAN_NPY_DIR,
+        )
+        if result is not None:
+            return result
+
+    # Slow path: load from NPZ with channel extraction
     data_dir = data_dir or _BORAN_DATA_DIR
     npz_path = data_dir / f"{subject_id}.npz"
 
@@ -5016,8 +5105,6 @@ def load_boran_subject(
         return None
 
     # Extract source and target signals
-    # np.ascontiguousarray ensures contiguous memory layout after fancy indexing,
-    # which dramatically speeds up per-window slicing in __getitem__
     source = np.ascontiguousarray(ieeg[source_chs, :], dtype=np.float32)
     target = np.ascontiguousarray(ieeg[target_chs, :], dtype=np.float32)
 
@@ -5062,7 +5149,7 @@ def list_boran_subjects(
 ) -> List[str]:
     """List available subject IDs in the Boran MTL dataset.
 
-    Discovers subjects by scanning for preprocessed NPZ files (S01.npz, S02.npz, ...).
+    Checks NPY directory first (faster), falls back to NPZ directory.
 
     Args:
         data_dir: Directory containing preprocessed NPZ files (default: _BORAN_DATA_DIR)
@@ -5070,12 +5157,21 @@ def list_boran_subjects(
     Returns:
         Sorted list of subject IDs like ["S01", "S02", ...]
     """
+    # Try NPY dir first (subdirectories named S01/, S02/, ...)
+    if _BORAN_NPY_DIR.exists():
+        subj_dirs = sorted(d.name for d in _BORAN_NPY_DIR.iterdir()
+                           if d.is_dir() and d.name.startswith("S"))
+        if subj_dirs:
+            return subj_dirs
+
+    # Fall back to NPZ dir
     data_dir = data_dir or _BORAN_DATA_DIR
 
     if not data_dir.exists():
         raise FileNotFoundError(
             f"Boran MTL data directory not found: {data_dir}\n"
-            f"Run: python scripts/preprocess_boran.py"
+            f"Run: python scripts/preprocess_boran.py\n"
+            f"Then: python scripts/convert_boran_npz_to_npy.py"
         )
 
     npz_files = sorted(data_dir.glob("S*.npz"))
