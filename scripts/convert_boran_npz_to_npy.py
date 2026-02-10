@@ -49,7 +49,7 @@ def convert_subject(npz_path: Path, output_dir: Path) -> dict:
     region_info = {}
     for region in BORAN_MTL_REGIONS:
         chs, region_probes = _boran_get_region_channels(
-            probes, probe_n_contacts, region, exclude_probes=None  # Don't exclude SOZ here, keep all
+            probes, probe_n_contacts, region, soz_probes=None  # Keep all channels, don't exclude SOZ
         )
         if len(chs) == 0:
             print(f"    {subject_id}: no channels for {region}, skipping region")
