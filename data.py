@@ -4607,7 +4607,21 @@ class ECoGDataset(Dataset):
                 start = w * stride
                 self.windows.append((subj_idx, start))
 
-        self.subjects_data = subjects_data
+        # Pre-slice channels to avoid per-window truncation overhead in __getitem__
+        self.subjects_data = []
+        for s in subjects_data:
+            src = s["source"][:self.n_source_channels]
+            tgt = s["target"][:self.n_target_channels]
+            # Ensure contiguous for fast window slicing
+            if not src.flags['C_CONTIGUOUS']:
+                src = np.ascontiguousarray(src)
+            if not tgt.flags['C_CONTIGUOUS']:
+                tgt = np.ascontiguousarray(tgt)
+            self.subjects_data.append({
+                "source": src,
+                "target": tgt,
+                "subject_id": s.get("subject_id", ""),
+            })
 
         if verbose:
             _print_primary(
@@ -4626,9 +4640,9 @@ class ECoGDataset(Dataset):
 
         end = start + self.window_size
 
-        # Extract window and truncate to normalized channel counts
-        source = subj_data["source"][:self.n_source_channels, start:end].copy()
-        target = subj_data["target"][:self.n_target_channels, start:end].copy()
+        # Extract window (channels already pre-sliced in __init__)
+        source = subj_data["source"][:, start:end].copy()
+        target = subj_data["target"][:, start:end].copy()
 
         # Optional per-window normalization
         if self.zscore_per_window:

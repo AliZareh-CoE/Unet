@@ -1713,10 +1713,20 @@ def train(
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
 
+        # Optimize dataloader — persistent workers avoid fork overhead each epoch
+        _dandi_nw = max(2, num_workers)
+        _dandi_pf = 2 if _dandi_nw > 0 else None
+        _dandi_persist = _dandi_nw > 0
+
+        if is_primary():
+            print(f"DANDI DataLoader: {_dandi_nw} workers, prefetch={_dandi_pf}, persistent={_dandi_persist}")
+
         loader_kwargs = {
-            "num_workers": num_workers,
+            "num_workers": _dandi_nw,
             "pin_memory": True,
             "collate_fn": dandi_collate_fn,
+            "persistent_workers": _dandi_persist,
+            "prefetch_factor": _dandi_pf,
         }
 
         loaders = {
@@ -1783,10 +1793,22 @@ def train(
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
 
+        # Optimize dataloader for multi-GPU
+        # ECoG/Boran datasets are small (~6 batches/epoch), so persistent_workers
+        # is critical to avoid worker fork overhead dominating each epoch.
+        _ecog_nw = max(2, num_workers)
+        _ecog_pf = 2 if _ecog_nw > 0 else None
+        _ecog_persist = _ecog_nw > 0  # Always persist — dataset is small, /dev/shm is fine
+
+        if is_primary():
+            print(f"ECoG/Boran DataLoader: {_ecog_nw} workers, prefetch={_ecog_pf}, persistent={_ecog_persist}")
+
         loader_kwargs = {
-            "num_workers": num_workers,
+            "num_workers": _ecog_nw,
             "pin_memory": True,
             "collate_fn": ecog_collate_fn,
+            "persistent_workers": _ecog_persist,
+            "prefetch_factor": _ecog_pf,
         }
 
         loaders = {
