@@ -838,6 +838,9 @@ def evaluate(
     baseline_corr_list, baseline_r2_list, baseline_nrmse_list = [], [], []
     baseline_psd_err_list, baseline_psd_diff_list = [], []
 
+    # Matched-channel model metrics (fair comparison when in_ch != out_ch)
+    matched_corr_list, matched_r2_list, matched_nrmse_list = [], [], []
+
     # Per-channel metrics (computed in non-fast mode only)
     per_channel_corr_list = []
     cross_channel_corr_accumulated = None
@@ -957,24 +960,32 @@ def evaluate(
                 if psd_diagnostics_collected is None:
                     psd_diagnostics_collected = psd_diagnostics_torch(pred_f32, pcx_f32, fs=sampling_rate)
 
-            # Baseline metrics: Compare raw source vs target
-            # For different channel counts (e.g., PFC 64ch → CA1 32ch), use mean across channels
-            # This gives a meaningful "how similar are these brain regions" baseline
+            # Baseline metrics: Compare raw source vs target (per-channel)
+            # Always use per-channel comparison to match how model is evaluated.
+            # When channel counts differ, truncate to min channels.
+            # NOTE: Previous mean-signal comparison inflated baseline correlation
+            # because averaging across channels denoises the signal.
             if not fast_mode:
-                if ob_f32.shape[1] == pcx_f32.shape[1]:
-                    # Same channel count: direct comparison
-                    ob_baseline = ob_f32
-                    pcx_baseline = pcx_f32
-                else:
-                    # Different channel counts: compare mean signals (reduces to [B, 1, T])
-                    ob_baseline = ob_f32.mean(dim=1, keepdim=True)
-                    pcx_baseline = pcx_f32.mean(dim=1, keepdim=True)
+                n_ch_src = ob_f32.shape[1]
+                n_ch_tgt = pcx_f32.shape[1]
+                n_ch_min = min(n_ch_src, n_ch_tgt)
+                ob_baseline = ob_f32[:, :n_ch_min, :]
+                pcx_baseline = pcx_f32[:, :n_ch_min, :]
 
                 baseline_corr_list.append(pearson_batch(ob_baseline, pcx_baseline).item())
                 baseline_r2_list.append(explained_variance_torch(ob_baseline, pcx_baseline).item())
                 baseline_nrmse_list.append(normalized_rmse_torch(ob_baseline, pcx_baseline).item())
                 baseline_psd_err_list.append(psd_error_db_torch(ob_baseline, pcx_baseline, fs=sampling_rate).item())
                 baseline_psd_diff_list.append(psd_diff_db_torch(ob_baseline, pcx_baseline, fs=sampling_rate).item())
+
+                # Matched-channel model metrics: evaluate model on same channels as baseline
+                # so the delta comparison is fair (both on n_ch_min channels)
+                if n_ch_src != n_ch_tgt:
+                    pred_matched = pred_f32[:, :n_ch_min, :]
+                    pcx_matched = pcx_f32[:, :n_ch_min, :]
+                    matched_corr_list.append(pearson_batch(pred_matched, pcx_matched).item())
+                    matched_r2_list.append(explained_variance_torch(pred_matched, pcx_matched).item())
+                    matched_nrmse_list.append(normalized_rmse_torch(pred_matched, pcx_matched).item())
 
                 # Per-channel correlation analysis (for channel correspondence investigation)
                 per_ch_corr = pearson_per_channel(pred_f32, pcx_f32)  # [C]
@@ -1216,6 +1227,12 @@ def evaluate(
         results["baseline_nrmse"] = float(np.mean(baseline_nrmse_list))
         results["baseline_psd_err_db"] = float(np.mean(baseline_psd_err_list))
         results["baseline_psd_diff_db"] = float(np.mean(baseline_psd_diff_list))
+
+    # Matched-channel model metrics (fair comparison when in_ch != out_ch)
+    if matched_corr_list:
+        results["matched_corr"] = float(np.mean(matched_corr_list))
+        results["matched_r2"] = float(np.mean(matched_r2_list))
+        results["matched_nrmse"] = float(np.mean(matched_nrmse_list))
 
     # Per-channel correlation metrics (for channel correspondence analysis)
     if per_channel_corr_list:
@@ -1696,10 +1713,20 @@ def train(
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
 
+        # Optimize dataloader — persistent workers avoid fork overhead each epoch
+        _dandi_nw = max(2, num_workers)
+        _dandi_pf = 2 if _dandi_nw > 0 else None
+        _dandi_persist = _dandi_nw > 0
+
+        if is_primary():
+            print(f"DANDI DataLoader: {_dandi_nw} workers, prefetch={_dandi_pf}, persistent={_dandi_persist}")
+
         loader_kwargs = {
-            "num_workers": num_workers,
+            "num_workers": _dandi_nw,
             "pin_memory": True,
             "collate_fn": dandi_collate_fn,
+            "persistent_workers": _dandi_persist,
+            "prefetch_factor": _dandi_pf,
         }
 
         loaders = {
@@ -1766,10 +1793,22 @@ def train(
         train_sampler = DistributedSampler(train_dataset, seed=42) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False, seed=42) if is_distributed else None
 
+        # Optimize dataloader for multi-GPU
+        # ECoG/Boran datasets are small (~6 batches/epoch), so persistent_workers
+        # is critical to avoid worker fork overhead dominating each epoch.
+        _ecog_nw = max(2, num_workers)
+        _ecog_pf = 2 if _ecog_nw > 0 else None
+        _ecog_persist = _ecog_nw > 0  # Always persist — dataset is small, /dev/shm is fine
+
+        if is_primary():
+            print(f"ECoG/Boran DataLoader: {_ecog_nw} workers, prefetch={_ecog_pf}, persistent={_ecog_persist}")
+
         loader_kwargs = {
-            "num_workers": num_workers,
+            "num_workers": _ecog_nw,
             "pin_memory": True,
             "collate_fn": ecog_collate_fn,
+            "persistent_workers": _ecog_persist,
+            "prefetch_factor": _ecog_pf,
         }
 
         loaders = {
@@ -2822,12 +2861,10 @@ def train(
         print("FINAL TEST RESULTS")
         print("="*60)
 
-        # Determine if we're using mean-signal baseline (different channel counts)
+        # Baseline: Natural difference between source and target (context for comparison)
         in_ch = config.get("in_channels", 32)
         out_ch = config.get("out_channels", 32)
-        baseline_note = "" if in_ch == out_ch else " (mean-signal comparison)"
-
-        # Baseline: Natural difference between source and target (context for comparison)
+        baseline_note = "" if in_ch == out_ch else f" (per-channel, truncated to min({in_ch},{out_ch})={min(in_ch,out_ch)}ch)"
         print(f"Baseline (Raw Source vs Target - natural difference){baseline_note}:")
         base_corr = test_metrics.get('baseline_corr', 0)
         base_r2 = test_metrics.get('baseline_r2', 0)
@@ -2855,6 +2892,17 @@ def train(
         print(f"  R²: {fwd_r2:.4f} (Δ={delta_r2:+.4f})")
         print(f"  NRMSE: {fwd_nrmse:.4f} (Δ={delta_nrmse:+.4f})")
         print(f"  PSD Bias: {psd_bias_fwd:+.2f} dB (|err|={psd_err_fwd:.2f}dB, Δerr={delta_psd_err:+.2f})")
+
+        # Matched-channel comparison (fair delta when in_ch != out_ch)
+        if 'matched_corr' in test_metrics:
+            m_corr = test_metrics['matched_corr']
+            m_r2 = test_metrics['matched_r2']
+            m_nrmse = test_metrics['matched_nrmse']
+            n_ch_min = min(in_ch, out_ch)
+            print(f"\n  Fair Comparison (model evaluated on same {n_ch_min}ch as baseline):")
+            print(f"    Correlation: {m_corr:.4f} (Δ={m_corr - base_corr:+.4f})")
+            print(f"    R²: {m_r2:.4f} (Δ={m_r2 - base_r2:+.4f})")
+            print(f"    NRMSE: {m_nrmse:.4f} (Δ={base_nrmse - m_nrmse:+.4f})")
 
         # Wiener contribution analysis (if enabled)
         if "wiener_contribution" in test_metrics:
@@ -4610,6 +4658,13 @@ def main():
                 "completed_successfully": True,
                 # Gated translator metrics
                 "gate_mean": final_gate_mean,
+                # Matched-channel metrics (fair comparison when in_ch != out_ch)
+                "matched_corr": test_metrics.get("matched_corr"),
+                "matched_r2": test_metrics.get("matched_r2"),
+                "matched_nrmse": test_metrics.get("matched_nrmse"),
+                # Baseline metrics
+                "baseline_corr": test_metrics.get("baseline_corr"),
+                "baseline_r2": test_metrics.get("baseline_r2"),
             }
             output_path = Path(args.output_results_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -87,6 +87,10 @@ class Phase1Config:
     use_gpu: bool = True
     n_jobs: int = -1  # -1 means use all available CPUs
 
+    # Boran MTL dataset settings
+    boran_source_region: str = "hippocampus"
+    boran_target_region: str = "entorhinal_cortex"
+
     # Additional options
     save_predictions: bool = False
     verbose: int = 1

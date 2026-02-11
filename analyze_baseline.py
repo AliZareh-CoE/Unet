@@ -487,7 +487,8 @@ def run_boran_analysis(window_size: int, stride: int):
         pair_name = f"{src_region} -> {tgt_region}"
         print_pair_header(pair_name)
 
-        results = []
+        # First pass: load all subjects to determine unified channel count
+        subjects_loaded = []
         for subj_id in subjects:
             try:
                 data = load_boran_subject(
@@ -497,17 +498,35 @@ def run_boran_analysis(window_size: int, stride: int):
                     zscore=False,
                     min_channels=4,
                 )
-                if data is None:
-                    continue
-                r = analyze_continuous_pair(
-                    data["source"], data["target"], subj_id,
-                    srate=float(BORAN_SAMPLING_RATE_HZ),
-                    window_size=window_size, stride=stride,
-                )
-                if r:
-                    results.append(r)
+                if data is not None:
+                    subjects_loaded.append(data)
             except Exception as e:
                 print(f"    Skipping {subj_id}: {e}")
+
+        if not subjects_loaded:
+            print(f"    No valid subjects for {pair_name}")
+            continue
+
+        # Unified channel count: min across all subjects AND both regions
+        n_ch_unified = min(
+            min(s["n_source_channels"] for s in subjects_loaded),
+            min(s["n_target_channels"] for s in subjects_loaded),
+        )
+        print(f"  Unified channel count: {n_ch_unified}")
+
+        # Second pass: analyze with truncated channels
+        results = []
+        for data in subjects_loaded:
+            subj_id = data["subject_id"]
+            source = data["source"][:n_ch_unified]
+            target = data["target"][:n_ch_unified]
+            r = analyze_continuous_pair(
+                source, target, subj_id,
+                srate=float(BORAN_SAMPLING_RATE_HZ),
+                window_size=window_size, stride=stride,
+            )
+            if r:
+                results.append(r)
 
         print_session_table(results)
         all_pair_results[pair_name] = results
