@@ -288,6 +288,7 @@ class LOSOConfig:
     ecog_target_region: str = "temporal"
     ecog_window_size: int = 5000
     ecog_stride_ratio: float = 0.5
+    ecog_channel_selection: str = "spatial_coverage"  # spatial_coverage, evenly_spaced, variance, first
 
     # Boran MTL Working Memory dataset options
     boran_source_region: str = "hippocampus"

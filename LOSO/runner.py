@@ -696,6 +696,7 @@ def run_single_fold(
             "--ecog-target-region", config.ecog_target_region,
             "--ecog-window-size", str(config.ecog_window_size),
             "--ecog-stride-ratio", str(config.ecog_stride_ratio),
+            "--ecog-channel-selection", config.ecog_channel_selection,
         ])
         # For ECoG, the --test-sessions will be treated as subject IDs
 

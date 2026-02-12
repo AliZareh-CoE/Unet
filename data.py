@@ -201,6 +201,97 @@ ECOG_EXPERIMENTS = {
 # We normalize to lowercase single-word keys.
 ECOG_BRAIN_LOBES = ["frontal", "temporal", "parietal", "occipital", "limbic"]
 
+# Channel selection strategies for ECoG inter-region translation.
+# When subjects have different channel counts, we need a consistent strategy
+# to select K channels from N available (K <= N).
+ECOG_CHANNEL_SELECTION_STRATEGIES = [
+    "evenly_spaced",  # Sample channels at uniform spatial intervals (default)
+    "variance",       # Pick highest-variance (most informative) channels
+    "first",          # Take first K channels (original naive approach)
+]
+
+
+def _select_channels(
+    data: np.ndarray,
+    n_keep: int,
+    strategy: str = "spatial_coverage",
+    locs: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Select n_keep channels from data using the given strategy.
+
+    The Miller ECoG Library provides 3D electrode coordinates ('locs' field)
+    for each channel. When available, spatial strategies use these to ensure
+    consistent coverage across the electrode array, which is critical because
+    different subjects have different electrode placements.
+
+    Args:
+        data: (n_channels, n_samples) array — all channels for one region
+        n_keep: Number of channels to select
+        strategy: Selection method:
+            - "spatial_coverage" (default): Use 3D electrode coordinates to
+              select channels that maximally cover the spatial extent of the
+              region. Falls back to "evenly_spaced" if locs unavailable.
+            - "evenly_spaced": Uniform sampling across channel indices.
+              Preserves spatial coverage when electrodes are on a regular grid.
+            - "variance": Pick highest-variance channels (most neural signal).
+              Excludes flat/dead channels. Maintains spatial order.
+            - "first": Take the first n_keep channels (legacy behavior).
+        locs: (n_channels, 3) array of 3D electrode coordinates, or None.
+            Required for "spatial_coverage" strategy; ignored otherwise.
+
+    Returns:
+        (n_keep, n_samples) array of selected channels
+    """
+    n_channels = data.shape[0]
+    if n_channels <= n_keep:
+        return data  # Nothing to select
+
+    if strategy == "spatial_coverage":
+        if locs is not None and len(locs) >= n_channels:
+            # Use electrode coordinates for spatially-aware selection.
+            # Strategy: greedy farthest-point sampling — start with the channel
+            # closest to the centroid, then iteratively add the channel that is
+            # farthest from all already-selected channels. This maximizes the
+            # spatial coverage of the selected subset.
+            coords = np.array(locs[:n_channels], dtype=np.float64)
+            centroid = coords.mean(axis=0)
+            # Start with channel closest to centroid
+            dists_to_centroid = np.linalg.norm(coords - centroid, axis=1)
+            selected = [int(np.argmin(dists_to_centroid))]
+
+            for _ in range(n_keep - 1):
+                # Distance from each unselected channel to nearest selected channel
+                min_dists = np.full(n_channels, np.inf)
+                for s in selected:
+                    d = np.linalg.norm(coords - coords[s], axis=1)
+                    min_dists = np.minimum(min_dists, d)
+                # Already-selected channels get -inf so they won't be picked
+                for s in selected:
+                    min_dists[s] = -np.inf
+                selected.append(int(np.argmax(min_dists)))
+
+            indices = np.sort(selected)  # Maintain spatial order
+        else:
+            # Fallback: uniform sampling across channel indices
+            indices = np.round(np.linspace(0, n_channels - 1, n_keep)).astype(int)
+    elif strategy == "evenly_spaced":
+        # Uniform spatial sampling — preserves full spatial coverage
+        indices = np.round(np.linspace(0, n_channels - 1, n_keep)).astype(int)
+    elif strategy == "variance":
+        # Pick highest-variance channels (most informative)
+        channel_var = data.var(axis=1)
+        top_k = np.argsort(channel_var)[-n_keep:]
+        indices = np.sort(top_k)  # Maintain spatial order
+    elif strategy == "first":
+        indices = np.arange(n_keep)
+    else:
+        raise ValueError(
+            f"Unknown channel selection strategy '{strategy}'. "
+            f"Options: {ECOG_CHANNEL_SELECTION_STRATEGIES}"
+        )
+
+    return data[indices]
+
 
 # =============================================================================
 # Constants - Boran MTL Working Memory (Depth Electrodes)
@@ -4547,6 +4638,31 @@ def load_ecog_subject(
     source = V[:, source_chs].T.copy()  # (n_source_channels, n_samples)
     target = V[:, target_chs].T.copy()  # (n_target_channels, n_samples)
 
+    # Extract electrode coordinates for spatial channel selection
+    # Miller ECoG Library provides 3D positions in 'locs' field
+    source_locs = None
+    target_locs = None
+    if "locs" in dat:
+        all_locs = np.array(dat["locs"], dtype=np.float64)
+        if all_locs.ndim == 2 and all_locs.shape[0] >= V.shape[1]:
+            source_locs = all_locs[source_chs]
+            target_locs = all_locs[target_chs]
+
+    # Extract gyrus and Brodmann area per selected channel (for metadata)
+    source_gyri = None
+    target_gyri = None
+    if "gyrus" in dat:
+        all_gyri = [str(g) for g in dat["gyrus"]]
+        source_gyri = [all_gyri[i] for i in source_chs if i < len(all_gyri)]
+        target_gyri = [all_gyri[i] for i in target_chs if i < len(all_gyri)]
+
+    source_brodmann = None
+    target_brodmann = None
+    if "Brodmann_Area" in dat:
+        all_ba = dat["Brodmann_Area"]
+        source_brodmann = [all_ba[i] for i in source_chs if i < len(all_ba)]
+        target_brodmann = [all_ba[i] for i in target_chs if i < len(all_ba)]
+
     # Z-score per channel
     if zscore:
         src_mean = source.mean(axis=1, keepdims=True)
@@ -4569,11 +4685,17 @@ def load_ecog_subject(
         "n_source_channels_raw": len(source_chs),
         "n_target_channels_raw": len(target_chs),
         "srate": srate,
+        "source_gyri": source_gyri,
+        "target_gyri": target_gyri,
+        "source_brodmann": source_brodmann,
+        "target_brodmann": target_brodmann,
     }
 
     return {
         "source": source,
         "target": target,
+        "source_locs": source_locs,
+        "target_locs": target_locs,
         "subject_id": subject_id,
         "n_source_channels": len(source_chs),
         "n_target_channels": len(target_chs),
@@ -4596,6 +4718,13 @@ class ECoGDataset(Dataset):
         verbose: Whether to print info messages
         n_source_channels: Fixed number of source channels (None = use min)
         n_target_channels: Fixed number of target channels (None = use min)
+        channel_selection: Strategy for selecting channels when a subject has
+            more than n_source/target_channels. Options:
+            - "evenly_spaced" (default): Uniform spatial sampling across the
+              electrode array. Ensures consistent spatial coverage regardless
+              of how many channels each subject has.
+            - "variance": Pick highest-variance channels (most neural signal).
+            - "first": Take first N channels (legacy behavior).
     """
 
     def __init__(
@@ -4607,6 +4736,7 @@ class ECoGDataset(Dataset):
         verbose: bool = True,
         n_source_channels: Optional[int] = None,
         n_target_channels: Optional[int] = None,
+        channel_selection: str = "evenly_spaced",
     ):
         self.window_size = window_size
         self.stride = stride
@@ -4634,11 +4764,17 @@ class ECoGDataset(Dataset):
                 start = w * stride
                 self.windows.append((subj_idx, start))
 
-        # Pre-slice channels to avoid per-window truncation overhead in __getitem__
+        # Select channels using the chosen strategy
         self.subjects_data = []
         for s in subjects_data:
-            src = s["source"][:self.n_source_channels]
-            tgt = s["target"][:self.n_target_channels]
+            src = _select_channels(
+                s["source"], self.n_source_channels, channel_selection,
+                locs=s.get("source_locs"),
+            )
+            tgt = _select_channels(
+                s["target"], self.n_target_channels, channel_selection,
+                locs=s.get("target_locs"),
+            )
             # Ensure contiguous for fast window slicing
             if not src.flags['C_CONTIGUOUS']:
                 src = np.ascontiguousarray(src)
@@ -4655,7 +4791,8 @@ class ECoGDataset(Dataset):
                 f"ECoGDataset: {len(subjects_data)} recordings, "
                 f"{len(self.windows)} windows, "
                 f"window_size={window_size}, stride={stride}, "
-                f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}"
+                f"source_ch={self.n_source_channels}, target_ch={self.n_target_channels}, "
+                f"channel_selection={channel_selection}"
             )
 
     def __len__(self) -> int:
@@ -4703,6 +4840,7 @@ def prepare_ecog_data(
     min_channels: int = 4,
     val_subjects: Optional[List[str]] = None,
     test_subjects: Optional[List[str]] = None,
+    channel_selection: str = "spatial_coverage",
 ) -> Dict[str, Any]:
     """Complete data preparation pipeline for Miller ECoG Library.
 
@@ -4937,12 +5075,12 @@ def prepare_ecog_data(
         train_dataset = ECoGDataset(
             train_portions, window_size=window_size, stride=stride,
             n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-            verbose=verbose,
+            channel_selection=channel_selection, verbose=verbose,
         )
         val_dataset = ECoGDataset(
             val_portions, window_size=window_size, stride=window_size,
             n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-            verbose=verbose,
+            channel_selection=channel_selection, verbose=verbose,
         )
 
         if verbose:
@@ -4954,12 +5092,12 @@ def prepare_ecog_data(
         train_dataset = ECoGDataset(
             train_data, window_size=window_size, stride=stride,
             n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-            verbose=verbose,
+            channel_selection=channel_selection, verbose=verbose,
         )
         val_dataset = ECoGDataset(
             val_data, window_size=window_size, stride=window_size,
             n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-            verbose=verbose,
+            channel_selection=channel_selection, verbose=verbose,
         )
 
     # In LOSO mode, data was loaded without z-scoring to prevent leakage.
@@ -4974,7 +5112,7 @@ def prepare_ecog_data(
     test_dataset = ECoGDataset(
         test_data, window_size=window_size, stride=window_size,
         n_source_channels=n_source_channels, n_target_channels=n_target_channels,
-        verbose=verbose,
+        channel_selection=channel_selection, verbose=verbose,
     )
 
     return {

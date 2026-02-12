@@ -3383,6 +3383,10 @@ def parse_args():
                         help="Stride as ratio of window size for ECoG (0.5 = 50%% overlap)")
     parser.add_argument("--ecog-data-dir", type=str, default=None,
                         help="Directory containing ECoG .npz files (default: $UNET_DATA_DIR/ECoG)")
+    parser.add_argument("--ecog-channel-selection", type=str, default="spatial_coverage",
+                        choices=["spatial_coverage", "evenly_spaced", "variance", "first"],
+                        help="Channel selection strategy when subjects have different counts "
+                             "(default: spatial_coverage)")
 
     # Boran MTL Working Memory dataset options
     parser.add_argument("--boran-source-region", type=str, default="hippocampus",
@@ -4202,6 +4206,7 @@ def main():
             verbose=is_primary(),
             val_subjects=loso_val_subjects,
             test_subjects=loso_test_subjects,
+            channel_selection=getattr(args, 'ecog_channel_selection', 'spatial_coverage'),
         )
 
         # Create minimal data dict for compatibility with training loop
