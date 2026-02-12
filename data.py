@@ -4298,18 +4298,37 @@ def _parse_ecog_lobe(raw_lobe: str) -> str:
     The data contains strings like "Frontal Lobe", "Temporal Lobe",
     "Limbic Lobe", "Sub-lobar", "Anterior Lobe", etc.
 
+    Mapping rules:
+    - "Frontal Lobe" -> "frontal"
+    - "Temporal Lobe" -> "temporal"
+    - "Parietal Lobe" -> "parietal"
+    - "Occipital Lobe" -> "occipital"
+    - "Limbic Lobe" -> "limbic"
+    - "Sub-lobar" -> "limbic" (insula, thalamus, basal ganglia — deep structures)
+    - "Anterior Lobe" -> None (cerebellum — not cortical, excluded)
+    - Other -> None (excluded with warning on first occurrence)
+
     Returns:
-        Canonical lobe name: frontal, temporal, parietal, occipital,
-        limbic, sub-lobar, or the lowercased input if unrecognized.
+        Canonical lobe name, or None if the region should be excluded.
     """
     s = raw_lobe.strip().lower()
     for known in ("frontal", "temporal", "parietal", "occipital", "limbic"):
         if known in s:
             return known
+    # Sub-lobar structures (insula, thalamus, basal ganglia) are anatomically
+    # closest to limbic system / deep cortical structures
     if "sub-lobar" in s or "sub lobar" in s:
-        return "sub-lobar"
-    # "Anterior Lobe" (cerebellum) and other rare cases
-    return s
+        return "limbic"
+    # "Anterior Lobe" = cerebellum, not cortical ECoG — exclude
+    if "anterior" in s:
+        return None
+    # Unknown annotation — exclude and warn
+    if not hasattr(_parse_ecog_lobe, "_warned"):
+        _parse_ecog_lobe._warned = set()
+    if s not in _parse_ecog_lobe._warned:
+        _parse_ecog_lobe._warned.add(s)
+        _print_primary(f"  WARNING: Unrecognized lobe annotation '{raw_lobe}', excluding channel")
+    return None
 
 
 def _parse_ecog_srate(dat: dict) -> int:
@@ -4334,6 +4353,11 @@ def _enumerate_ecog_recordings(
     returns a flat list of (subject_row, block_col, recording_id) where
     recording_id is unique per patient.
 
+    For multi-subject experiments (n_subj > 1), only block 0 is used per
+    subject (the primary/longest recording). For single-subject experiments
+    where blocks represent different patients (different channel counts),
+    each block becomes a separate recording.
+
     Returns:
         List of (row_idx, col_idx, recording_id) tuples
     """
@@ -4353,21 +4377,28 @@ def _enumerate_ecog_recordings(
             len(set(block_channels)) > 1 and n_subj == 1
         )
 
-        for bi in range(n_blocks):
-            dat = alldat[si][bi]
-            if dat is None:
-                continue
-            if "V" not in dat:
-                continue
-
-            if blocks_are_patients:
+        if blocks_are_patients:
+            # Single-subject experiment where blocks = different patients
+            for bi in range(n_blocks):
+                dat = alldat[si][bi]
+                if dat is None or "V" not in dat:
+                    continue
                 rec_id = f"ecog_s{si:02d}_b{bi:02d}"
-            elif n_subj > 1:
+                recordings.append((si, bi, rec_id))
+        elif n_subj > 1:
+            # Multi-subject experiment: use block 0 only per subject
+            dat = alldat[si][0]
+            if dat is not None and "V" in dat:
                 rec_id = f"ecog_s{si:02d}"
-            else:
+                recordings.append((si, 0, rec_id))
+        else:
+            # Single subject, single block (or identical channel counts)
+            for bi in range(n_blocks):
+                dat = alldat[si][bi]
+                if dat is None or "V" not in dat:
+                    continue
                 rec_id = f"ecog_s{si:02d}_b{bi:02d}"
-
-            recordings.append((si, bi, rec_id))
+                recordings.append((si, bi, rec_id))
 
     return recordings
 
@@ -4403,19 +4434,9 @@ def list_ecog_subjects(
     alldat = np.load(filepath, allow_pickle=True)["dat"]
     recordings = _enumerate_ecog_recordings(alldat)
 
-    # For multi-subject experiments, deduplicate to one entry per subject row
-    # (use first block only). For block-as-patient, each block is unique.
-    n_subj = alldat.shape[0]
-    if n_subj > 1:
-        seen = set()
-        unique = []
-        for si, bi, rec_id in recordings:
-            if si not in seen:
-                seen.add(si)
-                unique.append(rec_id)
-        return unique
-    else:
-        return [rec_id for _, _, rec_id in recordings]
+    # _enumerate_ecog_recordings already deduplicates: for multi-subject
+    # experiments it yields only block 0 per subject.
+    return [rec_id for _, _, rec_id in recordings]
 
 
 def _get_ecog_region_channels(
@@ -4442,6 +4463,12 @@ def _get_ecog_region_channels(
     V = np.float32(dat["V"])
     n_channels = V.shape[1]
     lobes = [_parse_ecog_lobe(str(l)) for l in dat["lobe"]]
+
+    if len(lobes) != n_channels:
+        _print_primary(
+            f"  WARNING: lobe annotations ({len(lobes)}) != channel count ({n_channels}), "
+            f"using min({len(lobes)}, {n_channels})"
+        )
 
     src = source_region.lower()
     tgt = target_region.lower()
@@ -4731,6 +4758,14 @@ def prepare_ecog_data(
     if verbose:
         _print_primary(f"  NPZ shape: {alldat.shape} ({len(recordings)} recordings)")
 
+    # In LOSO mode with temporal split, defer z-scoring to after split
+    # to prevent val statistics leaking into training normalization.
+    loso_mode_no_val_precheck = (
+        test_subjects is not None and len(test_subjects) > 0 and
+        (val_subjects is None or len(val_subjects) == 0)
+    )
+    load_zscore = False if (zscore and loso_mode_no_val_precheck) else zscore
+
     # Load each recording
     subjects_data = []
     valid_subject_ids = []
@@ -4742,7 +4777,7 @@ def prepare_ecog_data(
             experiment=experiment,
             source_region=source_region,
             target_region=target_region,
-            zscore=zscore,
+            zscore=load_zscore,
             min_channels=min_channels,
             _alldat=alldat,
         )
@@ -4815,14 +4850,25 @@ def prepare_ecog_data(
     val_data = [subj_id_to_data[sid] for sid in val_subject_ids]
     test_data = [subj_id_to_data[sid] for sid in test_subject_ids]
 
-    # Determine normalized channel counts across ALL valid recordings
+    # Determine normalized channel counts across ALL valid recordings.
+    # Using min ensures consistent tensor shapes. Subjects with more channels
+    # get truncated to this count (first N channels in grid order).
     all_n_src = [s["n_source_channels"] for s in subjects_data]
     all_n_tgt = [s["n_target_channels"] for s in subjects_data]
     n_source_channels = min(all_n_src)
     n_target_channels = min(all_n_tgt)
 
     if verbose:
-        _print_primary(f"  Normalized channels: source={n_source_channels}, target={n_target_channels}")
+        _print_primary(f"  Channel counts per subject ({source_region}): {all_n_src}")
+        _print_primary(f"  Channel counts per subject ({target_region}): {all_n_tgt}")
+        _print_primary(f"  Normalized to min: source={n_source_channels}, target={n_target_channels}")
+        if max(all_n_src) > 2 * n_source_channels or max(all_n_tgt) > 2 * n_target_channels:
+            _print_primary(
+                f"  WARNING: Large channel count disparity! "
+                f"Source range: {n_source_channels}-{max(all_n_src)}, "
+                f"Target range: {n_target_channels}-{max(all_n_tgt)}. "
+                f"Consider raising min_channels to exclude low-channel subjects."
+            )
 
     # Create datasets
     # Special handling for LOSO mode: when test_subjects provided but no val_subjects,
@@ -4842,10 +4888,31 @@ def prepare_ecog_data(
             n_samples = subj_data['n_samples']
             split_point = int(n_samples * 0.7)  # 70% train, 30% val
 
+            src_train = subj_data['source'][:, :split_point]
+            tgt_train = subj_data['target'][:, :split_point]
+            src_val = subj_data['source'][:, split_point:]
+            tgt_val = subj_data['target'][:, split_point:]
+
+            # Re-normalize each portion independently to prevent data leakage.
+            # The global z-score in load_ecog_subject used full-recording stats,
+            # which leaks val statistics into train. Re-normalize from raw scale.
+            if zscore:
+                # Train portion: normalize using only train statistics
+                src_mean = src_train.mean(axis=1, keepdims=True)
+                src_std = src_train.std(axis=1, keepdims=True) + 1e-8
+                src_train = (src_train - src_mean) / src_std
+                tgt_mean = tgt_train.mean(axis=1, keepdims=True)
+                tgt_std = tgt_train.std(axis=1, keepdims=True) + 1e-8
+                tgt_train = (tgt_train - tgt_mean) / tgt_std
+
+                # Val portion: normalize using TRAIN statistics (no leakage)
+                src_val = (src_val - src_mean) / src_std
+                tgt_val = (tgt_val - tgt_mean) / tgt_std
+
             train_portions.append({
                 'subject_id': subj_data['subject_id'],
-                'source': subj_data['source'][:, :split_point],
-                'target': subj_data['target'][:, :split_point],
+                'source': src_train,
+                'target': tgt_train,
                 'n_source_channels': subj_data['n_source_channels'],
                 'n_target_channels': subj_data['n_target_channels'],
                 'n_samples': split_point,
@@ -4855,8 +4922,8 @@ def prepare_ecog_data(
 
             val_portions.append({
                 'subject_id': subj_data['subject_id'],
-                'source': subj_data['source'][:, split_point:],
-                'target': subj_data['target'][:, split_point:],
+                'source': src_val,
+                'target': tgt_val,
                 'n_source_channels': subj_data['n_source_channels'],
                 'n_target_channels': subj_data['n_target_channels'],
                 'n_samples': n_samples - split_point,
@@ -4894,6 +4961,15 @@ def prepare_ecog_data(
             n_source_channels=n_source_channels, n_target_channels=n_target_channels,
             verbose=verbose,
         )
+
+    # In LOSO mode, data was loaded without z-scoring to prevent leakage.
+    # Normalize test data per-channel using its own statistics.
+    if loso_mode_no_val and zscore:
+        for subj_data in test_data:
+            src = subj_data['source']
+            tgt = subj_data['target']
+            subj_data['source'] = (src - src.mean(axis=1, keepdims=True)) / (src.std(axis=1, keepdims=True) + 1e-8)
+            subj_data['target'] = (tgt - tgt.mean(axis=1, keepdims=True)) / (tgt.std(axis=1, keepdims=True) + 1e-8)
 
     test_dataset = ECoGDataset(
         test_data, window_size=window_size, stride=window_size,

@@ -269,7 +269,10 @@ def get_all_sessions(
         return sessions, metadata
 
     elif dataset == "ecog":
-        from data import list_ecog_subjects, _ECOG_DATA_DIR
+        from data import (
+            _ECOG_DATA_DIR, _enumerate_ecog_recordings,
+            load_ecog_subject,
+        )
 
         # Get experiment and region from config
         experiment = "fingerflex"
@@ -286,22 +289,25 @@ def get_all_sessions(
                 f"Run: python scripts/download_ecog.py --experiments {experiment}"
             )
 
-        # Get all subjects and filter to those with valid regions
-        all_subjects = list_ecog_subjects(data_dir=_ECOG_DATA_DIR, experiment=experiment)
+        # Load NPZ and enumerate recordings with correct (subject_idx, block_idx) pairs
+        filepath = _ECOG_DATA_DIR / f"{experiment}.npz"
+        alldat = np.load(filepath, allow_pickle=True)["dat"]
+        recordings = _enumerate_ecog_recordings(alldat)
 
         # Filter subjects that have enough channels in both regions
-        from data import load_ecog_subject
         valid_subjects = []
-        for subj_idx, subj_id in enumerate(all_subjects):
+        for si, bi, rec_id in recordings:
             subj_data = load_ecog_subject(
-                subject_idx=subj_idx,
+                subject_idx=si,
+                block_idx=bi,
                 data_dir=_ECOG_DATA_DIR,
                 experiment=experiment,
                 source_region=source_region,
                 target_region=target_region,
+                _alldat=alldat,
             )
             if subj_data is not None:
-                valid_subjects.append(subj_id)
+                valid_subjects.append(rec_id)
 
         metadata = {
             "session_type": ds_config.session_type,  # "subject"

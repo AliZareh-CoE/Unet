@@ -54,8 +54,12 @@ def main():
 
             from data import _parse_ecog_lobe
             lobe_counts = {}
+            excluded = 0
             for lobe_raw in lobes:
                 lobe = _parse_ecog_lobe(str(lobe_raw))
+                if lobe is None:
+                    excluded += 1
+                    continue
                 lobe_counts[lobe] = lobe_counts.get(lobe, 0) + 1
 
             recording_lobes[rec_id] = {
@@ -64,7 +68,8 @@ def main():
                 "lobes": lobe_counts,
             }
 
-            print(f"    {rec_id}: {dict(sorted(lobe_counts.items()))}")
+            excl_str = f" (excl {excluded})" if excluded else ""
+            print(f"    {rec_id}: {dict(sorted(lobe_counts.items()))}{excl_str}")
 
         # Now test all region pairs
         print(f"\n  Region pair viability (>= {MIN_SUBJECTS} subjects with >= {MIN_CHANNELS} ch each):")
