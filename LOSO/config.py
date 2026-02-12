@@ -247,6 +247,10 @@ class LOSOConfig:
     fsdp_strategy: str = "full"
     nproc: Optional[int] = None  # Number of GPUs (None = auto-detect)
 
+    # Parallel fold execution (1 GPU per fold, no FSDP)
+    parallel_folds: bool = False  # Run folds in parallel across GPUs
+    n_gpus: Optional[int] = None  # Number of GPUs for parallel folds (None = auto-detect)
+
     # Nested CV settings
     inner_cv_folds: int = 3  # k-fold CV for inner loop
     run_inner_cv: bool = False  # Set True to run nested CV with ablation

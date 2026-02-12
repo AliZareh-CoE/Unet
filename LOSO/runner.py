@@ -16,11 +16,18 @@ Usage:
 
     # Run specific folds only
     python -m LOSO.runner --folds 0 1 2
+
+    # Run ECoG LOSO folds in parallel (1 GPU per fold, 8 GPUs)
+    python -m LOSO.runner --dataset ecog --parallel-folds --n-gpus 8
+
+    # Parallel folds with auto-detected GPU count
+    python -m LOSO.runner --dataset ecog --parallel-folds
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import pickle
@@ -560,6 +567,7 @@ def run_single_fold(
     config: LOSOConfig,
     output_results_file: Path,
     seed_idx: int = 0,
+    gpu_id: Optional[int] = None,
 ) -> Optional[LOSOFoldResult]:
     """Run a single LOSO fold by calling train.py.
 
@@ -570,6 +578,8 @@ def run_single_fold(
         config: LOSO configuration
         output_results_file: Path to save train.py results
         seed_idx: Seed index within this fold (for multi-seed runs)
+        gpu_id: GPU index to pin this fold to (sets CUDA_VISIBLE_DEVICES).
+                If None, no GPU pinning is done.
 
     Returns:
         LOSOFoldResult or None on failure
@@ -769,6 +779,10 @@ def run_single_fold(
     env["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"  # 30 minutes
     env["NCCL_TIMEOUT"] = "1800"
     env["NCCL_DEBUG"] = "WARN"
+
+    # Pin to specific GPU when running parallel folds
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     # Run subprocess
     start_time = time.time()
@@ -1040,6 +1054,71 @@ def _aggregate_seed_results(
 
 
 # =============================================================================
+# Parallel fold execution helper
+# =============================================================================
+
+def _run_fold_all_seeds(
+    fold_idx: int,
+    all_sessions: List[str],
+    config: LOSOConfig,
+    results_dir: Path,
+    gpu_id: int,
+) -> Tuple[int, List[LOSOFoldResult]]:
+    """Run all seeds for a single fold on a specific GPU.
+
+    This is the unit of work for parallel fold execution. Each call
+    runs one fold (all seeds) on one GPU via CUDA_VISIBLE_DEVICES.
+
+    Args:
+        fold_idx: Fold index (0-indexed)
+        all_sessions: List of all session names
+        config: LOSO configuration
+        results_dir: Directory for per-fold result JSON files
+        gpu_id: GPU index to pin to
+
+    Returns:
+        Tuple of (fold_idx, list of LOSOFoldResult for each seed)
+    """
+    test_session = all_sessions[fold_idx]
+    seed_results = []
+
+    for seed_idx in range(config.n_seeds):
+        output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_seed{seed_idx}_results.json"
+
+        print(f"[GPU {gpu_id}] Fold {fold_idx}, Seed {seed_idx + 1}/{config.n_seeds} "
+              f"(test={test_session})", flush=True)
+
+        # Skip if result already exists on disk
+        existing_result = _load_fold_result_from_json(
+            output_results_file, fold_idx, test_session, all_sessions, config,
+        )
+        if existing_result is not None:
+            print(f"[GPU {gpu_id}] Fold {fold_idx} seed {seed_idx}: "
+                  f"SKIPPING (exists, Corr={existing_result.val_corr:.4f})", flush=True)
+            seed_results.append(existing_result)
+            continue
+
+        result = run_single_fold(
+            fold_idx=fold_idx,
+            test_session=test_session,
+            all_sessions=all_sessions,
+            config=config,
+            output_results_file=output_results_file,
+            seed_idx=seed_idx,
+            gpu_id=gpu_id,
+        )
+
+        if result is not None:
+            seed_results.append(result)
+            print(f"[GPU {gpu_id}] Fold {fold_idx} seed {seed_idx}: "
+                  f"Corr={result.val_corr:.4f}, R²={result.val_r2:.4f}", flush=True)
+        else:
+            print(f"[GPU {gpu_id}] Fold {fold_idx} seed {seed_idx}: FAILED", flush=True)
+
+    return (fold_idx, seed_results)
+
+
+# =============================================================================
 # Main LOSO Runner
 # =============================================================================
 
@@ -1119,62 +1198,128 @@ def run_loso(
     results_dir = config.output_dir / "fold_results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    for fold_idx in folds_remaining:
-        test_session = all_sessions[fold_idx]
+    if config.parallel_folds and len(folds_remaining) > 0:
+        # =================================================================
+        # PARALLEL EXECUTION: run folds across GPUs (1 GPU per fold)
+        # =================================================================
+        n_gpus = config.n_gpus
+        if n_gpus is None:
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        n_gpus = min(n_gpus, len(folds_remaining))
 
-        # Run multiple seeds for this fold
-        seed_results = []
-        for seed_idx in range(config.n_seeds):
-            output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_seed{seed_idx}_results.json"
+        print(f"PARALLEL MODE: {len(folds_remaining)} folds across {n_gpus} GPUs")
+        print(f"  Each GPU trains one fold at a time (no FSDP)")
+        print()
 
-            print(f"\n--- Fold {fold_idx}, Seed {seed_idx + 1}/{config.n_seeds} ---")
+        # Process folds in batches of n_gpus
+        for batch_start in range(0, len(folds_remaining), n_gpus):
+            batch = folds_remaining[batch_start : batch_start + n_gpus]
+            print(f"\n{'='*70}")
+            print(f"BATCH {batch_start // n_gpus + 1}: Folds {batch} "
+                  f"(GPUs 0-{len(batch)-1})")
+            print(f"{'='*70}\n")
 
-            # Skip if result file already exists on disk (allows resuming without checkpoint)
-            existing_result = _load_fold_result_from_json(
-                output_results_file, fold_idx, test_session, all_sessions, config,
-            )
-            if existing_result is not None:
-                print(f"  SKIPPING: Result file already exists: {output_results_file.name}")
-                print(f"  (loaded: Corr={existing_result.val_corr:.4f}, R²={existing_result.val_r2:.4f})")
-                seed_results.append(existing_result)
-                continue
+            # Launch all folds in this batch concurrently
+            # Use ThreadPoolExecutor because actual compute is in subprocesses
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {}
+                for gpu_idx, fold_idx in enumerate(batch):
+                    future = executor.submit(
+                        _run_fold_all_seeds,
+                        fold_idx=fold_idx,
+                        all_sessions=all_sessions,
+                        config=config,
+                        results_dir=results_dir,
+                        gpu_id=gpu_idx,
+                    )
+                    futures[future] = (fold_idx, gpu_idx)
 
-            result = run_single_fold(
-                fold_idx=fold_idx,
-                test_session=test_session,
-                all_sessions=all_sessions,
-                config=config,
-                output_results_file=output_results_file,
-                seed_idx=seed_idx,
-            )
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(futures):
+                    fold_idx, gpu_idx = futures[future]
+                    test_session = all_sessions[fold_idx]
+                    try:
+                        _, seed_results = future.result()
+                    except Exception as e:
+                        print(f"\n[GPU {gpu_idx}] Fold {fold_idx} EXCEPTION: {e}")
+                        continue
 
-            if result is not None:
-                seed_results.append(result)
+                    if seed_results:
+                        aggregated_result = _aggregate_seed_results(
+                            seed_results, fold_idx, test_session, config,
+                        )
+                        fold_results.append(aggregated_result)
+                        completed_folds.append(fold_idx)
 
-            # Small delay between runs when using FSDP
-            if config.use_fsdp and seed_idx < config.n_seeds - 1:
-                time.sleep(2)
+                        save_checkpoint(
+                            checkpoint_path, config, fold_results,
+                            completed_folds, all_sessions,
+                        )
+                        print(f"[GPU {gpu_idx}] Fold {fold_idx} checkpoint saved "
+                              f"({len(seed_results)}/{config.n_seeds} seeds)", flush=True)
 
-        # Aggregate results across seeds for this fold
-        if seed_results:
-            aggregated_result = _aggregate_seed_results(seed_results, fold_idx, test_session, config)
-            fold_results.append(aggregated_result)
-            completed_folds.append(fold_idx)
+            print(f"\nBatch complete. {len(completed_folds)}/{n_folds} folds done.")
 
-            # Save checkpoint after each fold
-            save_checkpoint(
-                checkpoint_path,
-                config,
-                fold_results,
-                completed_folds,
-                all_sessions,
-            )
+    else:
+        # =================================================================
+        # SEQUENTIAL EXECUTION: original behavior
+        # =================================================================
+        for fold_idx in folds_remaining:
+            test_session = all_sessions[fold_idx]
 
-            print(f"\nCheckpoint saved after fold {fold_idx} ({len(seed_results)}/{config.n_seeds} seeds completed)")
+            # Run multiple seeds for this fold
+            seed_results = []
+            for seed_idx in range(config.n_seeds):
+                output_results_file = results_dir / f"fold_{fold_idx}_{test_session}_seed{seed_idx}_results.json"
 
-            # Small delay between folds when using FSDP
-            if config.use_fsdp and fold_idx < folds_remaining[-1]:
-                time.sleep(2)
+                print(f"\n--- Fold {fold_idx}, Seed {seed_idx + 1}/{config.n_seeds} ---")
+
+                # Skip if result file already exists on disk (allows resuming without checkpoint)
+                existing_result = _load_fold_result_from_json(
+                    output_results_file, fold_idx, test_session, all_sessions, config,
+                )
+                if existing_result is not None:
+                    print(f"  SKIPPING: Result file already exists: {output_results_file.name}")
+                    print(f"  (loaded: Corr={existing_result.val_corr:.4f}, R²={existing_result.val_r2:.4f})")
+                    seed_results.append(existing_result)
+                    continue
+
+                result = run_single_fold(
+                    fold_idx=fold_idx,
+                    test_session=test_session,
+                    all_sessions=all_sessions,
+                    config=config,
+                    output_results_file=output_results_file,
+                    seed_idx=seed_idx,
+                )
+
+                if result is not None:
+                    seed_results.append(result)
+
+                # Small delay between runs when using FSDP
+                if config.use_fsdp and seed_idx < config.n_seeds - 1:
+                    time.sleep(2)
+
+            # Aggregate results across seeds for this fold
+            if seed_results:
+                aggregated_result = _aggregate_seed_results(seed_results, fold_idx, test_session, config)
+                fold_results.append(aggregated_result)
+                completed_folds.append(fold_idx)
+
+                # Save checkpoint after each fold
+                save_checkpoint(
+                    checkpoint_path,
+                    config,
+                    fold_results,
+                    completed_folds,
+                    all_sessions,
+                )
+
+                print(f"\nCheckpoint saved after fold {fold_idx} ({len(seed_results)}/{config.n_seeds} seeds completed)")
+
+                # Small delay between folds when using FSDP
+                if config.use_fsdp and fold_idx < folds_remaining[-1]:
+                    time.sleep(2)
 
     # Create final result
     loso_result = LOSOResult(
@@ -1290,6 +1435,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fsdp", action="store_true", help="Enable FSDP")
     parser.add_argument("--fsdp-strategy", type=str, default="grad_op", help="FSDP strategy")
     parser.add_argument("--nproc", type=int, default=None, help="Number of GPUs for distributed training (default: auto-detect)")
+
+    # Parallel fold execution (1 GPU per fold, mutually exclusive with FSDP)
+    parser.add_argument(
+        "--parallel-folds",
+        action="store_true",
+        help="Run LOSO folds in parallel across GPUs (1 fold per GPU, no FSDP). "
+             "E.g., with 8 GPUs and 15 folds, runs 8 folds simultaneously.",
+    )
+    parser.add_argument(
+        "--n-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs for parallel fold execution (default: auto-detect). "
+             "Only used with --parallel-folds.",
+    )
 
     # Execution control
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
@@ -1471,6 +1631,13 @@ def main():
     """Main entry point."""
     args = parse_args()
 
+    # Validate mutually exclusive options
+    if args.parallel_folds and args.fsdp:
+        print("ERROR: --parallel-folds and --fsdp are mutually exclusive.")
+        print("  --parallel-folds: 1 GPU per fold (parallel LOSO folds)")
+        print("  --fsdp: all GPUs per fold (distributed single model)")
+        return 1
+
     # Create config from args
     config = LOSOConfig(
         # Dataset
@@ -1506,6 +1673,9 @@ def main():
         use_fsdp=args.fsdp,
         fsdp_strategy=args.fsdp_strategy,
         nproc=args.nproc,
+        # Parallel folds
+        parallel_folds=args.parallel_folds,
+        n_gpus=args.n_gpus,
         # Execution
         resume=not args.no_resume,
         verbose=not args.quiet,
