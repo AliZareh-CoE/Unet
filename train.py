@@ -3595,6 +3595,9 @@ def parse_args():
     parser.add_argument("--output-results-file", type=str, default=None,
                         help="JSON file to save training results (used by Phase 2 runner). "
                              "Contains best_r2, best_mae, best_epoch, train_losses, val_r2s, etc.")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override base output directory (default: artifacts). "
+                             "Checkpoints go to <output-dir>/checkpoints, logs to <output-dir>/logs.")
     parser.add_argument("--fold", type=int, default=None,
                         help="Fold number for Phase 2 CV logging (0-indexed)")
     parser.add_argument("--checkpoint-prefix", type=str, default=None,
@@ -3638,7 +3641,14 @@ def parse_args():
 
 
 def main():
+    global OUTPUT_DIR, CHECKPOINT_DIR, LOGS_DIR
     args = parse_args()
+
+    # Override output directories if --output-dir is provided
+    if args.output_dir is not None:
+        OUTPUT_DIR = Path(args.output_dir)
+        CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+        LOGS_DIR = OUTPUT_DIR / "logs"
 
     # Handle LOSO cross-validation mode
     if args.loso:

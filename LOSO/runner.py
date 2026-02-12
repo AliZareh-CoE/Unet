@@ -637,6 +637,13 @@ def run_single_fold(
         "--fold", str(fold_idx),
     ])
 
+    # When running parallel folds, give each fold its own output directory
+    # so checkpoints/logs don't overwrite each other
+    if gpu_id is not None:
+        fold_output_dir = config.output_dir / "fold_artifacts" / f"fold_{fold_idx}_{test_session}_seed{seed_idx}"
+        fold_output_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--output-dir", str(fold_output_dir)])
+
     # Skip plots for speed (unless enabled)
     if not config.generate_plots:
         cmd.append("--no-plots")
