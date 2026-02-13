@@ -633,22 +633,23 @@ def run_single_fold(
     # Base arguments
     # Seed formula ensures unique seeds across all folds and seed runs
     run_seed = config.seed + fold_idx * config.n_seeds + seed_idx
+    # Use absolute paths so train.py (which runs with cwd=PROJECT_ROOT) resolves correctly
+    abs_output_results_file = output_results_file.absolute()
     cmd.extend([
         "--arch", config.arch,
         "--epochs", str(config.epochs),
         "--batch-size", str(config.batch_size),
         "--lr", str(config.learning_rate),
         "--seed", str(run_seed),
-        "--output-results-file", str(output_results_file),
+        "--output-results-file", str(abs_output_results_file),
         "--fold", str(fold_idx),
     ])
 
-    # When running parallel folds, give each fold its own output directory
-    # so checkpoints/logs don't overwrite each other
-    if gpu_id is not None:
-        fold_output_dir = config.output_dir / "fold_artifacts" / f"fold_{fold_idx}_{test_session}_seed{seed_idx}"
-        fold_output_dir.mkdir(parents=True, exist_ok=True)
-        cmd.extend(["--output-dir", str(fold_output_dir)])
+    # Always give each fold its own output directory so checkpoints/logs
+    # don't overwrite each other (critical for concurrent external runners)
+    fold_output_dir = config.output_dir.absolute() / "fold_artifacts" / f"fold_{fold_idx}_{test_session}_seed{seed_idx}"
+    fold_output_dir.mkdir(parents=True, exist_ok=True)
+    cmd.extend(["--output-dir", str(fold_output_dir)])
 
     # Skip plots for speed (unless enabled)
     if not config.generate_plots:
@@ -1150,7 +1151,10 @@ def run_loso(
     Returns:
         LOSOResult with aggregated results
     """
-    # Setup output directory and logging
+    # Setup output directory and logging (resolve to absolute path early
+    # so all downstream paths are absolute and work correctly regardless
+    # of subprocess cwd differences)
+    config.output_dir = config.output_dir.absolute()
     config.output_dir.mkdir(parents=True, exist_ok=True)
     log_path, tee = setup_logging(config.output_dir)
 
