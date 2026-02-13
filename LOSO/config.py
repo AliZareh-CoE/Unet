@@ -281,6 +281,7 @@ class LOSOConfig:
     pfc_sliding_window: bool = False
     pfc_window_size: int = 2500
     pfc_stride_ratio: float = 0.5
+    pfc_reverse: bool = False  # If True, translate CA1 -> PFC instead of PFC -> CA1
 
     # Miller ECoG Library dataset options
     ecog_experiment: str = "fingerflex"
@@ -321,6 +322,12 @@ class LOSOConfig:
             ds_config.target_region = self.dandi_target_region
             ds_config.default_window_size = self.dandi_window_size
             ds_config.default_stride_ratio = self.dandi_stride_ratio
+        elif self.dataset == "pfc_hpc":
+            if self.pfc_reverse:
+                ds_config.source_region = "CA1"
+                ds_config.target_region = "PFC"
+                ds_config.in_channels = 32
+                ds_config.out_channels = 64
         elif self.dataset == "pcx1":
             ds_config.default_window_size = self.pcx1_window_size
             ds_config.default_stride_ratio = self.pcx1_stride_ratio

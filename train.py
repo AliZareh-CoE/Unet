@@ -1676,6 +1676,7 @@ def train(
                 num_workers=num_workers,
                 use_sessions=config.get("split_by_session", False),
                 distributed=is_distributed,
+                reverse_direction=config.get("pfc_reverse", False),
             )
             if is_primary():
                 print(f"PFC sliding window DataLoaders: {len(loaders['train'].dataset)} train windows, "
@@ -1686,6 +1687,7 @@ def train(
                 batch_size=config.get("batch_size", 16),
                 num_workers=num_workers,
                 distributed=is_distributed,
+                reverse_direction=config.get("pfc_reverse", False),
             )
     elif config.get("dataset_type") == "dandi":
         # DANDI uses pre-created datasets from prepare_dandi_data
@@ -3321,6 +3323,8 @@ def parse_args():
                              "'boran' (Boran MTL depth electrode inter-region)")
     parser.add_argument("--resample-pfc", action="store_true",
                         help="Resample PFC dataset from 1250Hz to 1000Hz (for compatibility)")
+    parser.add_argument("--pfc-reverse", action="store_true",
+                        help="Reverse PFC direction: translate CA1 -> PFC instead of PFC -> CA1")
 
     # PFC sliding window options
     parser.add_argument("--pfc-sliding-window", action="store_true",
@@ -4054,8 +4058,15 @@ def main():
         )
         # Set dataset-specific config
         config["dataset_type"] = "pfc"
-        config["in_channels"] = 64   # PFC channels
-        config["out_channels"] = 32  # CA1 channels
+        config["pfc_reverse"] = getattr(args, 'pfc_reverse', False)
+        if config["pfc_reverse"]:
+            config["in_channels"] = 32   # CA1 channels (source)
+            config["out_channels"] = 64  # PFC channels (target)
+            if is_primary():
+                print("PFC REVERSE MODE: translating CA1 -> PFC")
+        else:
+            config["in_channels"] = 64   # PFC channels (source)
+            config["out_channels"] = 32  # CA1 channels (target)
         config["sampling_rate"] = SAMPLING_RATE_HZ if args.resample_pfc else PFC_SAMPLING_RATE_HZ
         # Map PFC data keys to generic names for training loop
         data["n_odors"] = data["n_labels"]  # trial types instead of odors

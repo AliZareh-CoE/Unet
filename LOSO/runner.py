@@ -679,9 +679,11 @@ def run_single_fold(
         ])
 
     elif config.dataset == "pfc_hpc":
-        # PFC-specific: resampling and sliding window options
+        # PFC-specific: resampling, sliding window, and direction
         if config.pfc_resample_to_1khz:
             cmd.append("--resample-pfc")
+        if config.pfc_reverse:
+            cmd.append("--pfc-reverse")
         if config.pfc_sliding_window:
             cmd.extend([
                 "--pfc-sliding-window",
@@ -1542,6 +1544,11 @@ def parse_args() -> argparse.Namespace:
         help="Resample PFC data from 1.25kHz to 1kHz",
     )
     pfc_group.add_argument(
+        "--pfc-reverse",
+        action="store_true",
+        help="Reverse direction: translate CA1 -> PFC instead of PFC -> CA1",
+    )
+    pfc_group.add_argument(
         "--pfc-sliding-window",
         action="store_true",
         help="Use sliding window for PFC dataset",
@@ -1711,6 +1718,7 @@ def main():
         pfc_sliding_window=args.pfc_sliding_window,
         pfc_window_size=args.pfc_window_size,
         pfc_stride_ratio=args.pfc_stride_ratio,
+        pfc_reverse=args.pfc_reverse,
         # ECoG-specific
         ecog_experiment=args.ecog_experiment,
         ecog_source_region=args.ecog_source_region,

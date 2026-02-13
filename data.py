@@ -2342,6 +2342,7 @@ def create_pfc_dataloaders(
     temporal_ablation: Optional[str] = None,
     data_fraction: float = 1.0,
     distributed: bool = False,
+    reverse_direction: bool = False,
 ) -> Dict[str, DataLoader]:
     """Create DataLoaders for PFC/CA1 train/val/test splits.
 
@@ -2353,31 +2354,36 @@ def create_pfc_dataloaders(
         temporal_ablation: Temporal ablation pattern to apply
         data_fraction: Fraction of training data to use
         distributed: If True, use DistributedSampler
+        reverse_direction: If True, use CA1 as source and PFC as target
 
     Returns dictionary with 'train', 'val', 'test' DataLoaders.
     """
     # Create temporal ablation if specified
     temp_ablation = TemporalAblation(temporal_ablation) if temporal_ablation else None
 
-    # Use PFC as source and CA1 as target
-    pfc = data["pfc"]
-    ca1 = data["ca1"]
+    # Use PFC as source and CA1 as target (or reverse)
+    if reverse_direction:
+        source = data["ca1"]
+        target = data["pfc"]
+    else:
+        source = data["pfc"]
+        target = data["ca1"]
     trial_types = data["trial_types"]
 
     # Create datasets using the generic PairedNeuralDataset
     train_dataset = PairedNeuralDataset(
-        pfc, ca1, trial_types, data["train_idx"],
+        source, target, trial_types, data["train_idx"],
         filter_label_id=filter_label_id,
         temporal_ablation=temp_ablation,
         data_fraction=data_fraction,
     )
     val_dataset = PairedNeuralDataset(
-        pfc, ca1, trial_types, data["val_idx"],
+        source, target, trial_types, data["val_idx"],
         filter_label_id=filter_label_id,
         temporal_ablation=temp_ablation,
     )
     test_dataset = PairedNeuralDataset(
-        pfc, ca1, trial_types, data["test_idx"],
+        source, target, trial_types, data["test_idx"],
         filter_label_id=filter_label_id,
         temporal_ablation=temp_ablation,
     )
@@ -2807,6 +2813,7 @@ def create_pfc_sliding_window_dataloaders(
     prefetch_factor: int = 4,
     use_sessions: bool = False,
     distributed: bool = False,
+    reverse_direction: bool = False,
 ) -> Dict[str, Any]:
     """Create DataLoaders for PFC data with sliding windows.
 
@@ -2822,12 +2829,17 @@ def create_pfc_sliding_window_dataloaders(
         prefetch_factor: Prefetch multiplier
         use_sessions: If True, use session-aware dataset
         distributed: If True, use DistributedSampler for DDP
+        reverse_direction: If True, use CA1 as source and PFC as target
 
     Returns:
         Dictionary with train/val/test loaders and metadata
     """
-    pfc = data["pfc"]
-    ca1 = data["ca1"]
+    if reverse_direction:
+        pfc = data["ca1"]   # source = CA1
+        ca1 = data["pfc"]   # target = PFC
+    else:
+        pfc = data["pfc"]
+        ca1 = data["ca1"]
     trial_types = data.get("trial_types")
     train_idx = data["train_idx"]
     val_idx = data["val_idx"]
