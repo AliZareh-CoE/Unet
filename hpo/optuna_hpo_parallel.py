@@ -56,7 +56,7 @@ warnings.filterwarnings("ignore")
 
 # Import from existing modules
 from models import (
-    CondUNet1D,
+    NeuroGate,
     build_wavelet_loss,
     pearson_batch,
     explained_variance_torch,
@@ -224,7 +224,7 @@ def config_to_json_safe(config: Dict[str, Any]) -> str:
 
 def build_model_with_checkpointing(config: Dict[str, Any], device: torch.device) -> nn.Module:
     """Build model with gradient checkpointing for memory efficiency."""
-    model = CondUNet1D(
+    model = NeuroGate(
         in_channels=config["in_channels"],
         out_channels=config["out_channels"],
         base_channels=config["base_channels"],

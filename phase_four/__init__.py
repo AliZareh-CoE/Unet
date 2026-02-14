@@ -1,52 +1,14 @@
+"""Phase 4: Biological Validation of Neural Translation.
+
+Trains CondUNet on each dataset with a 70/30 train/test split, generates
+synthetic (predicted) target signals on the held-out test set, and runs
+three families of biological validation:
+
+1. Spectral fidelity  – PSD match, per-band R², CFC (PAC) preservation
+2. CCA / DCCA         – canonical-correlation baselines vs UNet
+3. Single-trial decoding – classifier trained on real targets, tested on
+                           predicted targets (and vice-versa)
+
+Generated signals are persisted to ``/data/synth/<dataset>/`` so downstream
+analyses can be run independently of the training step.
 """
-Phase 4: Inter vs Intra Session Generalization Study
-=====================================================
-
-This module implements cross-session and within-session generalization
-experiments across all three datasets.
-
-Experiments:
-    - Intra-session: Random train/test split within each session
-    - Inter-session: Train on some sessions, test on held-out sessions
-
-Datasets:
-    - Olfactory (OB → PCx)
-    - PFC (PFC → CA1)
-    - DANDI (AMY → HPC, human)
-
-Usage:
-    python -m phase_four.runner --epochs 60
-
-Author: Neural Signal Translation Team
-"""
-
-__version__ = "1.0.0"
-
-from .config import (
-    Phase4Config,
-    DatasetConfig,
-    SplitMode,
-    DATASET_CONFIGS,
-)
-from .runner import run_phase4, Phase4Result
-from .data_splitter import (
-    SessionSplitter,
-    create_session_splits,
-    create_intra_session_splits,
-    create_inter_session_splits,
-)
-from .visualization import Phase4Visualizer
-
-__all__ = [
-    "Phase4Config",
-    "DatasetConfig",
-    "SplitMode",
-    "DATASET_CONFIGS",
-    "run_phase4",
-    "Phase4Result",
-    "SessionSplitter",
-    "create_session_splits",
-    "create_intra_session_splits",
-    "create_inter_session_splits",
-    "Phase4Visualizer",
-]

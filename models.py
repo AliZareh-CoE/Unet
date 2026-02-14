@@ -1,7 +1,7 @@
-"""Neural signal translation model: CondUNet1D.
+"""Neural signal translation model: NeuroGate.
 
 This module contains the main model architecture for OB->PCx neural signal translation:
-- CondUNet1D: Conditional U-Net with FiLM modulation (our method)
+- NeuroGate: Conditional U-Net with FiLM modulation (our method)
 """
 from __future__ import annotations
 
@@ -2859,10 +2859,10 @@ class CovarianceExpansionAugmentation(nn.Module):
 
 
 # =============================================================================
-# Main Model: CondUNet1D
+# Main Model: NeuroGate
 # =============================================================================
 
-class CondUNet1D(nn.Module):
+class NeuroGate(nn.Module):
     """Conditional U-Net for neural signal translation with FiLM modulation.
 
     Supports FiLM conditioning, self-attention in bottleneck, multi-scale skip connections,
@@ -5379,8 +5379,8 @@ def create_gated_translator(
         GatedTranslator wrapping the provided translator
 
     Example:
-        >>> from models import CondUNet1D, create_gated_translator
-        >>> base_model = CondUNet1D(in_channels=32, out_channels=32)
+        >>> from models import NeuroGate, create_gated_translator
+        >>> base_model = NeuroGate(in_channels=32, out_channels=32)
         >>> gated_model = create_gated_translator(
         ...     translator=base_model,
         ...     in_channels=32,

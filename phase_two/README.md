@@ -137,7 +137,7 @@ Replaces attention with FFT-based mixing. O(N log N) complexity.
 ### ViT1D
 Vision Transformer adapted for 1D. Patches signal into segments, applies full self-attention.
 
-### CondUNet1D
+### NeuroGate
 Our proposed architecture:
 - U-Net encoder-decoder with skip connections
 - FiLM conditioning for adaptive modulation

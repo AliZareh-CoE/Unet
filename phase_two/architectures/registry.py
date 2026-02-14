@@ -15,7 +15,7 @@ from .linear import LinearBaseline
 from .simplecnn import SimpleCNN
 from .wavenet import WaveNet1D
 from .vit import ViT1D
-from .condunet import CondUNet1D
+from .condunet import NeuroGate
 
 
 # =============================================================================
@@ -27,7 +27,7 @@ ARCHITECTURE_REGISTRY: Dict[str, Callable[..., nn.Module]] = {
     "simplecnn": SimpleCNN,
     "wavenet": WaveNet1D,
     "vit": ViT1D,
-    "condunet": CondUNet1D,
+    "condunet": NeuroGate,
 }
 
 

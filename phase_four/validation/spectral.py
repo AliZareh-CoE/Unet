@@ -1,0 +1,340 @@
+"""Spectral fidelity validation.
+
+Compares real vs predicted target signals across three axes:
+1. Power Spectral Density (PSD) match – Welch periodogram per channel
+2. Per-band R²                       – delta / theta / alpha / beta / gamma
+3. Cross-Frequency Coupling (PAC)    – theta-gamma phase-amplitude coupling
+
+All functions accept arrays of shape [N, C, T] and a sampling rate.
+"""
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+from scipy import signal as sig
+
+from phase_four.config import FREQUENCY_BANDS
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1.  PSD  match
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_psd(
+    x: np.ndarray,
+    fs: int,
+    nperseg: int = 1024,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Mean Welch PSD across trials and channels.
+
+    Args:
+        x: [N, C, T]
+        fs: sampling rate (Hz)
+
+    Returns:
+        freqs [F], psd [F]  (averaged over N×C)
+    """
+    freqs, pxx = sig.welch(x, fs=fs, nperseg=nperseg, axis=-1)
+    return freqs, pxx.mean(axis=(0, 1))
+
+
+def psd_match_metrics(
+    real: np.ndarray,
+    pred: np.ndarray,
+    fs: int,
+    nperseg: int = 1024,
+) -> Dict[str, Any]:
+    """Compare PSD of real vs predicted signals.
+
+    Returns:
+        psd_corr       – Pearson-r between log-PSD curves
+        psd_mse_db     – mean squared error in dB space
+        psd_real       – [F] array
+        psd_pred       – [F] array
+        freqs          – [F] array
+    """
+    freqs, psd_real = compute_psd(real, fs, nperseg)
+    _, psd_pred = compute_psd(pred, fs, nperseg)
+
+    # Log-space comparison (dB)
+    log_real = 10 * np.log10(psd_real + 1e-20)
+    log_pred = 10 * np.log10(psd_pred + 1e-20)
+
+    psd_mse_db = float(np.mean((log_real - log_pred) ** 2))
+    psd_corr = float(np.corrcoef(log_real, log_pred)[0, 1])
+
+    return {
+        "psd_corr": psd_corr,
+        "psd_mse_db": psd_mse_db,
+        "freqs": freqs,
+        "psd_real": psd_real,
+        "psd_pred": psd_pred,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2.  Per-band  R²
+# ═══════════════════════════════════════════════════════════════════════════
+
+def bandpass(x: np.ndarray, lo: float, hi: float, fs: int, order: int = 4):
+    """Zero-phase Butterworth bandpass, applied along last axis."""
+    nyq = fs / 2.0
+    # Clamp to valid range
+    lo_n = max(lo / nyq, 1e-5)
+    hi_n = min(hi / nyq, 0.9999)
+    if lo_n >= hi_n:
+        return np.zeros_like(x)
+    sos = sig.butter(order, [lo_n, hi_n], btype="band", output="sos")
+    return sig.sosfiltfilt(sos, x, axis=-1)
+
+
+def per_band_r2(
+    real: np.ndarray,
+    pred: np.ndarray,
+    fs: int,
+    bands: Optional[Dict[str, tuple]] = None,
+) -> Dict[str, float]:
+    """R² between real and predicted for each frequency band.
+
+    Filters both signals into each band, then computes channel-averaged R².
+    """
+    if bands is None:
+        bands = FREQUENCY_BANDS
+
+    results = {}
+    for name, (lo, hi) in bands.items():
+        real_band = bandpass(real, lo, hi, fs)
+        pred_band = bandpass(pred, lo, hi, fs)
+
+        # Flatten to (N*C*T,) for global R²
+        r = real_band.ravel()
+        p = pred_band.ravel()
+        ss_res = np.sum((r - p) ** 2)
+        ss_tot = np.sum((r - r.mean()) ** 2)
+        r2 = 1.0 - ss_res / (ss_tot + 1e-20)
+        results[name] = float(r2)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3.  Phase-Amplitude Coupling  (PAC)  –  Modulation Index
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _modulation_index(phase: np.ndarray, amp: np.ndarray, n_bins: int = 18):
+    """Tort et al. (2010) Modulation Index (MI) via KL divergence.
+
+    Args:
+        phase: instantaneous phase of low-freq signal (radians)  [T]
+        amp  : instantaneous amplitude of high-freq signal         [T]
+
+    Returns:
+        MI (float) – 0 = no coupling, log(n_bins) = perfect coupling
+    """
+    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    mean_amp = np.zeros(n_bins)
+    for b in range(n_bins):
+        mask = (phase >= bin_edges[b]) & (phase < bin_edges[b + 1])
+        if mask.any():
+            mean_amp[b] = amp[mask].mean()
+
+    # Normalise to a distribution
+    total = mean_amp.sum()
+    if total < 1e-20:
+        return 0.0
+    p = mean_amp / total
+
+    # KL divergence from uniform
+    q = np.ones(n_bins) / n_bins
+    # Avoid log(0)
+    p_safe = np.where(p > 0, p, 1e-20)
+    kl = np.sum(p_safe * np.log(p_safe / q))
+    mi = kl / np.log(n_bins)
+    return float(mi)
+
+
+def compute_pac(
+    x: np.ndarray,
+    fs: int,
+    phase_band: Tuple[float, float] = (4, 8),
+    amp_band: Tuple[float, float] = (30, 100),
+) -> float:
+    """Mean PAC (Modulation Index) across trials and channels.
+
+    Args:
+        x: [N, C, T]
+    """
+    n_trials, n_ch, _ = x.shape
+    mis = []
+    for trial in range(n_trials):
+        for ch in range(n_ch):
+            trace = x[trial, ch]
+            # Phase of low-frequency
+            lo = bandpass(trace[np.newaxis, np.newaxis, :], *phase_band, fs)[0, 0]
+            phase = np.angle(sig.hilbert(lo))
+            # Amplitude of high-frequency
+            hi = bandpass(trace[np.newaxis, np.newaxis, :], *amp_band, fs)[0, 0]
+            amp = np.abs(sig.hilbert(hi))
+            mis.append(_modulation_index(phase, amp))
+    return float(np.mean(mis))
+
+
+def pac_with_surrogates(
+    x: np.ndarray,
+    fs: int,
+    phase_band: Tuple[float, float] = (4, 8),
+    amp_band: Tuple[float, float] = (30, 100),
+    n_surrogates: int = 200,
+) -> Dict[str, float]:
+    """PAC with time-shifted surrogate significance testing.
+
+    Returns:
+        mi          – observed Modulation Index
+        mi_z        – z-score vs surrogate distribution
+        mi_p        – p-value (proportion of surrogates >= observed)
+    """
+    mi_obs = compute_pac(x, fs, phase_band, amp_band)
+
+    # Surrogate distribution: circular-shift amplitude relative to phase
+    n_trials, n_ch, T = x.shape
+    rng = np.random.default_rng(42)
+    surrogate_mis = []
+    for _ in range(n_surrogates):
+        shift = rng.integers(T // 4, 3 * T // 4)
+        x_shifted = np.roll(x, shift, axis=-1)
+        surrogate_mis.append(compute_pac(x_shifted, fs, phase_band, amp_band))
+
+    surrogate_mis = np.array(surrogate_mis)
+    mi_z = (mi_obs - surrogate_mis.mean()) / (surrogate_mis.std() + 1e-20)
+    mi_p = float(np.mean(surrogate_mis >= mi_obs))
+
+    return {"mi": mi_obs, "mi_z": float(mi_z), "mi_p": mi_p}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Public entry point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_spectral_validation(
+    synth_dir: Path,
+    fs: int,
+    nperseg: int = 1024,
+    pac_phase_band: Tuple[float, float] = (4, 8),
+    pac_amp_band: Tuple[float, float] = (30, 100),
+    pac_n_surrogates: int = 200,
+) -> Dict[str, Any]:
+    """Run all spectral validations on saved synthetic data.
+
+    Args:
+        synth_dir: path containing target_test.npy, predicted_test.npy
+        fs: sampling rate in Hz
+
+    Returns:
+        Dictionary of all spectral metrics (JSON-serialisable, except arrays).
+    """
+    real = np.load(synth_dir / "target_test.npy")
+    pred = np.load(synth_dir / "predicted_test.npy")
+
+    print(f"  Spectral validation: {real.shape[0]} trials, "
+          f"{real.shape[1]} channels, {real.shape[2]} time steps")
+
+    # 1. PSD
+    psd = psd_match_metrics(real, pred, fs, nperseg)
+    print(f"    PSD correlation : {psd['psd_corr']:.4f}")
+    print(f"    PSD MSE (dB)   : {psd['psd_mse_db']:.2f}")
+
+    # 2. Band R²
+    band_r2 = per_band_r2(real, pred, fs)
+    for name, val in band_r2.items():
+        print(f"    {name:12s} R² : {val:.4f}")
+
+    # 3. PAC – real
+    print("    Computing PAC (real)...")
+    pac_real = pac_with_surrogates(real, fs, pac_phase_band, pac_amp_band, pac_n_surrogates)
+    print(f"    PAC real MI    : {pac_real['mi']:.4f}  (z={pac_real['mi_z']:.2f}, p={pac_real['mi_p']:.3f})")
+
+    # 4. PAC – predicted
+    print("    Computing PAC (predicted)...")
+    pac_pred = pac_with_surrogates(pred, fs, pac_phase_band, pac_amp_band, pac_n_surrogates)
+    print(f"    PAC pred MI    : {pac_pred['mi']:.4f}  (z={pac_pred['mi_z']:.2f}, p={pac_pred['mi_p']:.3f})")
+
+    # ── Per-channel statistics ────────────────────────────────────────────
+    n_channels = real.shape[1]
+    channel_stats = {}
+    print(f"    Computing per-channel stats ({n_channels} channels)...")
+    for ch in range(n_channels):
+        ch_real = real[:, ch:ch+1, :]   # [N, 1, T]
+        ch_pred = pred[:, ch:ch+1, :]
+
+        # Per-channel PSD correlation
+        _, psd_r = compute_psd(ch_real, fs, nperseg)
+        _, psd_p = compute_psd(ch_pred, fs, nperseg)
+        log_r = 10 * np.log10(psd_r + 1e-20)
+        log_p = 10 * np.log10(psd_p + 1e-20)
+        ch_psd_corr = float(np.corrcoef(log_r, log_p)[0, 1])
+
+        # Per-channel Pearson correlation (time-domain, trial-averaged)
+        ch_corr = float(np.corrcoef(ch_real.ravel(), ch_pred.ravel())[0, 1])
+
+        # Per-channel R²
+        r_flat = ch_real.ravel()
+        p_flat = ch_pred.ravel()
+        ss_res = np.sum((r_flat - p_flat) ** 2)
+        ss_tot = np.sum((r_flat - r_flat.mean()) ** 2)
+        ch_r2 = float(1.0 - ss_res / (ss_tot + 1e-20))
+
+        # Per-channel band R²
+        ch_band_r2 = per_band_r2(ch_real, ch_pred, fs)
+
+        channel_stats[f"ch_{ch}"] = {
+            "psd_corr": ch_psd_corr,
+            "pearson_r": ch_corr,
+            "r2": ch_r2,
+            "band_r2": ch_band_r2,
+        }
+
+    results = {
+        "psd_corr": psd["psd_corr"],
+        "psd_mse_db": psd["psd_mse_db"],
+        "band_r2": band_r2,
+        "pac_real": pac_real,
+        "pac_pred": pac_pred,
+        "pac_mi_ratio": pac_pred["mi"] / (pac_real["mi"] + 1e-20),
+        "per_channel": channel_stats,
+    }
+
+    # Save
+    out_path = synth_dir / "spectral_results.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"    → saved {out_path}")
+
+    # Save per-channel summary as CSV for easy inspection
+    _save_channel_csv(channel_stats, synth_dir / "spectral_per_channel.csv")
+
+    return results
+
+
+def _save_channel_csv(channel_stats: Dict, out_path: Path):
+    """Write per-channel spectral metrics as CSV."""
+    import csv
+    bands = list(FREQUENCY_BANDS.keys())
+    header = ["channel", "r2", "pearson_r", "psd_corr"] + [f"r2_{b}" for b in bands]
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for ch_key in sorted(channel_stats, key=lambda k: int(k.split("_")[1])):
+            ch = channel_stats[ch_key]
+            row = [
+                ch_key,
+                f"{ch['r2']:.6f}",
+                f"{ch['pearson_r']:.6f}",
+                f"{ch['psd_corr']:.6f}",
+            ]
+            for b in bands:
+                row.append(f"{ch['band_r2'].get(b, 0.0):.6f}")
+            writer.writerow(row)
+    print(f"    → saved {out_path}")

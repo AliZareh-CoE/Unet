@@ -74,7 +74,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.distribute
 
 # Local imports
 from models import (
-    CondUNet1D,
+    NeuroGate,
     pearson_batch,
     pearson_per_channel,
     cross_channel_correlation,
@@ -1914,7 +1914,7 @@ def train(
     # Create model based on architecture
     if arch == "condunet":
         # CondUNet with all its features
-        model = CondUNet1D(
+        model = NeuroGate(
             in_channels=in_channels,
             out_channels=out_channels,
             base=config.get("base_channels", 128),
@@ -1973,7 +1973,7 @@ def train(
     # Only for CondUNet - other architectures don't support conditioning
     reverse_model = None
     if config.get("use_bidirectional", False) and arch == "condunet":
-        reverse_model = CondUNet1D(
+        reverse_model = NeuroGate(
             in_channels=out_channels,  # Reverse: target → source
             out_channels=in_channels,
             base=config.get("base_channels", 128),
@@ -3306,7 +3306,7 @@ def train(
 # =============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train CondUNet1D for neural signal translation")
+    parser = argparse.ArgumentParser(description="Train NeuroGate for neural signal translation")
 
     # Architecture selection (for Phase 2 comparison)
     parser.add_argument("--arch", type=str, default="condunet",

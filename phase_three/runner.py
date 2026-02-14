@@ -1162,14 +1162,14 @@ def evaluate_on_test_sessions(
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         # Import model creation
-        from models import CondUNet1D
+        from models import NeuroGate
         from data import prepare_data, load_session_ids, ODOR_CSV_PATH
 
         # Get model config from checkpoint
         config = checkpoint.get("config", {})
 
         # Create model with same architecture
-        model = CondUNet1D(
+        model = NeuroGate(
             in_channels=config.get("in_channels", 32),
             out_channels=config.get("out_channels", 32),
             base=config.get("base_channels", 128),  # Note: CLI uses base_channels, model uses base

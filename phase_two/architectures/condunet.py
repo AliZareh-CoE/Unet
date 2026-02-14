@@ -1,8 +1,8 @@
 """
-CondUNet1D Wrapper for Phase 2
+NeuroGate Wrapper for Phase 2
 ==============================
 
-Wrapper around the main CondUNet1D implementation from models.py.
+Wrapper around the main NeuroGate implementation from models.py.
 Provides consistent interface with other Phase 2 architectures.
 """
 
@@ -20,10 +20,10 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-class CondUNet1D(nn.Module):
+class NeuroGate(nn.Module):
     """Conditional U-Net for 1D signal translation.
 
-    Wraps the full CondUNet1D implementation from models.py,
+    Wraps the full NeuroGate implementation from models.py,
     providing a consistent interface with other architectures.
 
     Features:
@@ -62,7 +62,7 @@ class CondUNet1D(nn.Module):
 
         # Try to import full implementation
         try:
-            from models import CondUNet1D as FullCondUNet
+            from models import NeuroGate as FullCondUNet
             self.model = FullCondUNet(
                 in_channels=in_channels,
                 out_channels=out_channels,

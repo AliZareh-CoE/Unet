@@ -1,285 +1,171 @@
-"""
-Configuration for Phase 4: Inter vs Intra Session
-==================================================
-
-Defines configuration for generalization study across datasets and split modes.
-"""
-
-from __future__ import annotations
+"""Phase 4 configuration – datasets, training, and validation parameters."""
 
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
-
-import torch
+from typing import Dict, List, Optional
 
 
-# =============================================================================
-# Split Modes
-# =============================================================================
+# ── Frequency bands (Hz) used across all spectral analyses ────────────────
+FREQUENCY_BANDS: Dict[str, tuple] = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 13),
+    "beta": (13, 30),
+    "low_gamma": (30, 60),
+    "high_gamma": (60, 150),
+}
 
-class SplitMode(Enum):
-    """Data splitting mode for generalization study."""
-
-    INTRA_SESSION = "intra"  # Random split within each session
-    INTER_SESSION = "inter"  # Hold out entire sessions
-
-
-# =============================================================================
-# Dataset Configurations
-# =============================================================================
+# ── Per-dataset defaults ──────────────────────────────────────────────────
+# Maps dataset name (as used by train.py --dataset) to its properties.
 
 @dataclass
-class DatasetConfig:
-    """Configuration for a single dataset.
-
-    Attributes:
-        name: Dataset identifier
-        source_region: Source brain region
-        target_region: Target brain region
-        n_sessions: Expected number of sessions
-        in_channels: Input channels
-        out_channels: Output channels
-        sample_rate: Sampling rate in Hz
-    """
-
-    name: str
+class DatasetSpec:
+    """Immutable specification for a single dataset."""
+    train_name: str          # --dataset value for train.py
+    display_name: str        # Human-readable name for figures
     source_region: str
     target_region: str
-    n_sessions: int
-    in_channels: int = 32
-    out_channels: int = 32
-    sample_rate: float = 1000.0
-
-    # DANDI-specific
-    dandi_source_region: Optional[str] = None
-    dandi_target_region: Optional[str] = None
+    in_channels: int
+    out_channels: int
+    sampling_rate: int       # Hz
+    n_labels: int            # Number of classes for decoding (0 = regression only)
+    label_column: str        # Column name for trial labels
+    extra_train_args: List[str] = field(default_factory=list)
 
 
-DATASET_CONFIGS: Dict[str, DatasetConfig] = {
-    "olfactory": DatasetConfig(
-        name="olfactory",
+DATASETS: Dict[str, DatasetSpec] = {
+    "olfactory": DatasetSpec(
+        train_name="olfactory",
+        display_name="Olfactory (OB→PCx)",
         source_region="OB",
         target_region="PCx",
-        n_sessions=10,  # Approximate
         in_channels=32,
         out_channels=32,
-        sample_rate=1000.0,
+        sampling_rate=1000,
+        n_labels=7,
+        label_column="odor_name",
+        extra_train_args=["--split-by-session"],
     ),
-    "pfc": DatasetConfig(
-        name="pfc",
+    "pfc_hpc": DatasetSpec(
+        train_name="pfc",
+        display_name="PFC→CA1",
         source_region="PFC",
         target_region="CA1",
-        n_sessions=8,  # Approximate
         in_channels=64,
         out_channels=32,
-        sample_rate=1000.0,
+        sampling_rate=1250,
+        n_labels=2,
+        label_column="trial_type",
+        extra_train_args=["--split-by-session"],
     ),
-    "dandi": DatasetConfig(
-        name="dandi",
-        source_region="AMY",
-        target_region="HPC",
-        n_sessions=18,  # 18 subjects
-        in_channels=32,  # Variable
-        out_channels=32,  # Variable
-        sample_rate=1000.0,
-        dandi_source_region="amygdala",
-        dandi_target_region="hippocampus",
+    "pfc_hpc_reverse": DatasetSpec(
+        train_name="pfc",
+        display_name="CA1→PFC",
+        source_region="CA1",
+        target_region="PFC",
+        in_channels=32,
+        out_channels=64,
+        sampling_rate=1250,
+        n_labels=2,
+        label_column="trial_type",
+        extra_train_args=["--split-by-session", "--pfc-reverse"],
+    ),
+    "dandi": DatasetSpec(
+        train_name="dandi",
+        display_name="DANDI iEEG (Amyg→Hipp)",
+        source_region="amygdala",
+        target_region="hippocampus",
+        in_channels=0,    # detected at runtime
+        out_channels=0,
+        sampling_rate=1000,
+        n_labels=0,       # continuous – no discrete labels
+        label_column="",
+        extra_train_args=[],
+    ),
+    "ecog": DatasetSpec(
+        train_name="ecog",
+        display_name="ECoG (Frontal→Temporal)",
+        source_region="frontal",
+        target_region="temporal",
+        in_channels=0,
+        out_channels=0,
+        sampling_rate=1000,
+        n_labels=0,
+        label_column="",
+        extra_train_args=[
+            "--ecog-experiment", "motor_imagery",
+            "--ecog-source-region", "frontal",
+            "--ecog-target-region", "temporal",
+        ],
+    ),
+    "boran": DatasetSpec(
+        train_name="boran",
+        display_name="Boran MTL (Hipp→EC)",
+        source_region="hippocampus",
+        target_region="entorhinal_cortex",
+        in_channels=0,
+        out_channels=0,
+        sampling_rate=1000,
+        n_labels=0,
+        label_column="",
+        extra_train_args=[],
     ),
 }
 
 
-# =============================================================================
-# Training Configuration
-# =============================================================================
-
-@dataclass
-class TrainingConfig:
-    """Training hyperparameters for Phase 4."""
-
-    epochs: int = 60
-    batch_size: int = 32
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    warmup_epochs: int = 5
-
-    # Learning rate schedule
-    lr_scheduler: str = "cosine"
-    lr_min: float = 1e-6
-
-    # Early stopping
-    patience: int = 15
-    min_delta: float = 1e-4
-
-    # Gradient clipping
-    grad_clip: float = 1.0
-
-    # Loss
-    loss_type: str = "huber"
-
-    # Mixed precision
-    use_amp: bool = True
-
-    # Robustness
-    checkpoint_every: int = 10
-    max_nan_recovery: int = 100
-    log_every: int = 5
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "epochs": self.epochs,
-            "batch_size": self.batch_size,
-            "learning_rate": self.learning_rate,
-            "weight_decay": self.weight_decay,
-            "warmup_epochs": self.warmup_epochs,
-            "lr_scheduler": self.lr_scheduler,
-            "lr_min": self.lr_min,
-            "patience": self.patience,
-            "grad_clip": self.grad_clip,
-            "loss_type": self.loss_type,
-            "use_amp": self.use_amp,
-        }
-
-
-# =============================================================================
-# Phase 4 Configuration
-# =============================================================================
+# ── Phase 4 master config ────────────────────────────────────────────────
 
 @dataclass
 class Phase4Config:
-    """Configuration for Phase 4 generalization study.
+    """Top-level configuration for Phase 4."""
 
-    Attributes:
-        datasets: List of datasets to evaluate
-        split_modes: Split modes to test (intra, inter)
-        n_folds: Number of cross-validation folds
-        cv_seed: Random seed for CV splits
-        training: Training configuration
-        output_dir: Directory for results
-    """
+    # Which datasets to run (keys into DATASETS)
+    datasets: List[str] = field(default_factory=lambda: [
+        "olfactory", "pfc_hpc", "pfc_hpc_reverse",
+        "dandi", "ecog", "boran",
+    ])
 
-    # Datasets to evaluate
-    datasets: List[str] = field(default_factory=lambda: ["olfactory", "pfc", "dandi"])
+    # ── Training ──────────────────────────────────────────────────────────
+    test_fraction: float = 0.30          # 70 / 30 split
+    epochs: int = 80
+    batch_size: int = 64
+    lr: float = 1e-3
+    seed: int = 42
+    arch: str = "condunet"
+    n_gpus: int = 1                      # GPUs per training run
 
-    # Split modes
-    split_modes: List[SplitMode] = field(
-        default_factory=lambda: [SplitMode.INTRA_SESSION, SplitMode.INTER_SESSION]
-    )
+    # ── Paths ─────────────────────────────────────────────────────────────
+    synth_root: Path = Path("/data/synth")
+    output_dir: Path = Path("results/phase4")
+    checkpoint_dir: Path = Path("artifacts/checkpoints/phase4")
 
-    # Cross-validation settings
-    n_folds: int = 5
-    cv_seed: int = 42
+    # ── Validation toggles ────────────────────────────────────────────────
+    run_spectral: bool = True
+    run_cca: bool = True
+    run_decoding: bool = True
 
-    # Training config
-    training: TrainingConfig = field(default_factory=TrainingConfig)
+    # ── Spectral validation ───────────────────────────────────────────────
+    nperseg: int = 1024                  # Welch PSD segment length
+    pac_n_surrogates: int = 200          # PAC significance surrogates
+    pac_phase_band: tuple = (4, 8)       # theta
+    pac_amp_band: tuple = (30, 100)      # gamma
 
-    # Model configuration (use best from Phase 2/3)
-    model_config: Dict[str, Any] = field(default_factory=lambda: {
-        "base_channels": 64,
-        "n_downsample": 2,
-        "attention_type": "cross_freq_v2",
-        "cond_mode": "cross_attn_gated",
-        "bidirectional": True,
-    })
+    # ── CCA / DCCA ────────────────────────────────────────────────────────
+    cca_n_components: int = 10
+    dcca_hidden_dim: int = 256
+    dcca_epochs: int = 100
+    dcca_lr: float = 1e-3
 
-    # Output
-    output_dir: Path = field(default_factory=lambda: Path("results/phase4"))
+    # ── Decoding ──────────────────────────────────────────────────────────
+    decode_classifiers: List[str] = field(default_factory=lambda: [
+        "lda", "svm", "rf",
+    ])
+    decode_n_cv_folds: int = 5
 
-    # Hardware
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    n_workers: int = 4
+    def get_synth_dir(self, dataset: str) -> Path:
+        """Return /data/synth/<dataset>/ path."""
+        return self.synth_root / dataset
 
-    # Checkpointing
-    save_checkpoints: bool = True
-    checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints/phase4"))
-
-    # Logging
-    use_wandb: bool = False
-    wandb_project: str = "neural-signal-translation"
-    verbose: int = 1
-    log_dir: Path = field(default_factory=lambda: Path("logs/phase4"))
-
-    # Inter-session settings
-    test_session_ratio: float = 0.2  # Fraction of sessions for test
-    leave_one_out: bool = False  # Use leave-one-session-out CV
-
-    def __post_init__(self):
-        """Validate configuration."""
-        self.output_dir = Path(self.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        self.checkpoint_dir = Path(self.checkpoint_dir)
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-        self.log_dir = Path(self.log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-
-        # Validate datasets
-        for ds in self.datasets:
-            if ds not in DATASET_CONFIGS:
-                raise ValueError(f"Unknown dataset: {ds}")
-
-    def get_dataset_config(self, dataset: str) -> DatasetConfig:
-        """Get configuration for a specific dataset."""
-        return DATASET_CONFIGS[dataset]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "datasets": self.datasets,
-            "split_modes": [m.value for m in self.split_modes],
-            "n_folds": self.n_folds,
-            "cv_seed": self.cv_seed,
-            "training": self.training.to_dict(),
-            "model_config": self.model_config,
-            "output_dir": str(self.output_dir),
-            "device": self.device,
-            "test_session_ratio": self.test_session_ratio,
-            "leave_one_out": self.leave_one_out,
-        }
-
-    @property
-    def total_runs(self) -> int:
-        """Total number of training runs (datasets × split_modes × folds)."""
-        return len(self.datasets) * len(self.split_modes) * self.n_folds
-
-
-@dataclass
-class ExperimentConfig:
-    """Configuration for a single experiment run.
-
-    Attributes:
-        dataset: Dataset name
-        split_mode: Intra or inter session
-        seed: Random seed
-    """
-
-    dataset: str
-    split_mode: SplitMode
-    seed: int
-
-    # Dataset info (filled from DATASET_CONFIGS)
-    in_channels: int = 32
-    out_channels: int = 32
-    sample_rate: float = 1000.0
-
-    def __post_init__(self):
-        if self.dataset in DATASET_CONFIGS:
-            cfg = DATASET_CONFIGS[self.dataset]
-            self.in_channels = cfg.in_channels
-            self.out_channels = cfg.out_channels
-            self.sample_rate = cfg.sample_rate
-
-    @property
-    def name(self) -> str:
-        """Experiment identifier."""
-        return f"{self.dataset}_{self.split_mode.value}_seed{self.seed}"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "dataset": self.dataset,
-            "split_mode": self.split_mode.value,
-            "seed": self.seed,
-            "in_channels": self.in_channels,
-            "out_channels": self.out_channels,
-        }
+    def get_checkpoint_path(self, dataset: str) -> Path:
+        """Return checkpoint path for a dataset model."""
+        return self.checkpoint_dir / dataset / "best_model.pt"

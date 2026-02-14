@@ -19,7 +19,7 @@ from .linear import LinearBaseline
 from .simplecnn import SimpleCNN
 from .wavenet import WaveNet1D
 from .vit import ViT1D
-from .condunet import CondUNet1D
+from .condunet import NeuroGate
 from .registry import ARCHITECTURE_REGISTRY, create_architecture, list_architectures
 
 __all__ = [
@@ -27,7 +27,7 @@ __all__ = [
     "SimpleCNN",
     "WaveNet1D",
     "ViT1D",
-    "CondUNet1D",
+    "NeuroGate",
     "ARCHITECTURE_REGISTRY",
     "create_architecture",
     "list_architectures",
