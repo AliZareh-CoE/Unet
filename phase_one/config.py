@@ -102,7 +102,7 @@ class Phase1Config:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Validate dataset
-        valid_datasets = {"olfactory", "pfc", "dandi", "pcx1", "ecog"}
+        valid_datasets = {"olfactory", "pfc", "dandi", "pcx1", "ecog", "boran"}
         if self.dataset not in valid_datasets:
             raise ValueError(f"Invalid dataset: {self.dataset}. Must be one of {valid_datasets}")
 

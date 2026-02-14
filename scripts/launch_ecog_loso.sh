@@ -31,6 +31,7 @@ launch() {
         --ecog-experiment "$experiment" \
         --ecog-source-region "$src" \
         --ecog-target-region "$tgt" \
+        --epochs 20 \
         --output-dir "$outdir" \
         > "$outdir/run.log" 2>&1 &
 }
