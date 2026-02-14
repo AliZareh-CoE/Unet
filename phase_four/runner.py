@@ -178,10 +178,12 @@ def generate_all(cfg: Phase4Config, datasets: Optional[List[str]] = None):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def validate_all(cfg: Phase4Config, datasets: Optional[List[str]] = None):
-    """Run all three validation families on saved synthetic data."""
+    """Run all five validation families on saved synthetic data."""
     from phase_four.validation.spectral import run_spectral_validation
     from phase_four.validation.cca import run_cca_validation
     from phase_four.validation.decoding import run_decoding_validation
+    from phase_four.validation.pid import run_pid_validation
+    from phase_four.validation.fingerprint import run_fingerprint_validation
 
     if datasets is None:
         datasets = cfg.datasets
@@ -235,6 +237,23 @@ def validate_all(cfg: Phase4Config, datasets: Optional[List[str]] = None):
             except Exception as e:
                 print(f"  Decoding failed: {e}")
 
+        # ── PID (information decomposition) ──
+        if cfg.run_pid:
+            try:
+                run_pid_validation(
+                    sd, fs,
+                    lag_ms=cfg.pid_lag_ms,
+                )
+            except Exception as e:
+                print(f"  PID failed: {e}")
+
+        # ── Fingerprinting (session identifiability) ──
+        if cfg.run_fingerprint:
+            try:
+                run_fingerprint_validation(sd, fs)
+            except Exception as e:
+                print(f"  Fingerprinting failed: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLI
@@ -254,8 +273,6 @@ def parse_args():
                         help="Run signal generation stage only")
     parser.add_argument("--validate", action="store_true",
                         help="Run validation stage only")
-    parser.add_argument("--figures", action="store_true",
-                        help="Generate publication figures only")
 
     # Dataset selection
     parser.add_argument("--datasets", nargs="+", default=None,
@@ -274,8 +291,12 @@ def parse_args():
     parser.add_argument("--no-spectral", action="store_true")
     parser.add_argument("--no-cca", action="store_true")
     parser.add_argument("--no-decoding", action="store_true")
+    parser.add_argument("--no-pid", action="store_true")
+    parser.add_argument("--no-fingerprint", action="store_true")
     parser.add_argument("--cca-components", type=int, default=10)
     parser.add_argument("--pac-surrogates", type=int, default=200)
+    parser.add_argument("--pid-lag-ms", type=int, default=50,
+                        help="Temporal PID prediction lag in ms")
 
     # Paths
     parser.add_argument("--synth-root", type=str, default="/data/synth")
@@ -288,7 +309,7 @@ def main():
     args = parse_args()
 
     # If no stage flags, run everything
-    run_all = not (args.train or args.generate or args.validate or args.figures)
+    run_all = not (args.train or args.generate or args.validate)
 
     cfg = Phase4Config(
         epochs=args.epochs,
@@ -301,8 +322,11 @@ def main():
         run_spectral=not args.no_spectral,
         run_cca=not args.no_cca,
         run_decoding=not args.no_decoding,
+        run_pid=not args.no_pid,
+        run_fingerprint=not args.no_fingerprint,
         cca_n_components=args.cca_components,
         pac_n_surrogates=args.pac_surrogates,
+        pid_lag_ms=args.pid_lag_ms,
     )
 
     if args.datasets:
@@ -336,12 +360,6 @@ def main():
     if run_all or args.validate:
         print("\n\n>>> STAGE 3: Biological validation <<<")
         validate_all(cfg)
-
-    # ── Figures ──
-    if run_all or args.figures:
-        print("\n\n>>> STAGE 4: Generating figures <<<")
-        from phase_four.visualization import generate_all_figures
-        generate_all_figures(cfg)
 
     print("\n\nPhase 4 complete.")
 

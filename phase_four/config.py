@@ -143,6 +143,8 @@ class Phase4Config:
     run_spectral: bool = True
     run_cca: bool = True
     run_decoding: bool = True
+    run_pid: bool = True
+    run_fingerprint: bool = True
 
     # ── Spectral validation ───────────────────────────────────────────────
     nperseg: int = 1024                  # Welch PSD segment length
@@ -161,6 +163,12 @@ class Phase4Config:
         "lda", "svm", "rf",
     ])
     decode_n_cv_folds: int = 5
+
+    # ── PID ───────────────────────────────────────────────────────────────
+    pid_lag_ms: int = 50                 # temporal PID prediction lag
+
+    # ── Fingerprinting ────────────────────────────────────────────────────
+    # (no extra params – uses session_ids from data or labels as proxy)
 
     def get_synth_dir(self, dataset: str) -> Path:
         """Return /data/synth/<dataset>/ path."""
