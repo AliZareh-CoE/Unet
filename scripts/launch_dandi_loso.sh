@@ -21,6 +21,7 @@ launch() {
         --dataset dandi_movie \
         --dandi-source-region "$src" \
         --dandi-target-region "$tgt" \
+        --epochs 20 \
         --output-dir "$outdir" \
         > "$outdir/run.log" 2>&1 &
 }
