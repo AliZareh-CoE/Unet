@@ -5,8 +5,11 @@ Usage
 # Full pipeline (all datasets):
     python -m phase_four.runner
 
-# Training only (all datasets, 8 GPUs):
+# Training only (all datasets, 8 GPUs – one dataset per GPU):
     python -m phase_four.runner --train --n-gpus 8
+
+# Single dataset with FSDP across 8 GPUs:
+    python -m phase_four.runner --train --datasets pcx1 --n-gpus 8 --fsdp
 
 # Generate synthetic signals only (models already trained):
     python -m phase_four.runner --generate
@@ -14,7 +17,7 @@ Usage
 # Run validations only (signals already saved):
     python -m phase_four.runner --validate
 
-# Single dataset:
+# Subset of datasets:
     python -m phase_four.runner --datasets olfactory pfc_hpc
 """
 
@@ -33,24 +36,18 @@ from phase_four.config import DATASETS, Phase4Config
 # 1.  Training  – invoke train.py per dataset
 # ═══════════════════════════════════════════════════════════════════════════
 
-def train_single_dataset(
-    dataset_key: str,
-    cfg: Phase4Config,
-    gpu_id: int = 0,
-) -> Path:
-    """Train CondUNet on one dataset with 70/30 split, return checkpoint path."""
+def _build_train_args(dataset_key: str, cfg: Phase4Config) -> List[str]:
+    """Build the common train.py arguments for a dataset (no launcher prefix)."""
     ds = DATASETS[dataset_key]
     ckpt_dir = cfg.checkpoint_dir / dataset_key
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_prefix = str(ckpt_dir / "phase4")
-
     results_file = cfg.output_dir / dataset_key / "train_results.json"
     results_file.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable, "train.py",
+    args = [
+        "train.py",
         "--dataset", ds.train_name,
-        # Architecture (LOSO-optimized)
+        # Architecture
         "--arch", cfg.arch,
         "--base-channels", str(cfg.base_channels),
         "--n-downsample", str(cfg.n_downsample),
@@ -65,17 +62,17 @@ def train_single_dataset(
         "--batch-size", str(cfg.batch_size),
         "--lr", str(cfg.lr),
         "--seed", str(cfg.seed),
-        # Optimizer (LOSO-optimized)
+        # Optimizer
         "--optimizer", cfg.optimizer,
         "--lr-schedule", cfg.lr_schedule,
-        # Noise augmentation (LOSO-optimized)
+        # Noise augmentation
         "--use-noise-augmentation",
         "--noise-gaussian-std", str(cfg.noise_gaussian_std),
         "--noise-pink-std", str(cfg.noise_pink_std),
         "--noise-channel-dropout", str(cfg.noise_channel_dropout),
         "--noise-temporal-dropout", str(cfg.noise_temporal_dropout),
         "--noise-prob", str(cfg.noise_prob),
-        # Session adaptation (LOSO-optimized)
+        # Session adaptation
         "--use-adaptive-scaling",
         "--no-bidirectional",
         # Output
@@ -86,13 +83,21 @@ def train_single_dataset(
         "--quiet",
         "--split-by-session",
     ]
-
-    # Add pink noise flag if enabled
     if cfg.noise_pink:
-        cmd.append("--noise-pink")
+        args.append("--noise-pink")
+    args.extend(ds.extra_train_args)
+    return args
 
-    # Dataset-specific extra args
-    cmd.extend(ds.extra_train_args)
+
+def train_single_dataset(
+    dataset_key: str,
+    cfg: Phase4Config,
+    gpu_id: int = 0,
+) -> Path:
+    """Train CondUNet on one dataset with 70/30 split, return checkpoint path."""
+    ds = DATASETS[dataset_key]
+    train_args = _build_train_args(dataset_key, cfg)
+    cmd = [sys.executable] + train_args
 
     env = {
         **__import__("os").environ,
@@ -108,7 +113,58 @@ def train_single_dataset(
     if proc.returncode != 0:
         print(f"  WARNING: train.py exited with code {proc.returncode}")
 
-    ckpt_path = ckpt_dir / "phase4_best_model.pt"
+    ckpt_path = cfg.checkpoint_dir / dataset_key / "phase4_best_model.pt"
+    if ckpt_path.exists():
+        print(f"  Checkpoint saved: {ckpt_path}")
+    else:
+        print(f"  WARNING: expected checkpoint not found at {ckpt_path}")
+
+    return ckpt_path
+
+
+def train_fsdp(
+    dataset_key: str,
+    cfg: Phase4Config,
+    n_gpus: int = 8,
+    fsdp_strategy: str = "full",
+) -> Path:
+    """Train one dataset with FSDP across multiple GPUs via torchrun."""
+    import shutil
+
+    ds = DATASETS[dataset_key]
+    train_args = _build_train_args(dataset_key, cfg)
+
+    # Add FSDP flags
+    train_args.extend(["--fsdp", "--fsdp-strategy", fsdp_strategy])
+
+    # Use torchrun for distributed launch
+    torchrun = shutil.which("torchrun")
+    if torchrun is None:
+        # Fallback to python -m torch.distributed.run
+        cmd = [sys.executable, "-m", "torch.distributed.run",
+               "--nproc_per_node", str(n_gpus)] + train_args
+    else:
+        cmd = [torchrun, "--nproc_per_node", str(n_gpus)] + train_args
+
+    log_file = cfg.output_dir / dataset_key / "train.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"FSDP Training: {ds.display_name} ({n_gpus} GPUs, strategy={fsdp_strategy})")
+    print(f"  Command: {' '.join(cmd)}")
+    print(f"  Log: {log_file}")
+    print(f"{'='*60}")
+
+    log_fh = open(log_file, "w")
+    proc = subprocess.run(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+    log_fh.close()
+
+    if proc.returncode != 0:
+        print(f"  FAILED (code {proc.returncode}) — check {log_file}")
+    else:
+        print(f"  OK")
+
+    ckpt_path = cfg.checkpoint_dir / dataset_key / "phase4_best_model.pt"
     if ckpt_path.exists():
         print(f"  Checkpoint saved: {ckpt_path}")
     else:
@@ -122,7 +178,7 @@ def train_all_parallel(
     datasets: Optional[List[str]] = None,
     n_gpus: int = 8,
 ) -> None:
-    """Launch training for all datasets in parallel across GPUs."""
+    """Launch training for all datasets in parallel across GPUs (one GPU per dataset)."""
     import os
 
     if datasets is None:
@@ -132,55 +188,10 @@ def train_all_parallel(
     for i, ds_key in enumerate(datasets):
         gpu_id = i % n_gpus
         ds = DATASETS[ds_key]
-        ckpt_dir = cfg.checkpoint_dir / ds_key
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        results_file = cfg.output_dir / ds_key / "train_results.json"
-        results_file.parent.mkdir(parents=True, exist_ok=True)
+        train_args = _build_train_args(ds_key, cfg)
+        cmd = [sys.executable] + train_args
 
         log_file = cfg.output_dir / ds_key / "train.log"
-
-        cmd = [
-            sys.executable, "train.py",
-            "--dataset", ds.train_name,
-            # Architecture (LOSO-optimized)
-            "--arch", cfg.arch,
-            "--base-channels", str(cfg.base_channels),
-            "--n-downsample", str(cfg.n_downsample),
-            "--attention-type", cfg.attention_type,
-            "--conv-type", cfg.conv_type,
-            "--activation", cfg.activation,
-            "--skip-type", cfg.skip_type,
-            "--cond-mode", cfg.cond_mode,
-            "--conditioning", cfg.conditioning,
-            # Training
-            "--epochs", str(cfg.epochs),
-            "--batch-size", str(cfg.batch_size),
-            "--lr", str(cfg.lr),
-            "--seed", str(cfg.seed),
-            # Optimizer (LOSO-optimized)
-            "--optimizer", cfg.optimizer,
-            "--lr-schedule", cfg.lr_schedule,
-            # Noise augmentation (LOSO-optimized)
-            "--use-noise-augmentation",
-            "--noise-gaussian-std", str(cfg.noise_gaussian_std),
-            "--noise-pink-std", str(cfg.noise_pink_std),
-            "--noise-channel-dropout", str(cfg.noise_channel_dropout),
-            "--noise-temporal-dropout", str(cfg.noise_temporal_dropout),
-            "--noise-prob", str(cfg.noise_prob),
-            # Session adaptation (LOSO-optimized)
-            "--use-adaptive-scaling",
-            "--no-bidirectional",
-            # Output
-            "--checkpoint-prefix", "phase4",
-            "--checkpoint-dir", str(ckpt_dir),
-            "--output-results-file", str(results_file),
-            "--no-plots",
-            "--quiet",
-            "--split-by-session",
-        ]
-        if cfg.noise_pink:
-            cmd.append("--noise-pink")
-        cmd.extend(ds.extra_train_args)
 
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
@@ -330,6 +341,11 @@ def parse_args():
     # Training
     parser.add_argument("--n-gpus", type=int, default=1,
                         help="Number of GPUs for parallel training")
+    parser.add_argument("--fsdp", action="store_true",
+                        help="Use FSDP to shard one dataset across all GPUs (requires --datasets with 1 dataset)")
+    parser.add_argument("--fsdp-strategy", type=str, default="full",
+                        choices=["full", "grad_op", "no_shard", "hybrid", "hybrid_zero2"],
+                        help="FSDP sharding strategy (default: full)")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -393,7 +409,16 @@ def main():
     # ── Train ──
     if run_all or args.train:
         print("\n\n>>> STAGE 1: Training <<<")
-        if cfg.n_gpus > 1 and len(cfg.datasets) > 1:
+        if args.fsdp:
+            # FSDP: shard single dataset across all GPUs
+            if len(cfg.datasets) != 1:
+                print(f"ERROR: --fsdp requires exactly 1 dataset via --datasets, "
+                      f"got {len(cfg.datasets)}: {cfg.datasets}")
+                sys.exit(1)
+            train_fsdp(cfg.datasets[0], cfg,
+                       n_gpus=cfg.n_gpus,
+                       fsdp_strategy=args.fsdp_strategy)
+        elif cfg.n_gpus > 1 and len(cfg.datasets) > 1:
             train_all_parallel(cfg, n_gpus=cfg.n_gpus)
         else:
             for ds_key in cfg.datasets:
