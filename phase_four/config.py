@@ -110,6 +110,18 @@ DATASETS: Dict[str, DatasetSpec] = {
         label_column="",
         extra_train_args=[],
     ),
+    "pcx1": DatasetSpec(
+        train_name="pcx1",
+        display_name="PCx1 Continuous (OB→PCx)",
+        source_region="OB",
+        target_region="PCx",
+        in_channels=32,
+        out_channels=32,
+        sampling_rate=1000,
+        n_labels=0,        # continuous – no discrete labels
+        label_column="",
+        extra_train_args=["--split-by-session"],
+    ),
 }
 
 
@@ -122,7 +134,7 @@ class Phase4Config:
     # Which datasets to run (keys into DATASETS)
     datasets: List[str] = field(default_factory=lambda: [
         "olfactory", "pfc_hpc", "pfc_hpc_reverse",
-        "dandi", "ecog", "boran",
+        "dandi", "ecog", "boran", "pcx1",
     ])
 
     # ── Training (aligned with LOSO-optimized config from ablation study) ─
