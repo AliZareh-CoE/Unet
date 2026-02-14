@@ -2,7 +2,8 @@
 
 Decomposes the information that real and predicted target signals carry
 about an external variable (trial label or future activity) into four
-atoms, following the Williams-Beer framework:
+atoms, following the Williams-Beer (2010) framework with I_min (MMI)
+redundancy:
 
     Redundancy  – information both real AND predicted carry (successfully translated)
     Unique_real – information only the real target carries  (lost in translation)
@@ -15,10 +16,14 @@ translation preserve vs lose?"
 Two decomposition modes:
 1. **Label-based PID** – sources = {real_target, predicted_target},
    target = trial label.  Works for datasets with discrete labels.
+   Uses class-conditional Gaussian MI (discriminant approach) so
+   discrete labels are handled correctly without one-hot hacks.
 2. **Temporal PID** – sources = {real_target_t, predicted_target_t},
    target = real_target_{t+1}.  Works for all datasets (no labels needed).
+   Respects trial boundaries (no cross-trial lag pairs).
 
-All estimates use a Gaussian copula for tractability (Ince et al. 2017).
+MI estimation: Gaussian copula (Ince et al. 2017, Entropy 19(10):502)
+for continuous variables; class-conditional Gaussian for discrete targets.
 """
 
 import csv
@@ -40,47 +45,101 @@ from phase_four.validation.spectral import bandpass
 def _mi_gaussian(x: np.ndarray, y: np.ndarray) -> float:
     """Mutual information between x and y assuming joint Gaussian.
 
+    Uses I(X;Y) = 0.5 * log( det(Σ_X) * det(Σ_Y) / det(Σ_XY) ).
+    Regularisation scales with the trace of the covariance to avoid
+    numerical issues without distorting estimates.
+
     Args:
         x: [N, d1] or [N]
         y: [N, d2] or [N]
 
     Returns:
-        MI in nats
+        MI in nats (non-negative by clamp).
     """
     if x.ndim == 1:
         x = x[:, None]
     if y.ndim == 1:
         y = y[:, None]
 
-    n = x.shape[0]
     d1, d2 = x.shape[1], y.shape[1]
-
-    # Regularise for numerical stability
-    eps = 1e-8 * np.eye(d1 + d2)
+    d = d1 + d2
 
     xy = np.concatenate([x, y], axis=1)
-    cov_xy = np.cov(xy, rowvar=False) + eps
+    cov_xy = np.cov(xy, rowvar=False)
+    if cov_xy.ndim == 0:
+        cov_xy = cov_xy.reshape(1, 1)
+
+    # Adaptive regularisation: 1e-10 * trace to scale with signal variance
+    reg = 1e-10 * max(np.trace(cov_xy), 1e-20) * np.eye(d)
+    cov_xy = cov_xy + reg
+
     cov_x = cov_xy[:d1, :d1]
     cov_y = cov_xy[d1:, d1:]
 
-    # I(X;Y) = 0.5 * log( det(Σ_X) * det(Σ_Y) / det(Σ_XY) )
-    sign_x, logdet_x = np.linalg.slogdet(cov_x)
-    sign_y, logdet_y = np.linalg.slogdet(cov_y)
-    sign_xy, logdet_xy = np.linalg.slogdet(cov_xy)
+    _, logdet_x = np.linalg.slogdet(cov_x)
+    _, logdet_y = np.linalg.slogdet(cov_y)
+    _, logdet_xy = np.linalg.slogdet(cov_xy)
 
     mi = 0.5 * (logdet_x + logdet_y - logdet_xy)
     return max(float(mi), 0.0)
 
 
+def _mi_class_conditional(x: np.ndarray, labels: np.ndarray) -> float:
+    """MI between continuous x and discrete labels via class-conditional Gaussians.
+
+    I(X; Y_discrete) = H(X) - H(X|Y) where H(X|Y) = Σ_c p(c) H(X|Y=c).
+    For Gaussians: H(X) = 0.5 * log((2πe)^d * det(Σ)) so the (2πe)^d
+    terms cancel and I = 0.5 * (logdet(Σ_total) - Σ_c p(c) logdet(Σ_c)).
+
+    This correctly handles discrete targets without one-hot encoding.
+    """
+    if x.ndim == 1:
+        x = x[:, None]
+
+    n, d = x.shape
+    unique_labels = np.unique(labels)
+
+    cov_total = np.cov(x, rowvar=False)
+    if cov_total.ndim == 0:
+        cov_total = cov_total.reshape(1, 1)
+    reg = 1e-10 * max(np.trace(cov_total), 1e-20) * np.eye(d)
+    cov_total = cov_total + reg
+
+    _, logdet_total = np.linalg.slogdet(cov_total)
+
+    # Weighted sum of class-conditional log-determinants
+    cond_logdet = 0.0
+    for c in unique_labels:
+        mask = labels == c
+        n_c = mask.sum()
+        if n_c < 2:
+            continue
+        p_c = n_c / n
+        cov_c = np.cov(x[mask], rowvar=False)
+        if cov_c.ndim == 0:
+            cov_c = cov_c.reshape(1, 1)
+        cov_c = cov_c + reg
+        _, logdet_c = np.linalg.slogdet(cov_c)
+        cond_logdet += p_c * logdet_c
+
+    mi = 0.5 * (logdet_total - cond_logdet)
+    return max(float(mi), 0.0)
+
+
 def _copula_transform(x: np.ndarray) -> np.ndarray:
-    """Gaussian copula (rank → normal quantile) for each column."""
+    """Gaussian copula (rank -> normal quantile) for each column.
+
+    Following Ince et al. (2017): rank data, map to uniform (0,1) via
+    r/(n+1), then invert the standard normal CDF.  This makes the
+    marginals exactly Gaussian so that Gaussian MI estimation is valid
+    for arbitrary marginal distributions.
+    """
     if x.ndim == 1:
         x = x[:, None]
     out = np.zeros_like(x, dtype=np.float64)
     n = x.shape[0]
     for j in range(x.shape[1]):
         ranks = sp_stats.rankdata(x[:, j])
-        # Map to (0, 1) then to standard normal quantile
         u = ranks / (n + 1)
         out[:, j] = sp_stats.norm.ppf(u)
     return out
@@ -90,40 +149,26 @@ def _copula_transform(x: np.ndarray) -> np.ndarray:
 # PID decomposition (Williams-Beer with MMI redundancy)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def pid_mmi(
-    s1: np.ndarray,
-    s2: np.ndarray,
-    target: np.ndarray,
-    use_copula: bool = True,
-) -> Dict[str, float]:
-    """Partial information decomposition using minimum MI (MMI) redundancy.
+def _pid_from_mis(mi_s1: float, mi_s2: float, mi_joint: float) -> Dict[str, float]:
+    """Compute PID atoms from the three MI values.
 
-    Sources: s1, s2  (e.g., real target features, predicted target features)
-    Target:  target  (e.g., trial label embedding, future activity)
+    Uses I_min (MMI) redundancy measure (Williams & Beer 2010):
+        RED = min(I(S1;T), I(S2;T))
 
-    Returns dict with: redundancy, unique_s1, unique_s2, synergy,
-                       mi_s1, mi_s2, mi_joint, co_information
+    The full decomposition:
+        I(S1,S2;T) = RED + UNQ_S1 + UNQ_S2 + SYN
+        UNQ_S1 = I(S1;T) - RED
+        UNQ_S2 = I(S2;T) - RED
+        SYN    = I(S1,S2;T) - I(S1;T) - I(S2;T) + RED
+
+    Co-information:
+        CI = I(S1;T) + I(S2;T) - I(S1,S2;T)
+        CI > 0 => redundancy-dominated; CI < 0 => synergy-dominated.
     """
-    if use_copula:
-        s1 = _copula_transform(s1)
-        s2 = _copula_transform(s2)
-        target = _copula_transform(target)
-
-    mi_s1 = _mi_gaussian(s1, target)         # I(real; label)
-    mi_s2 = _mi_gaussian(s2, target)         # I(pred; label)
-
-    s_joint = np.concatenate([s1, s2], axis=1) if s1.ndim > 1 else np.stack([s1, s2], axis=1)
-    mi_joint = _mi_gaussian(s_joint, target)  # I(real, pred; label)
-
-    # MMI redundancy (Minimum Mutual Information)
     redundancy = min(mi_s1, mi_s2)
-
-    # Unique information
-    unique_s1 = mi_s1 - redundancy   # lost in translation
-    unique_s2 = mi_s2 - redundancy   # hallucinated / noise
+    unique_s1 = mi_s1 - redundancy
+    unique_s2 = mi_s2 - redundancy
     synergy = mi_joint - mi_s1 - mi_s2 + redundancy
-
-    # Co-information (positive = redundancy-dominated, negative = synergy-dominated)
     co_info = mi_s1 + mi_s2 - mi_joint
 
     return {
@@ -135,11 +180,52 @@ def pid_mmi(
         "mi_pred": float(mi_s2),
         "mi_joint": float(mi_joint),
         "co_information": float(co_info),
-        # Derived ratios
         "translation_efficiency": float(redundancy / (mi_s1 + 1e-20)),
         "hallucination_ratio": float(unique_s2 / (mi_s2 + 1e-20)),
         "complementarity_ratio": float(synergy / (mi_joint + 1e-20)),
     }
+
+
+def pid_mmi_continuous(
+    s1: np.ndarray,
+    s2: np.ndarray,
+    target: np.ndarray,
+) -> Dict[str, float]:
+    """PID for continuous target using Gaussian copula MI.
+
+    Used for temporal PID where target = future real activity.
+    """
+    s1 = _copula_transform(s1)
+    s2 = _copula_transform(s2)
+    target = _copula_transform(target)
+
+    mi_s1 = _mi_gaussian(s1, target)
+    mi_s2 = _mi_gaussian(s2, target)
+    s_joint = np.concatenate([s1, s2], axis=1)
+    mi_joint = _mi_gaussian(s_joint, target)
+
+    return _pid_from_mis(mi_s1, mi_s2, mi_joint)
+
+
+def pid_mmi_discrete(
+    s1: np.ndarray,
+    s2: np.ndarray,
+    labels: np.ndarray,
+) -> Dict[str, float]:
+    """PID for discrete target (class labels) using class-conditional Gaussian MI.
+
+    Properly handles discrete targets without one-hot encoding artifacts.
+    Sources are copula-transformed for valid Gaussian MI estimation.
+    """
+    s1 = _copula_transform(s1)
+    s2 = _copula_transform(s2)
+
+    mi_s1 = _mi_class_conditional(s1, labels)
+    mi_s2 = _mi_class_conditional(s2, labels)
+    s_joint = np.concatenate([s1, s2], axis=1)
+    mi_joint = _mi_class_conditional(s_joint, labels)
+
+    return _pid_from_mis(mi_s1, mi_s2, mi_joint)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -147,7 +233,10 @@ def pid_mmi(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _band_power_features(x: np.ndarray, fs: int) -> np.ndarray:
-    """Mean band power per channel per trial → [N, C*n_bands]."""
+    """Mean band power per channel per trial -> [N, n_bands * C].
+
+    Layout: [band0_ch0, band0_ch1, ..., band1_ch0, band1_ch1, ...].
+    """
     N, C, T = x.shape
     feats = []
     for name, (lo, hi) in FREQUENCY_BANDS.items():
@@ -157,15 +246,14 @@ def _band_power_features(x: np.ndarray, fs: int) -> np.ndarray:
     return np.concatenate(feats, axis=1)
 
 
-def _label_to_embedding(labels: np.ndarray) -> np.ndarray:
-    """Convert integer labels to one-hot embedding [N, n_classes]."""
-    unique = np.unique(labels)
-    n_classes = len(unique)
-    label_map = {v: i for i, v in enumerate(unique)}
-    one_hot = np.zeros((len(labels), n_classes))
-    for i, lbl in enumerate(labels):
-        one_hot[i, label_map[lbl]] = 1.0
-    return one_hot
+def _single_channel_band_powers(x_ch: np.ndarray, fs: int) -> np.ndarray:
+    """Band powers for a single channel: x_ch [N, 1, T] -> [N, n_bands]."""
+    feats = []
+    for name, (lo, hi) in FREQUENCY_BANDS.items():
+        filtered = bandpass(x_ch, lo, hi, fs)
+        power = np.mean(filtered ** 2, axis=-1)  # [N, 1]
+        feats.append(power)
+    return np.concatenate(feats, axis=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,26 +267,28 @@ def label_based_pid(
     fs: int,
     bands: Optional[Dict[str, tuple]] = None,
 ) -> Dict[str, Any]:
-    """PID decomposition: {real_target, predicted_target} → trial label.
+    """PID decomposition: {real_target, predicted_target} -> trial label.
+
+    Uses class-conditional Gaussian MI so discrete labels are handled
+    correctly (no one-hot encoding needed).
 
     Args:
         real: [N, C, T] real target signals
         pred: [N, C, T] predicted target signals
-        labels: [N] integer trial labels
+        labels: [N] trial labels (int or str)
+        fs: sampling rate in Hz
 
     Returns:
-        Overall PID + per-band PID breakdown.
+        Overall PID + per-band + per-channel PID breakdown.
     """
     if bands is None:
         bands = FREQUENCY_BANDS
-
-    target_emb = _label_to_embedding(labels)
 
     # Overall PID using band power features
     feats_real = _band_power_features(real, fs)
     feats_pred = _band_power_features(pred, fs)
 
-    overall = pid_mmi(feats_real, feats_pred, target_emb)
+    overall = pid_mmi_discrete(feats_real, feats_pred, labels)
 
     # Per-band PID
     per_band = {}
@@ -206,33 +296,19 @@ def label_based_pid(
         real_band = bandpass(real, lo, hi, fs)
         pred_band = bandpass(pred, lo, hi, fs)
 
-        # Use mean power per channel as features
         real_bp = np.mean(real_band ** 2, axis=-1)  # [N, C]
         pred_bp = np.mean(pred_band ** 2, axis=-1)
 
-        per_band[name] = pid_mmi(real_bp, pred_bp, target_emb)
+        per_band[name] = pid_mmi_discrete(real_bp, pred_bp, labels)
 
     # Per-channel PID
     per_channel = []
     n_channels = real.shape[1]
-    n_bands = len(bands)
     for ch in range(n_channels):
-        # All band powers for this channel
-        ch_feats_real = feats_real[:, ch::n_channels]  # every n_channels-th column
-        ch_feats_pred = feats_pred[:, ch::n_channels]
+        ch_feats_r = _single_channel_band_powers(real[:, ch:ch+1, :], fs)
+        ch_feats_p = _single_channel_band_powers(pred[:, ch:ch+1, :], fs)
 
-        # Simpler: just use band powers for this channel
-        ch_bp_real = []
-        ch_bp_pred = []
-        for bname, (lo, hi) in bands.items():
-            r_band = bandpass(real[:, ch:ch+1, :], lo, hi, fs)
-            p_band = bandpass(pred[:, ch:ch+1, :], lo, hi, fs)
-            ch_bp_real.append(np.mean(r_band ** 2, axis=-1))  # [N, 1]
-            ch_bp_pred.append(np.mean(p_band ** 2, axis=-1))
-        ch_feats_r = np.concatenate(ch_bp_real, axis=1)  # [N, n_bands]
-        ch_feats_p = np.concatenate(ch_bp_pred, axis=1)
-
-        ch_pid = pid_mmi(ch_feats_r, ch_feats_p, target_emb)
+        ch_pid = pid_mmi_discrete(ch_feats_r, ch_feats_p, labels)
         ch_pid["channel"] = ch
         per_channel.append(ch_pid)
 
@@ -253,57 +329,75 @@ def temporal_pid(
     fs: int,
     lag_ms: int = 50,
 ) -> Dict[str, Any]:
-    """PID decomposition: {real_t, pred_t} → real_{t+lag}.
+    """PID decomposition: {real_t, pred_t} -> real_{t+lag}.
 
     Measures how well the predicted signal, combined with the current
     real signal, predicts the future real signal.
 
+    Trial boundaries are respected: lag pairs are only constructed within
+    each trial (no cross-trial contamination).
+
     Args:
         real: [N, C, T]
         pred: [N, C, T]
+        fs: sampling rate in Hz
         lag_ms: prediction horizon in milliseconds
 
     Returns:
         Overall temporal PID + per-channel breakdown.
     """
     lag_samples = max(1, int(lag_ms * fs / 1000))
-
-    # Use channel means for tractability
-    # real_t, pred_t → real_{t+lag}
     N, C, T = real.shape
     T_eff = T - lag_samples
 
-    # Flatten trials × time → samples (sub-sample for speed)
+    if T_eff < 1:
+        return {
+            "lag_ms": lag_ms,
+            "lag_samples": lag_samples,
+            "n_samples": 0,
+            "overall": {},
+            "per_channel": [],
+            "error": "lag exceeds trial length",
+        }
+
+    # Build lag pairs within each trial, then stack across trials
+    # real_t[i] and real_future[i] always come from the same trial
+    real_t_all = real[:, :, :T_eff].reshape(N, C, T_eff)
+    pred_t_all = pred[:, :, :T_eff].reshape(N, C, T_eff)
+    real_future = real[:, :, lag_samples:].reshape(N, C, T_eff)
+
+    # Transpose to [N, T_eff, C] then reshape to [N*T_eff, C]
+    # This preserves trial boundaries: rows 0..T_eff-1 are trial 0, etc.
+    real_t_flat = real_t_all.transpose(0, 2, 1).reshape(-1, C)
+    pred_t_flat = pred_t_all.transpose(0, 2, 1).reshape(-1, C)
+    future_flat = real_future.transpose(0, 2, 1).reshape(-1, C)
+
+    # Sub-sample for tractability
     max_samples = 100_000
     rng = np.random.default_rng(42)
-
-    real_t_all = real[:, :, :T_eff].reshape(-1, C)     # [N*T_eff, C]
-    pred_t_all = pred[:, :, :T_eff].reshape(-1, C)
-    real_future = real[:, :, lag_samples:].reshape(-1, C)
-
-    n_total = real_t_all.shape[0]
+    n_total = real_t_flat.shape[0]
     if n_total > max_samples:
         idx = rng.choice(n_total, max_samples, replace=False)
-        real_t_all = real_t_all[idx]
-        pred_t_all = pred_t_all[idx]
-        real_future = real_future[idx]
+        real_t_flat = real_t_flat[idx]
+        pred_t_flat = pred_t_flat[idx]
+        future_flat = future_flat[idx]
 
-    overall = pid_mmi(real_t_all, pred_t_all, real_future)
+    overall = pid_mmi_continuous(real_t_flat, pred_t_flat, future_flat)
 
     # Per-channel temporal PID
     per_channel = []
     for ch in range(C):
-        r_t = real_t_all[:, ch:ch+1]
-        p_t = pred_t_all[:, ch:ch+1]
-        r_f = real_future[:, ch:ch+1]
-        ch_pid = pid_mmi(r_t, p_t, r_f)
+        r_t = real_t_flat[:, ch:ch+1]
+        p_t = pred_t_flat[:, ch:ch+1]
+        r_f = future_flat[:, ch:ch+1]
+        ch_pid = pid_mmi_continuous(r_t, p_t, r_f)
         ch_pid["channel"] = ch
         per_channel.append(ch_pid)
 
     return {
         "lag_ms": lag_ms,
         "lag_samples": lag_samples,
-        "n_samples": int(real_t_all.shape[0]),
+        "n_samples": int(real_t_flat.shape[0]),
         "overall": overall,
         "per_channel": per_channel,
     }

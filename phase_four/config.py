@@ -125,14 +125,43 @@ class Phase4Config:
         "dandi", "ecog", "boran",
     ])
 
-    # ── Training ──────────────────────────────────────────────────────────
+    # ── Training (aligned with LOSO-optimized config from ablation study) ─
     test_fraction: float = 0.30          # 70 / 30 split
     epochs: int = 80
     batch_size: int = 64
     lr: float = 1e-3
     seed: int = 42
-    arch: str = "condunet"
     n_gpus: int = 1                      # GPUs per training run
+
+    # Architecture (LOSO-optimized)
+    arch: str = "condunet"
+    base_channels: int = 256             # optimized from 128
+    n_downsample: int = 2
+    attention_type: str = "none"         # ablation: no attention needed
+    conv_type: str = "modern"            # modern depthwise separable
+    activation: str = "gelu"
+    skip_type: str = "add"              # additive skip connections
+    cond_mode: str = "cross_attn_gated"  # gated cross-attention conditioning
+    conditioning: str = "spectro_temporal"
+
+    # Optimizer (LOSO-optimized)
+    optimizer: str = "adamw"
+    lr_schedule: str = "cosine_warmup"
+    weight_decay: float = 0.0            # ablation: no weight decay
+    dropout: float = 0.0
+
+    # Noise augmentation (LOSO-optimized)
+    use_noise_augmentation: bool = True
+    noise_gaussian_std: float = 0.1
+    noise_pink: bool = True
+    noise_pink_std: float = 0.05
+    noise_channel_dropout: float = 0.05
+    noise_temporal_dropout: float = 0.02
+    noise_prob: float = 0.5
+
+    # Session adaptation (LOSO-optimized)
+    use_adaptive_scaling: bool = True
+    use_bidirectional: bool = False
 
     # ── Paths ─────────────────────────────────────────────────────────────
     synth_root: Path = Path("/data/synth")

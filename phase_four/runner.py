@@ -16,9 +16,6 @@ Usage
 
 # Single dataset:
     python -m phase_four.runner --datasets olfactory pfc_hpc
-
-# Just figures:
-    python -m phase_four.runner --figures
 """
 
 import argparse
@@ -53,20 +50,46 @@ def train_single_dataset(
     cmd = [
         sys.executable, "train.py",
         "--dataset", ds.train_name,
+        # Architecture (LOSO-optimized)
         "--arch", cfg.arch,
+        "--base-channels", str(cfg.base_channels),
+        "--n-downsample", str(cfg.n_downsample),
+        "--attention-type", cfg.attention_type,
+        "--conv-type", cfg.conv_type,
+        "--activation", cfg.activation,
+        "--skip-type", cfg.skip_type,
+        "--cond-mode", cfg.cond_mode,
+        "--conditioning", cfg.conditioning,
+        # Training
         "--epochs", str(cfg.epochs),
         "--batch-size", str(cfg.batch_size),
         "--lr", str(cfg.lr),
         "--seed", str(cfg.seed),
+        # Optimizer (LOSO-optimized)
+        "--optimizer", cfg.optimizer,
+        "--lr-schedule", cfg.lr_schedule,
+        # Noise augmentation (LOSO-optimized)
+        "--use-noise-augmentation",
+        "--noise-gaussian-std", str(cfg.noise_gaussian_std),
+        "--noise-pink-std", str(cfg.noise_pink_std),
+        "--noise-channel-dropout", str(cfg.noise_channel_dropout),
+        "--noise-temporal-dropout", str(cfg.noise_temporal_dropout),
+        "--noise-prob", str(cfg.noise_prob),
+        # Session adaptation (LOSO-optimized)
+        "--use-adaptive-scaling",
+        "--no-bidirectional",
+        # Output
         "--checkpoint-prefix", "phase4",
         "--checkpoint-dir", str(ckpt_dir),
         "--output-results-file", str(results_file),
-        "--no-bidirectional",
         "--no-plots",
         "--quiet",
-        # 70/30 split: hold out 30% of sessions for test
         "--split-by-session",
     ]
+
+    # Add pink noise flag if enabled
+    if cfg.noise_pink:
+        cmd.append("--noise-pink")
 
     # Dataset-specific extra args
     cmd.extend(ds.extra_train_args)
@@ -119,19 +142,44 @@ def train_all_parallel(
         cmd = [
             sys.executable, "train.py",
             "--dataset", ds.train_name,
+            # Architecture (LOSO-optimized)
             "--arch", cfg.arch,
+            "--base-channels", str(cfg.base_channels),
+            "--n-downsample", str(cfg.n_downsample),
+            "--attention-type", cfg.attention_type,
+            "--conv-type", cfg.conv_type,
+            "--activation", cfg.activation,
+            "--skip-type", cfg.skip_type,
+            "--cond-mode", cfg.cond_mode,
+            "--conditioning", cfg.conditioning,
+            # Training
             "--epochs", str(cfg.epochs),
             "--batch-size", str(cfg.batch_size),
             "--lr", str(cfg.lr),
             "--seed", str(cfg.seed),
+            # Optimizer (LOSO-optimized)
+            "--optimizer", cfg.optimizer,
+            "--lr-schedule", cfg.lr_schedule,
+            # Noise augmentation (LOSO-optimized)
+            "--use-noise-augmentation",
+            "--noise-gaussian-std", str(cfg.noise_gaussian_std),
+            "--noise-pink-std", str(cfg.noise_pink_std),
+            "--noise-channel-dropout", str(cfg.noise_channel_dropout),
+            "--noise-temporal-dropout", str(cfg.noise_temporal_dropout),
+            "--noise-prob", str(cfg.noise_prob),
+            # Session adaptation (LOSO-optimized)
+            "--use-adaptive-scaling",
+            "--no-bidirectional",
+            # Output
             "--checkpoint-prefix", "phase4",
             "--checkpoint-dir", str(ckpt_dir),
             "--output-results-file", str(results_file),
-            "--no-bidirectional",
             "--no-plots",
             "--quiet",
             "--split-by-session",
         ]
+        if cfg.noise_pink:
+            cmd.append("--noise-pink")
         cmd.extend(ds.extra_train_args)
 
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_id)}

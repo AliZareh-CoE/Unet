@@ -2,7 +2,7 @@
 
 Measures whether NeuroGate-translated signals preserve individual
 session or subject identity — the neural translation analogue of
-the "identifiability index" from Amico & Goñi (2018).
+the "identifiability index" from Amico & Goni (2018, Sci Reports 8:8254).
 
 Protocol
 --------
@@ -15,10 +15,13 @@ band powers).  Then compute:
 If the predicted signals are identifiable, the translation preserves
 session-specific neural signatures — not just population-level structure.
 
+Identification uses **leave-one-out templates**: when classifying trial i,
+the template for trial i's session is built from all *other* trials in
+that session.  This prevents self-match inflation.
+
 Outputs
 -------
 - Identifiability index for: source, real target, predicted target
-- Per-session similarity matrices (for source, real, predicted)
 - Confusion matrix: given a predicted trial, which session is it most
   similar to?
 - All results as JSON + CSV (no figures)
@@ -30,7 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.spatial.distance import cosine
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -50,18 +52,17 @@ def _channel_correlation_features(x: np.ndarray) -> np.ndarray:
     n_features = C * (C - 1) // 2
     features = np.zeros((N, n_features))
 
+    triu_idx = np.triu_indices(C, k=1)
     for trial in range(N):
         corr = np.corrcoef(x[trial])  # [C, C]
-        # Handle NaN from constant channels
         corr = np.nan_to_num(corr, nan=0.0)
-        idx = np.triu_indices(C, k=1)
-        features[trial] = corr[idx]
+        features[trial] = corr[triu_idx]
 
     return features
 
 
 def _band_power_features(x: np.ndarray, fs: int) -> np.ndarray:
-    """Mean band power per channel per trial → [N, C * n_bands]."""
+    """Mean band power per channel per trial -> [N, C * n_bands]."""
     from phase_four.validation.spectral import bandpass
     from phase_four.config import FREQUENCY_BANDS
 
@@ -87,28 +88,32 @@ def extract_fingerprint_features(x: np.ndarray, fs: int) -> np.ndarray:
 
 def _cosine_similarity_matrix(features: np.ndarray) -> np.ndarray:
     """Pairwise cosine similarity [N, N] from features [N, D]."""
-    # Normalise rows
     norms = np.linalg.norm(features, axis=1, keepdims=True) + 1e-20
     normed = features / norms
     return normed @ normed.T
+
+
+def _build_session_mask(session_ids: np.ndarray) -> np.ndarray:
+    """Boolean matrix [N, N] where [i,j] = True iff same session."""
+    # Works for any dtype (int, str, etc.)
+    return session_ids[:, None] == session_ids[None, :]
 
 
 def compute_identifiability(
     features: np.ndarray,
     session_ids: np.ndarray,
 ) -> Dict[str, Any]:
-    """Compute the identifiability index (Amico & Goñi 2018).
+    """Compute the identifiability index (Amico & Goni 2018).
 
     identifiability = mean(within-session similarity) - mean(between-session similarity)
 
-    Also computes:
-    - Per-session mean feature (template)
-    - Identification accuracy: for each trial, is the nearest-template
-      the correct session?
+    Identification accuracy uses leave-one-out templates to prevent
+    self-match inflation: when classifying trial i, the template for
+    trial i's own session excludes trial i itself.
 
     Args:
         features: [N, D]
-        session_ids: [N] integer session labels
+        session_ids: [N] session labels (int or str)
 
     Returns:
         Dict with identifiability, accuracy, and per-session stats.
@@ -118,59 +123,83 @@ def compute_identifiability(
 
     unique_sessions = np.unique(session_ids)
     n_sessions = len(unique_sessions)
+    sess_to_idx = {s: i for i, s in enumerate(unique_sessions)}
 
-    # Within vs between session similarity
-    within_sims = []
-    between_sims = []
-    for i in range(N):
-        for j in range(i + 1, N):
-            if session_ids[i] == session_ids[j]:
-                within_sims.append(sim[i, j])
-            else:
-                between_sims.append(sim[i, j])
+    # ── Vectorised within/between using boolean mask ──────────────────────
+    same_sess = _build_session_mask(session_ids)
+    upper_tri = np.triu(np.ones((N, N), dtype=bool), k=1)
 
-    within_mean = float(np.mean(within_sims)) if within_sims else 0.0
-    between_mean = float(np.mean(between_sims)) if between_sims else 0.0
+    within_mask = same_sess & upper_tri
+    between_mask = (~same_sess) & upper_tri
+
+    within_mean = float(sim[within_mask].mean()) if within_mask.any() else 0.0
+    between_mean = float(sim[between_mask].mean()) if between_mask.any() else 0.0
     identifiability = within_mean - between_mean
 
-    # Template-based identification
-    # Build session templates (mean feature per session)
-    templates = {}
-    for sess in unique_sessions:
-        mask = session_ids == sess
-        templates[int(sess)] = features[mask].mean(axis=0)
+    # ── Leave-one-out template identification ─────────────────────────────
+    # For each trial i, build session templates excluding trial i, then
+    # classify trial i to the session with highest cosine similarity.
+    #
+    # session_sums[s] = sum of features for session s
+    # session_counts[s] = number of trials in session s
+    # LOO template for trial i in session s = (session_sums[s] - features[i]) / (count[s] - 1)
 
-    template_matrix = np.array([templates[int(s)] for s in unique_sessions])  # [n_sess, D]
-    template_norms = np.linalg.norm(template_matrix, axis=1, keepdims=True) + 1e-20
-    template_normed = template_matrix / template_norms
+    D = features.shape[1]
+    session_sums = np.zeros((n_sessions, D))
+    session_counts = np.zeros(n_sessions)
+    trial_sess_idx = np.zeros(N, dtype=int)
 
-    # For each trial, find nearest template
-    feat_norms = np.linalg.norm(features, axis=1, keepdims=True) + 1e-20
-    feat_normed = features / feat_norms
-    sims_to_templates = feat_normed @ template_normed.T  # [N, n_sess]
+    for i, s in enumerate(session_ids):
+        si = sess_to_idx[s]
+        session_sums[si] += features[i]
+        session_counts[si] += 1
+        trial_sess_idx[i] = si
 
-    predicted_sessions = unique_sessions[np.argmax(sims_to_templates, axis=1)]
-    correct = (predicted_sessions == session_ids).astype(float)
+    correct = np.zeros(N)
+    for i in range(N):
+        si = trial_sess_idx[i]
+
+        # Build LOO templates: for trial i's session, subtract trial i
+        templates = session_sums.copy()
+        counts = session_counts.copy()
+        templates[si] -= features[i]
+        counts[si] -= 1
+
+        # Skip sessions with 0 trials after LOO
+        valid = counts > 0
+        if not valid.any():
+            continue
+
+        # Normalise templates
+        t_norms = np.linalg.norm(templates, axis=1, keepdims=True) + 1e-20
+        t_normed = templates / t_norms
+
+        # Cosine similarity of trial i to each template
+        f_norm = features[i] / (np.linalg.norm(features[i]) + 1e-20)
+        sims_i = t_normed @ f_norm  # [n_sessions]
+
+        # Mask out invalid sessions
+        sims_i[~valid] = -np.inf
+
+        pred_idx = np.argmax(sims_i)
+        if pred_idx == si:
+            correct[i] = 1.0
+
     identification_accuracy = float(correct.mean())
 
-    # Per-session stats
+    # ── Per-session stats ─────────────────────────────────────────────────
     per_session = []
-    for sess in unique_sessions:
-        mask = session_ids == sess
+    for s in unique_sessions:
+        mask = session_ids == s
         n_trials = int(mask.sum())
         sess_acc = float(correct[mask].mean()) if n_trials > 0 else 0.0
 
-        # Within-session similarity (mean pairwise)
-        sess_idx = np.where(mask)[0]
-        if len(sess_idx) > 1:
-            ws = [sim[sess_idx[a], sess_idx[b]]
-                  for a in range(len(sess_idx)) for b in range(a + 1, len(sess_idx))]
-            ws_mean = float(np.mean(ws))
-        else:
-            ws_mean = 0.0
+        # Within-session similarity from precomputed matrix
+        sess_mask = np.outer(mask, mask) & upper_tri
+        ws_mean = float(sim[sess_mask].mean()) if sess_mask.any() else 0.0
 
         per_session.append({
-            "session": int(sess),
+            "session": _to_json_safe(s),
             "n_trials": n_trials,
             "identification_accuracy": sess_acc,
             "within_session_similarity": ws_mean,
@@ -188,15 +217,29 @@ def compute_identifiability(
     }
 
 
+def _to_json_safe(val):
+    """Convert numpy types / arbitrary session IDs to JSON-serialisable form."""
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    return val
+
+
 def compute_cross_domain_identification(
     features_real: np.ndarray,
     features_pred: np.ndarray,
     session_ids: np.ndarray,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Cross-domain identification: build templates from real, identify predicted.
 
     This is the strongest test: can we identify the session of a *predicted*
     trial using templates built from *real* trials?
+
+    No LOO correction needed here because templates and test features
+    come from different signal domains (real vs predicted).
 
     Args:
         features_real: [N, D] features from real target signals
@@ -208,14 +251,15 @@ def compute_cross_domain_identification(
     """
     unique_sessions = np.unique(session_ids)
     n_sessions = len(unique_sessions)
+    sess_to_idx = {s: i for i, s in enumerate(unique_sessions)}
 
     # Build templates from real
-    templates = {}
-    for sess in unique_sessions:
-        mask = session_ids == sess
-        templates[int(sess)] = features_real[mask].mean(axis=0)
+    D = features_real.shape[1]
+    template_matrix = np.zeros((n_sessions, D))
+    for s in unique_sessions:
+        mask = session_ids == s
+        template_matrix[sess_to_idx[s]] = features_real[mask].mean(axis=0)
 
-    template_matrix = np.array([templates[int(s)] for s in unique_sessions])
     template_norms = np.linalg.norm(template_matrix, axis=1, keepdims=True) + 1e-20
     template_normed = template_matrix / template_norms
 
@@ -223,21 +267,21 @@ def compute_cross_domain_identification(
     pred_norms = np.linalg.norm(features_pred, axis=1, keepdims=True) + 1e-20
     pred_normed = features_pred / pred_norms
     sims = pred_normed @ template_normed.T
-    predicted_sessions = unique_sessions[np.argmax(sims, axis=1)]
+    pred_sess_idx = np.argmax(sims, axis=1)
+    predicted_sessions = unique_sessions[pred_sess_idx]
     accuracy = float((predicted_sessions == session_ids).mean())
 
     # Confusion matrix
     confusion = np.zeros((n_sessions, n_sessions), dtype=int)
-    sess_to_idx = {int(s): i for i, s in enumerate(unique_sessions)}
     for true_s, pred_s in zip(session_ids, predicted_sessions):
-        confusion[sess_to_idx[int(true_s)], sess_to_idx[int(pred_s)]] += 1
+        confusion[sess_to_idx[true_s], sess_to_idx[pred_s]] += 1
 
     return {
         "cross_domain_accuracy": accuracy,
         "chance_level": 1.0 / n_sessions,
         "n_sessions": n_sessions,
         "confusion_matrix": confusion.tolist(),
-        "session_labels": [int(s) for s in unique_sessions],
+        "session_labels": [_to_json_safe(s) for s in unique_sessions],
     }
 
 
@@ -252,8 +296,11 @@ def run_fingerprint_validation(
 ) -> Dict[str, Any]:
     """Run session fingerprinting on saved synthetic data.
 
-    If session_ids is not provided, attempts to load from metadata or
-    uses labels as a proxy.
+    Session ID resolution order:
+    1. Explicit session_ids argument
+    2. session_ids_test.npy in synth_dir
+    3. session_ids field in metadata.json
+    4. labels_test.npy as proxy (e.g., odor identity = session proxy)
 
     Args:
         synth_dir: contains source_test.npy, target_test.npy,
@@ -269,9 +316,13 @@ def run_fingerprint_validation(
     pred = np.load(synth_dir / "predicted_test.npy")
     labels = np.load(synth_dir / "labels_test.npy")
 
-    # Use labels as session proxy if no session_ids provided
+    # Resolve session IDs
     if session_ids is None:
-        # Try loading from metadata
+        sid_path = synth_dir / "session_ids_test.npy"
+        if sid_path.exists():
+            session_ids = np.load(sid_path, allow_pickle=True)
+
+    if session_ids is None:
         meta_path = synth_dir / "metadata.json"
         if meta_path.exists():
             with open(meta_path) as f:
@@ -280,7 +331,6 @@ def run_fingerprint_validation(
                 session_ids = np.array(meta["session_ids"])
 
     if session_ids is None:
-        # Fall back to labels
         session_ids = labels.copy()
 
     unique_sessions = np.unique(session_ids)
