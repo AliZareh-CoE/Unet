@@ -84,7 +84,7 @@ class Phase1Config:
     baselines: List[str] = field(default_factory=lambda: BASELINE_METHODS.copy())
 
     # Performance settings
-    use_gpu: bool = True
+    use_gpu: bool = False
     n_jobs: int = -1  # -1 means use all available CPUs
 
     # Boran MTL dataset settings
