@@ -987,6 +987,63 @@ def load_ecog_data(
     return X, y, train_idx, val_idx, test_idx, None
 
 
+def load_boran_data(
+    source_region: str = "hippocampus",
+    target_region: str = "entorhinal_cortex",
+    window_size: int = 5000,
+    stride: int = 2500,
+) -> Tuple[NDArray, NDArray, NDArray, NDArray, NDArray, Optional[Dict[str, NDArray]]]:
+    """Load Boran MTL dataset for inter-region neural signal translation.
+
+    Returns:
+        X: Input signals (source region) [N, C, T]
+        y: Target signals (target region) [N, C, T]
+        train_idx: Training indices
+        val_idx: Validation indices
+        test_idx: Test indices
+        val_idx_per_session: None (no session grouping in standard eval)
+    """
+    from data import prepare_boran_data
+
+    print(f"Loading Boran MTL dataset ({source_region} -> {target_region})...")
+    data = prepare_boran_data(
+        source_region=source_region,
+        target_region=target_region,
+        window_size=window_size,
+        stride=stride,
+    )
+
+    train_dataset = data["train_dataset"]
+    val_dataset = data["val_dataset"]
+    test_dataset = data["test_dataset"]
+
+    # Convert datasets to arrays (same pattern as load_ecog_data)
+    def dataset_to_arrays(dataset):
+        sources, targets = [], []
+        for i in range(len(dataset)):
+            item = dataset[i]
+            sources.append(item["source"].numpy())
+            targets.append(item["target"].numpy())
+        return np.stack(sources), np.stack(targets)
+
+    X_train, y_train = dataset_to_arrays(train_dataset)
+    X_val, y_val = dataset_to_arrays(val_dataset)
+    X_test, y_test = dataset_to_arrays(test_dataset) if len(test_dataset) > 0 else (np.array([]), np.array([]))
+
+    # Combine into full arrays
+    X = np.concatenate([X_train, X_val] + ([X_test] if len(X_test) > 0 else []))
+    y = np.concatenate([y_train, y_val] + ([y_test] if len(y_test) > 0 else []))
+
+    train_idx = np.arange(len(X_train))
+    val_idx = np.arange(len(X_train), len(X_train) + len(X_val))
+    test_idx = np.arange(len(X_train) + len(X_val), len(X)) if len(X_test) > 0 else np.array([])
+
+    print(f"  Loaded: Source {X.shape} -> Target {y.shape}")
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+
+    return X, y, train_idx, val_idx, test_idx, None
+
+
 # =============================================================================
 # LOSO (Leave-One-Session-Out) Functions
 # =============================================================================
@@ -3314,6 +3371,11 @@ Examples:
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_pcx1_data(seed=config.seed)
             elif config.dataset == "ecog":
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_ecog_data()
+            elif config.dataset == "boran":
+                X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_boran_data(
+                    source_region=config.boran_source_region,
+                    target_region=config.boran_target_region,
+                )
             else:  # olfactory (default)
                 X, y, train_idx, val_idx, test_idx, val_idx_per_session = load_olfactory_data()
 
