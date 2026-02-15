@@ -36,11 +36,16 @@ def _build_model_from_config(config: dict, device: torch.device):
     except ImportError:
         from Unet.models import NeuroGate
 
+    # n_odors is not stored in config (it comes from data["n_odors"] during
+    # training).  Infer it from the checkpoint state_dict if available,
+    # otherwise default to 1 for continuous datasets.
+    n_odors = config.get("n_odors", 1)
+
     model = NeuroGate(
         in_channels=config["in_channels"],
         out_channels=config["out_channels"],
         base=config.get("base_channels", 128),
-        n_odors=config.get("n_odors", 0),
+        n_odors=n_odors,
         dropout=config.get("dropout", 0.0),
         use_attention=config.get("use_attention", True),
         attention_type=config.get("attention_type", "self_attn"),
@@ -73,6 +78,13 @@ def _load_model(checkpoint_path: Path, device: torch.device):
     """Load model + config from a Phase-4 checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = ckpt["config"]
+
+    # Infer n_odors from checkpoint state_dict if not in config
+    model_sd = ckpt.get("model", {})
+    embed_key = "embed.weight"
+    if embed_key in model_sd and "n_odors" not in config:
+        config["n_odors"] = model_sd[embed_key].shape[0]
+
     model = _build_model_from_config(config, device)
     model.load_state_dict(ckpt["model"])
     return model, config, ckpt
@@ -136,9 +148,15 @@ def generate_and_save(
     # ── Rebuild test dataloader from saved split info ─────────────────────
     split_info = ckpt.get("split_info", {})
     test_idx = split_info.get("test_idx")
-    if test_idx is None:
-        raise RuntimeError(f"Checkpoint missing split_info.test_idx for {dataset_key}")
 
+    # If no test set (e.g., --no-test-set was used), fall back to val indices
+    if not test_idx:
+        test_idx = split_info.get("val_idx")
+        if test_idx:
+            print(f"  No test set — using {len(test_idx)} validation samples for generation")
+
+    # For PCx1 and similar session-based datasets, test_idx may not exist;
+    # the loader factory will recreate from session splits instead.
     loader = _make_test_loader(dataset_key, ds, train_config, test_idx, cfg)
 
     # ── Run inference ─────────────────────────────────────────────────────
@@ -165,7 +183,7 @@ def generate_and_save(
         "sampling_rate": ds.sampling_rate,
         "n_labels": int(np.unique(results["labels"]).shape[0]),
         "checkpoint": str(ckpt_path),
-        "test_idx": [int(i) for i in test_idx],
+        "test_idx": [int(i) for i in test_idx] if test_idx is not None else [],
     }
     with open(out_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -189,6 +207,14 @@ def _make_test_loader(
     """Create a test-only DataLoader for the given dataset."""
     import numpy as np
 
+    # PCx1 uses session-based splits (no index arrays)
+    if ds.train_name == "pcx1":
+        return _pcx1_test_loader(train_config, cfg)
+
+    if test_idx is None:
+        raise RuntimeError(
+            f"No test/val indices found in checkpoint for {dataset_key}"
+        )
     test_idx = np.array(test_idx)
 
     if ds.train_name == "olfactory":
@@ -256,6 +282,39 @@ def _ecog_test_loader(test_idx, train_config, cfg):
     full_ds = data["dataset"]
     ds = Subset(full_ds, test_idx)
     return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4)
+
+
+def _pcx1_test_loader(train_config, cfg):
+    """Recreate the PCx1 validation DataLoader from saved config.
+
+    PCx1 uses session-based splits (not index arrays).  We recreate the
+    val loader using the same deterministic session split (seed from config).
+    """
+    from data import create_pcx1_dataloaders, get_pcx1_session_splits
+
+    seed = train_config.get("seed", 42)
+    window_size = train_config.get("pcx1_window_size", 5000)
+    stride = train_config.get("pcx1_val_stride", train_config.get("pcx1_stride", 2500))
+
+    n_val = train_config.get("pcx1_n_val", 4)
+    train_sessions, val_sessions, _ = get_pcx1_session_splits(
+        seed=seed, n_val=n_val, n_test=0,
+    )
+    print(f"  Recreating PCx1 val loader: sessions={val_sessions}")
+
+    loaders = create_pcx1_dataloaders(
+        train_sessions=train_sessions,
+        val_sessions=val_sessions,
+        window_size=window_size,
+        stride=stride,
+        val_stride=stride,
+        batch_size=cfg.batch_size,
+        zscore_per_window=True,
+        num_workers=4,
+        separate_val_sessions=False,
+        persistent_workers=False,
+    )
+    return loaders["val"]
 
 
 def _boran_test_loader(test_idx, train_config, cfg):
