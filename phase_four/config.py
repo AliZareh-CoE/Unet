@@ -155,6 +155,7 @@ class Phase4Config:
     skip_type: str = "add"              # additive skip connections
     cond_mode: str = "cross_attn_gated"  # gated cross-attention conditioning
     conditioning: str = "spectro_temporal"
+    n_heads: int = 4                     # attention heads (matches LOSO)
 
     # Optimizer (LOSO-optimized)
     optimizer: str = "adamw"
@@ -217,4 +218,4 @@ class Phase4Config:
 
     def get_checkpoint_path(self, dataset: str) -> Path:
         """Return checkpoint path for a dataset model."""
-        return self.checkpoint_dir / dataset / "best_model.pt"
+        return self.checkpoint_dir / dataset / "checkpoints" / "phase4_best_model.pt"

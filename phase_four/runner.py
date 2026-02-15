@@ -39,15 +39,16 @@ from phase_four.config import DATASETS, Phase4Config
 def _build_train_args(dataset_key: str, cfg: Phase4Config) -> List[str]:
     """Build the common train.py arguments for a dataset (no launcher prefix)."""
     ds = DATASETS[dataset_key]
-    ckpt_dir = cfg.checkpoint_dir / dataset_key
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # train.py uses --output-dir to set base; checkpoints go to <output-dir>/checkpoints
+    output_dir = cfg.checkpoint_dir / dataset_key
+    output_dir.mkdir(parents=True, exist_ok=True)
     results_file = cfg.output_dir / dataset_key / "train_results.json"
     results_file.parent.mkdir(parents=True, exist_ok=True)
 
     args = [
         "train.py",
         "--dataset", ds.train_name,
-        # Architecture
+        # Architecture (LOSO-optimized)
         "--arch", cfg.arch,
         "--base-channels", str(cfg.base_channels),
         "--n-downsample", str(cfg.n_downsample),
@@ -57,27 +58,28 @@ def _build_train_args(dataset_key: str, cfg: Phase4Config) -> List[str]:
         "--skip-type", cfg.skip_type,
         "--cond-mode", cfg.cond_mode,
         "--conditioning", cfg.conditioning,
+        "--n-heads", str(cfg.n_heads),
         # Training
         "--epochs", str(cfg.epochs),
         "--batch-size", str(cfg.batch_size),
         "--lr", str(cfg.lr),
         "--seed", str(cfg.seed),
-        # Optimizer
+        # Optimizer (LOSO-optimized)
         "--optimizer", cfg.optimizer,
         "--lr-schedule", cfg.lr_schedule,
-        # Noise augmentation
+        # Noise augmentation (LOSO-optimized)
         "--use-noise-augmentation",
         "--noise-gaussian-std", str(cfg.noise_gaussian_std),
         "--noise-pink-std", str(cfg.noise_pink_std),
         "--noise-channel-dropout", str(cfg.noise_channel_dropout),
         "--noise-temporal-dropout", str(cfg.noise_temporal_dropout),
         "--noise-prob", str(cfg.noise_prob),
-        # Session adaptation
+        # Session adaptation (LOSO-optimized)
         "--use-adaptive-scaling",
         "--no-bidirectional",
         # Output
         "--checkpoint-prefix", "phase4",
-        "--checkpoint-dir", str(ckpt_dir),
+        "--output-dir", str(output_dir),
         "--output-results-file", str(results_file),
         "--no-plots",
         "--quiet",
@@ -113,7 +115,7 @@ def train_single_dataset(
     if proc.returncode != 0:
         print(f"  WARNING: train.py exited with code {proc.returncode}")
 
-    ckpt_path = cfg.checkpoint_dir / dataset_key / "phase4_best_model.pt"
+    ckpt_path = cfg.checkpoint_dir / dataset_key / "checkpoints" / "phase4_best_model.pt"
     if ckpt_path.exists():
         print(f"  Checkpoint saved: {ckpt_path}")
     else:
@@ -164,7 +166,7 @@ def train_fsdp(
     else:
         print(f"  OK")
 
-    ckpt_path = cfg.checkpoint_dir / dataset_key / "phase4_best_model.pt"
+    ckpt_path = cfg.checkpoint_dir / dataset_key / "checkpoints" / "phase4_best_model.pt"
     if ckpt_path.exists():
         print(f"  Checkpoint saved: {ckpt_path}")
     else:
