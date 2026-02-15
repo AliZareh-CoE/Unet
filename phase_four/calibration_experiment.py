@@ -29,56 +29,87 @@ from sklearn.isotonic import IsotonicRegression
 from phase_four.config import DATASETS, FREQUENCY_BANDS, Phase4Config
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MC-Dropout Inference
+# Stochastic Inference (MC-Dropout or Input Perturbation)
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _has_active_dropout(model) -> bool:
+    """Check if the model has any Dropout layers with p > 0."""
+    import torch.nn as nn
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d)):
+            if m.p > 0:
+                return True
+    return False
+
 
 def _enable_mc_dropout(model):
     """Enable dropout layers at inference time for MC-Dropout."""
+    import torch.nn as nn
     for m in model.modules():
-        if isinstance(m, (
-            __import__("torch").nn.Dropout,
-            __import__("torch").nn.Dropout1d,
-            __import__("torch").nn.Dropout2d,
-        )):
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d)):
             m.train()
 
 
-def mc_dropout_inference(
+def stochastic_inference(
     model,
     loader,
     device,
     n_samples: int = 20,
+    noise_std: float = 0.05,
 ) -> Dict[str, np.ndarray]:
-    """Run MC-Dropout inference to get predictive mean and variance.
+    """Run stochastic inference to get predictive mean and variance.
 
-    Returns dict with keys: mean, variance, target, source, labels.
+    Uses MC-Dropout if the model has active dropout layers (p > 0).
+    Otherwise falls back to input perturbation: adds small Gaussian
+    noise to inputs and measures output variance across passes.
+
+    Returns dict with keys: mean, variance, target, source, labels, method.
     Shapes: [N, C, T] for mean/variance/target/source.
     """
     import torch
 
     model.eval()
-    _enable_mc_dropout(model)
+    use_mc_dropout = _has_active_dropout(model)
 
-    # First pass: collect targets and count batches
+    if use_mc_dropout:
+        _enable_mc_dropout(model)
+        method = "mc_dropout"
+        print(f"  Using MC-Dropout (found active dropout layers)")
+    else:
+        method = "input_perturbation"
+        print(f"  No active dropout (p=0) — using input perturbation (noise_std={noise_std})")
+
+    # First pass: collect all input data, targets, labels
+    all_src_batches = []
     targets, sources, labels_list = [], [], []
     for batch in loader:
-        src, tgt = batch[0].to(device), batch[1].to(device)
+        src, tgt = batch[0], batch[1]
         label = batch[2] if len(batch) > 2 else torch.zeros(src.shape[0])
-        sources.append(src.cpu().numpy())
-        targets.append(tgt.cpu().numpy())
+        all_src_batches.append(src)
+        sources.append(src.numpy())
+        targets.append(tgt.numpy())
         labels_list.append(label.numpy() if isinstance(label, torch.Tensor) else np.array(label))
 
     all_sources = np.concatenate(sources, axis=0)
     all_targets = np.concatenate(targets, axis=0)
     all_labels = np.concatenate(labels_list, axis=0)
 
-    # MC forward passes
+    # Compute per-channel input std for scaling perturbation noise
+    if method == "input_perturbation":
+        input_std = np.std(all_sources, axis=(0, 2), keepdims=True)  # [1, C, 1]
+        input_std = np.clip(input_std, 1e-8, None)
+        input_std_t = torch.tensor(input_std, dtype=torch.float32, device=device)
+
+    # Stochastic forward passes
     all_preds = []
     for s in range(n_samples):
         preds = []
         with torch.no_grad():
-            for batch in loader:
-                src = batch[0].to(device)
+            for src_batch in all_src_batches:
+                src = src_batch.to(device)
+                if method == "input_perturbation":
+                    noise = torch.randn_like(src) * input_std_t * noise_std
+                    src = src + noise
                 pred = model(src)
                 preds.append(pred.cpu().numpy())
         all_preds.append(np.concatenate(preds, axis=0))
@@ -94,6 +125,7 @@ def mc_dropout_inference(
         "target": all_targets,
         "source": all_sources,
         "labels": all_labels,
+        "method": method,
     }
 
 
@@ -176,9 +208,11 @@ class GPBetaCalibrator:
     recalibration mapping.  Falls back to isotonic if netcal unavailable.
     """
 
-    def __init__(self, n_inducing: int = 12, n_epochs: int = 256):
+    def __init__(self, n_inducing: int = 12, n_epochs: int = 256,
+                 max_fit_samples: int = 10000):
         self.n_inducing = n_inducing
         self.n_epochs = n_epochs
+        self.max_fit_samples = max_fit_samples
         self.calibrators: Dict[int, object] = {}
         self._use_netcal = True
 
@@ -193,10 +227,17 @@ class GPBetaCalibrator:
             self._fallback.fit(mu, sigma, y)
             return
 
+        rng = np.random.default_rng(42)
+
         for c in range(C):
-            mu_c = mu[:, c, :].ravel()[:, None]       # (M, 1)
-            sig_c = np.clip(sigma[:, c, :].ravel()[:, None], 1e-8, None)
-            y_c = y[:, c, :].ravel()[:, None]
+            mu_c = mu[:, c, :].ravel()
+            sig_c = np.clip(sigma[:, c, :].ravel(), 1e-8, None)
+            y_c = y[:, c, :].ravel()
+
+            # Subsample to keep GP tractable
+            if len(mu_c) > self.max_fit_samples:
+                idx = rng.choice(len(mu_c), self.max_fit_samples, replace=False)
+                mu_c, sig_c, y_c = mu_c[idx], sig_c[idx], y_c[idx]
 
             gp = GPBeta(
                 n_inducing_points=self.n_inducing,
@@ -205,8 +246,9 @@ class GPBetaCalibrator:
                 use_cuda=False,
             )
             try:
-                gp.fit((mu_c.astype(np.float32), sig_c.astype(np.float32)),
-                       y_c.astype(np.float32))
+                gp.fit((mu_c[:, None].astype(np.float32),
+                        sig_c[:, None].astype(np.float32)),
+                       y_c[:, None].astype(np.float32))
                 self.calibrators[c] = gp
             except Exception as e:
                 print(f"  [GP-Beta] channel {c} failed: {e} — skipping")
@@ -565,6 +607,7 @@ def run_experiment(
     cfg: Phase4Config,
     mc_samples: int = 20,
     max_train: Optional[int] = None,
+    noise_std: float = 0.05,
 ):
     """Run the full calibration comparison experiment."""
     import torch
@@ -578,14 +621,17 @@ def run_experiment(
 
     model, train_loader, test_loader = load_train_test_loaders(dataset_key, cfg, device)
 
-    # ── MC-Dropout inference ──────────────────────────────────────────────
-    print(f"\nRunning MC-Dropout inference ({mc_samples} forward passes)...")
+    # ── Stochastic inference (MC-Dropout or input perturbation) ───────────
+    print(f"\nRunning stochastic inference ({mc_samples} forward passes)...")
     t0 = time.time()
     print("  Train split...")
-    train_data = mc_dropout_inference(model, train_loader, device, n_samples=mc_samples)
+    train_data = stochastic_inference(model, train_loader, device,
+                                      n_samples=mc_samples, noise_std=noise_std)
     print("  Test split...")
-    test_data = mc_dropout_inference(model, test_loader, device, n_samples=mc_samples)
-    print(f"  MC-Dropout done in {time.time() - t0:.1f}s")
+    test_data = stochastic_inference(model, test_loader, device,
+                                     n_samples=mc_samples, noise_std=noise_std)
+    unc_method = test_data["method"]
+    print(f"  Inference done in {time.time() - t0:.1f}s (method: {unc_method})")
 
     mu_train = train_data["mean"]
     sig_train = np.sqrt(np.clip(train_data["variance"], 1e-12, None))
@@ -753,12 +799,15 @@ def main():
                         help="Max training samples for calibrator fitting")
     parser.add_argument("--mc-samples", type=int, default=20,
                         help="Number of MC-Dropout forward passes")
+    parser.add_argument("--noise-std", type=float, default=0.05,
+                        help="Input perturbation noise std (used when model has no dropout)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--output-dir", type=str, default="results/phase4")
     args = parser.parse_args()
 
     cfg = Phase4Config(batch_size=args.batch_size, output_dir=Path(args.output_dir))
-    run_experiment(args.dataset, cfg, mc_samples=args.mc_samples, max_train=args.max_train)
+    run_experiment(args.dataset, cfg, mc_samples=args.mc_samples,
+                   max_train=args.max_train, noise_std=args.noise_std)
 
 
 if __name__ == "__main__":
