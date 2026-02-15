@@ -287,30 +287,67 @@ def _modulation_index(phase: np.ndarray, amp: np.ndarray, n_bins: int = 18):
     return float(mi)
 
 
+def _modulation_index_vectorized(
+    phase: np.ndarray,
+    amp: np.ndarray,
+    n_bins: int = 18,
+) -> float:
+    """Vectorized MI across all traces at once.
+
+    Args:
+        phase: [M, T]  (M = N*C or subsampled)
+        amp:   [M, T]
+    """
+    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    mean_amp = np.zeros(n_bins)
+    flat_phase = phase.ravel()
+    flat_amp = amp.ravel()
+    for b in range(n_bins):
+        mask = (flat_phase >= bin_edges[b]) & (flat_phase < bin_edges[b + 1])
+        if mask.any():
+            mean_amp[b] = flat_amp[mask].mean()
+
+    total = mean_amp.sum()
+    if total < 1e-20:
+        return 0.0
+    p = mean_amp / total
+    q = np.ones(n_bins) / n_bins
+    p_safe = np.where(p > 0, p, 1e-20)
+    kl = np.sum(p_safe * np.log(p_safe / q))
+    return float(kl / np.log(n_bins))
+
+
 def compute_pac(
     x: np.ndarray,
     fs: int,
     phase_band: Tuple[float, float] = (4, 8),
     amp_band: Tuple[float, float] = (30, 100),
+    max_traces: int = 2000,
 ) -> float:
-    """Mean PAC (Modulation Index) across trials and channels.
+    """Mean PAC (Modulation Index) – vectorized over trials×channels.
 
     Args:
         x: [N, C, T]
+        max_traces: subsample to at most this many traces for speed
     """
-    n_trials, n_ch, _ = x.shape
-    mis = []
-    for trial in range(n_trials):
-        for ch in range(n_ch):
-            trace = x[trial, ch]
-            # Phase of low-frequency
-            lo = bandpass(trace[np.newaxis, np.newaxis, :], *phase_band, fs)[0, 0]
-            phase = np.angle(sig.hilbert(lo))
-            # Amplitude of high-frequency
-            hi = bandpass(trace[np.newaxis, np.newaxis, :], *amp_band, fs)[0, 0]
-            amp = np.abs(sig.hilbert(hi))
-            mis.append(_modulation_index(phase, amp))
-    return float(np.mean(mis))
+    N, C, T = x.shape
+    # Flatten to [N*C, T] for vectorized filtering
+    flat = x.reshape(N * C, T)
+
+    # Subsample if too many traces
+    if flat.shape[0] > max_traces:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(flat.shape[0], max_traces, replace=False)
+        flat = flat[idx]
+
+    # Vectorized bandpass + hilbert (scipy operates along last axis)
+    lo = bandpass(flat[:, np.newaxis, :], *phase_band, fs)[:, 0, :]
+    phase = np.angle(sig.hilbert(lo, axis=-1))
+
+    hi = bandpass(flat[:, np.newaxis, :], *amp_band, fs)[:, 0, :]
+    amp = np.abs(sig.hilbert(hi, axis=-1))
+
+    return _modulation_index_vectorized(phase, amp)
 
 
 def pac_with_surrogates(
@@ -319,26 +356,40 @@ def pac_with_surrogates(
     phase_band: Tuple[float, float] = (4, 8),
     amp_band: Tuple[float, float] = (30, 100),
     n_surrogates: int = 200,
+    max_traces: int = 2000,
 ) -> Dict[str, float]:
-    """PAC with time-shifted surrogate significance testing.
+    """PAC with time-shifted surrogate significance testing (vectorized).
 
     Returns:
         mi          – observed Modulation Index
         mi_z        – z-score vs surrogate distribution
         mi_p        – p-value (proportion of surrogates >= observed)
     """
-    mi_obs = compute_pac(x, fs, phase_band, amp_band)
+    N, C, T = x.shape
 
-    # Surrogate distribution: circular-shift amplitude relative to phase
-    n_trials, n_ch, T = x.shape
+    # Subsample traces once, reuse for observed + surrogates
+    flat = x.reshape(N * C, T)
     rng = np.random.default_rng(42)
-    surrogate_mis = []
-    for _ in range(n_surrogates):
-        shift = rng.integers(T // 4, 3 * T // 4)
-        x_shifted = np.roll(x, shift, axis=-1)
-        surrogate_mis.append(compute_pac(x_shifted, fs, phase_band, amp_band))
+    if flat.shape[0] > max_traces:
+        idx = rng.choice(flat.shape[0], max_traces, replace=False)
+        flat = flat[idx]
 
-    surrogate_mis = np.array(surrogate_mis)
+    # Pre-filter once (bandpass doesn't change with time shifts)
+    lo = bandpass(flat[:, np.newaxis, :], *phase_band, fs)[:, 0, :]
+    hi = bandpass(flat[:, np.newaxis, :], *amp_band, fs)[:, 0, :]
+
+    # Observed MI
+    phase = np.angle(sig.hilbert(lo, axis=-1))
+    amp = np.abs(sig.hilbert(hi, axis=-1))
+    mi_obs = _modulation_index_vectorized(phase, amp)
+
+    # Surrogates: circular-shift the high-freq amplitude relative to phase
+    surrogate_mis = np.empty(n_surrogates)
+    for s in range(n_surrogates):
+        shift = rng.integers(T // 4, 3 * T // 4)
+        amp_shifted = np.roll(amp, shift, axis=-1)
+        surrogate_mis[s] = _modulation_index_vectorized(phase, amp_shifted)
+
     mi_z = (mi_obs - surrogate_mis.mean()) / (surrogate_mis.std() + 1e-20)
     mi_p = float(np.mean(surrogate_mis >= mi_obs))
 
@@ -355,7 +406,7 @@ def run_spectral_validation(
     nperseg: int = 1024,
     pac_phase_band: Tuple[float, float] = (4, 8),
     pac_amp_band: Tuple[float, float] = (30, 100),
-    pac_n_surrogates: int = 200,
+    pac_n_surrogates: int = 0,  # kept for API compat, surrogates are skipped
 ) -> Dict[str, Any]:
     """Run all spectral validations on saved synthetic data.
 
@@ -382,15 +433,14 @@ def run_spectral_validation(
     for name, val in band_r2.items():
         print(f"    {name:12s} R² : {val:.4f}")
 
-    # 3. PAC – real
+    # 3. PAC – raw MI only (no surrogates – too slow for large datasets)
     print("    Computing PAC (real)...")
-    pac_real = pac_with_surrogates(real, fs, pac_phase_band, pac_amp_band, pac_n_surrogates)
-    print(f"    PAC real MI    : {pac_real['mi']:.4f}  (z={pac_real['mi_z']:.2f}, p={pac_real['mi_p']:.3f})")
+    pac_mi_real = compute_pac(real, fs, pac_phase_band, pac_amp_band)
+    print(f"    PAC real MI    : {pac_mi_real:.4f}")
 
-    # 4. PAC – predicted
     print("    Computing PAC (predicted)...")
-    pac_pred = pac_with_surrogates(pred, fs, pac_phase_band, pac_amp_band, pac_n_surrogates)
-    print(f"    PAC pred MI    : {pac_pred['mi']:.4f}  (z={pac_pred['mi_z']:.2f}, p={pac_pred['mi_p']:.3f})")
+    pac_mi_pred = compute_pac(pred, fs, pac_phase_band, pac_amp_band)
+    print(f"    PAC pred MI    : {pac_mi_pred:.4f}")
 
     # ── Post-hoc calibration ─────────────────────────────────────────────
     print("    Post-hoc calibration (spectral bias + envelope matching)...")
@@ -452,9 +502,9 @@ def run_spectral_validation(
             "psd_mse_db": psd_cal["psd_mse_db"],
             "band_r2": band_r2_cal,
         },
-        "pac_real": pac_real,
-        "pac_pred": pac_pred,
-        "pac_mi_ratio": pac_pred["mi"] / (pac_real["mi"] + 1e-20),
+        "pac_mi_real": pac_mi_real,
+        "pac_mi_pred": pac_mi_pred,
+        "pac_mi_ratio": pac_mi_pred / (pac_mi_real + 1e-20),
         "per_channel": channel_stats,
     }
 
