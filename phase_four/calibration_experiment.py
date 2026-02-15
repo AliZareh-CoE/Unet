@@ -334,28 +334,103 @@ def _pcx1_train_test(model, train_config, cfg, device):
 
 
 def _indexed_train_test(model, dataset_key, ds, train_config, split_info, cfg, device):
-    """Index-based datasets: use split_info to build both loaders."""
+    """Index-based datasets: rebuild data + splits, run inference on both."""
     import torch
+    from torch.utils.data import DataLoader
     from phase_four.generate import run_inference
 
+    # Try checkpoint split_info first
     train_idx = np.array(split_info.get("train_idx", []))
     test_idx = np.array(split_info.get("test_idx", split_info.get("val_idx", [])))
 
+    # If indices missing from checkpoint, rebuild splits from the data module
     if len(train_idx) == 0 or len(test_idx) == 0:
-        raise RuntimeError(f"Missing train/test indices in checkpoint for {dataset_key}")
+        print(f"  No train/test indices in checkpoint — rebuilding splits from data...")
+        train_idx, test_idx, data_dict = _rebuild_splits(dataset_key, ds, train_config)
+    else:
+        data_dict = None
 
-    # Build loaders (reuse generate.py factories)
+    # Build loaders
     from phase_four.generate import _make_test_loader
-    # Temporarily swap test_idx to get train/test loaders
-    train_loader = _make_test_loader(dataset_key, ds, train_config, train_idx, cfg)
-    test_loader = _make_test_loader(dataset_key, ds, train_config, test_idx, cfg)
 
+    if data_dict is not None:
+        # We already have the full dataset loaded — build loaders directly
+        from data import PairedNeuralDataset
+        reverse = "--pfc-reverse" in ds.extra_train_args
+
+        if ds.train_name == "pfc":
+            if reverse:
+                source, target = data_dict["ca1"], data_dict["pfc"]
+            else:
+                source, target = data_dict["pfc"], data_dict["ca1"]
+            labels = data_dict["trial_types"]
+        elif ds.train_name == "olfactory":
+            source, target, labels = data_dict["ob"], data_dict["pcx"], data_dict["labels"]
+        else:
+            # Fallback for other datasets: try the generate.py factory
+            train_loader = _make_test_loader(dataset_key, ds, train_config, train_idx, cfg)
+            test_loader = _make_test_loader(dataset_key, ds, train_config, test_idx, cfg)
+            print("  Running inference on train split...")
+            train_res = run_inference(model, train_loader, device)
+            print("  Running inference on test split...")
+            test_res = run_inference(model, test_loader, device)
+            return train_res["predicted"], train_res["target"], test_res["predicted"], test_res["target"]
+
+        train_ds = PairedNeuralDataset(source, target, labels, train_idx)
+        test_ds = PairedNeuralDataset(source, target, labels, test_idx)
+        train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4)
+        test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=4)
+    else:
+        train_loader = _make_test_loader(dataset_key, ds, train_config, train_idx, cfg)
+        test_loader = _make_test_loader(dataset_key, ds, train_config, test_idx, cfg)
+
+    print(f"  Train: {len(train_idx)} trials, Test: {len(test_idx)} trials")
     print("  Running inference on train split...")
     train_res = run_inference(model, train_loader, device)
     print("  Running inference on test split...")
     test_res = run_inference(model, test_loader, device)
 
     return train_res["predicted"], train_res["target"], test_res["predicted"], test_res["target"]
+
+
+def _rebuild_splits(dataset_key, ds, train_config):
+    """Rebuild train/test splits from data when checkpoint doesn't store indices."""
+    if ds.train_name == "pfc":
+        from data import prepare_pfc_data
+        data = prepare_pfc_data(split_by_session=True)
+        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+
+    if ds.train_name == "olfactory":
+        from data import prepare_data
+        data = prepare_data(split_by_session=True)
+        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+
+    if ds.train_name == "dandi":
+        from data import prepare_dandi_data
+        data = prepare_dandi_data(
+            source_region=train_config.get("dandi_source_region", "amygdala"),
+            target_region=train_config.get("dandi_target_region", "hippocampus"),
+        )
+        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+
+    if ds.train_name == "ecog":
+        from data import prepare_ecog_data
+        data = prepare_ecog_data(
+            experiment=train_config.get("ecog_experiment", "motor_imagery"),
+            source_region=train_config.get("ecog_source_region", "frontal"),
+            target_region=train_config.get("ecog_target_region", "temporal"),
+        )
+        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+
+    if ds.train_name == "boran":
+        from data import prepare_boran_data
+        data = prepare_boran_data(
+            source_region=train_config.get("boran_source_region", "hippocampus"),
+            target_region=train_config.get("boran_target_region", "entorhinal_cortex"),
+        )
+        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+
+    raise RuntimeError(f"Don't know how to rebuild splits for {dataset_key} ({ds.train_name})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
