@@ -37,6 +37,10 @@ _CALIBRATION_BANDS: Dict[str, Tuple[float, float]] = {
 }
 
 
+_MIN_TRIALS_FOR_CALIBRATION = 200  # need enough trials for stable PSD estimates
+_MAX_LOG_AMP_CORRECTION = 1.5     # clamp: at most ~4.5× amplitude change per band
+
+
 def calibrate_spectral_bias(
     pred: np.ndarray,
     real: np.ndarray,
@@ -49,6 +53,8 @@ def calibrate_spectral_bias(
     each frequency band, then scales the prediction's FFT magnitudes to
     close the gap.  Operates per-channel, averaged across trials.
 
+    Skips calibration when N < 200 (PSD estimates too noisy).
+
     Args:
         pred: predicted signals  [N, C, T]
         real: real target signals [N, C, T]
@@ -58,10 +64,15 @@ def calibrate_spectral_bias(
     Returns:
         Calibrated predictions  [N, C, T]
     """
+    N, C, T = pred.shape
+
+    if N < _MIN_TRIALS_FOR_CALIBRATION:
+        print(f"      spectral bias: skipped (N={N} < {_MIN_TRIALS_FOR_CALIBRATION})")
+        return pred.copy()
+
     if bands is None:
         bands = _CALIBRATION_BANDS
 
-    N, C, T = pred.shape
     freqs = np.fft.rfftfreq(T, d=1.0 / fs)
 
     # Build smooth band masks  [n_bands, n_freq]
@@ -92,6 +103,9 @@ def calibrate_spectral_bias(
     # Log-amplitude ratio:  log(sqrt(real_power / pred_power))
     log_amp_ratio = 0.5 * (np.log(real_bp + 1e-20) - np.log(pred_bp + 1e-20))  # [C, K]
 
+    # Clamp to prevent extreme corrections on noisy estimates
+    log_amp_ratio = np.clip(log_amp_ratio, -_MAX_LOG_AMP_CORRECTION, _MAX_LOG_AMP_CORRECTION)
+
     # Convert per-band ratios to per-frequency amplitude scale
     amp_scales = np.exp(np.einsum("ck,kf->cf", log_amp_ratio, masks))  # [C, F]
 
@@ -117,6 +131,8 @@ def calibrate_envelope(
     then linearly scales the prediction envelope to match the target
     statistics per channel.  Phase is preserved.
 
+    Skips calibration when N < 200 (envelope stats too noisy).
+
     Args:
         pred: predicted signals  [N, C, T]
         real: real target signals [N, C, T]
@@ -127,6 +143,11 @@ def calibrate_envelope(
     from scipy.signal import hilbert
 
     N, C, T = pred.shape
+
+    if N < _MIN_TRIALS_FOR_CALIBRATION:
+        print(f"      envelope: skipped (N={N} < {_MIN_TRIALS_FOR_CALIBRATION})")
+        return pred.copy()
+
     calibrated = np.empty_like(pred)
 
     for ch in range(C):
