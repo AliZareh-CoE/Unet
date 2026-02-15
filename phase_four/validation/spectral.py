@@ -69,8 +69,8 @@ def calibrate_spectral_bias(
     n_bands = len(band_list)
     masks = np.zeros((n_bands, len(freqs)), dtype=np.float64)
     for i, (lo, hi) in enumerate(band_list):
-        rise = 1.0 / (1.0 + np.exp(-5.0 * (freqs - lo)))
-        fall = 1.0 / (1.0 + np.exp(-5.0 * (hi - freqs)))
+        rise = 1.0 / (1.0 + np.exp(np.clip(-5.0 * (freqs - lo), -500, 500)))
+        fall = 1.0 / (1.0 + np.exp(np.clip(-5.0 * (hi - freqs), -500, 500)))
         masks[i] = rise * fall
 
     # Normalise so masks sum to 1 per freq bin (where covered)
