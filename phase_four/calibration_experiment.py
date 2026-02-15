@@ -398,39 +398,39 @@ def _rebuild_splits(dataset_key, ds, train_config):
     if ds.train_name == "pfc":
         from data import prepare_pfc_data
         data = prepare_pfc_data(split_by_session=True)
-        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
-
-    if ds.train_name == "olfactory":
+    elif ds.train_name == "olfactory":
         from data import prepare_data
         data = prepare_data(split_by_session=True)
-        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
-
-    if ds.train_name == "dandi":
+    elif ds.train_name == "dandi":
         from data import prepare_dandi_data
         data = prepare_dandi_data(
             source_region=train_config.get("dandi_source_region", "amygdala"),
             target_region=train_config.get("dandi_target_region", "hippocampus"),
         )
-        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
-
-    if ds.train_name == "ecog":
+    elif ds.train_name == "ecog":
         from data import prepare_ecog_data
         data = prepare_ecog_data(
             experiment=train_config.get("ecog_experiment", "motor_imagery"),
             source_region=train_config.get("ecog_source_region", "frontal"),
             target_region=train_config.get("ecog_target_region", "temporal"),
         )
-        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
-
-    if ds.train_name == "boran":
+    elif ds.train_name == "boran":
         from data import prepare_boran_data
         data = prepare_boran_data(
             source_region=train_config.get("boran_source_region", "hippocampus"),
             target_region=train_config.get("boran_target_region", "entorhinal_cortex"),
         )
-        return np.array(data["train_idx"]), np.array(data["test_idx"]), data
+    else:
+        raise RuntimeError(f"Don't know how to rebuild splits for {dataset_key} ({ds.train_name})")
 
-    raise RuntimeError(f"Don't know how to rebuild splits for {dataset_key} ({ds.train_name})")
+    train_idx = np.array(data["train_idx"])
+    test_idx = np.array(data["test_idx"])
+    # Fall back to val_idx when test split is empty (e.g. PFC session splits
+    # use val as the held-out set with 0 dedicated test sessions)
+    if len(test_idx) == 0:
+        test_idx = np.array(data["val_idx"])
+        print(f"  test_idx empty — using val_idx ({len(test_idx)} trials) as test set")
+    return train_idx, test_idx, data
 
 
 # ═══════════════════════════════════════════════════════════════════════════
