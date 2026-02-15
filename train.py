@@ -1,7 +1,6 @@
 """Stage 1 Training: Neural signal translation with UNet1D.
 
 This script trains a UNet model for OB → PCx signal translation.
-For post-hoc calibration (Stage 2), use calibrate.py after training.
 
 Usage:
     # Train model (single GPU)
@@ -12,9 +11,6 @@ Usage:
 
     # Cross-session evaluation with 4 test sessions
     python train.py --epochs 80 --n-test-sessions 4
-
-    # After training, run calibration:
-    python calibrate.py --checkpoint artifacts/checkpoints/best_model.pt
 
 Notes:
     - Auto-conditioning from input signal (--conditioning spectro_temporal) is the default
@@ -90,7 +86,6 @@ from models import (
     VQVAEEncoder,
     FreqDisentangledEncoder,
     CycleConsistentEncoder,
-    hilbert_torch,
     # Session matching for inference
     SessionMatcher,
     # Noise augmentation for training robustness
@@ -783,8 +778,6 @@ def evaluate(
     fast_mode: bool = True,  # Skip expensive metrics (PSD, phase, baseline) during training
     sampling_rate: int = SAMPLING_RATE_HZ,  # Sampling rate for PSD calculations
     cond_encoder: Optional[nn.Module] = None,
-    envelope_matcher_fwd: Optional[nn.Module] = None,
-    envelope_matcher_rev: Optional[nn.Module] = None,
     wiener_boost: Optional["WienerBoost"] = None,
     wiener_alpha: float = 1.0,
 ) -> Dict[str, float]:
@@ -906,11 +899,6 @@ def evaluate(
                 # Other architectures: just pass input
                 pred = model(ob)
 
-            # Apply envelope histogram matching (closed-form correction for amplitude dynamics)
-            # This corrects bursty vs smooth characteristics
-            if envelope_matcher_fwd is not None:
-                pred = envelope_matcher_fwd(pred, odor_ids=odor)
-
             # Apply Wiener residual learning: pred = NeuralNet(x) + alpha * Wiener(x)
             # Track neural-only prediction for contribution analysis
             pred_neural_only = pred.clone() if (wiener_boost is not None and wiener_boost.is_fitted) else None
@@ -1021,10 +1009,6 @@ def evaluate(
                     pred_rev = reverse_model(pcx, cond_emb=cond_emb, session_ids=session_ids)
                 else:
                     pred_rev = reverse_model(pcx, odor, session_ids=session_ids)
-
-                # Apply envelope histogram matching (reverse direction)
-                if envelope_matcher_rev is not None:
-                    pred_rev = envelope_matcher_rev(pred_rev, odor_ids=odor)
 
                 pred_rev_c = crop_to_target_torch(pred_rev)
 
@@ -2209,9 +2193,6 @@ def train(
         if cond_encoder is not None:
             cond_encoder = cond_encoder.to(device)
 
-    # Import EnvelopeHistogramMatching for post-processing
-    from models import EnvelopeHistogramMatching
-
     # Define betas early since it's used by multiple optimizers
     betas = (config.get("beta1", 0.9), config.get("beta2", 0.999))
 
@@ -2821,18 +2802,6 @@ def train(
                 if 'psd_err_db' in test_metrics_stage1:
                     print(f"STAGE1_RESULT_PSD_ERR_DB={test_metrics_stage1['psd_err_db']:.4f}")
 
-    # =============================================================================
-    # POST-HOC CALIBRATION MOVED TO calibrate.py
-    # =============================================================================
-    # Stage 2 (spectral bias + envelope matching) is now in a separate script.
-    # Run: python calibrate.py --checkpoint artifacts/checkpoints/best_model.pt
-    #
-    # This keeps train.py focused on Stage 1 (UNet training) only.
-
-    # Initialize envelope matchers to None (calibrate.py handles these)
-    envelope_matcher_fwd = None
-    envelope_matcher_rev = None
-
     # Final test evaluation (full metrics, fast_mode=False)
     # Skip if no test set (no_test_set=True means all held-out sessions are validation)
     # Check both index-based (olfactory/pfc) and loader-based (pcx1) test sets
@@ -2844,8 +2813,6 @@ def train(
             fast_mode=False,  # Full metrics for final evaluation
             sampling_rate=config.get("sampling_rate", SAMPLING_RATE_HZ),
             cond_encoder=cond_encoder,
-            envelope_matcher_fwd=envelope_matcher_fwd,
-            envelope_matcher_rev=envelope_matcher_rev,
             wiener_boost=wiener_filter,
             wiener_alpha=config.get("wiener_alpha", 1.0),
         )

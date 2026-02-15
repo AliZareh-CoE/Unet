@@ -310,24 +310,6 @@ def run_spectral_validation(
     pac_mi_pred = compute_pac(pred, fs, pac_phase_band, pac_amp_band)
     print(f"    PAC pred MI    : {pac_mi_pred:.4f}")
 
-    # ── Post-hoc calibration (must be fit on TRAIN data, not test!) ─────
-    # Load calibrated predictions if they were produced by
-    # calibration_experiment.py (which fits on train, applies to test).
-    cal_path = synth_dir / "predicted_test_calibrated.npy"
-    if cal_path.exists():
-        print(f"    Loading pre-calibrated predictions from {cal_path}")
-        pred_cal = np.load(cal_path)
-        psd_cal = psd_match_metrics(real, pred_cal, fs, nperseg)
-        band_r2_cal = per_band_r2(real, pred_cal, fs)
-        print(f"    [calibrated] PSD corr  : {psd_cal['psd_corr']:.4f}")
-        print(f"    [calibrated] PSD MSE   : {psd_cal['psd_mse_db']:.2f}")
-        for name, val in band_r2_cal.items():
-            print(f"    [calibrated] {name:12s} R² : {val:.4f}")
-    else:
-        print("    No calibrated predictions found (run calibration_experiment.py first)")
-        psd_cal = None
-        band_r2_cal = None
-
     # ── Per-channel statistics ────────────────────────────────────────────
     n_channels = real.shape[1]
     channel_stats = {}
@@ -372,13 +354,6 @@ def run_spectral_validation(
         "pac_mi_ratio": pac_mi_pred / (pac_mi_real + 1e-20),
         "per_channel": channel_stats,
     }
-    if psd_cal is not None:
-        results["calibrated"] = {
-            "psd_corr": psd_cal["psd_corr"],
-            "psd_mse_db": psd_cal["psd_mse_db"],
-            "band_r2": band_r2_cal,
-        }
-
     # Save
     out_path = synth_dir / "spectral_results.json"
     with open(out_path, "w") as f:
