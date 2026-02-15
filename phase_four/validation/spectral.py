@@ -19,159 +19,6 @@ from phase_four.config import FREQUENCY_BANDS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 0.  Post-hoc calibration  (numpy, closed-form)
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Fine-grained bands for spectral bias correction (matches legacy 10-band)
-_CALIBRATION_BANDS: Dict[str, Tuple[float, float]] = {
-    "delta_lo":   (1.0, 2.0),
-    "delta_hi":   (2.0, 4.0),
-    "theta_lo":   (4.0, 6.0),
-    "theta_hi":   (6.0, 8.0),
-    "alpha":      (8.0, 12.0),
-    "beta_lo":    (12.0, 20.0),
-    "beta_hi":    (20.0, 30.0),
-    "gamma_lo":   (30.0, 50.0),
-    "gamma_mid":  (50.0, 70.0),
-    "gamma_hi":   (70.0, 100.0),
-}
-
-
-_MIN_TRIALS_FOR_CALIBRATION = 200  # need enough trials for stable PSD estimates
-_MAX_LOG_AMP_CORRECTION = 1.5     # clamp: at most ~4.5× amplitude change per band
-
-
-def calibrate_spectral_bias(
-    pred: np.ndarray,
-    real: np.ndarray,
-    fs: int,
-    bands: Optional[Dict[str, Tuple[float, float]]] = None,
-) -> np.ndarray:
-    """Per-band spectral bias correction in FFT domain (closed-form).
-
-    Measures the power-spectral-density ratio between *real* and *pred* in
-    each frequency band, then scales the prediction's FFT magnitudes to
-    close the gap.  Operates per-channel, averaged across trials.
-
-    Skips calibration when N < 200 (PSD estimates too noisy).
-
-    Args:
-        pred: predicted signals  [N, C, T]
-        real: real target signals [N, C, T]
-        fs:   sampling rate (Hz)
-        bands: frequency band dict  {name: (lo_hz, hi_hz)}
-
-    Returns:
-        Calibrated predictions  [N, C, T]
-    """
-    N, C, T = pred.shape
-
-    if N < _MIN_TRIALS_FOR_CALIBRATION:
-        print(f"      spectral bias: skipped (N={N} < {_MIN_TRIALS_FOR_CALIBRATION})")
-        return pred.copy()
-
-    if bands is None:
-        bands = _CALIBRATION_BANDS
-
-    freqs = np.fft.rfftfreq(T, d=1.0 / fs)
-
-    # Build smooth band masks  [n_bands, n_freq]
-    band_list = list(bands.values())
-    n_bands = len(band_list)
-    masks = np.zeros((n_bands, len(freqs)), dtype=np.float64)
-    for i, (lo, hi) in enumerate(band_list):
-        rise = 1.0 / (1.0 + np.exp(np.clip(-5.0 * (freqs - lo), -500, 500)))
-        fall = 1.0 / (1.0 + np.exp(np.clip(-5.0 * (hi - freqs), -500, 500)))
-        masks[i] = rise * fall
-
-    # Normalise so masks sum to 1 per freq bin (where covered)
-    mask_sum = masks.sum(axis=0, keepdims=True).clip(min=1e-6)
-    masks /= mask_sum
-
-    # Per-channel PSD in each band
-    pred_fft = np.fft.rfft(pred.astype(np.float64), axis=-1)  # [N, C, F]
-    real_fft = np.fft.rfft(real.astype(np.float64), axis=-1)
-
-    pred_power = np.abs(pred_fft) ** 2   # [N, C, F]
-    real_power = np.abs(real_fft) ** 2
-
-    # Band power per channel (averaged over trials)
-    # einsum: ncf,kf -> nck  then mean over n -> [C, n_bands]
-    pred_bp = np.einsum("ncf,kf->nck", pred_power, masks).mean(axis=0)  # [C, K]
-    real_bp = np.einsum("ncf,kf->nck", real_power, masks).mean(axis=0)
-
-    # Log-amplitude ratio:  log(sqrt(real_power / pred_power))
-    log_amp_ratio = 0.5 * (np.log(real_bp + 1e-20) - np.log(pred_bp + 1e-20))  # [C, K]
-
-    # Clamp to prevent extreme corrections on noisy estimates
-    log_amp_ratio = np.clip(log_amp_ratio, -_MAX_LOG_AMP_CORRECTION, _MAX_LOG_AMP_CORRECTION)
-
-    # Convert per-band ratios to per-frequency amplitude scale
-    amp_scales = np.exp(np.einsum("ck,kf->cf", log_amp_ratio, masks))  # [C, F]
-
-    # Leave uncovered frequencies (outside all bands) unchanged
-    coverage = masks.sum(axis=0)
-    uncovered = coverage < 0.01
-    amp_scales[:, uncovered] = 1.0
-
-    # Apply in FFT domain
-    calibrated_fft = pred_fft * amp_scales[np.newaxis, :, :]  # [N, C, F]
-    calibrated = np.fft.irfft(calibrated_fft, n=T, axis=-1)
-
-    return calibrated.astype(pred.dtype)
-
-
-def calibrate_envelope(
-    pred: np.ndarray,
-    real: np.ndarray,
-) -> np.ndarray:
-    """Envelope mean/std matching (closed-form).
-
-    Computes the analytic-signal envelope of both *pred* and *real*,
-    then linearly scales the prediction envelope to match the target
-    statistics per channel.  Phase is preserved.
-
-    Skips calibration when N < 200 (envelope stats too noisy).
-
-    Args:
-        pred: predicted signals  [N, C, T]
-        real: real target signals [N, C, T]
-
-    Returns:
-        Calibrated predictions  [N, C, T]
-    """
-    from scipy.signal import hilbert
-
-    N, C, T = pred.shape
-
-    if N < _MIN_TRIALS_FOR_CALIBRATION:
-        print(f"      envelope: skipped (N={N} < {_MIN_TRIALS_FOR_CALIBRATION})")
-        return pred.copy()
-
-    calibrated = np.empty_like(pred)
-
-    for ch in range(C):
-        # Target envelope stats (across all trials for this channel)
-        real_analytic = hilbert(real[:, ch, :].astype(np.float64), axis=-1)
-        real_env = np.abs(real_analytic)
-        tgt_mean = real_env.mean()
-        tgt_std = max(real_env.std(), 1e-8)
-
-        # Prediction envelope + phase
-        pred_analytic = hilbert(pred[:, ch, :].astype(np.float64), axis=-1)
-        pred_env = np.abs(pred_analytic)
-        pred_phase = np.angle(pred_analytic)
-        pred_mean = pred_env.mean()
-        pred_std = max(pred_env.std(), 1e-8)
-
-        # Linear scaling: match mean/std
-        corrected_env = (pred_env - pred_mean) * (tgt_std / pred_std) + tgt_mean
-        calibrated[:, ch, :] = corrected_env * np.cos(pred_phase)
-
-    return calibrated.astype(pred.dtype)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # 1.  PSD  match
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -463,21 +310,23 @@ def run_spectral_validation(
     pac_mi_pred = compute_pac(pred, fs, pac_phase_band, pac_amp_band)
     print(f"    PAC pred MI    : {pac_mi_pred:.4f}")
 
-    # ── Post-hoc calibration ─────────────────────────────────────────────
-    print("    Post-hoc calibration (spectral bias + envelope matching)...")
-    pred_cal = calibrate_spectral_bias(pred, real, fs)
-    pred_cal = calibrate_envelope(pred_cal, real)
-
-    psd_cal = psd_match_metrics(real, pred_cal, fs, nperseg)
-    band_r2_cal = per_band_r2(real, pred_cal, fs)
-
-    print(f"    [calibrated] PSD corr  : {psd_cal['psd_corr']:.4f}")
-    print(f"    [calibrated] PSD MSE   : {psd_cal['psd_mse_db']:.2f}")
-    for name, val in band_r2_cal.items():
-        print(f"    [calibrated] {name:12s} R² : {val:.4f}")
-
-    # Save calibrated predictions for downstream validators
-    np.save(synth_dir / "predicted_test_calibrated.npy", pred_cal)
+    # ── Post-hoc calibration (must be fit on TRAIN data, not test!) ─────
+    # Load calibrated predictions if they were produced by
+    # calibration_experiment.py (which fits on train, applies to test).
+    cal_path = synth_dir / "predicted_test_calibrated.npy"
+    if cal_path.exists():
+        print(f"    Loading pre-calibrated predictions from {cal_path}")
+        pred_cal = np.load(cal_path)
+        psd_cal = psd_match_metrics(real, pred_cal, fs, nperseg)
+        band_r2_cal = per_band_r2(real, pred_cal, fs)
+        print(f"    [calibrated] PSD corr  : {psd_cal['psd_corr']:.4f}")
+        print(f"    [calibrated] PSD MSE   : {psd_cal['psd_mse_db']:.2f}")
+        for name, val in band_r2_cal.items():
+            print(f"    [calibrated] {name:12s} R² : {val:.4f}")
+    else:
+        print("    No calibrated predictions found (run calibration_experiment.py first)")
+        psd_cal = None
+        band_r2_cal = None
 
     # ── Per-channel statistics ────────────────────────────────────────────
     n_channels = real.shape[1]
@@ -518,16 +367,17 @@ def run_spectral_validation(
         "psd_corr": psd["psd_corr"],
         "psd_mse_db": psd["psd_mse_db"],
         "band_r2": band_r2,
-        "calibrated": {
-            "psd_corr": psd_cal["psd_corr"],
-            "psd_mse_db": psd_cal["psd_mse_db"],
-            "band_r2": band_r2_cal,
-        },
         "pac_mi_real": pac_mi_real,
         "pac_mi_pred": pac_mi_pred,
         "pac_mi_ratio": pac_mi_pred / (pac_mi_real + 1e-20),
         "per_channel": channel_stats,
     }
+    if psd_cal is not None:
+        results["calibrated"] = {
+            "psd_corr": psd_cal["psd_corr"],
+            "psd_mse_db": psd_cal["psd_mse_db"],
+            "band_r2": band_r2_cal,
+        }
 
     # Save
     out_path = synth_dir / "spectral_results.json"
